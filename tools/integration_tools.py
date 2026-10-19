@@ -161,6 +161,16 @@ def application_block(applications: list, tickets: list, corpus_path: str) -> st
     return "\n".join(lines)
 
 
+def cadrage_answers_block(state: dict) -> str:
+    """Besoin reformulé et réponses obtenues, pour compléter le cadrage."""
+    lines = ["=== BESOIN REFORMULÉ (onglet Intégration) ===", state.get("besoin", "").strip() or "(vide)",
+             "=== RÉPONSES DU MÉTIER ==="]
+    for q in answered(state):
+        lines += [f"- Q{q['id']}. {q['question']}", f"  Réponse : {q['reponse'].strip()}"]
+    lines.append("=== FIN DES RÉPONSES ===")
+    return "\n".join(lines)
+
+
 def previous_qa_block(state: dict) -> str:
     """Rappel, pour l'agent, des questions déjà posées et des réponses obtenues."""
     if not state.get("questions"):

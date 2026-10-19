@@ -20,7 +20,7 @@ from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
     fetch_application_tickets, find_jira_issue_by_summary, get_epic_children, get_full_jira_issue_context,
-    get_issue_field_values, update_jira_release_note,
+    get_issue_field_values, update_jira_cadrage, update_jira_release_note,
 )
 from tools.memory_tools import (
     get_capitalized_experience,
@@ -80,6 +80,7 @@ CLAUDE_MODEL_ENV = {
     "patch": "CLAUDE_MODEL_PATCH",
     "generate-cucumber-postmerge": "CLAUDE_MODEL_POSTMERGE",
     "besoin": "CLAUDE_MODEL_BESOIN",
+    "cadrage-reponses": "CLAUDE_MODEL_REFINE",
 }
 
 # ---------------------------------------------------------------------------
@@ -589,7 +590,7 @@ def main():
     parser.add_argument("--project", required=True, help="Clé du projet Jira (ex: SPEC, OXY)")
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
-    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes)")
+    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration)")
     parser.add_argument("--feedback", default="", help="Remarques de l'utilisateur pour la révision")
     # Les tests Cucumber sont désormais traités après merge, par le ticket SPEC [CUCUMBER] (generate-cucumber-postmerge)
     parser.add_argument("--generate-cucumber", action="store_true", default=False, help="Réactiver ponctuellement la génération des tests Cucumber avec le patch")
@@ -634,12 +635,14 @@ def main():
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
     python_exe = sys.executable
 
-    # La rédaction du besoin ne s'appuie que sur Jira : aucun dépôt à préparer
+    # Rédaction du besoin et complément du cadrage par les réponses : Jira et fichiers locaux seulement, aucun dépôt
     is_besoin = args.step == "besoin"
+    is_cadrage_answers = args.step == "cadrage-reponses"
+    jira_only = is_besoin or is_cadrage_answers
     local_std_repo = local_client_repo = local_cucumber_std_repo = ""
     odatio_version, branch_rule, repo_scope = "non requise", "", ""
     conventions_path = ""
-    if not is_besoin:
+    if not jira_only:
         std_repo_arg = args.std_repo or os.getenv("BITBUCKET_STD_REPO_PATH", "").strip()
         if not std_repo_arg:
             print("❌ Dépôt du socle Standard non configuré : renseignez BITBUCKET_STD_REPO_PATH (onglet Configuration) "
@@ -698,7 +701,7 @@ def main():
             query_text=f"{jira_context.get('summary', '')}\n{jira_context.get('description', '')[:3000]}",
             exclude_issue_key=target_issue,
             max_chars=memory_max_chars,
-        ) if memory_max_chars and not is_besoin else ""
+        ) if memory_max_chars and not jira_only else ""
     except Exception as e:
         print(f"[MÉMOIRE] ⚠️ Lecture de la mémoire impossible ({e})")
         capitalized_exp = ""
@@ -715,7 +718,7 @@ def main():
     run_started_at = time.time()
 
     # Accès base en lecture seule (cadrage, refine, patch) ; le mot de passe reste dans le .env
-    db_block = "" if is_postmerge or is_besoin else build_db_block(args.db_schema.strip(), python_exe, workspace_dir)
+    db_block = "" if is_postmerge or jira_only else build_db_block(args.db_schema.strip(), python_exe, workspace_dir)
 
     # Contexte Jira injecté dans le cadrage : l'agent ne réinterroge Jira que si une information manque
     jira_context_block = format_jira_context(jira_context, _env_int("JIRA_CONTEXT_MAX_CHARS", 12000))
@@ -775,6 +778,16 @@ def main():
         prompt = render_prompt("besoin", **prompt_values, output_file=besoin_output,
                                previous_qa_block=f"{qa_block}\n" if qa_block else "",
                                application_block=f"{app_block}\n" if app_block else "")
+    elif is_cadrage_answers:
+        integration_state = integration_tools.load_state(target_issue)
+        if not os.path.exists(cadrage_file):
+            print(f"❌ Aucun cadrage '{cadrage_file}' à compléter : lancez d'abord l'analyse du ticket.")
+            sys.exit(2)
+        if not integration_tools.answered(integration_state):
+            print(f"❌ Aucune réponse enregistrée pour {target_issue} (onglet Intégration).")
+            sys.exit(2)
+        prompt = render_prompt("cadrage_reponses", **prompt_values, cadrage_file=cadrage_file,
+                               integration_block=integration_tools.cadrage_answers_block(integration_state))
     elif args.step == "patch":
         prompt = render_prompt("patch_cucumber" if args.generate_cucumber else "patch", **prompt_values)
     elif is_postmerge:
@@ -885,6 +898,7 @@ def main():
             if _safe_memory(save_cadrage_memory, target_issue, target_project,
                             cadrage_text=cadrage_content, jira_context=jira_context):
                 print(f"[MÉMOIRE] Besoin initial et cadrage enregistrés pour {target_issue}.")
+            restore_integration_section(target_issue)
         elif args.step == "epic-cadrage":
             manifest_file = epic_manifest_path(target_issue)
             # En révision, l'agent peut ne retoucher que les analyses : le manifeste existant reste valable
@@ -903,6 +917,10 @@ def main():
             if _safe_memory(save_refine_feedback, target_issue, args.feedback,
                             previous_cadrage=cadrage_before_run, updated_cadrage=cadrage_content):
                 print(f"[MÉMOIRE] Consigne de révision et écarts enregistrés pour {target_issue}.")
+            restore_integration_section(target_issue)
+        elif is_cadrage_answers:
+            if not finalize_cadrage_answers(target_issue, cadrage_content, cadrage_before_run):
+                sys.exit(1)
         elif args.step == "patch":
             # Seuls les patchs produits pendant CETTE exécution
             patch_paths = [f for f in os.listdir(".")
@@ -954,6 +972,35 @@ def build_application_block(issue_key: str, application_arg: str) -> str:
     corpus_path = integration_tools.write_application_corpus(issue_key, applications, tickets)
     print(f"[BESOIN] {len(tickets)} ticket(s) {', '.join(applications)} fournis comme référence ({corpus_path}).")
     return integration_tools.application_block(applications, tickets, corpus_path)
+
+
+def restore_integration_section(issue_key: str) -> None:
+    """Republie la section « Intégration du besoin » (questions et réponses) si l'agent l'a réécrite ou supprimée."""
+    state = integration_tools.load_state(issue_key)
+    if not state:
+        return
+    try:
+        integration_tools.publish_state(issue_key, state)
+        print(f"[INTÉGRATION] Section « {integration_tools.SECTION_TITLE} » rétablie dans la description de {issue_key}.")
+    except (RuntimeError, requests.RequestException) as e:
+        print(f"[INTÉGRATION] ⚠️ Section « {integration_tools.SECTION_TITLE} » non rétablie : {e}")
+
+
+def finalize_cadrage_answers(issue_key: str, cadrage: str, cadrage_before: str) -> bool:
+    """Publie dans Jira le cadrage complété par l'agent (à la place de l'ancien, le reste de la description intact)."""
+    if not cadrage.strip():
+        print(f"[CADRAGE] ❌ Cadrage vide après l'exécution de l'agent.")
+        return False
+    if cadrage.strip() == cadrage_before.strip():
+        print("[CADRAGE] Les réponses ne changent rien au cadrage : Jira non modifié.")
+        return True
+    try:
+        update_jira_cadrage(issue_key, cadrage, stop_titles=(integration_tools.SECTION_TITLE,))
+    except (RuntimeError, requests.RequestException) as e:
+        print(f"[CADRAGE] ❌ Cadrage complété localement mais non publié dans Jira : {e}")
+        return False
+    print(f"[CADRAGE] Cadrage complété avec les réponses et mis à jour dans la description de {issue_key}.")
+    return True
 
 
 def finalize_besoin(issue_key: str, project_key: str, output_file: str, previous: dict, run_started_at: float) -> bool:

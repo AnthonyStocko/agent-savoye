@@ -769,21 +769,60 @@ def upsert_adf_section(adf_doc, title: str, markdown: str, level: int = 2) -> di
     return doc
 
 
-def update_jira_section(issue_key: str, title: str, markdown: str) -> None:
+def upsert_cadrage_adf(adf_doc, cadrage_markdown: str, stop_titles=()) -> dict:
     """
-    Ajoute ou remplace la section `title` de la description du ticket (document ADF modifié directement :
-    le reste de la description reste intact). Lève RuntimeError en cas d'échec.
+    Copie du document ADF où le cadrage est remplacé par `cadrage_markdown` (qui commence par « # Cadrage … »).
+    Le cadrage existant va de son titre de niveau 1 commençant par « Cadrage » jusqu'au titre de niveau 1
+    suivant, à la release note ou à une section de `stop_titles`, qui sont conservés. Sans cadrage existant,
+    il est inséré avant ces sections, ou en fin de description.
     """
+    import copy
+    doc = copy.deepcopy(adf_doc) if isinstance(adf_doc, dict) and adf_doc.get("type") == "doc" \
+        else {"type": "doc", "version": 1, "content": []}
+    nodes = doc.get("content") or []
+    stops = {_normalize_title(t) for t in stop_titles}
+
+    def is_stop(node) -> bool:
+        return _is_release_note_heading(node) or (bool(_heading_level(node))
+                                                  and _normalize_title(_adf_plain_text(node)) in stops)
+
+    start = next((i for i, n in enumerate(nodes) if _heading_level(n) == 1
+                  and _normalize_title(_adf_plain_text(n)).startswith("cadrage")), None)
+    if start is None:
+        start = end = next((i for i, n in enumerate(nodes) if is_stop(n)), len(nodes))
+    else:
+        end = next((i for i in range(start + 1, len(nodes)) if _heading_level(nodes[i]) == 1 or is_stop(nodes[i])),
+                   len(nodes))
+    doc["content"] = nodes[:start] + _markdown_to_adf_rich(cadrage_markdown)["content"] + nodes[end:]
+    return doc
+
+
+def _update_jira_description(issue_key: str, transform) -> None:
+    """Applique `transform` (document ADF -> document ADF) à la description du ticket. Lève RuntimeError en cas d'échec."""
     api, auth = _jira_connection()
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     response = requests.get(f"{api}/issue/{issue_key}?fields=description", auth=auth, headers=headers, timeout=15)
     if response.status_code != 200:
         raise RuntimeError(f"Lecture de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
     description = response.json().get("fields", {}).get("description")
-    payload = {"fields": {"description": upsert_adf_section(description, title, markdown)}}
+    payload = {"fields": {"description": transform(description)}}
     response = requests.put(f"{api}/issue/{issue_key}", auth=auth, headers=headers, json=payload, timeout=30)
     if response.status_code not in (200, 204):
         raise RuntimeError(f"Mise à jour de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
+
+
+def update_jira_section(issue_key: str, title: str, markdown: str) -> None:
+    """
+    Ajoute ou remplace la section `title` de la description du ticket (document ADF modifié directement :
+    le reste de la description reste intact). Lève RuntimeError en cas d'échec.
+    """
+    _update_jira_description(issue_key, lambda description: upsert_adf_section(description, title, markdown))
+
+
+def update_jira_cadrage(issue_key: str, cadrage_markdown: str, stop_titles=()) -> None:
+    """Remplace le cadrage dans la description du ticket (cf. upsert_cadrage_adf). Lève RuntimeError en cas d'échec."""
+    _update_jira_description(issue_key,
+                             lambda description: upsert_cadrage_adf(description, cadrage_markdown, stop_titles))
 
 
 # ---------------------------------------------------------------------------

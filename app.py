@@ -825,16 +825,35 @@ with tab_integration:
                         else:
                             st.info(f"{len(changed)} réponse(s) ajoutée(s) à Jira. L'agent complète le besoin...")
                             returncode = run_besoin_step(integ_ticket, integ_project, integ_application)
-                            if returncode == 0:
-                                st.session_state["integ_completed"] = integ_ticket
+                            cadrage_done = None
+                            if returncode == 0 and os.path.exists(f"{integ_ticket}-cadrage.md"):
+                                st.info(f"Besoin complété. L'agent complète maintenant le cadrage de {integ_ticket}...")
+                                cadrage_done = run_main_step([
+                                    sys.executable, "main.py",
+                                    "--issue", integ_ticket,
+                                    "--project", integ_project,
+                                    "--step", "cadrage-reponses"
+                                ]) == 0
+                            if returncode == 0 and cadrage_done is not False:
+                                st.session_state["integ_completed"] = (integ_ticket, cadrage_done)
                                 st.rerun()
-                            st.error(f"Les réponses sont dans Jira, mais l'agent n'a pas pu compléter le besoin "
-                                     f"(code {returncode}). Relancez la rédaction ci-dessus.")
+                            if returncode != 0:
+                                st.error(f"Les réponses sont dans Jira, mais l'agent n'a pas pu compléter le besoin "
+                                         f"(code {returncode}). Relancez la rédaction ci-dessus.")
+                            else:
+                                st.error(f"Besoin complété, mais le cadrage {integ_ticket}-cadrage.md n'a pas pu être "
+                                         "complété avec les réponses : voir le journal ci-dessus.")
                 st.caption("Les réponses déjà envoyées restent dans la description Jira, sous leur question.")
-            if st.session_state.pop("integ_completed", None) == integ_ticket:
+            completed = st.session_state.get("integ_completed")
+            if completed and completed[0] == integ_ticket:
+                del st.session_state["integ_completed"]
                 remaining = len(questions) - len(integration_tools.answered(integ_state))
-                st.success(f"Besoin de {integ_ticket} complété avec les réponses et mis à jour dans Jira. "
+                st.success(f"Besoin de {integ_ticket} complété avec les réponses"
+                           + (" ainsi que le cadrage" if completed[1] else "") + ", et mis à jour dans Jira. "
                            + (f"{remaining} question(s) restent ouvertes." if remaining else "Plus aucune question ouverte."))
+                if completed[1] is None:
+                    st.caption(f"Pas encore de cadrage pour {integ_ticket} : l'analyse lancée depuis l'onglet "
+                               "Lancement tiendra compte des réponses présentes dans la description.")
 
 
 # ---------------------------------------------------------
