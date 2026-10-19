@@ -192,8 +192,8 @@ load_dotenv(ENV_PATH, override=True)
 
 st.title("🤖 Tableau de bord - Agent Scrum Master")
 
-tab_execution, tab_integration, tab_merges, tab_config = st.tabs(
-    ["🚀 Lancement", "🧩 Intégration", "🔔 Écoute des merges", "⚙️ Configuration (.env)"])
+tab_integration, tab_execution, tab_merges, tab_config = st.tabs(
+    ["🧩 Intégration", "🚀 Lancement", "🔔 Écoute des merges", "⚙️ Configuration (.env)"])
 
 # Initialisation de l'état
 if "workflow_step" not in st.session_state:
