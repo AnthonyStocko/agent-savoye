@@ -34,6 +34,8 @@ DEFAULT_EXCLUDE_GLOBS = (
     "kis.db.*,bundle.list,import.*.sql,*AppServer.java,*ci.yaml,*ci.yml,*.xlsx,*.xls,*.docx,*.pdf"
 )
 DEFAULT_PARAM_GLOBS = "*.properties,*i18n*,*messages*,*.sql,*param*.xml,*parameter*,*.csv"
+# Dépôts front (écrans AngularJS) : aucun step du Cucumber Standard ne pilote l'interface web
+DEFAULT_EXCLUDE_REPOS = "*-frontend,*-front,*-ui"
 
 STUDIO_FILES = re.compile(r"^(customized\.(xml|json)|original\.xml|i18n\..+\.txt)$")
 STEP_PATTERN = r"@(Given|When|Then|And|But)\("
@@ -131,7 +133,24 @@ def save_state(client_name: str, state: dict) -> None:
 
 
 def pending_lots(state: dict) -> list:
-    return [lot for lot in state.get("lots", []) if lot.get("statut") != "termine"]
+    return [lot for lot in state.get("lots", []) if lot.get("statut") not in ("termine", "exclu")]
+
+
+def drop_excluded(state: dict, spec_ids) -> list:
+    """
+    Reprise après un nouvel inventaire : retire des lots restants les spécifiques qui n'y figurent plus (dépôt
+    ou fichiers désormais exclus). Un lot vidé passe au statut « exclu ». Renvoie les identifiants retirés.
+    """
+    dropped = []
+    for lot in pending_lots(state):
+        kept = [i for i in lot["ids"] if i in spec_ids]
+        if len(kept) < len(lot["ids"]):
+            lot["exclus"] = lot.get("exclus", []) + [i for i in lot["ids"] if i not in spec_ids]
+            dropped += [i for i in lot["ids"] if i not in spec_ids]
+            lot["ids"] = kept
+            if not kept:
+                lot["statut"] = "exclu"
+    return dropped
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +373,9 @@ def build_inventory(client_name: str, client_root: str, std_root: str, max_files
     """
     exclude, params = _globs("CUCUMBER_EXCLUDE_GLOBS", DEFAULT_EXCLUDE_GLOBS), _globs("CUCUMBER_PARAM_GLOBS",
                                                                                       DEFAULT_PARAM_GLOBS)
-    client_repos = {n: p for n, p in git_repos(client_root).items() if "cucumber" not in n.lower()}
+    excluded_repos = _globs("CUCUMBER_EXCLUDE_REPOS", DEFAULT_EXCLUDE_REPOS)
+    client_repos = {n: p for n, p in git_repos(client_root).items()
+                    if "cucumber" not in n.lower() and not _matches(n, excluded_repos)}
     std_repos = git_repos(std_root)
     std_index = _std_index(std_repos)
     refs, files = {}, []

@@ -1263,6 +1263,11 @@ with tab_config:
             placeholder="Vide = exclusions par défaut (pom.xml, tests unitaires, ressources statiques…)",
             help="Motifs (séparés par des virgules) des fichiers techniques exclus de l'inventaire des spécifiques. "
                  "Une valeur remplace entièrement la liste par défaut : tools/cucumber_tools.py, DEFAULT_EXCLUDE_GLOBS.")
+        env_values["CUCUMBER_EXCLUDE_REPOS"] = st.text_input(
+            "CUCUMBER_EXCLUDE_REPOS", value=os.getenv("CUCUMBER_EXCLUDE_REPOS", ""),
+            placeholder="Vide = *-frontend, *-front, *-ui",
+            help="Motifs des dépôts clients exclus de l'inventaire : les dépôts front (écrans) ne sont pas testables "
+                 "avec les steps du Cucumber Standard.")
         env_values["CUCUMBER_PARAM_GLOBS"] = st.text_input(
             "CUCUMBER_PARAM_GLOBS", value=os.getenv("CUCUMBER_PARAM_GLOBS", ""),
             placeholder="Vide = *.properties, *i18n*, *messages*, *.sql, *param*.xml, *parameter*, *.csv",

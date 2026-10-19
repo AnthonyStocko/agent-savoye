@@ -1121,6 +1121,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # 2. Lots : reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
     if resume_state:
         state = resume_state
+        dropped = cucumber_tools.drop_excluded(state, specifics)
+        if dropped:
+            print(f"[CUCUMBER] {len(dropped)} spécifique(s) absent(s) de l'inventaire actuel retiré(s) des lots.")
         print(f"[CUCUMBER] Reprise : {len(cucumber_tools.pending_lots(state))} lot(s) restant(s).")
     else:
         wanted = [i.strip() for i in args.specifics.split(",") if i.strip()] if args.specifics else [
@@ -1159,7 +1162,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
 
     # 3. Un appel Claude neuf par lot ; commit après chaque lot
     for lot in lots:
-        if lot.get("statut") == "termine":
+        if lot.get("statut") in ("termine", "exclu"):
             continue
         lot_specs = [specifics[i] for i in lot["ids"] if i in specifics]
         print(f"\n[LOT {lot['numero']}/{len(lots)}] " + " ; ".join(s["libelle"] for s in lot_specs))
