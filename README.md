@@ -56,7 +56,10 @@ venv\Scripts\python.exe -m streamlit run app.py
 
 1. **🧩 Intégration** : recherchez les tickets (projet, équipe, statuts, labels) ; choisissez un ticket puis **Rédaction du besoin**. L'agent reformule le besoin et liste les questions dont la réponse ne figure pas dans l'expression initiale. Pour cela, il consulte aussi tous les tickets Jira (tous projets) du même « Projet / Application » que le ticket, par exemple CANSON : champ `JIRA_APPLICATION_FIELD`, valeur modifiable dans l'onglet. Le tout est publié dans la section « Intégration du besoin » de la description Jira, le reste de la description restant intact. Répondez aux questions dans l'IHM puis cliquez sur **Envoyer les réponses et compléter le besoin**. Les réponses sont d'abord ajoutées sous leur question dans la description Jira. L'agent complète ensuite le besoin reformulé avec ces réponses et ne garde que les questions restantes. Si le ticket a déjà un cadrage (`<TICKET>-cadrage.md`), l'agent le complète aussi avec les réponses, puis le cadrage est remplacé dans la description Jira (le reste de la description est conservé). Questions et réponses sont conservées dans `.tmp/integration/`.
 2. **🚀 Lancement** : recherchez les tickets (projet, équipe, statuts, labels), choisissez le ticket et le dépôt client, puis lancez l'analyse ou le patch. Pour le projet `OXY`, seul le socle Standard (branche `dev`) est utilisé.
-3. **🥒 Cucumber** : saisissez le dépôt Bitbucket du projet client (le nom du client, et donc le dépôt cible `<client>-cucumber`, en est déduit et reste modifiable), et éventuellement le schéma BDD et le Projet / Application Jira (ex. `CANSON`). **Génération des tests Cucumber** fait inventorier par l'agent les spécifiques du client (écarts avec le Standard). Il écrit ensuite, dans un worktree isolé du dépôt `<client>-cucumber`, les `.feature` et Step Definitions qui les couvrent, au formalisme du Cucumber Standard. Résultat : `<client>-cucumber.patch` (téléchargeable dans l'onglet) et le récapitulatif `<client>-cucumber-couverture.md`. Rien n'est poussé, et le dépôt `<client>-cucumber` doit déjà exister.
+3. **🥒 Cucumber** : saisissez le dépôt Bitbucket du projet client (le nom du client, donc le dépôt cible `<client>-cucumber`, en est déduit et reste modifiable), puis éventuellement le schéma BDD et le Projet / Application Jira (ex. `CANSON`).
+   - **Inventaire des spécifiques** (aucun token) : Python compare chaque dépôt client au Standard. Un fichier dont le contenu a déjà existé dans le Standard est un simple écart de version et est ignoré. Les fichiers restants sont classés `override`, `extension` ou `parametrage`, puis regroupés en spécifiques fonctionnels (processus Studio, plugin d'interface, objet métier). Python rapproche ensuite chaque spécifique de la couverture Cucumber existante et de ses tickets Jira. Le tableau permet de choisir les spécifiques à traiter ; les non couverts et partiels sont cochés par défaut. Une estimation du coût s'affiche à partir des lots déjà exécutés.
+   - **Génération des tests Cucumber** : les spécifiques cochés sont traités par lots de `CUCUMBER_BATCH_SIZE`, avec un appel Claude neuf par lot (Sonnet par défaut, `--max-turns` `CUCUMBER_MAX_TURNS`, outils Read/Write/Edit/Grep/Glob seulement). L'agent ne reçoit que le sommaire du catalogue Cucumber Standard, les fichiers et diffs résumés du lot, et les extraits Jira utiles. Python crée le worktree, commite après chaque lot, puis produit `<client>-cucumber.patch` et le récapitulatif `<client>-cucumber-couverture.md`. Rien n'est poussé, et le dépôt `<client>-cucumber` doit déjà exister.
+   - **Reprendre** : après une interruption (quota, erreur), reprend au premier lot non terminé (`.tmp/cucumber/<client>/etat.json`).
 4. **🔔 Écoute des merges** : démarre et arrête l'écoute périodique des merges Bitbucket (post-merge Cucumber).
 5. **⚙️ Configuration** : toutes les variables du `.env`, le test de connexion à la base et la gestion de la mémoire de l'agent.
 
@@ -64,7 +67,9 @@ Sans IHM :
 
 ```powershell
 venv\Scripts\python.exe main.py --issue SPEC-1234 --project SPEC --client-repo https://git.kiscloud.io/projects/NOVALIA --step cadrage
-venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/NOVALIA --application CANSON --db-schema NOVALIA   # tests Cucumber des spécifiques (client déduit : novalia)
+venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/NOVALIA --application CANSON --inventory-only   # inventaire seul, sans token
+venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/NOVALIA --application CANSON --db-schema NOVALIA   # tests des spécifiques non couverts (client déduit : novalia)
+venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/NOVALIA --resume   # reprise des lots non terminés
 venv\Scripts\python.exe webhook_server.py --poll --projects NOVALIA   # écoute des merges
 ```
 
@@ -77,7 +82,7 @@ Les consignes envoyées à l'agent sont dans `prompts/` :
 | Fichier | Étape |
 |---|---|
 | `besoin.md`, `cadrage_reponses.md` | Rédaction du besoin et questions ouvertes, cadrage complété avec les réponses (onglet Intégration) |
-| `cucumber_client.md` | Tests Cucumber couvrant tous les spécifiques d'un client (onglet Cucumber) |
+| `cucumber_client_lot.md` | Un lot de tests Cucumber des spécifiques d'un client (onglet Cucumber) : partie fixe en tête, lot en fin |
 | `cadrage.md`, `refine.md` | Analyse d'un ticket, révision |
 | `epic_cadrage.md`, `epic_revision.md` | Découpage d'une épopée |
 | `patch.md`, `patch_cucumber.md` | Génération du patch (sans ou avec tests Cucumber) |

@@ -191,6 +191,48 @@ def parse_claude_output(raw: str) -> tuple:
     return text, usage
 
 
+def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
+               cwd: str = None) -> tuple:
+    """
+    Exécute `claude --print` sur le prompt (envoyé sur stdin) et affiche sa réponse.
+    Renvoie (code retour, texte de la réponse, usage des tokens, quota atteint).
+    """
+    claude_bin = shutil.which("claude") or "claude"
+    cmd = [claude_bin, "--print", "--output-format", "json"]
+    if model:
+        cmd.extend(["--model", model])
+    for directory in add_dirs:
+        cmd.extend(["--add-dir", directory])
+    cmd.extend(extra_args)
+    cmd.extend(["--allowedTools", *allowed_tools])
+
+    # stderr séparé : la sortie standard doit rester du JSON exploitable
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=(os.name == "nt"),
+        cwd=cwd,
+    )
+
+    raw_stdout, raw_stderr = process.communicate(input=prompt)
+    # Texte de la réponse (champ `result`), ou sortie brute en repli si ce n'est pas du JSON
+    stdout_output, token_usage = parse_claude_output(raw_stdout)
+    if raw_stderr and raw_stderr.strip():
+        stdout_output = f"{stdout_output.rstrip()}\n{raw_stderr.strip()}" if stdout_output.strip() else raw_stderr.strip()
+    session_limit_hit = "hit your session limit" in (stdout_output or "")
+
+    if stdout_output:
+        print(stdout_output)
+        if session_limit_hit:
+            print("\n⚠️ QUOTA ATTEINT : La session Claude Code a atteint sa limite d'utilisation.")
+    return process.returncode, stdout_output, token_usage, session_limit_hit
+
+
 def report_token_usage(issue: str, step: str, model: str, usage: dict, prompt_chars: int, returncode: int) -> None:
     """Affiche la ligne [TOKENS] et l'ajoute à .tmp/token_usage.csv (ne fait jamais échouer l'étape)."""
     if not usage:
@@ -259,13 +301,15 @@ DB_BLOCK_WORDING = {
         "db_usage": "les données du cas décrit dans le ticket",
         "db_findings_target": "la Partie 2 (Analyse Technique) du cadrage",
         "db_private_targets": "dans le cadrage,\n  dans Jira ni dans le patch",
+        "db_max_commands": "8",
     },
     "generate-cucumber-client": {
-        "db_usage": "le paramétrage qui active ou conditionne chaque spécifique du client, ainsi que les valeurs de "
+        "db_usage": "le paramétrage qui active ou conditionne les spécifiques du lot, ainsi que les valeurs de "
                     "référence utiles aux jeux de données des scénarios",
-        "db_findings_target": "le récapitulatif de couverture (paramétrage constaté pour chaque spécifique), et "
-                              "appuie les jeux de données des scénarios sur ces valeurs réelles",
-        "db_private_targets": "dans les scénarios,\n  les Step Definitions, le patch ni le récapitulatif",
+        "db_findings_target": "le champ « raison » du JSON final (paramétrage constaté), et appuie les jeux de "
+                              "données des scénarios sur ces valeurs réelles",
+        "db_private_targets": "dans les scénarios,\n  les Step Definitions ni le JSON final",
+        "db_max_commands": "3",
     },
 }
 
@@ -613,6 +657,9 @@ def main():
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
     parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
+    parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
+    parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
+    parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
     parser.add_argument("--client-name", default="", help="generate-cucumber-client : nom du client, qui donne le dépôt cible <client>-cucumber (défaut : déduit de --client-repo)")
     parser.add_argument("--feedback", default="", help="Remarques de l'utilisateur pour la révision")
     # Les tests Cucumber sont désormais traités après merge, par le ticket SPEC [CUCUMBER] (generate-cucumber-postmerge)
@@ -830,24 +877,10 @@ def main():
                   f"créé automatiquement : créez-le dans Bitbucket ou passez --cucumber-repo.")
             sys.exit(2)
         print(f"[CUCUMBER] Dépôt Cucumber client : {args.cucumber_repo} ({cucumber_repo_dir})")
-
-        applications = [a.strip() for a in args.application.split(",") if a.strip()]
-        application_field = os.getenv("JIRA_APPLICATION_FIELD", "").strip()
-        jira_tickets_file = ""
-        if applications and application_field:
-            _, jira_tickets_file = prepare_application_corpus(target_issue, applications, application_field)
-        elif applications:
-            print("[JIRA] JIRA_APPLICATION_FIELD non renseigné : pas de tickets Jira de référence.")
-        jira_tickets_label = (f"'{jira_tickets_file}'" if jira_tickets_file
-                              else "aucun (pas de Projet / Application ou aucun ticket) : appuie-toi sur le code")
-        os.makedirs(cucumber_tools.WORKTREE_ROOT, exist_ok=True)
-        prompt = render_prompt(
-            "cucumber_client", **prompt_values,
-            client_name=client_name, cucumber_repo_dir=cucumber_repo_dir, cucumber_repo=args.cucumber_repo,
-            cucumber_base_branch=args.cucumber_base_branch, application=", ".join(applications) or "non renseigné",
-            jira_tickets_file=jira_tickets_label, worktree_root=cucumber_tools.WORKTREE_ROOT,
-            workspace_dir=workspace_dir, local_std_repo=local_std_repo,
-        )
+        # Pré-calculs en Python puis génération par lots : un appel Claude neuf par lot
+        sys.exit(run_cucumber_client(args, target_issue, local_client_repo, local_std_repo, local_cucumber_std_repo,
+                                     odatio_version, cucumber_repo_dir, token_saving_rules, python_exe,
+                                     workspace_dir))
     elif is_cadrage_answers:
         integration_state = integration_tools.load_state(target_issue)
         if not os.path.exists(cadrage_file):
@@ -906,60 +939,18 @@ def main():
     print(f"Génération Cucumber  : {'Oui' if args.generate_cucumber else 'Non'}")
     print(f"Dépôt Cucumber Std   : {local_cucumber_std_repo if local_cucumber_std_repo else ('Désactivé' if not args.generate_cucumber else 'Non configuré')}")
 
-    claude_bin = shutil.which("claude") or "claude"
     claude_model = os.getenv(CLAUDE_MODEL_ENV[args.step], "").strip()
     print(f"Modèle Claude        : {claude_model or 'défaut de Claude Code'}")
     print(f"Taille du prompt     : {len(prompt)} caractères")
 
-    cmd = [
-        claude_bin, "--print",
-        "--output-format", "json",
-        "--add-dir", workspace_dir
-    ]
-    if claude_model:
-        cmd.extend(["--model", claude_model])
+    add_dirs = [workspace_dir] + [d for d in (local_std_repo, local_client_repo, local_cucumber_std_repo)
+                                  if d and os.path.exists(d)]
+    returncode, stdout_output, token_usage, session_limit_hit = run_claude(
+        prompt, claude_model, add_dirs,
+        ["Read", "Write", "Edit", "Grep", "Glob", "Bash", f"Bash({python_exe}:*)", "Bash(git:*)"])
+    report_token_usage(target_issue, args.step, claude_model, token_usage, len(prompt), returncode)
 
-    if local_std_repo and os.path.exists(local_std_repo):
-        cmd.extend(["--add-dir", local_std_repo])
-
-    if local_client_repo and os.path.exists(local_client_repo):
-        cmd.extend(["--add-dir", local_client_repo])
-
-    if local_cucumber_std_repo and os.path.exists(local_cucumber_std_repo):
-        cmd.extend(["--add-dir", local_cucumber_std_repo])
-
-    cmd.extend([
-        "--allowedTools",
-        "Read", "Write", "Edit", "Grep", "Glob", "Bash",
-        f"Bash({python_exe}:*)", "Bash(git:*)"
-    ])
-
-    # stderr séparé : la sortie standard doit rester du JSON exploitable
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        shell=(os.name == "nt")
-    )
-
-    raw_stdout, raw_stderr = process.communicate(input=prompt)
-    # Texte de la réponse (champ `result`), ou sortie brute en repli si ce n'est pas du JSON
-    stdout_output, token_usage = parse_claude_output(raw_stdout)
-    if raw_stderr and raw_stderr.strip():
-        stdout_output = f"{stdout_output.rstrip()}\n{raw_stderr.strip()}" if stdout_output.strip() else raw_stderr.strip()
-    session_limit_hit = "hit your session limit" in (stdout_output or "")
-
-    if stdout_output:
-        print(stdout_output)
-        if session_limit_hit:
-            print("\n⚠️ QUOTA ATTEINT : La session Claude Code a atteint sa limite d'utilisation.")
-    report_token_usage(target_issue, args.step, claude_model, token_usage, len(prompt), process.returncode)
-
-    if process.returncode == 0 and not session_limit_hit:
+    if returncode == 0 and not session_limit_hit:
         print(f"\n=== Étape {args.step.upper()} terminée avec succès pour {target_issue} ===")
         
         # Enregistrement en mémoire / capitalisation d'expérience
@@ -988,9 +979,6 @@ def main():
                             previous_cadrage=cadrage_before_run, updated_cadrage=cadrage_content):
                 print(f"[MÉMOIRE] Consigne de révision et écarts enregistrés pour {target_issue}.")
             restore_integration_section(target_issue)
-        elif is_cucumber_client:
-            if not finalize_cucumber_client(args.client_name, run_started_at):
-                sys.exit(1)
         elif is_cadrage_answers:
             if not finalize_cadrage_answers(target_issue, cadrage_content, cadrage_before_run):
                 sys.exit(1)
@@ -1014,9 +1002,9 @@ def main():
                                       workspace_dir, run_started_at, stdout_output):
                 sys.exit(1)
     else:
-        print(f"\n=== Étape {args.step.upper()} interrompue pour {target_issue} (Code: {process.returncode}) ===")
+        print(f"\n=== Étape {args.step.upper()} interrompue pour {target_issue} (Code: {returncode}) ===")
         # Quota atteint : Claude peut sortir en code 0, on signale quand même l'échec
-        sys.exit(process.returncode or 1)
+        sys.exit(returncode or 1)
 
 
 def build_application_block(issue_key: str, application_arg: str) -> str:
@@ -1068,22 +1056,157 @@ def resolve_client_cucumber_repo(client_name: str, local_client_repo: str, wante
     return wanted or f"{client_name}-cucumber", ""
 
 
-def finalize_cucumber_client(client_name: str, run_started_at: float) -> bool:
-    """Vérifie que l'agent a produit le patch et le récapitulatif de couverture pendant cette exécution."""
-    patch_file = cucumber_tools.patch_path(client_name)
-    coverage_file = cucumber_tools.coverage_path(client_name)
-    if not os.path.exists(patch_file) or os.path.getmtime(patch_file) < run_started_at:
-        print(f"[CUCUMBER] ❌ L'agent n'a pas produit le patch '{patch_file}' pendant cette exécution.")
-        return False
-    if os.path.getsize(patch_file) == 0:
-        print(f"[CUCUMBER] ❌ Patch '{patch_file}' vide : aucun commit sur la branche de couverture.")
-        return False
-    print(f"[CUCUMBER] Patch généré : {patch_file}")
-    if os.path.exists(coverage_file) and os.path.getmtime(coverage_file) >= run_started_at:
-        print(f"[CUCUMBER] Récapitulatif de couverture : {coverage_file}")
+def cucumber_jira_tickets(client_name: str, application_arg: str) -> list:
+    """Tickets Jira du Projet / Application (mis en cache 24 h pour les reprises) ; [] si non renseigné."""
+    applications = [a.strip() for a in application_arg.split(",") if a.strip()]
+    field_id = os.getenv("JIRA_APPLICATION_FIELD", "").strip()
+    if not applications:
+        return []
+    if not field_id:
+        print("[JIRA] JIRA_APPLICATION_FIELD non renseigné : pas de tickets Jira de référence.")
+        return []
+    tickets = cucumber_tools.cached_tickets(client_name)
+    if tickets is not None:
+        print(f"[JIRA] {len(tickets)} ticket(s) {', '.join(applications)} repris du cache.")
+        return tickets
+    try:
+        tickets = fetch_application_tickets(field_id, applications, "", _env_int("JIRA_APPLICATION_MAX_TICKETS", 300))
+    except (RuntimeError, requests.RequestException) as e:
+        print(f"[JIRA] ⚠️ Tickets de {', '.join(applications)} indisponibles : {e}")
+        return []
+    cucumber_tools.save_tickets(client_name, tickets)
+    print(f"[JIRA] {len(tickets)} ticket(s) {', '.join(applications)} récupérés.")
+    return tickets
+
+
+def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_repo: str,
+                        local_cucumber_std_repo: str, odatio_version: str, cucumber_repo_dir: str,
+                        token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
+    """
+    Couverture Cucumber des spécifiques d'un client. Python fait tout le déterministe (inventaire, catalogues,
+    extraits Jira, git, récapitulatif) ; Claude n'écrit que les tests, par lots, avec un appel neuf par lot.
+    Reprise : les lots terminés (etat.json) ne sont pas refaits. Renvoie le code de sortie.
+    """
+    client = args.client_name
+    base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
+    if not base:
+        print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")
+        return 2
+    resume_state = cucumber_tools.load_state(client) if args.resume else {}
+    if args.resume and not cucumber_tools.pending_lots(resume_state):
+        print("[CUCUMBER] Aucun lot à reprendre.")
+        return 0
+
+    # 1. Pré-calculs (0 token). Reprise ou sélection faite sur un inventaire : celui-ci est réutilisé tel quel
+    subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
+    inventory = cucumber_tools.load_inventory(client) if (resume_state or args.specifics) else {}
+    started = time.time()
+    if inventory.get("specifiques"):
+        print(f"[CUCUMBER] Inventaire du {inventory['genere_le'].replace('T', ' ')} réutilisé.")
     else:
-        print(f"[CUCUMBER] ⚠️ Récapitulatif de couverture '{coverage_file}' non produit.")
-    return True
+        print("[CUCUMBER] Inventaire des spécifiques, catalogues et extraits Jira...")
+        inventory = cucumber_tools.prepare(client, local_client_repo, local_std_repo, local_cucumber_std_repo,
+                                           odatio_version, cucumber_repo_dir, base,
+                                           cucumber_jira_tickets(client, args.application))
+    specifics = {s["id"]: s for s in inventory["specifiques"]}
+    counts = {}
+    for spec in specifics.values():
+        counts[spec["couverture"]] = counts.get(spec["couverture"], 0) + 1
+    print(f"[CUCUMBER] {len(specifics)} spécifique(s) en {time.time() - started:.0f} s : "
+          + ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
+          + f" — {cucumber_tools.inventory_path(client)}")
+    if args.inventory_only:
+        return 0
+
+    # 2. Lots : reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
+    if resume_state:
+        state = resume_state
+        print(f"[CUCUMBER] Reprise : {len(cucumber_tools.pending_lots(state))} lot(s) restant(s).")
+    else:
+        wanted = [i.strip() for i in args.specifics.split(",") if i.strip()] if args.specifics else [
+            i for i, s in specifics.items() if s["couverture"] in ("non_couvert", "partiel")]
+        unknown = [i for i in wanted if i not in specifics]
+        if unknown:
+            print(f"⚠️ Spécifiques inconnus ignorés : {', '.join(unknown)}")
+        wanted = [i for i in wanted if i in specifics]
+        if not wanted:
+            print("[CUCUMBER] Aucun spécifique à traiter.")
+            return 0
+        state = {"client": client, "debut": datetime.now().isoformat(timespec="seconds"), "base": base,
+                 "lots": cucumber_tools.make_lots(wanted, _env_int("CUCUMBER_BATCH_SIZE", 3))}
+    try:
+        worktree = cucumber_tools.prepare_worktree(cucumber_repo_dir, client, state["base"], reset=not resume_state)
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return 2
+    cucumber_tools.save_state(client, state)
+
+    catalogue = inventory["catalogue_standard"]
+    fixed_values = {
+        "client_name": client, "token_saving_rules": token_saving_rules,
+        "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
+        "features_std": catalogue["features_std"],
+        "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",
+        "couverture_existante": inventory["couverture_existante"], "cucumber_repo": args.cucumber_repo,
+        "worktree": worktree,
+    }
+    model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
+    max_turns = str(_env_int("CUCUMBER_MAX_TURNS", 25))
+    run_dir = cucumber_tools.cache_dir(client)
+    total = {"tokens_entree": 0, "cache_ecrit": 0, "cache_lu": 0, "tokens_sortie": 0, "cout_usd": 0.0}
+    lots = state["lots"]
+    exit_code = 0
+
+    # 3. Un appel Claude neuf par lot ; commit après chaque lot
+    for lot in lots:
+        if lot.get("statut") == "termine":
+            continue
+        lot_specs = [specifics[i] for i in lot["ids"] if i in specifics]
+        print(f"\n[LOT {lot['numero']}/{len(lots)}] " + " ; ".join(s["libelle"] for s in lot_specs))
+        has_parameters = any(s["type"] == "parametrage" for s in lot_specs)
+        db_block = build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
+                                  step="generate-cucumber-client") if has_parameters else ""
+        prompt = render_prompt("cucumber_client_lot", **fixed_values, lot_block=cucumber_tools.lot_block(lot_specs),
+                               lot_label=f"{lot['numero']}/{len(lots)}", db_block=db_block)
+        tools_allowed = ["Read", "Write", "Edit", "Grep", "Glob"] + ([f"Bash({python_exe}:*)"] if db_block else [])
+        # Accès limité au dossier de travail du client (worktree, sources, extraits Jira) et aux catalogues
+        returncode, output, usage, limit_hit = run_claude(
+            prompt, model, [cucumber_tools.STD_CACHE_DIR], tools_allowed,
+            extra_args=("--max-turns", max_turns), cwd=run_dir)
+        report_token_usage(work_key, "cucumber-lot", model, usage, len(prompt), returncode)
+        for key in total:
+            value = (usage or {}).get(key)
+            total[key] += value if isinstance(value, (int, float)) else 0
+        results = cucumber_tools.parse_lot_result(output)
+        committed = cucumber_tools.commit_lot(worktree, client, lot["numero"])
+        lot.update(tokens={k: (usage or {}).get(k) for k in ("tokens_entree", "cache_ecrit", "cache_lu",
+                                                                "tokens_sortie", "cout_usd")},
+                   commit=committed, fin=datetime.now().isoformat(timespec="seconds"))
+        if returncode != 0 or limit_hit or results is None:
+            lot["statut"] = "echec"
+            lot["erreur"] = ("quota atteint" if limit_hit else
+                             f"code {returncode}" if returncode != 0 else "JSON final absent ou invalide")
+            cucumber_tools.save_state(client, state)
+            print(f"[LOT {lot['numero']}/{len(lots)}] ❌ Échec ({lot['erreur']}) : relancez avec « Reprendre ».")
+            exit_code = 1
+            break
+        lot.update(statut="termine", resultats=results)
+        cucumber_tools.save_state(client, state)
+        done = sum(1 for r in results if r.get("statut") == "couvert")
+        print(f"[LOT {lot['numero']}/{len(lots)}] ✅ {done}/{len(lot_specs)} spécifique(s) couvert(s)"
+              f"{' — commit créé' if committed else ' — aucun fichier écrit'}.")
+
+    # 4. Patch et récapitulatif, produits en Python
+    patch_file = cucumber_tools.patch_path(client)
+    if cucumber_tools.write_patch(worktree, state["base"], patch_file):
+        print(f"\n[CUCUMBER] Patch généré : {patch_file}")
+    else:
+        print("\n[CUCUMBER] Aucun test écrit : pas de patch.")
+    print(f"[CUCUMBER] Récapitulatif : {cucumber_tools.write_coverage_summary(client, inventory, state)}")
+    cost = f"{total['cout_usd']:.4f} $" if total["cout_usd"] else "?"
+    print(f"[TOKENS TOTAL] entrée={total['tokens_entree']} | cache écrit={total['cache_ecrit']} | "
+          f"cache lu={total['cache_lu']} | sortie={total['tokens_sortie']} | coût={cost}")
+    return exit_code
 
 
 def restore_integration_section(issue_key: str) -> None:

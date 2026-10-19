@@ -62,8 +62,8 @@ def show_release_note(ticket: str, since: float) -> None:
         st.markdown(note or "_Fichier vide._")
 
 
-def run_main_step(cmd: list) -> int:
-    """Lance main.py en affichant ses logs au fil de l'eau. Renvoie le code retour."""
+def run_main_step(cmd: list, on_line=None) -> int:
+    """Lance main.py en affichant ses logs au fil de l'eau (`on_line` : appelé à chaque ligne). Renvoie le code retour."""
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -77,6 +77,8 @@ def run_main_step(cmd: list) -> int:
     for line in process.stdout:
         logs += line
         output_container.code(logs, language="text")
+        if on_line:
+            on_line(line)
     process.wait()
     return process.returncode
 
@@ -902,21 +904,106 @@ with tab_cucumber:
         st.caption(f"Dépôt cible : **{cucumber_client}-cucumber** · identifiant de travail "
                    f"**{cucumber_tools.work_id(cucumber_client)}**")
 
-    if st.button("Génération des tests Cucumber", type="primary", use_container_width=True,
-                 icon=":material/science:", disabled=not (cucumber_repo_input and cucumber_client)):
-        st.info(f"Génération des tests Cucumber des spécifiques {cucumber_client} en cours...")
-        returncode = run_main_step([
-            sys.executable, "main.py",
-            "--step", "generate-cucumber-client",
-            "--client-repo", cucumber_repo_input,
-            "--client-name", cucumber_client,
-            "--application", cucumber_application,
-            "--db-schema", cucumber_schema
-        ])
+    cucumber_cmd = [
+        sys.executable, "main.py",
+        "--step", "generate-cucumber-client",
+        "--client-repo", cucumber_repo_input,
+        "--client-name", cucumber_client,
+        "--application", cucumber_application,
+        "--db-schema", cucumber_schema
+    ]
+    ready = bool(cucumber_repo_input and cucumber_client)
+
+    # 1. Inventaire des spécifiques (calculs Python, aucun token)
+    if st.button("Inventaire des spécifiques", use_container_width=True, icon=":material/inventory_2:",
+                 disabled=not ready, help="Prépare les dépôts, puis inventorie les spécifiques du client, les "
+                                          "catalogues Cucumber et les extraits Jira. Aucun appel à Claude."):
+        st.info(f"Inventaire des spécifiques {cucumber_client} en cours...")
+        if run_main_step(cucumber_cmd + ["--inventory-only"]) == 0:
+            st.success("Inventaire terminé.")
+        else:
+            st.error("L'inventaire a échoué : voir le journal ci-dessus.")
+
+    inventory = cucumber_tools.load_inventory(cucumber_client) if cucumber_client else {}
+    cucumber_state = cucumber_tools.load_state(cucumber_client) if cucumber_client else {}
+    selected_ids = []
+    if inventory.get("specifiques"):
+        specs = inventory["specifiques"]
+        counts = {k: sum(1 for s in specs if s["couverture"] == k) for k in ("non_couvert", "partiel", "deja_couvert")}
+        st.markdown(f"**{len(specs)} spécifique(s)** :gray[(inventaire du "
+                    f"{inventory['genere_le'].replace('T', ' ')[:16]})] · {counts['non_couvert']} non couvert(s) · "
+                    f"{counts['partiel']} partiel(s) · {counts['deja_couvert']} déjà couvert(s)")
+        table = [{"Traiter": s["couverture"] in ("non_couvert", "partiel"), "Spécifique": s["libelle"],
+                  "Type": s["type"], "Fichiers": s["nb_fichiers"], "Couverture": s["couverture"],
+                  "Jira": bool(s.get("jira")), "id": s["id"]} for s in specs]
+        edited = st.data_editor(
+            table, key=f"cucumber_selection_{cucumber_client}_{inventory['genere_le']}", hide_index=True,
+            width="stretch", height=320,
+            disabled=["Spécifique", "Type", "Fichiers", "Couverture", "Jira", "id"],
+            column_config={
+                "Traiter": st.column_config.CheckboxColumn("Traiter", width="small"),
+                "Fichiers": st.column_config.NumberColumn("Fichiers", width="small"),
+                "Jira": st.column_config.CheckboxColumn("Jira", width="small", help="Tickets Jira associés"),
+                "id": st.column_config.TextColumn("id", width="small"),
+            },
+        )
+        selected_ids = [row["id"] for row in edited if row["Traiter"]]
+        batch_size = max(1, env_int("CUCUMBER_BATCH_SIZE", 3))
+        lot_count = -(-len(selected_ids) // batch_size)
+        average = cucumber_tools.lot_cost_average(os.path.join(".tmp", "token_usage.csv"))
+        if average["lots"]:
+            estimate = (f"≈ {lot_count * average['tokens'] / 1e6:.1f} M tokens, "
+                        f"≈ {lot_count * average['cout_usd']:.2f} $ (moyenne de {average['lots']} lot(s) précédent(s))")
+        else:
+            estimate = "coût inconnu (aucun lot exécuté jusqu'ici)"
+        st.caption(f"{len(selected_ids)} spécifique(s) coché(s) → {lot_count} lot(s) de {batch_size} · {estimate}")
+
+    # 2. Génération par lots (un appel Claude neuf par lot) et reprise
+    pending = cucumber_tools.pending_lots(cucumber_state)
+    col_generate, col_resume = st.columns([3, 1])
+    with col_generate:
+        generate = st.button("Génération des tests Cucumber", type="primary", use_container_width=True,
+                             icon=":material/science:", disabled=not (ready and selected_ids),
+                             help="Traite uniquement les spécifiques cochés. Lancez d'abord l'inventaire.")
+    with col_resume:
+        resume = st.button("Reprendre", use_container_width=True, icon=":material/play_arrow:",
+                           disabled=not (ready and pending),
+                           help=f"{len(pending)} lot(s) non terminé(s) lors de la dernière génération."
+                           if pending else "Aucun lot à reprendre.")
+    if generate or resume:
+        progress = st.progress(0.0, text="Préparation (inventaire, catalogues, worktree)...")
+
+        def show_lot_progress(line: str) -> None:
+            match = re.match(r"\[LOT (\d+)/(\d+)\]", line)
+            if match:
+                current, total_lots = int(match.group(1)), int(match.group(2))
+                progress.progress(min((current - 1) / total_lots, 1.0), text=f"Lot {current}/{total_lots} en cours")
+
+        extra = ["--resume"] if resume else ["--specifics", ",".join(selected_ids)]
+        returncode = run_main_step(cucumber_cmd + extra, on_line=show_lot_progress)
+        progress.progress(1.0, text="Terminé" if returncode == 0 else "Interrompu")
         if returncode == 0:
             st.success(f"Tests Cucumber des spécifiques {cucumber_client} générés.")
         else:
-            st.error(f"La génération des tests Cucumber a échoué (code {returncode}).")
+            st.error(f"Génération interrompue (code {returncode}) : utilisez « Reprendre » pour continuer.")
+        cucumber_state = cucumber_tools.load_state(cucumber_client)
+
+    if cucumber_state.get("lots"):
+        lot_rows = []
+        for lot in cucumber_state["lots"]:
+            tokens = lot.get("tokens") or {}
+            total_tokens = sum(v for k, v in tokens.items() if k != "cout_usd" and isinstance(v, (int, float)))
+            results = lot.get("resultats") or []
+            lot_rows.append({
+                "Lot": lot["numero"], "Statut": lot.get("statut", ""), "Spécifiques": len(lot["ids"]),
+                "Couverts": sum(1 for r in results if r.get("statut") == "couvert"),
+                "Tokens": total_tokens or None,
+                "Coût ($)": round(tokens["cout_usd"], 3) if isinstance(tokens.get("cout_usd"), (int, float)) else None,
+                "Erreur": lot.get("erreur", ""),
+            })
+        with st.expander(f"Lots de la dernière génération ({sum(1 for r in lot_rows if r['Statut'] == 'termine')}"
+                         f"/{len(lot_rows)} terminés)", expanded=bool(pending)):
+            st.dataframe(lot_rows, hide_index=True, width="stretch")
 
     # Derniers livrables du client (affichés aussi après un rechargement de la page)
     if cucumber_client and os.path.exists(cucumber_tools.patch_path(cucumber_client)):
@@ -1161,6 +1248,27 @@ with tab_config:
         )
 
         st.markdown("---")
+        st.markdown("#### 🥒 Tests Cucumber d'un client (onglet Cucumber)")
+        with st.container(horizontal=True):
+            cucumber_batch = st.number_input(
+                "CUCUMBER_BATCH_SIZE", min_value=1, step=1, value=env_int("CUCUMBER_BATCH_SIZE", 3),
+                help="Nombre de spécifiques par lot : un appel Claude neuf par lot.")
+            cucumber_turns = st.number_input(
+                "CUCUMBER_MAX_TURNS", min_value=5, step=5, value=env_int("CUCUMBER_MAX_TURNS", 25),
+                help="Nombre maximal de tours de l'agent par lot (--max-turns).")
+        env_values["CUCUMBER_BATCH_SIZE"] = str(int(cucumber_batch))
+        env_values["CUCUMBER_MAX_TURNS"] = str(int(cucumber_turns))
+        env_values["CUCUMBER_EXCLUDE_GLOBS"] = st.text_input(
+            "CUCUMBER_EXCLUDE_GLOBS", value=os.getenv("CUCUMBER_EXCLUDE_GLOBS", ""),
+            placeholder="Vide = exclusions par défaut (pom.xml, tests unitaires, ressources statiques…)",
+            help="Motifs (séparés par des virgules) des fichiers techniques exclus de l'inventaire des spécifiques. "
+                 "Une valeur remplace entièrement la liste par défaut : tools/cucumber_tools.py, DEFAULT_EXCLUDE_GLOBS.")
+        env_values["CUCUMBER_PARAM_GLOBS"] = st.text_input(
+            "CUCUMBER_PARAM_GLOBS", value=os.getenv("CUCUMBER_PARAM_GLOBS", ""),
+            placeholder="Vide = *.properties, *i18n*, *messages*, *.sql, *param*.xml, *parameter*, *.csv",
+            help="Motifs des fichiers classés « parametrage » (paramètres et messages).")
+
+        st.markdown("---")
         st.markdown("#### 🔔 Post-merge Cucumber & écoute des merges")
         with st.container(horizontal=True):
             env_values["POSTMERGE_CUCUMBER_REPOS"] = st.text_input(
@@ -1219,7 +1327,8 @@ with tab_config:
             env_values["CLAUDE_MODEL_BESOIN"] = st.text_input("CLAUDE_MODEL_BESOIN", value=os.getenv("CLAUDE_MODEL_BESOIN", ""),
                                                               help=model_help + " Utilisé par la rédaction du besoin (onglet Intégration).")
             env_values["CLAUDE_MODEL_CUCUMBER"] = st.text_input("CLAUDE_MODEL_CUCUMBER", value=os.getenv("CLAUDE_MODEL_CUCUMBER", ""),
-                                                                help=model_help + " Utilisé par la génération des tests Cucumber d'un client (onglet Cucumber).")
+                                                                help=model_help.replace("Vide = modèle par défaut de Claude Code.", "Vide = sonnet.")
+                                                                + " Utilisé par chaque lot de la génération des tests Cucumber d'un client (onglet Cucumber).")
         st.caption("La consommation de chaque exécution est affichée (ligne [TOKENS]) et ajoutée à .tmp/token_usage.csv.")
 
         st.markdown("---")
