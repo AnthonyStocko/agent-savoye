@@ -1193,6 +1193,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             print(f"[LOT {lot['numero']}/{len(lots)}] ❌ Échec ({lot['erreur']}) : relancez avec « Reprendre ».")
             exit_code = 1
             break
+        lot.pop("erreur", None)
         lot.update(statut="termine", resultats=results)
         cucumber_tools.save_state(client, state)
         done = sum(1 for r in results if r.get("statut") == "couvert")
