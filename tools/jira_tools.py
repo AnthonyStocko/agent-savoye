@@ -291,10 +291,11 @@ def get_jira_issue_details(issue_key: str) -> str:
         return f"Erreur : {str(e)}"
 
 
-def get_full_jira_issue_context(issue_key: str) -> dict:
+def get_full_jira_issue_context(issue_key: str, exclude_sections: tuple = ()) -> dict:
     """
     Récupère la description du ticket, les détails de l'Épopée (Epic) parente,
     ainsi que les fiches COST ou tickets d'exigences liés.
+    `exclude_sections` : titres des sections de la description à ignorer (ex. section produite par l'agent).
     """
     domain = os.getenv("JIRA_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
     email = os.getenv("JIRA_EMAIL", "").strip()
@@ -316,7 +317,7 @@ def get_full_jira_issue_context(issue_key: str) -> dict:
         fields = data.get("fields", {})
 
         # 1. Description du ticket
-        description = _extract_adf_text(fields.get("description"))
+        description = _extract_adf_text(remove_adf_sections(fields.get("description"), exclude_sections))
 
         # 2. Récupération de l'Épopée (Epic / Parent)
         epic_data = {}
@@ -699,6 +700,87 @@ def update_jira_release_note(issue_key: str, paragraph: str) -> None:
         raise RuntimeError(f"Lecture de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
     description = response.json().get("fields", {}).get("description")
     payload = {"fields": {"description": upsert_release_note_adf(description, paragraph)}}
+    response = requests.put(f"{api}/issue/{issue_key}", auth=auth, headers=headers, json=payload, timeout=30)
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"Mise à jour de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
+
+
+# ---------------------------------------------------------------------------
+# Sections de description gérées par l'agent (ex. « Intégration du besoin »)
+# ---------------------------------------------------------------------------
+
+def _normalize_title(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w ]", "", text.lower())).strip()
+
+
+def _heading_level(node) -> int:
+    if isinstance(node, dict) and node.get("type") == "heading":
+        return (node.get("attrs") or {}).get("level", 1)
+    return 0
+
+
+def _split_adf_sections(adf_doc, titles) -> tuple:
+    """
+    Renvoie (copie du document, noeuds conservés, index du premier retrait ou None) : chaque section dont
+    le titre figure dans `titles` (son titre jusqu'au titre suivant de niveau égal ou supérieur) est retirée.
+    """
+    import copy
+    if isinstance(adf_doc, dict) and adf_doc.get("type") == "doc":
+        doc = copy.deepcopy(adf_doc)
+    else:
+        doc = {"type": "doc", "version": 1, "content": []}
+    wanted = {_normalize_title(t) for t in titles}
+    kept, removed_at, skip_level = [], None, None
+    for node in doc.get("content") or []:
+        level = _heading_level(node)
+        if level:
+            if skip_level is not None and level <= skip_level:
+                skip_level = None
+            if skip_level is None and _normalize_title(_adf_plain_text(node)) in wanted:
+                skip_level = level
+                removed_at = len(kept) if removed_at is None else removed_at
+                continue
+        if skip_level is None:
+            kept.append(node)
+    return doc, kept, removed_at
+
+
+def remove_adf_sections(adf_doc, titles):
+    """Copie du document ADF sans les sections `titles`. Renvoie l'entrée telle quelle si rien à retirer."""
+    if not titles or not (isinstance(adf_doc, dict) and adf_doc.get("type") == "doc"):
+        return adf_doc
+    doc, kept, _ = _split_adf_sections(adf_doc, titles)
+    doc["content"] = kept
+    return doc
+
+
+def upsert_adf_section(adf_doc, title: str, markdown: str, level: int = 2) -> dict:
+    """
+    Copie du document ADF où la section `title` contient `markdown`. Une section existante est remplacée
+    à sa place ; sinon elle est insérée avant la release note, ou en fin de description.
+    Le reste du document est conservé tel quel.
+    """
+    doc, kept, insert_at = _split_adf_sections(adf_doc, [title])
+    if insert_at is None:
+        insert_at = next((i for i, n in enumerate(kept) if _is_release_note_heading(n)), len(kept))
+    section = [{"type": "heading", "attrs": {"level": level}, "content": [{"type": "text", "text": title}]}]
+    section += _markdown_to_adf_rich(markdown)["content"] if markdown.strip() else []
+    doc["content"] = kept[:insert_at] + section + kept[insert_at:]
+    return doc
+
+
+def update_jira_section(issue_key: str, title: str, markdown: str) -> None:
+    """
+    Ajoute ou remplace la section `title` de la description du ticket (document ADF modifié directement :
+    le reste de la description reste intact). Lève RuntimeError en cas d'échec.
+    """
+    api, auth = _jira_connection()
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    response = requests.get(f"{api}/issue/{issue_key}?fields=description", auth=auth, headers=headers, timeout=15)
+    if response.status_code != 200:
+        raise RuntimeError(f"Lecture de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
+    description = response.json().get("fields", {}).get("description")
+    payload = {"fields": {"description": upsert_adf_section(description, title, markdown)}}
     response = requests.put(f"{api}/issue/{issue_key}", auth=auth, headers=headers, json=payload, timeout=30)
     if response.status_code not in (200, 204):
         raise RuntimeError(f"Mise à jour de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")

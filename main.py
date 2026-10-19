@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import db_tools
+from tools import db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -78,6 +78,7 @@ CLAUDE_MODEL_ENV = {
     "refine": "CLAUDE_MODEL_REFINE",
     "patch": "CLAUDE_MODEL_PATCH",
     "generate-cucumber-postmerge": "CLAUDE_MODEL_POSTMERGE",
+    "besoin": "CLAUDE_MODEL_BESOIN",
 }
 
 # ---------------------------------------------------------------------------
@@ -587,7 +588,7 @@ def main():
     parser.add_argument("--project", required=True, help="Clé du projet Jira (ex: SPEC, OXY)")
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
-    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées)")
+    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes)")
     parser.add_argument("--feedback", default="", help="Remarques de l'utilisateur pour la révision")
     # Les tests Cucumber sont désormais traités après merge, par le ticket SPEC [CUCUMBER] (generate-cucumber-postmerge)
     parser.add_argument("--generate-cucumber", action="store_true", default=False, help="Réactiver ponctuellement la génération des tests Cucumber avec le patch")
@@ -631,37 +632,43 @@ def main():
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
     python_exe = sys.executable
 
-    std_repo_arg = args.std_repo or os.getenv("BITBUCKET_STD_REPO_PATH", "").strip()
-    if not std_repo_arg:
-        print("❌ Dépôt du socle Standard non configuré : renseignez BITBUCKET_STD_REPO_PATH (onglet Configuration) "
-              "ou passez --std-repo.")
-        sys.exit(2)
-    conventions_path = (os.getenv("DEV_CONVENTIONS_PATH", "").strip()
-                        or os.path.join(workspace_dir, "odatio-specific-code-conventions-dev.md"))
+    # La rédaction du besoin ne s'appuie que sur Jira : aucun dépôt à préparer
+    is_besoin = args.step == "besoin"
+    local_std_repo = local_client_repo = local_cucumber_std_repo = ""
+    odatio_version, branch_rule, repo_scope = "non requise", "", ""
+    conventions_path = ""
+    if not is_besoin:
+        std_repo_arg = args.std_repo or os.getenv("BITBUCKET_STD_REPO_PATH", "").strip()
+        if not std_repo_arg:
+            print("❌ Dépôt du socle Standard non configuré : renseignez BITBUCKET_STD_REPO_PATH (onglet Configuration) "
+                  "ou passez --std-repo.")
+            sys.exit(2)
+        conventions_path = (os.getenv("DEV_CONVENTIONS_PATH", "").strip()
+                            or os.path.join(workspace_dir, "odatio-specific-code-conventions-dev.md"))
 
-    # 1. Dépôt Socle Standard
-    local_std_repo = ensure_local_repo(std_repo_arg, "std")
+        # 1. Dépôt Socle Standard
+        local_std_repo = ensure_local_repo(std_repo_arg, "std")
 
-    # 2. Détection de la version Odatio & Clonage Cucumber Standard (si activé)
-    local_cucumber_std_repo = ""
-    odatio_version = detect_odatio_version(local_std_repo)
-    if args.generate_cucumber:
-        cucumber_std_url = os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "")
-        local_cucumber_std_repo = ensure_cucumber_std_repo(cucumber_std_url, odatio_version)
-    else:
-        print("\n[CUCUMBER STD] Génération des tests Cucumber désactivée par l'utilisateur.")
+        # 2. Détection de la version Odatio & Clonage Cucumber Standard (si activé)
+        local_cucumber_std_repo = ""
+        odatio_version = detect_odatio_version(local_std_repo)
+        if args.generate_cucumber:
+            cucumber_std_url = os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "")
+            local_cucumber_std_repo = ensure_cucumber_std_repo(cucumber_std_url, odatio_version)
+        else:
+            print("\n[CUCUMBER STD] Génération des tests Cucumber désactivée par l'utilisateur.")
 
-    # 3. Dépôt Client & Règles de branches
-    if target_project == "OXY" or args.client_repo == "STD_ONLY":
-        print("ℹ️ Projet OXY détecté : Socle Standard uniquement (branche dev).")
-        local_client_repo = ""
-        branch_rule = f"Projet OXY : utilise la branche de base 'dev' sur le socle Standard. Branche de travail : '{target_issue}_dev_...'."
-        repo_scope = f"Explore le code source UNIQUEMENT dans le socle standard '{local_std_repo}'."
-    else:
-        client_repo_arg = args.client_repo or os.getenv("BITBUCKET_CLIENT_REPO_PATH", "")
-        local_client_repo = ensure_local_repo(client_repo_arg, "client")
-        branch_rule = f"Projet '{target_project}' : la branche de base sur le dépôt client est 'integration'. Branche de travail : '{target_issue}_dev_...'."
-        repo_scope = f"Explore le code source dans le socle '{local_std_repo}' et dans le dépôt client '{local_client_repo}'."
+        # 3. Dépôt Client & Règles de branches
+        if target_project == "OXY" or args.client_repo == "STD_ONLY":
+            print("ℹ️ Projet OXY détecté : Socle Standard uniquement (branche dev).")
+            local_client_repo = ""
+            branch_rule = f"Projet OXY : utilise la branche de base 'dev' sur le socle Standard. Branche de travail : '{target_issue}_dev_...'."
+            repo_scope = f"Explore le code source UNIQUEMENT dans le socle standard '{local_std_repo}'."
+        else:
+            client_repo_arg = args.client_repo or os.getenv("BITBUCKET_CLIENT_REPO_PATH", "")
+            local_client_repo = ensure_local_repo(client_repo_arg, "client")
+            branch_rule = f"Projet '{target_project}' : la branche de base sur le dépôt client est 'integration'. Branche de travail : '{target_issue}_dev_...'."
+            repo_scope = f"Explore le code source dans le socle '{local_std_repo}' et dans le dépôt client '{local_client_repo}'."
 
     cucumber_instruction = ""
     if args.generate_cucumber:
@@ -674,7 +681,8 @@ def main():
     token_saving_rules = "\n" + render_prompt("token_saving_rules")
 
     # Besoin initial Jira : sert à retrouver les tickets similaires et à capitaliser
-    jira_context = get_full_jira_issue_context(target_issue)
+    jira_context = get_full_jira_issue_context(
+        target_issue, exclude_sections=(integration_tools.SECTION_TITLE,) if is_besoin else ())
     if jira_context.get("error"):
         print(f"[MÉMOIRE] Contexte Jira indisponible : {jira_context['error']}")
         jira_context = {}
@@ -688,7 +696,7 @@ def main():
             query_text=f"{jira_context.get('summary', '')}\n{jira_context.get('description', '')[:3000]}",
             exclude_issue_key=target_issue,
             max_chars=memory_max_chars,
-        ) if memory_max_chars else ""
+        ) if memory_max_chars and not is_besoin else ""
     except Exception as e:
         print(f"[MÉMOIRE] ⚠️ Lecture de la mémoire impossible ({e})")
         capitalized_exp = ""
@@ -705,7 +713,7 @@ def main():
     run_started_at = time.time()
 
     # Accès base en lecture seule (cadrage, refine, patch) ; le mot de passe reste dans le .env
-    db_block = "" if is_postmerge else build_db_block(args.db_schema.strip(), python_exe, workspace_dir)
+    db_block = "" if is_postmerge or is_besoin else build_db_block(args.db_schema.strip(), python_exe, workspace_dir)
 
     # Contexte Jira injecté dans le cadrage : l'agent ne réinterroge Jira que si une information manque
     jira_context_block = format_jira_context(jira_context, _env_int("JIRA_CONTEXT_MAX_CHARS", 12000))
@@ -757,6 +765,12 @@ def main():
                                children_block=children_block, revision_block=revision_block)
     elif args.step == "refine":
         prompt = render_prompt("refine", **prompt_values, feedback=args.feedback)
+    elif is_besoin:
+        besoin_output = integration_tools.agent_output_path(target_issue)
+        previous_besoin = integration_tools.load_state(target_issue)
+        qa_block = integration_tools.previous_qa_block(previous_besoin)
+        prompt = render_prompt("besoin", **prompt_values, output_file=besoin_output,
+                               previous_qa_block=f"{qa_block}\n" if qa_block else "")
     elif args.step == "patch":
         prompt = render_prompt("patch_cucumber" if args.generate_cucumber else "patch", **prompt_values)
     elif is_postmerge:
@@ -897,6 +911,9 @@ def main():
                                 final_cadrage=cadrage_content, jira_context=jira_context):
                     print(f"[MÉMOIRE] Livrable validé indexé : {', '.join(patch_paths)}.")
                 publish_release_note(target_issue, release_note_file, run_started_at)
+        elif is_besoin:
+            if not finalize_besoin(target_issue, target_project, besoin_output, previous_besoin, run_started_at):
+                sys.exit(1)
         elif is_postmerge:
             if not finalize_postmerge(args, target_issue, postmerge_summary, description_file,
                                       workspace_dir, run_started_at, stdout_output):
@@ -905,6 +922,30 @@ def main():
         print(f"\n=== Étape {args.step.upper()} interrompue pour {target_issue} (Code: {process.returncode}) ===")
         # Quota atteint : Claude peut sortir en code 0, on signale quand même l'échec
         sys.exit(process.returncode or 1)
+
+
+def finalize_besoin(issue_key: str, project_key: str, output_file: str, previous: dict, run_started_at: float) -> bool:
+    """Fusionne le besoin rédigé avec les questions déjà répondues, l'enregistre et le publie dans Jira."""
+    if not os.path.exists(output_file) or os.path.getmtime(output_file) < run_started_at:
+        print(f"[BESOIN] ❌ L'agent n'a pas écrit '{output_file}' pendant cette exécution.")
+        return False
+    try:
+        agent = integration_tools.load_agent_output(output_file)
+    except ValueError as e:
+        print(f"[BESOIN] ❌ Résultat de l'agent inexploitable : {e}")
+        return False
+    state = integration_tools.merge_agent_output(previous or {"issue": issue_key}, agent)
+    state["project"] = project_key
+    integration_tools.save_state(issue_key, state)
+    pending = len(state["questions"]) - len(integration_tools.answered(state))
+    print(f"[BESOIN] Besoin reformulé enregistré : {len(state['questions'])} question(s) dont {pending} en attente.")
+    try:
+        integration_tools.publish_state(issue_key, state)
+    except (RuntimeError, requests.RequestException) as e:
+        print(f"[BESOIN] ❌ Publication dans Jira impossible : {e}")
+        return False
+    print(f"[BESOIN] Section « {integration_tools.SECTION_TITLE} » mise à jour dans la description de {issue_key}.")
+    return True
 
 
 def finalize_postmerge(args, source_issue: str, summary: str, description_file: str,

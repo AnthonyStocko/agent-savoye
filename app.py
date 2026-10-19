@@ -6,6 +6,7 @@ import time
 import streamlit as st
 from dotenv import load_dotenv, set_key
 
+from tools import integration_tools
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -106,6 +107,81 @@ def run_epic_patches(epic_key: str, project: str, client_repo: str, db_schema: s
     return True
 
 
+def search_criteria_form(key_prefix: str) -> dict:
+    """Critères de recherche Jira, mêmes champs et valeurs par défaut dans les onglets Lancement et Intégration."""
+    # Recherche rapide « épopées ouvertes de l'équipe » (onglet Configuration)
+    open_epics_team = os.getenv("JIRA_OPEN_EPICS_TEAM", "").strip()
+    open_epics_status = os.getenv("JIRA_OPEN_EPICS_STATUS", "").strip()
+    open_epics_only = st.checkbox(
+        f"Épopées au statut « {open_epics_status} » de l'équipe {open_epics_team}"
+        if open_epics_team and open_epics_status else "Épopées ouvertes de mon équipe",
+        key=f"{key_prefix}open_epics_only",
+        disabled=not (open_epics_team and open_epics_status),
+        help="Si coché, la recherche porte sur les épopées du projet cible à ce statut pour cette équipe : "
+             "les critères Équipe, Statuts et Labels ci-dessous sont ignorés. "
+             "Équipe et statut : JIRA_OPEN_EPICS_TEAM et JIRA_OPEN_EPICS_STATUS (onglet Configuration)."
+    ) and bool(open_epics_team and open_epics_status)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        jira_project_input = st.text_input(
+            "Projet Jira cible :",
+            value=os.getenv("JIRA_PROJECT_KEY", ""),
+            key=f"{key_prefix}search_project",
+            help="Ex: SPEC, OXY, PHE..."
+        )
+        jira_team_input = st.text_input(
+            "Équipe / Composant (Optionnel) :",
+            value=os.getenv("JIRA_SEARCH_TEAM", ""),
+            key=f"{key_prefix}search_team",
+            help="Composant Jira ou équipe Atlassian. Ex: TEAM_SPEC, WMS, Socle...",
+            disabled=open_epics_only
+        )
+
+    with col2:
+        jira_status_input = st.text_input(
+            "États / Statuts (Séparés par une virgule) :",
+            value=os.getenv("JIRA_SEARCH_STATUSES", ""),
+            key=f"{key_prefix}search_statuses",
+            help="Ex: Analysée, En cours, A traiter (laissez vide pour tous les états)",
+            disabled=open_epics_only
+        )
+        jira_label_input = st.text_input(
+            "Labels (Séparés par une virgule) :",
+            value=os.getenv("JIRA_SEARCH_LABELS", ""),
+            key=f"{key_prefix}search_labels",
+            help="Ex: WAIT_TEAM_SPEC, BUG (laissez vide si aucun label requis)",
+            disabled=open_epics_only
+        )
+
+    return {
+        "project_key": jira_project_input.strip().upper(),
+        "statuses": [s.strip() for s in jira_status_input.split(",") if s.strip()],
+        "labels": [l.strip() for l in jira_label_input.split(",") if l.strip()],
+        "team": jira_team_input.strip(),
+        "open_epics_only": open_epics_only,
+        "open_epics_team": open_epics_team,
+        "open_epics_status": open_epics_status,
+    }
+
+
+def search_jira_tickets(criteria: dict) -> list:
+    """Tickets correspondant aux critères de search_criteria_form. Lève JiraSearchError."""
+    if criteria["open_epics_only"]:
+        return fetch_tickets_data(
+            project_key=criteria["project_key"],
+            statuses=[criteria["open_epics_status"]],
+            epics_only=True,
+            atlassian_team=criteria["open_epics_team"]
+        )
+    return fetch_tickets_data(
+        project_key=criteria["project_key"],
+        statuses=criteria["statuses"],
+        labels=criteria["labels"],
+        team=criteria["team"]
+    )
+
+
 ENV_PATH = ".env"
 if not os.path.exists(ENV_PATH):
     open(ENV_PATH, "w", encoding="utf-8").close()
@@ -116,7 +192,8 @@ load_dotenv(ENV_PATH, override=True)
 
 st.title("🤖 Tableau de bord - Agent Scrum Master")
 
-tab_execution, tab_merges, tab_config = st.tabs(["🚀 Lancement", "🔔 Écoute des merges", "⚙️ Configuration (.env)"])
+tab_execution, tab_integration, tab_merges, tab_config = st.tabs(
+    ["🚀 Lancement", "🧩 Intégration", "🔔 Écoute des merges", "⚙️ Configuration (.env)"])
 
 # Initialisation de l'état
 if "workflow_step" not in st.session_state:
@@ -133,71 +210,15 @@ with tab_execution:
 
     st.markdown("### 1. Critères de Recherche Jira")
 
-    # Recherche rapide « épopées ouvertes de l'équipe » (onglet Configuration)
-    open_epics_team = os.getenv("JIRA_OPEN_EPICS_TEAM", "").strip()
-    open_epics_status = os.getenv("JIRA_OPEN_EPICS_STATUS", "").strip()
-    open_epics_only = st.checkbox(
-        f"Épopées au statut « {open_epics_status} » de l'équipe {open_epics_team}"
-        if open_epics_team and open_epics_status else "Épopées ouvertes de mon équipe",
-        key="open_epics_only",
-        disabled=not (open_epics_team and open_epics_status),
-        help="Si coché, la recherche porte sur les épopées du projet cible à ce statut pour cette équipe : "
-             "les critères Équipe, Statuts et Labels ci-dessous sont ignorés. "
-             "Équipe et statut : JIRA_OPEN_EPICS_TEAM et JIRA_OPEN_EPICS_STATUS (onglet Configuration)."
-    ) and bool(open_epics_team and open_epics_status)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        jira_project_input = st.text_input(
-            "Projet Jira cible :",
-            value=os.getenv("JIRA_PROJECT_KEY", ""),
-            help="Ex: SPEC, OXY, PHE..."
-        )
-        jira_team_input = st.text_input(
-            "Équipe / Composant (Optionnel) :",
-            value=os.getenv("JIRA_SEARCH_TEAM", ""),
-            help="Composant Jira ou équipe Atlassian. Ex: TEAM_SPEC, WMS, Socle...",
-            disabled=open_epics_only
-        )
-
-    with col2:
-        jira_status_input = st.text_input(
-            "États / Statuts (Séparés par une virgule) :",
-            value=os.getenv("JIRA_SEARCH_STATUSES", ""),
-            help="Ex: Analysée, En cours, A traiter (laissez vide pour tous les états)",
-            disabled=open_epics_only
-        )
-        jira_label_input = st.text_input(
-            "Labels (Séparés par une virgule) :",
-            value=os.getenv("JIRA_SEARCH_LABELS", ""),
-            help="Ex: WAIT_TEAM_SPEC, BUG (laissez vide si aucun label requis)",
-            disabled=open_epics_only
-        )
-
-    project_key = jira_project_input.strip().upper()
-    statuses = [s.strip() for s in jira_status_input.split(",") if s.strip()]
-    labels = [l.strip() for l in jira_label_input.split(",") if l.strip()]
-    team = jira_team_input.strip()
+    search_criteria = search_criteria_form("")
+    project_key = search_criteria["project_key"]
 
     search_clicked = st.button("🔍 Rechercher les tickets", type="primary", use_container_width=True)
 
     if search_clicked:
         with st.spinner(f"Recherche Jira sur le projet {project_key}..."):
             try:
-                if open_epics_only:
-                    tickets_data = fetch_tickets_data(
-                        project_key=project_key,
-                        statuses=[open_epics_status],
-                        epics_only=True,
-                        atlassian_team=open_epics_team
-                    )
-                else:
-                    tickets_data = fetch_tickets_data(
-                        project_key=project_key,
-                        statuses=statuses,
-                        labels=labels,
-                        team=team
-                    )
+                tickets_data = search_jira_tickets(search_criteria)
                 search_error = None
             except JiraSearchError as e:
                 tickets_data, search_error = [], str(e)
@@ -674,10 +695,120 @@ with tab_execution:
 
 
 # ---------------------------------------------------------
-# ONGLET 2 : CONFIGURATION ENTIÈRE DU .ENV
+# ONGLET 2 : INTÉGRATION — BESOIN REFORMULÉ ET QUESTIONS OUVERTES
 # ---------------------------------------------------------
+def integration_option_label(ticket: dict) -> str:
+    """'CLÉ - Titre [statut]', suivi du nombre de questions en attente s'il y en a."""
+    label = f"{ticket['key']} - {ticket.get('summary', '')} [{ticket.get('status', '?')}]"
+    state = integration_tools.load_state(ticket["key"])
+    if state:
+        pending = len(state.get("questions", [])) - len(integration_tools.answered(state))
+        label += f" · ❓ {pending} en attente" if pending else " · ✅ besoin rédigé"
+    return label
+
+
+with tab_integration:
+    st.markdown("### 1. Critères de Recherche Jira")
+    integration_criteria = search_criteria_form("integ_")
+
+    if st.button("🔍 Rechercher les tickets", type="primary", use_container_width=True, key="integ_search"):
+        with st.spinner(f"Recherche Jira sur le projet {integration_criteria['project_key']}..."):
+            try:
+                integration_found, integration_error = search_jira_tickets(integration_criteria), None
+            except JiraSearchError as e:
+                integration_found, integration_error = [], str(e)
+        st.session_state["integ_tickets"] = [
+            {"key": t["key"], "summary": t.get("summary", ""), "status": t.get("status", "")} for t in integration_found
+        ]
+        st.session_state["integ_project"] = integration_criteria["project_key"]
+        if integration_error:
+            st.error(f"❌ {integration_error}")
+        elif not integration_found:
+            st.warning(f"Aucun ticket trouvé avec ces critères sur le projet {integration_criteria['project_key']}.")
+
+    integration_tickets = st.session_state.get("integ_tickets", [])
+    if integration_tickets:
+        st.markdown("---")
+        st.markdown(f"### 2. Tickets trouvés ({len(integration_tickets)})")
+        tickets_by_key = {t["key"]: t for t in integration_tickets}
+        integ_ticket = st.selectbox(
+            "Ticket à intégrer :",
+            list(tickets_by_key),
+            format_func=lambda key: integration_option_label(tickets_by_key[key]),
+            key="integ_selected",
+        )
+        integ_project = st.session_state.get("integ_project") or os.getenv("JIRA_PROJECT_KEY", "")
+        jira_domain = os.getenv("JIRA_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
+        if jira_domain:
+            st.caption(f"[Ouvrir {integ_ticket} dans Jira](https://{jira_domain}/browse/{integ_ticket})")
+
+        has_state = bool(integration_tools.load_state(integ_ticket))
+        if st.button("📝 Rédaction du besoin" if not has_state else "📝 Rédiger à nouveau le besoin (avec les réponses)",
+                     type="primary", use_container_width=True, key="integ_redaction",
+                     help="L'agent reformule le besoin et liste les questions sans réponse dans l'expression initiale. "
+                          "Le résultat est ajouté à la description Jira (section « Intégration du besoin »)."):
+            st.info(f"Rédaction du besoin de {integ_ticket} en cours...")
+            returncode = run_main_step([
+                sys.executable, "main.py",
+                "--issue", integ_ticket,
+                "--project", integ_project,
+                "--step", "besoin"
+            ])
+            if returncode == 0:
+                st.success(f"Besoin reformulé et questions ajoutés à la description Jira de {integ_ticket}.")
+            else:
+                st.error(f"La rédaction du besoin a échoué (code {returncode}).")
+
+        integ_state = integration_tools.load_state(integ_ticket)
+        if integ_state:
+            st.markdown("### 3. Besoin reformulé")
+            with st.container(border=True):
+                st.markdown(integ_state.get("besoin", "") or "_Vide._")
+
+            questions = integ_state.get("questions", [])
+            pending_count = len(questions) - len(integration_tools.answered(integ_state))
+            st.markdown(f"### 4. Questions ({pending_count} en attente)" if questions else "### 4. Questions")
+            if not questions:
+                st.success("Aucune question ouverte : le besoin est complet.")
+            else:
+                # La clé dépend de la date de l'état : les champs repartent des valeurs enregistrées après chaque mise à jour
+                version = integ_state.get("updated_at", "")
+                with st.form(f"integ_answers_{integ_ticket}"):
+                    answers = {}
+                    for q in questions:
+                        st.markdown(f"**Q{q['id']}.** {q['question']}")
+                        if q.get("pourquoi"):
+                            st.caption(f"Pourquoi : {q['pourquoi']}")
+                        answers[q["id"]] = st.text_area(
+                            f"Réponse Q{q['id']}", value=q.get("reponse", ""), height=80,
+                            key=f"integ_answer_{integ_ticket}_{q['id']}_{version}",
+                            label_visibility="collapsed", placeholder="Votre réponse…",
+                        )
+                    save_answers = st.form_submit_button("💾 Enregistrer les réponses dans Jira", type="primary",
+                                                         use_container_width=True)
+                if save_answers:
+                    for q in questions:
+                        q["reponse"] = answers[q["id"]].strip()
+                    integration_tools.save_state(integ_ticket, integ_state)
+                    try:
+                        with st.spinner(f"Mise à jour de la description de {integ_ticket}..."):
+                            integration_tools.publish_state(integ_ticket, integ_state)
+                        publish_error = None
+                    except Exception as e:
+                        publish_error = e
+                    if publish_error:
+                        st.error(f"Réponses enregistrées localement, mais la mise à jour Jira a échoué : {publish_error}")
+                    else:
+                        st.session_state["integ_saved"] = integ_ticket
+                        st.rerun()
+                if st.session_state.pop("integ_saved", None) == integ_ticket:
+                    st.success(f"Réponses ajoutées à la description Jira de {integ_ticket}.")
+                st.caption("Une fois les réponses saisies, relancez la rédaction : l'agent les intègre au besoin "
+                           "reformulé et ne pose que les questions restantes.")
+
+
 # ---------------------------------------------------------
-# ONGLET 2 : ÉCOUTE DES MERGES BITBUCKET (post-merge Cucumber)
+# ONGLET 3 : ÉCOUTE DES MERGES BITBUCKET (post-merge Cucumber)
 # ---------------------------------------------------------
 @st.fragment(run_every="10s")
 def merge_listener_status():
@@ -947,6 +1078,8 @@ with tab_config:
         with st.container(horizontal=True):
             env_values["CLAUDE_MODEL_PATCH"] = st.text_input("CLAUDE_MODEL_PATCH", value=os.getenv("CLAUDE_MODEL_PATCH", ""), help=model_help)
             env_values["CLAUDE_MODEL_POSTMERGE"] = st.text_input("CLAUDE_MODEL_POSTMERGE", value=os.getenv("CLAUDE_MODEL_POSTMERGE", ""), help=model_help)
+        env_values["CLAUDE_MODEL_BESOIN"] = st.text_input("CLAUDE_MODEL_BESOIN", value=os.getenv("CLAUDE_MODEL_BESOIN", ""),
+                                                          help=model_help + " Utilisé par la rédaction du besoin (onglet Intégration).")
         st.caption("La consommation de chaque exécution est affichée (ligne [TOKENS]) et ajoutée à .tmp/token_usage.csv.")
 
         st.markdown("---")

@@ -2,6 +2,7 @@
 
 Agent d'assistance aux développements Odatio. À partir d'un ticket Jira, il produit l'analyse (cadrage fonctionnel et technique), puis le patch Git et la release note, et les publie sur le ticket. Il s'appuie sur la CLI [Claude Code](https://docs.claude.com/fr/docs/claude-code/overview).
 
+- **Intégration du besoin** : reformulation du besoin et questions ouvertes ajoutées à la description Jira. Les réponses saisies dans l'IHM y sont ajoutées à leur tour.
 - **Analyse / cadrage** d'un ticket : la description Jira est mise à jour avec l'analyse.
 - **Révision** de l'analyse selon vos consignes. Vos corrections sont mémorisées et réutilisées sur les tickets suivants.
 - **Patch** : création de la branche, modifications, fichier `.patch` attaché au ticket et release note ajoutée à la description.
@@ -54,8 +55,9 @@ venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 1. **🚀 Lancement** : recherchez les tickets (projet, équipe, statuts, labels), choisissez le ticket et le dépôt client, puis lancez l'analyse ou le patch. Pour le projet `OXY`, seul le socle Standard (branche `dev`) est utilisé.
-2. **🔔 Écoute des merges** : démarre et arrête l'écoute périodique des merges Bitbucket (post-merge Cucumber).
-3. **⚙️ Configuration** : toutes les variables du `.env`, le test de connexion à la base et la gestion de la mémoire de l'agent.
+2. **🧩 Intégration** : mêmes critères de recherche ; choisissez un ticket puis **Rédaction du besoin**. L'agent reformule le besoin et liste les questions dont la réponse ne figure pas dans l'expression initiale. Le tout est publié dans la section « Intégration du besoin » de la description Jira, le reste de la description restant intact. Répondez aux questions dans l'IHM puis **Enregistrer les réponses dans Jira**. Relancez la rédaction pour intégrer les réponses au besoin : seules les questions restantes sont reposées. Questions et réponses sont conservées dans `.tmp/integration/`.
+3. **🔔 Écoute des merges** : démarre et arrête l'écoute périodique des merges Bitbucket (post-merge Cucumber).
+4. **⚙️ Configuration** : toutes les variables du `.env`, le test de connexion à la base et la gestion de la mémoire de l'agent.
 
 Sans IHM :
 
@@ -72,6 +74,7 @@ Les consignes envoyées à l'agent sont dans `prompts/` :
 
 | Fichier | Étape |
 |---|---|
+| `besoin.md` | Rédaction du besoin et questions ouvertes (onglet Intégration) |
 | `cadrage.md`, `refine.md` | Analyse d'un ticket, révision |
 | `epic_cadrage.md`, `epic_revision.md` | Découpage d'une épopée |
 | `patch.md`, `patch_cucumber.md` | Génération du patch (sans ou avec tests Cucumber) |
