@@ -1,0 +1,11 @@
+streamlit>=1.64
+python-dotenv>=1.0
+requests>=2.31
+crewai>=1.15
+
+# Accès base de données en lecture seule (facultatif) : SQLAlchemy + le pilote du SGBD utilisé
+sqlalchemy>=2.0
+psycopg2-binary>=2.9   # PostgreSQL
+# oracledb             # Oracle
+# pymssql              # SQL Server (ou pyodbc + pilote ODBC Microsoft, cf. DB_ODBC_DRIVER)
+# pymysql              # MySQL

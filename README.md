@@ -1,0 +1,94 @@
+# Agent Scrum Master
+
+Agent d'assistance aux développements Odatio. À partir d'un ticket Jira, il produit l'analyse (cadrage fonctionnel et technique), puis le patch Git et la release note, et les publie sur le ticket. Il s'appuie sur la CLI [Claude Code](https://docs.claude.com/fr/docs/claude-code/overview).
+
+- **Analyse / cadrage** d'un ticket : la description Jira est mise à jour avec l'analyse.
+- **Révision** de l'analyse selon vos consignes. Vos corrections sont mémorisées et réutilisées sur les tickets suivants.
+- **Patch** : création de la branche, modifications, fichier `.patch` attaché au ticket et release note ajoutée à la description.
+- **Épopées** : découpage en tâches enfants créées dans Jira, puis un patch par tâche.
+- **Post-merge Cucumber** : à chaque merge Bitbucket, création d'un ticket `[CUCUMBER]` avec les scénarios BDD à adapter et le patch correspondant.
+
+## Prérequis
+
+| Outil | Usage |
+|---|---|
+| **Python 3.12** | Application (Streamlit) et outils |
+| **Git** | Clones, branches et patchs |
+| **Claude Code CLI** (`claude`), connectée | Exécution de l'agent |
+| **JDK 21 + Maven** (recommandé) | Permet à l'agent de compiler et tester les patchs Java |
+| **Pilote ODBC Microsoft** (facultatif) | Uniquement pour une base SQL Server via `pyodbc` |
+
+Comptes et accès nécessaires : Jira Cloud (jeton API), Bitbucket KISCloud (jeton HTTP, droits lecture) et, en option, Jenkins et un compte base de données en lecture seule.
+
+### Installer Claude Code
+
+```powershell
+irm https://claude.ai/install.ps1 | iex   # ou : npm install -g @anthropic-ai/claude-code
+claude                                    # première exécution : connexion (/login)
+```
+
+L'agent utilise l'abonnement Claude de la CLI connectée. Pour passer par une clé API, renseignez `ANTHROPIC_API_KEY`.
+
+## Installation
+
+```powershell
+git clone https://github.com/AnthonyStocko/agent-savoye.git
+cd agent-savoye
+py -3.12 -m venv venv
+venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env
+```
+
+Complétez ensuite le `.env`, ou lancez l'application et utilisez l'onglet **⚙️ Configuration**. Les variables indispensables sont `JIRA_DOMAIN`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY`, `BITBUCKET_URL`, `BITBUCKET_HTTP_TOKEN` et `BITBUCKET_STD_REPO_PATH`. L'onglet Lancement signale celles qui manquent.
+
+À personnaliser pour chaque utilisateur :
+
+- `JIRA_OPEN_EPICS_TEAM` et `POSTMERGE_JIRA_COMPONENT` : votre équipe Atlassian (ex. `oda_Prenom_N`).
+- `JIRA_SEARCH_TEAM`, `JIRA_SEARCH_STATUSES` et `JIRA_SEARCH_LABELS` : vos critères de recherche habituels.
+- `BITBUCKET_STD_REPO_PATH` : URL du projet Bitbucket (clonée automatiquement dans `.tmp/`) ou chemin d'un clone local.
+
+## Utilisation
+
+```powershell
+venv\Scripts\python.exe -m streamlit run app.py
+```
+
+1. **🚀 Lancement** : recherchez les tickets (projet, équipe, statuts, labels), choisissez le ticket et le dépôt client, puis lancez l'analyse ou le patch. Pour le projet `OXY`, seul le socle Standard (branche `dev`) est utilisé.
+2. **🔔 Écoute des merges** : démarre et arrête l'écoute périodique des merges Bitbucket (post-merge Cucumber).
+3. **⚙️ Configuration** : toutes les variables du `.env`, le test de connexion à la base et la gestion de la mémoire de l'agent.
+
+Sans IHM :
+
+```powershell
+venv\Scripts\python.exe main.py --issue SPEC-1234 --project SPEC --client-repo https://git.kiscloud.io/projects/NOVALIA --step cadrage
+venv\Scripts\python.exe webhook_server.py --poll --projects NOVALIA   # écoute des merges
+```
+
+Les livrables (`<TICKET>-cadrage.md`, `<TICKET>-*.patch`, `<TICKET>-release-note.md`…) sont écrits à la racine du projet. Les clones, la mémoire et les journaux sont écrits dans `.tmp/`. Aucun de ces fichiers n'est versionné.
+
+## Personnaliser les prompts
+
+Les consignes envoyées à l'agent sont dans `prompts/` :
+
+| Fichier | Étape |
+|---|---|
+| `cadrage.md`, `refine.md` | Analyse d'un ticket, révision |
+| `epic_cadrage.md`, `epic_revision.md` | Découpage d'une épopée |
+| `patch.md`, `patch_cucumber.md` | Génération du patch (sans ou avec tests Cucumber) |
+| `postmerge.md` | Ticket et patch Cucumber post-merge |
+| `token_saving_rules.md`, `db_access.md`, `cucumber_enabled.md`, `cucumber_disabled.md`, `release_note.md` | Blocs communs |
+
+Les variables s'écrivent `${nom}`, par exemple `${target_issue}`. Pour écrire un `$` littéral, utilisez `$$`. Si un modèle contient une variable inconnue, l'exécution s'arrête et le message liste les variables disponibles.
+
+Pour adapter les prompts sans toucher au dépôt, renseignez `PROMPTS_DIR` avec un dossier personnel. Tout `<nom>.md` présent dans ce dossier remplace le modèle du même nom, et les autres modèles restent ceux du projet.
+
+Les conventions de développement lues par l'agent sont dans `odatio-specific-code-conventions-dev.md`. Pour en utiliser d'autres, renseignez `DEV_CONVENTIONS_PATH`.
+
+## Mise à jour
+
+```powershell
+git pull
+venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Comparez ensuite votre `.env` avec `.env.example` pour repérer les nouvelles variables.

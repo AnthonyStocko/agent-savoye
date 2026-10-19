@@ -1,0 +1,1034 @@
+import os
+import re
+import subprocess
+import sys
+import time
+import streamlit as st
+from dotenv import load_dotenv, set_key
+
+from tools.epic_tools import load_epic_manifest
+from tools.jira_tools import (
+    JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
+    set_jira_description_markdown,
+)
+from tools.db_tools import DB_TYPES, test_connection
+from tools.jenkins_tools import trigger_cucumber_job
+from tools.memory_tools import (
+    find_similar_tickets, get_project_lessons, load_ticket_memory, record_manual_edit,
+    get_all_memories, clear_memory, delete_ticket_memory, import_existing_deliverables,
+)
+from tools.poller_control import force_stop, get_poller_status, request_stop, start_poller, tail_log
+
+st.set_page_config(page_title="Scrum Master IA Dashboard", layout="centered")
+
+# Variables indispensables : leur absence est signalée dans l'onglet Lancement
+REQUIRED_ENV = ["JIRA_DOMAIN", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY",
+                "BITBUCKET_URL", "BITBUCKET_HTTP_TOKEN", "BITBUCKET_STD_REPO_PATH"]
+
+
+def format_ticket_option(key: str) -> str:
+    """Formatte l'affichage d'un ticket Jira sous la forme 'CLÉ - Titre/Summary'."""
+    if not key:
+        return ""
+    jira_titles = st.session_state.get("jira_titles", {})
+    summary = jira_titles.get(key)
+    if not summary:
+        summary = get_jira_issue_summary(key)
+        if summary:
+            if "jira_titles" not in st.session_state:
+                st.session_state["jira_titles"] = {}
+            st.session_state["jira_titles"][key] = summary
+    return f"{key} - {summary}" if summary else key
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def show_release_note(ticket: str, since: float) -> None:
+    """Affiche la release note rédigée avec le patch (ajoutée par main.py en fin de description Jira)."""
+    path = f"{ticket}-release-note.md"
+    if not os.path.exists(path) or os.path.getmtime(path) < since:
+        st.warning(f"Aucune release note produite pour {ticket} lors de cette exécution.", icon=":material/campaign:")
+        return
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        note = f.read().strip()
+    with st.container(border=True):
+        st.markdown("**:material/campaign: Release note** :gray[(ajoutée à la fin de la description Jira)]")
+        st.markdown(note or "_Fichier vide._")
+
+
+def run_main_step(cmd: list) -> int:
+    """Lance main.py en affichant ses logs au fil de l'eau. Renvoie le code retour."""
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace"
+    )
+    output_container = st.empty()
+    logs = ""
+    for line in process.stdout:
+        logs += line
+        output_container.code(logs, language="text")
+    process.wait()
+    return process.returncode
+
+
+def run_epic_patches(epic_key: str, project: str, client_repo: str, db_schema: str) -> bool:
+    """Génère le patch de chaque tâche enfant de l'épopée, dans l'ordre du découpage. S'arrête au premier échec."""
+    tasks = [t for t in load_epic_manifest(epic_key).get("tasks", []) if t.get("key")]
+    if not tasks:
+        st.error(f"Aucune tâche enfant créée pour {epic_key} : lancez d'abord l'analyse de l'épopée.")
+        return False
+    for index, task in enumerate(tasks, 1):
+        st.info(f"[{index}/{len(tasks)}] Génération du patch de {task['key']} — {task.get('summary', '')}...")
+        patch_started_at = time.time()
+        returncode = run_main_step([
+            sys.executable, "main.py",
+            "--issue", task["key"],
+            "--project", project,
+            "--client-repo", client_repo,
+            "--step", "patch",
+            "--db-schema", db_schema
+        ])
+        if returncode != 0:
+            remaining = ", ".join(t["key"] for t in tasks[index:]) or "aucune"
+            st.error(f"La génération du patch de {task['key']} a échoué (code {returncode}). Tâches non traitées : {remaining}.")
+            return False
+        st.success(f"Patch généré et attaché au ticket Jira {task['key']}.")
+        show_release_note(task["key"], patch_started_at)
+    return True
+
+
+ENV_PATH = ".env"
+if not os.path.exists(ENV_PATH):
+    open(ENV_PATH, "w", encoding="utf-8").close()
+
+# override=True : Streamlit ré-exécute ce script à chaque interaction ; on recharge donc la
+# configuration enregistrée (onglet ⚙️) au lieu de garder les valeurs du démarrage.
+load_dotenv(ENV_PATH, override=True)
+
+st.title("🤖 Tableau de bord - Agent Scrum Master")
+
+tab_execution, tab_merges, tab_config = st.tabs(["🚀 Lancement", "🔔 Écoute des merges", "⚙️ Configuration (.env)"])
+
+# Initialisation de l'état
+if "workflow_step" not in st.session_state:
+    st.session_state["workflow_step"] = "INIT"
+
+# ---------------------------------------------------------
+# ONGLET 1 : LANCEMENT & RECHERCHE PARAMÉTRABLE
+# ---------------------------------------------------------
+with tab_execution:
+    missing_env = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
+    if missing_env:
+        st.warning("Configuration incomplète : renseignez " + ", ".join(missing_env)
+                   + " dans l'onglet « ⚙️ Configuration ».", icon=":material/settings:")
+
+    st.markdown("### 1. Critères de Recherche Jira")
+
+    # Recherche rapide « épopées ouvertes de l'équipe » (onglet Configuration)
+    open_epics_team = os.getenv("JIRA_OPEN_EPICS_TEAM", "").strip()
+    open_epics_status = os.getenv("JIRA_OPEN_EPICS_STATUS", "").strip()
+    open_epics_only = st.checkbox(
+        f"Épopées au statut « {open_epics_status} » de l'équipe {open_epics_team}"
+        if open_epics_team and open_epics_status else "Épopées ouvertes de mon équipe",
+        key="open_epics_only",
+        disabled=not (open_epics_team and open_epics_status),
+        help="Si coché, la recherche porte sur les épopées du projet cible à ce statut pour cette équipe : "
+             "les critères Équipe, Statuts et Labels ci-dessous sont ignorés. "
+             "Équipe et statut : JIRA_OPEN_EPICS_TEAM et JIRA_OPEN_EPICS_STATUS (onglet Configuration)."
+    ) and bool(open_epics_team and open_epics_status)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        jira_project_input = st.text_input(
+            "Projet Jira cible :",
+            value=os.getenv("JIRA_PROJECT_KEY", ""),
+            help="Ex: SPEC, OXY, PHE..."
+        )
+        jira_team_input = st.text_input(
+            "Équipe / Composant (Optionnel) :",
+            value=os.getenv("JIRA_SEARCH_TEAM", ""),
+            help="Composant Jira ou équipe Atlassian. Ex: TEAM_SPEC, WMS, Socle...",
+            disabled=open_epics_only
+        )
+
+    with col2:
+        jira_status_input = st.text_input(
+            "États / Statuts (Séparés par une virgule) :",
+            value=os.getenv("JIRA_SEARCH_STATUSES", ""),
+            help="Ex: Analysée, En cours, A traiter (laissez vide pour tous les états)",
+            disabled=open_epics_only
+        )
+        jira_label_input = st.text_input(
+            "Labels (Séparés par une virgule) :",
+            value=os.getenv("JIRA_SEARCH_LABELS", ""),
+            help="Ex: WAIT_TEAM_SPEC, BUG (laissez vide si aucun label requis)",
+            disabled=open_epics_only
+        )
+
+    project_key = jira_project_input.strip().upper()
+    statuses = [s.strip() for s in jira_status_input.split(",") if s.strip()]
+    labels = [l.strip() for l in jira_label_input.split(",") if l.strip()]
+    team = jira_team_input.strip()
+
+    search_clicked = st.button("🔍 Rechercher les tickets", type="primary", use_container_width=True)
+
+    if search_clicked:
+        with st.spinner(f"Recherche Jira sur le projet {project_key}..."):
+            try:
+                if open_epics_only:
+                    tickets_data = fetch_tickets_data(
+                        project_key=project_key,
+                        statuses=[open_epics_status],
+                        epics_only=True,
+                        atlassian_team=open_epics_team
+                    )
+                else:
+                    tickets_data = fetch_tickets_data(
+                        project_key=project_key,
+                        statuses=statuses,
+                        labels=labels,
+                        team=team
+                    )
+                search_error = None
+            except JiraSearchError as e:
+                tickets_data, search_error = [], str(e)
+
+            if search_error:
+                st.session_state["jira_tickets"] = []
+                st.session_state["jira_titles"] = {}
+                st.error(f"❌ {search_error}")
+            elif tickets_data:
+                found_keys = [t["key"] for t in tickets_data]
+                jira_titles = {t["key"]: t["summary"] for t in tickets_data if t.get("summary")}
+                st.session_state["jira_tickets"] = found_keys
+                st.session_state["jira_titles"] = jira_titles
+                st.session_state["jira_context"] = {t["key"]: t for t in tickets_data}
+                st.session_state["selected_index"] = 0
+                st.session_state["selected_jira_project"] = project_key
+                st.session_state["workflow_step"] = "INIT"
+                
+                formatted_list = [f"{t['key']} - {t['summary']}" if t.get('summary') else t['key'] for t in tickets_data]
+                st.success(f"{len(found_keys)} ticket(s) trouvé(s) :\n" + "\n".join([f"- {item}" for item in formatted_list]))
+            else:
+                st.session_state["jira_tickets"] = []
+                st.session_state["jira_titles"] = {}
+                st.warning(f"Aucun ticket trouvé avec ces critères sur le projet {project_key}.")
+
+    if "jira_tickets" in st.session_state and st.session_state["jira_tickets"]:
+        tickets = st.session_state["jira_tickets"]
+        current_project = st.session_state.get("selected_jira_project", os.getenv("JIRA_PROJECT_KEY", ""))
+        
+        st.markdown("---")
+        st.markdown("### 2. Sélection du Ticket & Mode d'Exécution")
+        
+        is_oxy = (current_project == "OXY")
+        if is_oxy:
+            st.info("ℹ️ Projet OXY détecté : Analyse basée uniquement sur le socle Standard (branche dev).")
+            client_repo_path = "STD_ONLY"
+        else:
+            client_repo_path = st.text_input(
+                "Chemin local ou URL Bitbucket du dépôt Client :",
+                value=os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""),
+                help="Ex: https://git.kiscloud.io/projects/PHEACR ou C:\\development\\PHEACR"
+            )
+
+        db_schema_input = st.text_input(
+            "Schéma BDD cible :",
+            value=os.getenv("DB_SCHEMA", ""),
+            key="db_schema_input",
+            help="Schéma de la base client consultée en lecture seule par l'agent (structure des tables, paramétrage, "
+                 "données du cas). Laissez vide pour que l'agent n'utilise pas la base."
+        ).strip()
+
+        if "selected_index" not in st.session_state:
+            st.session_state["selected_index"] = 0
+
+        selected_ticket = st.selectbox(
+            "Sélectionne le ticket Jira à traiter :",
+            options=tickets,
+            index=st.session_state["selected_index"],
+            key="ticket_selectbox",
+            format_func=format_ticket_option
+        )
+        
+        st.session_state["selected_index"] = tickets.index(selected_ticket)
+
+        # Indicateur de capitalisation : mêmes critères que ceux utilisés par main.py
+        ticket_ctx = st.session_state.get("jira_context", {}).get(selected_ticket, {})
+        similar = find_similar_tickets(
+            current_project,
+            component_name=ticket_ctx.get("components", []),
+            query_text=f"{ticket_ctx.get('summary', '')}\n{ticket_ctx.get('description', '')}",
+            exclude_issue_key=selected_ticket,
+        )
+        lessons = get_project_lessons(current_project, exclude_issue_key=selected_ticket)
+        own_feedbacks = load_ticket_memory(selected_ticket).get("feedbacks", [])
+
+        with st.container(border=True):
+            st.markdown("**:material/psychology: Mémoire de l'agent**")
+            with st.container(horizontal=True):
+                st.metric("Tickets similaires", len(similar))
+                st.metric("Consignes projet", len(lessons))
+                st.metric("Retours sur ce ticket", len(own_feedbacks))
+            if similar:
+                with st.expander("Analyses et patchs similaires injectés dans le prompt"):
+                    for item in similar:
+                        mem = item["memory"]
+                        st.markdown(f"**{mem['issue_key']}** — {mem.get('summary', '')}  \n"
+                                    f":gray[{mem.get('status')} · score {item['score']} · {', '.join(item['reasons'])}]")
+                        files = mem.get("patch_info", {}).get("modified_files", [])
+                        if files:
+                            st.caption("Fichiers du patch : " + ", ".join(files[:8]))
+            if lessons:
+                with st.expander("Consignes récurrentes appliquées"):
+                    st.markdown("\n".join(f"- {l}" for l in lessons))
+            if not similar and not lessons:
+                st.caption("Aucune expérience mémorisée pertinente pour ce ticket.")
+
+        # Vérification si une analyse existe déjà localement pour ce ticket
+        cadrage_file = f"{selected_ticket}-cadrage.md"
+        # Épopée : l'analyse la découpe en tâches enfants, chacune avec sa propre analyse puis son patch
+        is_epic = bool(ticket_ctx.get("is_epic"))
+        epic_manifest_tasks = load_epic_manifest(selected_ticket).get("tasks", []) if is_epic else []
+        epic_tasks = [t for t in epic_manifest_tasks if t.get("key")]
+        # Découpage rédigé mais tâches pas (toutes) créées dans Jira : on les crée sans relancer l'agent
+        epic_pending = len(epic_manifest_tasks) - len(epic_tasks)
+        has_existing_cadrage = bool(epic_tasks) and not epic_pending if is_epic else os.path.exists(cadrage_file)
+
+        if is_epic:
+            if epic_pending:
+                st.warning(f"Le découpage de {selected_ticket} est rédigé ({len(epic_manifest_tasks)} tâche(s)) mais "
+                           f"{epic_pending} tâche(s) ne sont pas encore créées dans Jira.")
+            elif epic_tasks:
+                st.success(f"💡 {format_ticket_option(selected_ticket)} est déjà découpée en {len(epic_tasks)} tâche(s) : "
+                           + ", ".join(t["key"] for t in epic_tasks) + ".")
+            else:
+                st.info("ℹ️ Épopée : l'analyse crée la ou les tâches enfants nécessaires (une seule si un découpage "
+                        "n'est pas utile), avec leur analyse fonctionnelle et technique en description.")
+        elif has_existing_cadrage:
+            st.success(f"💡 Une analyse préalable existe déjà pour {format_ticket_option(selected_ticket)} (`{cadrage_file}`).")
+
+        col_cadrage, col_direct_patch, col_next = st.columns([2, 2, 1])
+
+        with col_cadrage:
+            if is_epic and epic_pending:
+                btn_cadrage_label = "📌 Créer les tâches dans Jira (analyse prête)"
+            elif is_epic:
+                btn_cadrage_label = "📝 Relire les analyses des tâches" if has_existing_cadrage else "⚡ 1. Analyser l'épopée & créer les tâches"
+            else:
+                btn_cadrage_label = "🔄 Revoir l'analyse" if has_existing_cadrage else "⚡ 1. Lancer l'analyse"
+            run_cadrage_btn = st.button(btn_cadrage_label, use_container_width=True)
+
+        with col_direct_patch:
+            if is_epic:
+                btn_patch_label = "🛠️ Générer les Patchs des tâches"
+            else:
+                btn_patch_label = "🛠️ Générer le Patch (Analyse prête)" if has_existing_cadrage else "🚀 Générer le Patch directement"
+            run_direct_patch_btn = st.button(btn_patch_label, type="primary", use_container_width=True,
+                                             disabled=is_epic and not has_existing_cadrage)
+
+        with col_next:
+            has_next = st.session_state["selected_index"] < len(tickets) - 1
+            if st.button("➡️ Suivant", disabled=not has_next, use_container_width=True):
+                st.session_state["selected_index"] += 1
+                st.session_state["workflow_step"] = "INIT"
+                st.rerun()
+
+        # Épopée : analyse avec création des tâches enfants, relecture, ou patchs de toutes les tâches
+        if is_epic and (run_cadrage_btn or run_direct_patch_btn):
+            if not is_oxy and not client_repo_path.strip():
+                st.error("Veuillez renseigner le chemin local ou l'URL Bitbucket du dépôt client.")
+            elif run_direct_patch_btn:
+                if run_epic_patches(selected_ticket, current_project, client_repo_path.strip(), db_schema_input):
+                    st.success(f"🎉 Patchs générés pour toutes les tâches de l'épopée {selected_ticket} !")
+                    st.session_state["workflow_step"] = "EPIC_FINISHED"
+                    st.session_state["current_ticket"] = selected_ticket
+                    st.session_state["current_client_repo"] = client_repo_path.strip()
+            else:
+                returncode = 0
+                if not has_existing_cadrage:
+                    st.info(f"Création des tâches enfants de {selected_ticket} dans Jira..." if epic_pending
+                            else f"Analyse de l'épopée {selected_ticket} et création des tâches enfants en cours...")
+                    returncode = run_main_step([
+                        sys.executable, "main.py",
+                        "--issue", selected_ticket,
+                        "--project", current_project,
+                        "--client-repo", client_repo_path.strip(),
+                        "--step", "epic-sync" if epic_pending else "epic-cadrage",
+                        "--db-schema", db_schema_input
+                    ])
+                if returncode == 0:
+                    st.session_state["workflow_step"] = "REVIEW_EPIC"
+                    st.session_state["current_ticket"] = selected_ticket
+                    st.session_state["current_client_repo"] = client_repo_path.strip()
+                    st.rerun()
+                else:
+                    st.error("Une erreur est survenue lors de l'analyse de l'épopée : consultez les logs ci-dessus "
+                             "(les tâches déjà créées sont conservées et réutilisées à la relance).")
+            run_cadrage_btn = run_direct_patch_btn = False
+
+        # Option A : Lancer ou revoir l'analyse
+        if run_cadrage_btn:
+            if not is_oxy and not client_repo_path.strip():
+                st.error("Veuillez renseigner le chemin local ou l'URL Bitbucket du dépôt client.")
+            else:
+                st.info(f"Analyse/Cadrage en cours pour {selected_ticket}...")
+                cmd_cadrage = [
+                    sys.executable, "main.py",
+                    "--issue", selected_ticket,
+                    "--project", current_project,
+                    "--client-repo", client_repo_path.strip(),
+                    "--step", "cadrage",
+                    "--db-schema", db_schema_input
+                ]
+
+                process = subprocess.Popen(
+                    cmd_cadrage,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+                output_container = st.empty()
+                logs = ""
+                for line in process.stdout:
+                    logs += line
+                    output_container.code(logs, language="text")
+
+                process.wait()
+
+                if process.returncode == 0:
+                    st.success("Analyse terminée et sauvegardée.")
+                    st.session_state["workflow_step"] = "REVIEW_ANALYSIS"
+                    st.session_state["current_ticket"] = selected_ticket
+                    st.session_state["current_client_repo"] = client_repo_path.strip()
+                    st.rerun()
+                else:
+                    st.error("Une erreur est survenue lors du cadrage.")
+
+        # Option B : Génération directe du Patch (sans passer par la relecture)
+        if run_direct_patch_btn:
+            if not is_oxy and not client_repo_path.strip():
+                st.error("Veuillez renseigner le chemin local ou l'URL Bitbucket du dépôt client.")
+            else:
+                st.info(f"Génération directe du patch et envoi sur Jira pour {selected_ticket}...")
+                cmd_patch = [
+                    sys.executable, "main.py",
+                    "--issue", selected_ticket,
+                    "--project", current_project,
+                    "--client-repo", client_repo_path.strip(),
+                    "--step", "patch",
+                    "--db-schema", db_schema_input
+                ]
+                patch_started_at = time.time()
+
+                process = subprocess.Popen(
+                    cmd_patch,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+                output_container = st.empty()
+                logs = ""
+                for line in process.stdout:
+                    logs += line
+                    output_container.code(logs, language="text")
+
+                process.wait()
+
+                if process.returncode == 0:
+                    st.success(f"🎉 Patch généré et attaché avec succès au ticket Jira {selected_ticket} !")
+                    show_release_note(selected_ticket, patch_started_at)
+                    st.session_state["workflow_step"] = "FINISHED"
+                else:
+                    st.error("Une erreur est survenue lors de la génération du patch.")
+
+    # ---------------------------------------------------------
+    # PHASE 2 : RELECTURE, REVISION ET VALIDATION DU PATCH
+    # ---------------------------------------------------------
+    if st.session_state.get("workflow_step") in ["REVIEW_ANALYSIS", "FINISHED"]:
+        active_ticket = st.session_state.get("current_ticket", "")
+        active_repo = st.session_state.get("current_client_repo", "")
+        active_project = st.session_state.get("selected_jira_project", os.getenv("JIRA_PROJECT_KEY", ""))
+
+        st.markdown("---")
+        st.subheader(f"📝 Relecture & Ajustement de l'Analyse ({active_ticket})")
+
+        cadrage_file = f"{active_ticket}-cadrage.md"
+        cadrage_content = ""
+        if os.path.exists(cadrage_file):
+            with open(cadrage_file, "r", encoding="utf-8") as f:
+                cadrage_content = f.read()
+
+        user_analysis = st.text_area(
+            "Analyse enregistrée (Modifiable directement avant de générer le patch) :",
+            value=cadrage_content,
+            height=300
+        )
+
+        user_feedback = st.text_input(
+            "Consignes de révision pour l'agent (Optionnel) :",
+            placeholder="Ex: Préciser l'impact sur les retours, ajuster le composant..."
+        )
+
+        col_review, col_validate = st.columns(2)
+
+        with col_review:
+            if st.button("🔄 Demander une révision à l'agent", use_container_width=True):
+                st.info("Révision du cadrage par l'agent...")
+
+                if record_manual_edit(active_ticket, cadrage_content, user_analysis):
+                    st.toast("Vos corrections manuelles ont été mémorisées.", icon=":material/edit_note:")
+
+                with open(cadrage_file, "w", encoding="utf-8") as f:
+                    f.write(user_analysis)
+
+                cmd_refine = [
+                    sys.executable, "main.py",
+                    "--issue", active_ticket,
+                    "--project", active_project,
+                    "--client-repo", active_repo,
+                    "--step", "refine",
+                    "--feedback", user_feedback.strip(),
+                    "--db-schema", st.session_state.get("db_schema_input", "").strip()
+                ]
+
+                process = subprocess.Popen(
+                    cmd_refine,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+
+                output_container = st.empty()
+                logs = ""
+                for line in process.stdout:
+                    logs += line
+                    output_container.code(logs, language="text")
+
+                process.wait()
+
+                if process.returncode == 0:
+                    st.toast("Analyse révisée et mise à jour !", icon=":material/check_circle:")
+                    st.rerun()
+                else:
+                    # Pas de rerun : les logs restent affichés pour diagnostiquer l'échec
+                    st.error(f"La révision a échoué (code {process.returncode}). Rien n'a été enregistré en mémoire : consultez les logs ci-dessus.")
+
+        with col_validate:
+            if st.button("✅ Valider l'analyse & Générer le Patch", type="primary", use_container_width=True):
+                st.info("Génération du patch Git et envoi sur Jira...")
+
+                if record_manual_edit(active_ticket, cadrage_content, user_analysis):
+                    st.toast("Vos corrections manuelles ont été mémorisées.", icon=":material/edit_note:")
+
+                with open(cadrage_file, "w", encoding="utf-8") as f:
+                    f.write(user_analysis)
+
+                cmd_val_patch = [
+                    sys.executable, "main.py",
+                    "--issue", active_ticket,
+                    "--project", active_project,
+                    "--client-repo", active_repo,
+                    "--step", "patch",
+                    "--db-schema", st.session_state.get("db_schema_input", "").strip()
+                ]
+                patch_started_at = time.time()
+
+                process = subprocess.Popen(
+                    cmd_val_patch,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+
+                output_container = st.empty()
+                logs = ""
+                for line in process.stdout:
+                    logs += line
+                    output_container.code(logs, language="text")
+
+                process.wait()
+
+                if process.returncode == 0:
+                    st.success(f"🎉 Traitement terminé avec succès ! Le patch est attaché au ticket {active_ticket}.")
+                    show_release_note(active_ticket, patch_started_at)
+                    st.session_state["workflow_step"] = "FINISHED"
+                else:
+                    st.error("Une erreur est survenue lors de la création du patch.")
+                    
+    # ---------------------------------------------------------
+    # PHASE 2 (ÉPOPÉE) : RELECTURE DES TÂCHES ENFANTS ET PATCHS
+    # ---------------------------------------------------------
+    if st.session_state.get("workflow_step") in ["REVIEW_EPIC", "EPIC_FINISHED"]:
+        active_epic = st.session_state.get("current_ticket", "")
+        active_repo = st.session_state.get("current_client_repo", "")
+        active_project = st.session_state.get("selected_jira_project", os.getenv("JIRA_PROJECT_KEY", ""))
+        active_schema = st.session_state.get("db_schema_input", "").strip()
+        epic_manifest = load_epic_manifest(active_epic)
+        review_tasks = [t for t in epic_manifest.get("tasks", []) if t.get("key")]
+
+        st.markdown("---")
+        st.subheader(f"📝 Relecture des tâches de l'épopée ({active_epic})")
+        if epic_manifest.get("justification"):
+            st.caption(f"Découpage en {len(review_tasks)} tâche(s) — {epic_manifest['justification']}")
+
+        task_edits = {}
+        for task in review_tasks:
+            task_file = f"{task['key']}-cadrage.md"
+            task_content = ""
+            if os.path.exists(task_file):
+                with open(task_file, "r", encoding="utf-8") as f:
+                    task_content = f.read()
+            with st.expander(f"{task['key']} — {task.get('summary', '')}", expanded=len(review_tasks) == 1):
+                task_edits[task["key"]] = (task_file, task_content, st.text_area(
+                    f"Analyse de {task['key']} (Modifiable directement avant de générer les patchs) :",
+                    value=task_content,
+                    height=300
+                ))
+
+        def save_task_edits():
+            """Enregistre les corrections manuelles (fichier local, mémoire, description Jira de la tâche)."""
+            for task_key, (task_file, before, after) in task_edits.items():
+                with open(task_file, "w", encoding="utf-8") as f:
+                    f.write(after)
+                if record_manual_edit(task_key, before, after):
+                    st.toast(f"Vos corrections sur {task_key} ont été mémorisées.", icon=":material/edit_note:")
+                    try:
+                        set_jira_description_markdown(task_key, after)
+                    except Exception as e:
+                        st.warning(f"Description Jira de {task_key} non mise à jour : {e}")
+
+        epic_feedback = st.text_input(
+            "Consignes de révision pour l'agent (Optionnel) :",
+            placeholder="Ex: Regrouper les tâches 1 et 2, séparer la partie Studio, préciser l'impact sur les retours...",
+            key="epic_feedback"
+        )
+
+        col_epic_review, col_epic_validate = st.columns(2)
+
+        with col_epic_review:
+            if st.button("🔄 Demander une révision à l'agent", use_container_width=True, key="epic_refine_btn"):
+                st.info("Révision du découpage et des analyses par l'agent...")
+                save_task_edits()
+                returncode = run_main_step([
+                    sys.executable, "main.py",
+                    "--issue", active_epic,
+                    "--project", active_project,
+                    "--client-repo", active_repo,
+                    "--step", "epic-cadrage",
+                    "--feedback", epic_feedback.strip(),
+                    "--db-schema", active_schema
+                ])
+                if returncode == 0:
+                    st.toast("Analyses révisées et tâches Jira mises à jour !", icon=":material/check_circle:")
+                    st.rerun()
+                else:
+                    st.error(f"La révision a échoué (code {returncode}) : consultez les logs ci-dessus.")
+
+        with col_epic_validate:
+            if st.button("✅ Valider les analyses & Générer les Patchs", type="primary", use_container_width=True,
+                         key="epic_validate_btn", disabled=not review_tasks):
+                save_task_edits()
+                if run_epic_patches(active_epic, active_project, active_repo, active_schema):
+                    st.success(f"🎉 Traitement terminé : un patch est attaché à chaque tâche de l'épopée {active_epic}.")
+                    st.session_state["workflow_step"] = "EPIC_FINISHED"
+
+    # Dans app.py, sous le bouton de validation du patch :
+    if st.session_state.get("workflow_step") == "FINISHED":
+        st.markdown("---")
+        st.subheader("🧪 Validation Cucumber / Jenkins")
+        
+        job_name = st.text_input("Nom du Job Jenkins Cucumber :", value=os.getenv("JENKINS_CUCUMBER_JOB", ""))
+        
+        if st.button("🚀 Lancer les tests Cucumber sur Jenkins", use_container_width=True):
+            with st.spinner("Déclenchement du build Jenkins..."):
+                build_url = trigger_cucumber_job(
+                    job_name=job_name,
+                    parameters={
+                        "ISSUE_KEY": active_ticket,
+                        "PROJECT": active_project,
+                        "PATCH_APPLIED": "true"
+                    }
+                )
+                if build_url:
+                    st.success(f"Job lancé ! Suivi du build : [{build_url}]({build_url})")
+                else:
+                    st.error("Échec du lancement du job Jenkins.")
+
+
+# ---------------------------------------------------------
+# ONGLET 2 : CONFIGURATION ENTIÈRE DU .ENV
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# ONGLET 2 : ÉCOUTE DES MERGES BITBUCKET (post-merge Cucumber)
+# ---------------------------------------------------------
+@st.fragment(run_every="10s")
+def merge_listener_status():
+    """Statut et journal rafraîchis toutes les 10 s sans recharger toute la page."""
+    status = get_poller_status()
+    # Passage actif <-> arrêté détecté par le rafraîchissement : recharge complète pour réactiver le formulaire
+    running = bool(status)
+    previous = st.session_state.get("merge_listener_running")
+    st.session_state["merge_listener_running"] = running
+    if previous is not None and previous != running:
+        st.rerun()
+
+    with st.container(border=True):
+        if not status:
+            st.markdown(":gray-badge[:material/pause_circle: Écoute arrêtée]")
+        elif status.get("state") == "stopping":
+            st.markdown(":orange-badge[:material/hourglass_top: Arrêt en cours] "
+                        "— l'écoute finit le traitement en cours avant de s'arrêter.")
+        else:
+            st.markdown(f":green-badge[:material/sensors: Écoute active] sur **{status['projects']}**")
+            started = status["started_at"].replace("T", " ")
+            last_poll = status.get("last_poll", "").replace("T", " ") or "en cours…"
+            st.caption(f"Depuis {started} · toutes les {status['interval'] // 60} min · "
+                       f"dernier passage : {last_poll} · en file : {status.get('queued', 0)}")
+            if status.get("repositories"):
+                st.caption("Dépôts surveillés : " + ", ".join(status["repositories"]))
+
+        if status and status.get("state") != "stopping":
+            with st.container(horizontal=True):
+                if st.button("Arrêter l'écoute", icon=":material/stop_circle:",
+                             help="Plus aucun nouveau merge n'est pris ; un traitement déjà lancé va jusqu'au bout."):
+                    request_stop()
+                    st.rerun()
+                if st.button("Forcer l'arrêt", icon=":material/dangerous:",
+                             help="Arrête immédiatement, y compris l'agent s'il est en train de traiter un merge."):
+                    st.toast(force_stop())
+                    st.rerun()
+
+    with st.expander("Journal de l'écoute", icon=":material/receipt_long:"):
+        st.code(tail_log(40) or "Journal vide.", language="text")
+    return status
+
+
+with tab_merges:
+    st.subheader("Écoute des merges Bitbucket")
+    postmerge_project = os.getenv("POSTMERGE_JIRA_PROJECT", "").strip() or os.getenv("JIRA_PROJECT_KEY", "").strip()
+    target_branches = " ou ".join(b.strip() for b in os.getenv("WEBHOOK_TARGET_BRANCHES", "integration,dev").split(",")
+                                  if b.strip()) or "n'importe quelle branche"
+    st.caption(f"À chaque Pull Request fusionnée vers {target_branches}, l'agent analyse le code fusionné, "
+               f"crée le ticket {postmerge_project} « [CUCUMBER] Adaptation des tests post-merge » et y attache le patch Cucumber.")
+
+    listener_status = merge_listener_status()
+
+    with st.form("merge_listener_form"):
+        listen_projects = st.text_input(
+            "Projets Bitbucket à écouter",
+            value=os.getenv("POLL_REPOSITORIES", ""),
+            help="Clé de projet (tous ses dépôts) ou PROJET/dépôt, séparés par des virgules. "
+                 "Ex : NOVALIA, OSCARO/odatio-oscaro. Les dépôts *cucumber* sont toujours ignorés."
+        )
+        listen_interval = st.number_input(
+            "Fréquence de vérification (minutes)", min_value=1, max_value=60,
+            value=max(int(os.getenv("POLL_INTERVAL_SECONDS", "300")) // 60, 1)
+        )
+        listen_catch_up = st.checkbox(
+            "Traiter aussi les merges survenus pendant l'arrêt de l'écoute", value=False,
+            help="Décoché : seuls les merges postérieurs au démarrage sont traités."
+        )
+        start_listening = st.form_submit_button(
+            "Démarrer l'écoute", type="primary", icon=":material/play_circle:",
+            disabled=bool(listener_status),
+            help="Arrêtez l'écoute pour en modifier les paramètres." if listener_status else None
+        )
+
+    if start_listening:
+        projects_value = ",".join(p.strip().upper() if "/" not in p else p.strip()
+                                  for p in listen_projects.split(",") if p.strip())
+        if not projects_value:
+            st.error("Renseignez au moins un projet Bitbucket.")
+        else:
+            set_key(ENV_PATH, "POLL_REPOSITORIES", projects_value)
+            set_key(ENV_PATH, "POLL_INTERVAL_SECONDS", str(int(listen_interval) * 60))
+            os.environ["POLL_REPOSITORIES"] = projects_value
+            os.environ["POLL_INTERVAL_SECONDS"] = str(int(listen_interval) * 60)
+            with st.spinner("Démarrage de l'écoute…"):
+                ok, message = start_poller(projects_value, int(listen_interval) * 60, listen_catch_up)
+            if ok:
+                st.toast(message, icon=":material/sensors:")
+                st.rerun()
+            else:
+                st.error(message)
+
+
+with tab_config:
+    st.subheader("🛠️ Configuration globale du fichier .env")
+    st.caption("Modifiez l'ensemble des variables d'environnement utilisées par l'application. "
+               "Le fichier .env.example du projet donne les valeurs usuelles.")
+
+    with st.form("env_form_global"):
+        # Valeurs enregistrées dans le .env à la validation du formulaire
+        env_values = {}
+
+        st.markdown("#### 📌 Identifiants Jira")
+        env_values["JIRA_DOMAIN"] = st.text_input("JIRA_DOMAIN", value=os.getenv("JIRA_DOMAIN", ""),
+                                                  help="Ex: monentreprise.atlassian.net")
+        env_values["JIRA_EMAIL"] = st.text_input("JIRA_EMAIL", value=os.getenv("JIRA_EMAIL", ""))
+        env_values["JIRA_API_TOKEN"] = st.text_input("JIRA_API_TOKEN", value=os.getenv("JIRA_API_TOKEN", ""), type="password",
+                                                     help="À créer sur https://id.atlassian.com/manage-profile/security/api-tokens")
+        env_values["JIRA_PROJECT_KEY"] = st.text_input("JIRA_PROJECT_KEY (Par défaut)", value=os.getenv("JIRA_PROJECT_KEY", ""))
+
+        st.markdown("---")
+        st.markdown("#### 🔎 Recherche Jira (valeurs par défaut de l'onglet Lancement)")
+        with st.container(horizontal=True):
+            env_values["JIRA_SEARCH_TEAM"] = st.text_input(
+                "JIRA_SEARCH_TEAM", value=os.getenv("JIRA_SEARCH_TEAM", ""),
+                help="Équipe / composant pré-rempli dans la recherche (composant Jira ou équipe Atlassian).")
+            env_values["JIRA_SEARCH_STATUSES"] = st.text_input(
+                "JIRA_SEARCH_STATUSES", value=os.getenv("JIRA_SEARCH_STATUSES", ""),
+                help="Statuts pré-remplis, séparés par une virgule. Ex: Analysée, Analysé")
+            env_values["JIRA_SEARCH_LABELS"] = st.text_input(
+                "JIRA_SEARCH_LABELS", value=os.getenv("JIRA_SEARCH_LABELS", ""),
+                help="Labels pré-remplis, séparés par une virgule. Ex: WAIT_TEAM_SPEC")
+        with st.container(horizontal=True):
+            env_values["JIRA_OPEN_EPICS_TEAM"] = st.text_input(
+                "JIRA_OPEN_EPICS_TEAM", value=os.getenv("JIRA_OPEN_EPICS_TEAM", ""),
+                help="Équipe Atlassian de la recherche rapide « Épopées ouvertes de mon équipe ». Ex: oda_Prenom_N")
+            env_values["JIRA_OPEN_EPICS_STATUS"] = st.text_input(
+                "JIRA_OPEN_EPICS_STATUS", value=os.getenv("JIRA_OPEN_EPICS_STATUS", ""),
+                help="Statut des épopées de cette recherche rapide. Ex: Ouvert")
+
+        st.markdown("---")
+        st.markdown("#### 🎫 Tickets Jira créés par l'agent (tâches d'épopée, post-merge Cucumber)")
+        with st.container(horizontal=True):
+            env_values["POSTMERGE_JIRA_PROJECT"] = st.text_input(
+                "POSTMERGE_JIRA_PROJECT", value=os.getenv("POSTMERGE_JIRA_PROJECT", ""),
+                help="Projet des tickets [CUCUMBER] post-merge. Vide = JIRA_PROJECT_KEY.")
+            env_values["POSTMERGE_JIRA_COMPONENT"] = st.text_input(
+                "POSTMERGE_JIRA_COMPONENT", value=os.getenv("POSTMERGE_JIRA_COMPONENT", ""),
+                help="Composant Jira ou équipe Atlassian posé sur les tickets créés (post-merge et tâches d'épopée). "
+                     "Vide = aucun.")
+            env_values["POSTMERGE_JIRA_LABEL"] = st.text_input(
+                "POSTMERGE_JIRA_LABEL", value=os.getenv("POSTMERGE_JIRA_LABEL", ""),
+                help="Label des tickets post-merge. Vide = aucun.")
+        with st.container(horizontal=True):
+            env_values["JIRA_POSTMERGE_ISSUE_TYPE"] = st.text_input(
+                "JIRA_POSTMERGE_ISSUE_TYPE", value=os.getenv("JIRA_POSTMERGE_ISSUE_TYPE", "Development"),
+                help="Type des tickets post-merge.")
+            env_values["JIRA_EPIC_TASK_ISSUE_TYPE"] = st.text_input(
+                "JIRA_EPIC_TASK_ISSUE_TYPE", value=os.getenv("JIRA_EPIC_TASK_ISSUE_TYPE", ""),
+                help="Type des tâches créées sous une épopée. Vide = premier type existant parmi Tâche, Task, "
+                     "Development, Story.")
+            env_values["JIRA_TEAM_FIELD"] = st.text_input(
+                "JIRA_TEAM_FIELD", value=os.getenv("JIRA_TEAM_FIELD", "customfield_10001"),
+                help="Champ Jira de l'équipe Atlassian (Team).")
+
+        st.markdown("---")
+        st.markdown("#### 🐙 Connexion Bitbucket / KISCloud")
+        env_values["BITBUCKET_URL"] = st.text_input("BITBUCKET_URL", value=os.getenv("BITBUCKET_URL", ""),
+                                                    help="Ex: https://git.kiscloud.io")
+        env_values["BITBUCKET_HTTP_TOKEN"] = st.text_input("BITBUCKET_HTTP_TOKEN", value=os.getenv("BITBUCKET_HTTP_TOKEN", ""),
+                                                           type="password",
+                                                           help="Jeton d'accès HTTP personnel Bitbucket (lecture des dépôts).")
+        env_values["BITBUCKET_WEBHOOK_SECRET"] = st.text_input(
+            "BITBUCKET_WEBHOOK_SECRET",
+            value=os.getenv("BITBUCKET_WEBHOOK_SECRET", ""),
+            type="password",
+            help="Secret partagé avec le webhook Bitbucket (champ Secret) pour signer les événements post-merge. "
+                 "Générer : python -c \"import secrets; print(secrets.token_hex(32))\". "
+                 "Redémarrer webhook_server.py après modification."
+        )
+
+        st.markdown("---")
+        st.markdown("#### 🏗️ Connexion Jenkins (Cucumber / Tirs de tests)")
+        env_values["JENKINS_URL"] = st.text_input("JENKINS_URL", value=os.getenv("JENKINS_URL", ""),
+                                                  help="Ex: https://jenkins.kiscloud.io")
+        env_values["JENKINS_USER"] = st.text_input("JENKINS_USER", value=os.getenv("JENKINS_USER", ""))
+        env_values["JENKINS_API_TOKEN"] = st.text_input("JENKINS_API_TOKEN", value=os.getenv("JENKINS_API_TOKEN", ""),
+                                                        type="password")
+        env_values["JENKINS_CUCUMBER_JOB"] = st.text_input("JENKINS_CUCUMBER_JOB", value=os.getenv("JENKINS_CUCUMBER_JOB", ""),
+                                                           help="Job pré-rempli après génération d'un patch. "
+                                                                "Ex: ODATIO_CUCUMBER_NIGHTLY")
+
+        st.markdown("---")
+        st.markdown("#### 📁 Dépôts, Conventions & Prompts")
+        env_values["BITBUCKET_STD_REPO_PATH"] = st.text_input(
+            "BITBUCKET_STD_REPO_PATH (Lien ou chemin du Socle Standard)",
+            value=os.getenv("BITBUCKET_STD_REPO_PATH", ""),
+            help="URL du projet Bitbucket/KISCloud (ex: https://git.kiscloud.io/projects/COMPONENT) "
+                 "ou chemin local d'un clone (ex: C:\\development\\branch_dev)."
+        )
+        env_values["BITBUCKET_CLIENT_REPO_PATH"] = st.text_input(
+            "BITBUCKET_CLIENT_REPO_PATH (Dépôt client par défaut)",
+            value=os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""),
+            help="Pré-remplit le dépôt client de l'onglet Lancement. "
+                 "Ex: https://git.kiscloud.io/projects/NOVALIA ou C:\\development\\NOVALIA"
+        )
+        env_values["BITBUCKET_CUCUMBER_STD_REPO"] = st.text_input(
+            "BITBUCKET_CUCUMBER_STD_REPO",
+            value=os.getenv("BITBUCKET_CUCUMBER_STD_REPO", ""),
+            help="URL du dépôt Bitbucket contenant les scénarios Cucumber du socle Standard."
+        )
+        env_values["DEV_CONVENTIONS_PATH"] = st.text_input(
+            "DEV_CONVENTIONS_PATH",
+            value=os.getenv("DEV_CONVENTIONS_PATH", ""),
+            help="Fichier Markdown des conventions de développement. "
+                 "Vide = odatio-specific-code-conventions-dev.md du projet."
+        )
+        env_values["PROMPTS_DIR"] = st.text_input(
+            "PROMPTS_DIR",
+            value=os.getenv("PROMPTS_DIR", ""),
+            help="Dossier de prompts personnalisés : un fichier <nom>.md présent ici remplace le modèle du même nom "
+                 "du dossier prompts/ du projet. Vide = modèles du projet."
+        )
+
+        st.markdown("---")
+        st.markdown("#### 🔔 Post-merge Cucumber & écoute des merges")
+        with st.container(horizontal=True):
+            env_values["POSTMERGE_CUCUMBER_REPOS"] = st.text_input(
+                "POSTMERGE_CUCUMBER_REPOS", value=os.getenv("POSTMERGE_CUCUMBER_REPOS", ""),
+                help="Dépôt Cucumber de chaque projet client. Ex: NOVALIA=novalia-cucumber-2,OSCARO=oscaro-cucumber. "
+                     "Vide = détection du dépôt *cucumber* du projet.")
+            env_values["POSTMERGE_CUCUMBER_BASE_BRANCH"] = st.text_input(
+                "POSTMERGE_CUCUMBER_BASE_BRANCH", value=os.getenv("POSTMERGE_CUCUMBER_BASE_BRANCH", "integration"),
+                help="Branche de base des patchs Cucumber post-merge.")
+        with st.container(horizontal=True):
+            env_values["WEBHOOK_TARGET_BRANCHES"] = st.text_input(
+                "WEBHOOK_TARGET_BRANCHES", value=os.getenv("WEBHOOK_TARGET_BRANCHES", "integration,dev"),
+                help="Branches dont les merges déclenchent l'agent, séparées par une virgule.")
+            env_values["WEBHOOK_IGNORED_REPOS"] = st.text_input(
+                "WEBHOOK_IGNORED_REPOS", value=os.getenv("WEBHOOK_IGNORED_REPOS", "cucumber"),
+                help="Motifs de dépôts ignorés, séparés par une virgule.")
+            env_values["WEBHOOK_STD_PROJECT"] = st.text_input(
+                "WEBHOOK_STD_PROJECT", value=os.getenv("WEBHOOK_STD_PROJECT", ""),
+                help="Projet Bitbucket du socle Standard. Vide = déduit de BITBUCKET_STD_REPO_PATH.")
+        with st.container(horizontal=True):
+            env_values["WEBHOOK_HOST"] = st.text_input("WEBHOOK_HOST", value=os.getenv("WEBHOOK_HOST", "0.0.0.0"),
+                                                       help="Mode webhook uniquement (python webhook_server.py).")
+            env_values["WEBHOOK_PORT"] = st.text_input("WEBHOOK_PORT", value=os.getenv("WEBHOOK_PORT", "8085"),
+                                                       help="Mode webhook uniquement (python webhook_server.py).")
+
+        st.markdown("---")
+        st.markdown("#### 🔑 Clé API Anthropic")
+        env_values["ANTHROPIC_API_KEY"] = st.text_input(
+            "ANTHROPIC_API_KEY (Laissez vide pour utiliser Claude Pro CLI)",
+            value=os.getenv("ANTHROPIC_API_KEY", ""), type="password")
+
+        st.markdown("---")
+        st.markdown("#### 💸 Optimisation des tokens")
+        jira_context_max = st.number_input(
+            "JIRA_CONTEXT_MAX_CHARS", min_value=0, max_value=200000, step=1000,
+            value=env_int("JIRA_CONTEXT_MAX_CHARS", 12000),
+            help="Taille maximale du contexte Jira (description, Épopée, COST) injecté dans le prompt de cadrage. "
+                 "0 = pas d'injection : l'agent interroge Jira lui-même."
+        )
+        memory_max = st.number_input(
+            "MEMORY_MAX_CHARS", min_value=0, max_value=100000, step=1000,
+            value=env_int("MEMORY_MAX_CHARS", 6000),
+            help="Taille maximale des retours d'expérience injectés dans les prompts. 0 = désactivé."
+        )
+        env_values["JIRA_CONTEXT_MAX_CHARS"] = str(int(jira_context_max))
+        env_values["MEMORY_MAX_CHARS"] = str(int(memory_max))
+        model_help = ("Alias (sonnet, opus, haiku) ou identifiant complet du modèle, transmis avec --model. "
+                      "Vide = modèle par défaut de Claude Code.")
+        with st.container(horizontal=True):
+            env_values["CLAUDE_MODEL_CADRAGE"] = st.text_input("CLAUDE_MODEL_CADRAGE", value=os.getenv("CLAUDE_MODEL_CADRAGE", ""), help=model_help)
+            env_values["CLAUDE_MODEL_REFINE"] = st.text_input("CLAUDE_MODEL_REFINE", value=os.getenv("CLAUDE_MODEL_REFINE", ""), help=model_help)
+        with st.container(horizontal=True):
+            env_values["CLAUDE_MODEL_PATCH"] = st.text_input("CLAUDE_MODEL_PATCH", value=os.getenv("CLAUDE_MODEL_PATCH", ""), help=model_help)
+            env_values["CLAUDE_MODEL_POSTMERGE"] = st.text_input("CLAUDE_MODEL_POSTMERGE", value=os.getenv("CLAUDE_MODEL_POSTMERGE", ""), help=model_help)
+        st.caption("La consommation de chaque exécution est affichée (ligne [TOKENS]) et ajoutée à .tmp/token_usage.csv.")
+
+        st.markdown("---")
+        st.markdown("#### 🗄️ Connexion Base de données (lecture seule)")
+        current_db_type = os.getenv("DB_TYPE", "postgresql")
+        env_values["DB_TYPE"] = st.selectbox("DB_TYPE", DB_TYPES,
+                                             index=DB_TYPES.index(current_db_type) if current_db_type in DB_TYPES else 0)
+        with st.container(horizontal=True):
+            env_values["DB_HOST"] = st.text_input("DB_HOST", value=os.getenv("DB_HOST", ""))
+            env_values["DB_PORT"] = st.text_input("DB_PORT", value=os.getenv("DB_PORT", ""), help="Vide = port par défaut du SGBD.")
+        env_values["DB_NAME"] = st.text_input("DB_NAME (base, ou service name Oracle)", value=os.getenv("DB_NAME", ""))
+        with st.container(horizontal=True):
+            env_values["DB_USER"] = st.text_input("DB_USER", value=os.getenv("DB_USER", ""))
+            env_values["DB_PASSWORD"] = st.text_input("DB_PASSWORD", value=os.getenv("DB_PASSWORD", ""), type="password")
+        env_values["DB_SCHEMA"] = st.text_input(
+            "DB_SCHEMA (valeur par défaut)", value=os.getenv("DB_SCHEMA", ""),
+            help="Pré-remplit le champ « Schéma BDD cible » de l'onglet Lancement."
+        )
+        env_values["DB_ODBC_DRIVER"] = st.text_input(
+            "DB_ODBC_DRIVER", value=os.getenv("DB_ODBC_DRIVER", "ODBC Driver 18 for SQL Server"),
+            help="SQL Server via pyodbc uniquement : nom du pilote ODBC installé sur le poste."
+        )
+        st.caption("Utilisez de préférence un compte base en lecture seule : le mot de passe reste dans le .env "
+                   "et n'est jamais transmis à l'agent.")
+
+        st.markdown("---")
+        submit_save = st.form_submit_button("💾 Enregistrer la configuration complète", type="primary", use_container_width=True)
+
+        if submit_save:
+            # Les secrets sont enregistrés tels quels ; les autres valeurs sans espaces superflus
+            for env_name, env_value in env_values.items():
+                is_secret = env_name.endswith(("_TOKEN", "_SECRET", "_PASSWORD", "_API_KEY"))
+                set_key(ENV_PATH, env_name, env_value if is_secret else env_value.strip())
+
+            st.success("Toute la configuration a été enregistrée avec succès dans le fichier .env !")
+            st.rerun()
+
+    # Hors formulaire : teste la configuration base déjà enregistrée dans le .env
+    with st.container(horizontal=True, vertical_alignment="center"):
+        test_db_clicked = st.button("Tester la connexion", icon=":material/lan:")
+        st.caption("Teste la connexion base enregistrée (et le schéma DB_SCHEMA s'il est renseigné).")
+    if test_db_clicked:
+        with st.spinner("Connexion à la base…"):
+            db_ok, db_message = test_connection(os.getenv("DB_SCHEMA", "").strip())
+        if db_ok:
+            st.success(db_message, icon=":material/check_circle:")
+        else:
+            st.error(db_message, icon=":material/error:")
+
+    st.divider()
+    st.subheader("Mémoire de l'agent")
+    memories = get_all_memories()
+
+    with st.container(horizontal=True):
+        if st.button("Importer l'historique local", icon=":material/download:",
+                     help="Ajoute les *-cadrage.md et *.patch présents dans le workspace"):
+            count = import_existing_deliverables(os.path.dirname(os.path.abspath(__file__)))
+            st.toast(f"{count} ticket(s) importé(s) en mémoire.")
+            st.rerun()
+
+    if not memories:
+        st.info("La mémoire est vide.")
+    else:
+        st.dataframe(memories, hide_index=True, width="stretch")
+
+        selected_mem = st.selectbox("Consulter un ticket mémorisé", [m["issue_key"] for m in memories])
+        mem = load_ticket_memory(selected_mem)
+        with st.expander(f"Détail de {selected_mem}"):
+            for fb in mem.get("feedbacks", []):
+                st.markdown(f"- `{fb.get('source')}` {fb.get('feedback')}")
+                if fb.get("diff"):
+                    st.code(fb["diff"], language="diff")
+            st.markdown(mem.get("final_cadrage") or "_Pas de cadrage._")
+        if st.button(f"Supprimer {selected_mem} de la mémoire", icon=":material/delete:"):
+            delete_ticket_memory(selected_mem)
+            st.rerun()
+
+        with st.container(border=True):
+            st.markdown("**Purger la mémoire**")
+            scope = st.selectbox("Périmètre", ["Tous les projets"] + sorted({m["project_key"] for m in memories}))
+            confirm = st.checkbox("Je confirme la suppression définitive")
+            if st.button("Purger", type="primary", disabled=not confirm, icon=":material/delete_sweep:"):
+                count = clear_memory("" if scope == "Tous les projets" else scope)
+                st.toast(f"{count} ticket(s) supprimé(s) de la mémoire.")
+                st.rerun()

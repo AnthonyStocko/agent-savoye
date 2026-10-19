@@ -1,0 +1,27 @@
+# Configuration personnelle (identifiants, jetons) : partir de .env.example
+.env
+
+# Environnements Python et caches
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Données de travail de l'agent (clones, mémoire, journaux, consommation de tokens)
+.tmp/
+
+# Livrables produits par ticket à la racine du projet
+*.patch
+*.diff
+*-cadrage.md
+*-release-note.md
+*-postmerge-cucumber.md
+*-decoupage.json
+*-tache-*.md
+
+# Outils locaux
+.idea/
+.vscode/
+.agents/
+.claude/
+*.stackdump
