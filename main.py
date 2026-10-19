@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import db_tools, integration_tools
+from tools import cucumber_tools, db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -81,6 +81,7 @@ CLAUDE_MODEL_ENV = {
     "generate-cucumber-postmerge": "CLAUDE_MODEL_POSTMERGE",
     "besoin": "CLAUDE_MODEL_BESOIN",
     "cadrage-reponses": "CLAUDE_MODEL_REFINE",
+    "generate-cucumber-client": "CLAUDE_MODEL_CUCUMBER",
 }
 
 # ---------------------------------------------------------------------------
@@ -320,6 +321,10 @@ def ensure_cucumber_std_repo(repo_url: str, odatio_version: str) -> str:
         return ""
 
     clean_url = repo_url.split("/browse")[0].rstrip("/")
+    # URL de navigation Bitbucket (.../projects/COMPONENT-QA/repos/cucumber) -> URL clonable (.../scm/component-qa/cucumber.git)
+    web_repo = re.match(r"^(https?://[^/]+)/projects/([^/]+)/repos/([^/]+)$", clean_url)
+    if web_repo:
+        clean_url = f"{web_repo.group(1)}/scm/{web_repo.group(2).lower()}/{web_repo.group(3)}.git"
 
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
     target_dir = os.path.join(workspace_dir, ".tmp", "cucumber_std")
@@ -586,17 +591,18 @@ def build_postmerge_diff(repo_dir: str, merge_commit: str, base_commit: str, lab
 
 def main():
     parser = argparse.ArgumentParser(description="Agent Scrum Master - Cadrage, Patching & Cucumber")
-    parser.add_argument("--issue", required=True, help="Clé du ticket Jira (ex: SPEC-1975, OXY-123)")
-    parser.add_argument("--project", required=True, help="Clé du projet Jira (ex: SPEC, OXY)")
+    parser.add_argument("--issue", default="", help="Clé du ticket Jira (ex: SPEC-1975, OXY-123) ; inutile pour generate-cucumber-client")
+    parser.add_argument("--project", default="", help="Clé du projet Jira (ex: SPEC, OXY) ; inutile pour generate-cucumber-client")
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
-    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration)")
+    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
+    parser.add_argument("--client-name", default="", help="generate-cucumber-client : nom du client, qui donne le dépôt cible <client>-cucumber (défaut : déduit de --client-repo)")
     parser.add_argument("--feedback", default="", help="Remarques de l'utilisateur pour la révision")
     # Les tests Cucumber sont désormais traités après merge, par le ticket SPEC [CUCUMBER] (generate-cucumber-postmerge)
     parser.add_argument("--generate-cucumber", action="store_true", default=False, help="Réactiver ponctuellement la génération des tests Cucumber avec le patch")
     parser.add_argument("--skip-cucumber", dest="generate_cucumber", action="store_false", help="Désactiver la génération des tests Cucumber (comportement par défaut)")
     parser.add_argument("--db-schema", default="", help="Schéma de la base client consultable en lecture seule par l'agent (vide = pas d'accès base)")
-    parser.add_argument("--application", default="", help="Étape besoin : Projet / Application dont les tickets servent de référence, séparés par des virgules (défaut : valeur du champ JIRA_APPLICATION_FIELD du ticket)")
+    parser.add_argument("--application", default="", help="Étapes besoin et generate-cucumber-client : Projet / Application dont les tickets servent de référence, séparés par des virgules (étape besoin, défaut : valeur du champ JIRA_APPLICATION_FIELD du ticket)")
     parser.add_argument("--epic-task-type", default=os.getenv("JIRA_EPIC_TASK_ISSUE_TYPE", ""), help="Type des tâches créées sous une épopée (défaut : premier type existant du projet parmi Tâche, Task, Development, Story)")
 
     postmerge = parser.add_argument_group("Post-merge (--step generate-cucumber-postmerge, déclenché par webhook_server.py)")
@@ -622,6 +628,18 @@ def main():
             parser.error("Projet Jira des tickets post-merge inconnu : renseignez POSTMERGE_JIRA_PROJECT ou JIRA_PROJECT_KEY "
                          "(onglet Configuration)")
         args.generate_cucumber = True
+    # Couverture Cucumber d'un client : pas de ticket Jira, un identifiant de travail CUCUMBER-<CLIENT>
+    is_cucumber_client = args.step == "generate-cucumber-client"
+    if is_cucumber_client:
+        args.client_name = (args.client_name.strip().lower() or cucumber_tools.client_name_from_repo(
+            args.client_repo or os.getenv("BITBUCKET_CLIENT_REPO_PATH", "")))
+        if not args.client_name:
+            parser.error("Nom du client inconnu : passez --client-name ou --client-repo")
+        args.issue = args.issue or cucumber_tools.work_id(args.client_name)
+        args.project = args.project or args.client_name.upper()
+        args.generate_cucumber = True
+    elif not (args.issue.strip() and args.project.strip()):
+        parser.error("--issue et --project sont obligatoires pour cette étape")
 
     target_issue = args.issue.strip().upper()
     target_project = args.project.strip().upper()
@@ -686,7 +704,7 @@ def main():
     token_saving_rules = "\n" + render_prompt("token_saving_rules")
 
     # Besoin initial Jira : sert à retrouver les tickets similaires et à capitaliser
-    jira_context = get_full_jira_issue_context(
+    jira_context = {} if is_cucumber_client else get_full_jira_issue_context(
         target_issue, exclude_sections=(integration_tools.SECTION_TITLE,) if is_besoin else ())
     if jira_context.get("error"):
         print(f"[MÉMOIRE] Contexte Jira indisponible : {jira_context['error']}")
@@ -701,7 +719,7 @@ def main():
             query_text=f"{jira_context.get('summary', '')}\n{jira_context.get('description', '')[:3000]}",
             exclude_issue_key=target_issue,
             max_chars=memory_max_chars,
-        ) if memory_max_chars and not jira_only else ""
+        ) if memory_max_chars and not (jira_only or is_cucumber_client) else ""
     except Exception as e:
         print(f"[MÉMOIRE] ⚠️ Lecture de la mémoire impossible ({e})")
         capitalized_exp = ""
@@ -778,6 +796,40 @@ def main():
         prompt = render_prompt("besoin", **prompt_values, output_file=besoin_output,
                                previous_qa_block=f"{qa_block}\n" if qa_block else "",
                                application_block=f"{app_block}\n" if app_block else "")
+    elif is_cucumber_client:
+        client_name = args.client_name
+        if not local_client_repo:
+            print("❌ Dépôt client non renseigné : passez --client-repo ou renseignez BITBUCKET_CLIENT_REPO_PATH.")
+            sys.exit(2)
+        if not local_cucumber_std_repo:
+            print("❌ Dépôt Cucumber Standard indisponible : vérifiez BITBUCKET_CUCUMBER_STD_REPO (URL clonable, ex. "
+                  "https://git.kiscloud.io/scm/component-qa/cucumber.git) et BITBUCKET_HTTP_TOKEN.")
+            sys.exit(2)
+        args.cucumber_repo, cucumber_repo_dir = resolve_client_cucumber_repo(client_name, local_client_repo,
+                                                                             args.cucumber_repo.strip())
+        if not cucumber_repo_dir:
+            print(f"❌ Dépôt Cucumber client '{args.cucumber_repo}' introuvable dans {local_client_repo}. Il n'est pas "
+                  f"créé automatiquement : créez-le dans Bitbucket ou passez --cucumber-repo.")
+            sys.exit(2)
+        print(f"[CUCUMBER] Dépôt Cucumber client : {args.cucumber_repo} ({cucumber_repo_dir})")
+
+        applications = [a.strip() for a in args.application.split(",") if a.strip()]
+        application_field = os.getenv("JIRA_APPLICATION_FIELD", "").strip()
+        jira_tickets_file = ""
+        if applications and application_field:
+            _, jira_tickets_file = prepare_application_corpus(target_issue, applications, application_field)
+        elif applications:
+            print("[JIRA] JIRA_APPLICATION_FIELD non renseigné : pas de tickets Jira de référence.")
+        jira_tickets_label = (f"'{jira_tickets_file}'" if jira_tickets_file
+                              else "aucun (pas de Projet / Application ou aucun ticket) : appuie-toi sur le code")
+        os.makedirs(cucumber_tools.WORKTREE_ROOT, exist_ok=True)
+        prompt = render_prompt(
+            "cucumber_client", **prompt_values,
+            client_name=client_name, cucumber_repo_dir=cucumber_repo_dir, cucumber_repo=args.cucumber_repo,
+            cucumber_base_branch=args.cucumber_base_branch, application=", ".join(applications) or "non renseigné",
+            jira_tickets_file=jira_tickets_label, worktree_root=cucumber_tools.WORKTREE_ROOT,
+            workspace_dir=workspace_dir, local_std_repo=local_std_repo,
+        )
     elif is_cadrage_answers:
         integration_state = integration_tools.load_state(target_issue)
         if not os.path.exists(cadrage_file):
@@ -918,6 +970,9 @@ def main():
                             previous_cadrage=cadrage_before_run, updated_cadrage=cadrage_content):
                 print(f"[MÉMOIRE] Consigne de révision et écarts enregistrés pour {target_issue}.")
             restore_integration_section(target_issue)
+        elif is_cucumber_client:
+            if not finalize_cucumber_client(args.client_name, run_started_at):
+                sys.exit(1)
         elif is_cadrage_answers:
             if not finalize_cadrage_answers(target_issue, cadrage_content, cadrage_before_run):
                 sys.exit(1)
@@ -960,18 +1015,57 @@ def build_application_block(issue_key: str, application_arg: str) -> str:
     if not applications:
         print(f"[BESOIN] Aucun Projet / Application ({field_id}) sur {issue_key} : pas de tickets de référence.")
         return ""
+    tickets, corpus_path = prepare_application_corpus(issue_key, applications, field_id)
+    return integration_tools.application_block(applications, tickets, corpus_path) if tickets else ""
+
+
+def prepare_application_corpus(issue_key: str, applications: list, field_id: str) -> tuple:
+    """
+    Récupère les tickets Jira (tous projets) des `applications` et les écrit dans un fichier consulté par l'agent.
+    Renvoie (tickets, chemin du fichier) ; ([], '') si aucun ticket.
+    """
     try:
         tickets = fetch_application_tickets(field_id, applications, issue_key,
                                             _env_int("JIRA_APPLICATION_MAX_TICKETS", 300))
     except (RuntimeError, requests.RequestException) as e:
-        print(f"[BESOIN] ⚠️ Tickets de référence indisponibles : {e}")
-        return ""
+        print(f"[JIRA] ⚠️ Tickets de {', '.join(applications)} indisponibles : {e}")
+        return [], ""
     if not tickets:
-        print(f"[BESOIN] Aucun autre ticket pour {', '.join(applications)}.")
-        return ""
+        print(f"[JIRA] Aucun autre ticket pour {', '.join(applications)}.")
+        return [], ""
     corpus_path = integration_tools.write_application_corpus(issue_key, applications, tickets)
-    print(f"[BESOIN] {len(tickets)} ticket(s) {', '.join(applications)} fournis comme référence ({corpus_path}).")
-    return integration_tools.application_block(applications, tickets, corpus_path)
+    print(f"[JIRA] {len(tickets)} ticket(s) {', '.join(applications)} fournis comme référence ({corpus_path}).")
+    return tickets, corpus_path
+
+
+def resolve_client_cucumber_repo(client_name: str, local_client_repo: str, wanted: str = "") -> tuple:
+    """
+    Dépôt Cucumber du client pour generate-cucumber-client : `wanted` s'il est fourni, sinon '<client>-cucumber',
+    sinon la détection de resolve_cucumber_repo. Renvoie (nom du dépôt, clone local) ; clone '' si introuvable.
+    """
+    for slug in [wanted] if wanted else [f"{client_name}-cucumber", resolve_cucumber_repo(local_client_repo)]:
+        repo_dir = find_local_repo_dir(slug, [local_client_repo]) if slug else ""
+        if repo_dir:
+            return slug, repo_dir
+    return wanted or f"{client_name}-cucumber", ""
+
+
+def finalize_cucumber_client(client_name: str, run_started_at: float) -> bool:
+    """Vérifie que l'agent a produit le patch et le récapitulatif de couverture pendant cette exécution."""
+    patch_file = cucumber_tools.patch_path(client_name)
+    coverage_file = cucumber_tools.coverage_path(client_name)
+    if not os.path.exists(patch_file) or os.path.getmtime(patch_file) < run_started_at:
+        print(f"[CUCUMBER] ❌ L'agent n'a pas produit le patch '{patch_file}' pendant cette exécution.")
+        return False
+    if os.path.getsize(patch_file) == 0:
+        print(f"[CUCUMBER] ❌ Patch '{patch_file}' vide : aucun commit sur la branche de couverture.")
+        return False
+    print(f"[CUCUMBER] Patch généré : {patch_file}")
+    if os.path.exists(coverage_file) and os.path.getmtime(coverage_file) >= run_started_at:
+        print(f"[CUCUMBER] Récapitulatif de couverture : {coverage_file}")
+    else:
+        print(f"[CUCUMBER] ⚠️ Récapitulatif de couverture '{coverage_file}' non produit.")
+    return True
 
 
 def restore_integration_section(issue_key: str) -> None:

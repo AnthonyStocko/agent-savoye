@@ -6,7 +6,7 @@ import time
 import streamlit as st
 from dotenv import load_dotenv, set_key
 
-from tools import integration_tools
+from tools import cucumber_tools, integration_tools
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -192,8 +192,8 @@ load_dotenv(ENV_PATH, override=True)
 
 st.title("🤖 Tableau de bord - Agent Scrum Master")
 
-tab_integration, tab_execution, tab_merges, tab_config = st.tabs(
-    ["🧩 Intégration", "🚀 Lancement", "🔔 Écoute des merges", "⚙️ Configuration (.env)"])
+tab_integration, tab_execution, tab_cucumber, tab_merges, tab_config = st.tabs(
+    ["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🔔 Écoute des merges", "⚙️ Configuration (.env)"])
 
 # Initialisation de l'état
 if "workflow_step" not in st.session_state:
@@ -857,6 +857,84 @@ with tab_integration:
 
 
 # ---------------------------------------------------------
+# ONGLET CUCUMBER : COUVERTURE DES SPÉCIFIQUES D'UN CLIENT
+# ---------------------------------------------------------
+with tab_cucumber:
+    st.markdown("### Tests Cucumber des spécifiques d'un client")
+    st.caption("L'agent inventorie les spécifiques du dépôt client (écarts avec le Standard), puis écrit les .feature et "
+               "Step Definitions qui les couvrent dans le dépôt <client>-cucumber, au formalisme du Cucumber Standard. "
+               "Le résultat est un patch local : rien n'est poussé.")
+
+    # Valeurs par défaut du .env, puis dernières valeurs saisies (conservées dans la session)
+    st.session_state.setdefault("cucumber_repo", os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""))
+    st.session_state.setdefault("cucumber_db_schema", os.getenv("DB_SCHEMA", ""))
+    st.session_state.setdefault("cucumber_application", "")
+
+    cucumber_repo_input = st.text_input(
+        "Dépôt Bitbucket du projet client :", key="cucumber_repo",
+        help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/NOVALIA) ou chemin d'un clone local.",
+    ).strip()
+    # Nom du client recalculé quand le dépôt change, sauf s'il a été modifié à la main depuis
+    derived_client = cucumber_tools.client_name_from_repo(cucumber_repo_input)
+    if st.session_state.get("cucumber_client_derived") != derived_client:
+        st.session_state["cucumber_client_derived"] = derived_client
+        st.session_state["cucumber_client_name"] = derived_client
+
+    col_client, col_schema, col_app = st.columns(3)
+    with col_client:
+        cucumber_client = st.text_input(
+            "Nom du client :", key="cucumber_client_name",
+            help="Déduit du dépôt (clé du projet Bitbucket). Le dépôt cible est <client>-cucumber.",
+        ).strip().lower()
+    with col_schema:
+        cucumber_schema = st.text_input(
+            "Schéma BDD (optionnel) :", key="cucumber_db_schema",
+            help="Schéma de la base client consultable en lecture seule. Vide = l'agent n'utilise pas la base.",
+        ).strip()
+    with col_app:
+        cucumber_application = st.text_input(
+            "Projet / Application Jira (optionnel) :", key="cucumber_application",
+            disabled=not os.getenv("JIRA_APPLICATION_FIELD", "").strip(),
+            help="Ex: CANSON. Les tickets Jira ayant cette valeur (champ JIRA_APPLICATION_FIELD) servent de "
+                 "référence fonctionnelle sur les spécifiques.",
+        ).strip()
+    if cucumber_client:
+        st.caption(f"Dépôt cible : **{cucumber_client}-cucumber** · identifiant de travail "
+                   f"**{cucumber_tools.work_id(cucumber_client)}**")
+
+    if st.button("Génération des tests Cucumber", type="primary", use_container_width=True,
+                 icon=":material/science:", disabled=not (cucumber_repo_input and cucumber_client)):
+        st.info(f"Génération des tests Cucumber des spécifiques {cucumber_client} en cours...")
+        returncode = run_main_step([
+            sys.executable, "main.py",
+            "--step", "generate-cucumber-client",
+            "--client-repo", cucumber_repo_input,
+            "--client-name", cucumber_client,
+            "--application", cucumber_application,
+            "--db-schema", cucumber_schema
+        ])
+        if returncode == 0:
+            st.success(f"Tests Cucumber des spécifiques {cucumber_client} générés.")
+        else:
+            st.error(f"La génération des tests Cucumber a échoué (code {returncode}).")
+
+    # Derniers livrables du client (affichés aussi après un rechargement de la page)
+    if cucumber_client and os.path.exists(cucumber_tools.patch_path(cucumber_client)):
+        patch_file = cucumber_tools.patch_path(cucumber_client)
+        coverage_file = cucumber_tools.coverage_path(cucumber_client)
+        generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(patch_file)))
+        with st.container(border=True):
+            st.markdown(f"**:material/description: Patch** `{patch_file}` :gray[(généré le {generated_at})]")
+            with open(patch_file, "rb") as f:
+                st.download_button("Télécharger le patch", f.read(), file_name=os.path.basename(patch_file),
+                                   mime="text/x-diff", icon=":material/download:")
+            if os.path.exists(coverage_file):
+                with st.expander("Récapitulatif de couverture"):
+                    with open(coverage_file, "r", encoding="utf-8", errors="replace") as f:
+                        st.markdown(f.read())
+
+
+# ---------------------------------------------------------
 # ONGLET 3 : ÉCOUTE DES MERGES BITBUCKET (post-merge Cucumber)
 # ---------------------------------------------------------
 @st.fragment(run_every="10s")
@@ -1137,8 +1215,11 @@ with tab_config:
         with st.container(horizontal=True):
             env_values["CLAUDE_MODEL_PATCH"] = st.text_input("CLAUDE_MODEL_PATCH", value=os.getenv("CLAUDE_MODEL_PATCH", ""), help=model_help)
             env_values["CLAUDE_MODEL_POSTMERGE"] = st.text_input("CLAUDE_MODEL_POSTMERGE", value=os.getenv("CLAUDE_MODEL_POSTMERGE", ""), help=model_help)
-        env_values["CLAUDE_MODEL_BESOIN"] = st.text_input("CLAUDE_MODEL_BESOIN", value=os.getenv("CLAUDE_MODEL_BESOIN", ""),
-                                                          help=model_help + " Utilisé par la rédaction du besoin (onglet Intégration).")
+        with st.container(horizontal=True):
+            env_values["CLAUDE_MODEL_BESOIN"] = st.text_input("CLAUDE_MODEL_BESOIN", value=os.getenv("CLAUDE_MODEL_BESOIN", ""),
+                                                              help=model_help + " Utilisé par la rédaction du besoin (onglet Intégration).")
+            env_values["CLAUDE_MODEL_CUCUMBER"] = st.text_input("CLAUDE_MODEL_CUCUMBER", value=os.getenv("CLAUDE_MODEL_CUCUMBER", ""),
+                                                                help=model_help + " Utilisé par la génération des tests Cucumber d'un client (onglet Cucumber).")
         st.caption("La consommation de chaque exécution est affichée (ligne [TOKENS]) et ajoutée à .tmp/token_usage.csv.")
 
         st.markdown("---")
