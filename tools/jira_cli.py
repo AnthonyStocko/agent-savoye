@@ -38,13 +38,12 @@ def create_or_get_issue(project: str, summary: str, description: str, component:
 def attach_files(issue_key: str, file_paths: list) -> list:
     """Attache les fichiers absents du ticket. Renvoie la liste des messages."""
     already = get_jira_attachment_names(issue_key)
-    attach = getattr(add_jira_attachment, "func", add_jira_attachment)  # @tool CrewAI -> fonction brute
     messages = []
     for path in file_paths:
         if os.path.basename(path) in already:
             messages.append(f"Déjà attaché, ignoré : {os.path.basename(path)}")
         else:
-            messages.append(attach(issue_key, os.path.abspath(path)))
+            messages.append(add_jira_attachment(issue_key, os.path.abspath(path)))
     return messages
 
 

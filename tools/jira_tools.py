@@ -2,7 +2,6 @@ import os
 import re
 import requests
 from dotenv import load_dotenv
-from crewai.tools import tool
 
 load_dotenv()
 
@@ -227,90 +226,6 @@ def fetch_tickets_with_epic_context(
     return "\n".join(results)
 
 
-@tool("Lister les tickets à analyser pour un projet Jira")
-def get_tickets_with_epic_context(project_key: str = "") -> str:
-    """Interroge Jira pour récupérer la liste des tickets du projet spécifié à cadrer."""
-    return fetch_tickets_with_epic_context(project_key)
-
-
-@tool("Interroger Jira pour lister les tickets bloqués d'un projet")
-def get_sprint_blockers(project_key: str = "") -> str:
-    """Récupère la liste des tickets Jira bloqués pour le projet spécifié."""
-    domain = os.getenv("JIRA_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
-    email = os.getenv("JIRA_EMAIL", "").strip()
-    token = os.getenv("JIRA_API_TOKEN", "").strip()
-    project = project_key or os.getenv("JIRA_PROJECT_KEY", "").strip()
-
-    if not all([domain, email, token]):
-        return "Erreur : Identifiants Jira manquants dans la configuration (.env)."
-
-    url = f"https://{domain}/rest/api/3/search/jql"
-    auth = (email, token)
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-
-    jql = f'project = "{project}" AND (status = "Blocked" OR status = "Bloqué" OR Flagged IS NOT EMPTY)'
-    payload = {
-        "jql": jql,
-        "fields": ["key", "summary", "status", "assignee"]
-    }
-
-    try:
-        response = requests.post(url, headers=headers, auth=auth, json=payload)
-        if response.status_code != 200:
-            return f"Erreur API Jira ({response.status_code}) : {response.text}"
-
-        data = response.json()
-        issues = data.get("issues", [])
-
-        if not issues:
-            return f"Aucun ticket bloqué trouvé sur le projet {project}."
-
-        results = []
-        for issue in issues:
-            key = issue["key"]
-            summary = issue["fields"].get("summary", "")
-            status_name = issue["fields"].get("status", {}).get("name", "Inconnu")
-            assignee = issue["fields"].get("assignee")
-            assignee_name = assignee.get("displayName", "Non assigné") if assignee else "Non assigné"
-
-            results.append(
-                f"Clé: {key} | Statut: {status_name} | Assigné à: {assignee_name} | Titre: {summary}"
-            )
-
-        return "\n".join(results)
-
-    except Exception as e:
-        return f"Erreur de connexion à Jira : {str(e)}"
-
-
-@tool("Mettre à jour la description d'un ticket Jira avec l'analyse technique")
-def update_jira_description(issue_key: str, new_description: str) -> str:
-    """Met à jour la description d'un ticket Jira spécifié par issue_key avec un contenu structuré."""
-    domain = os.getenv("JIRA_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
-    email = os.getenv("JIRA_EMAIL", "").strip()
-    token = os.getenv("JIRA_API_TOKEN", "").strip()
-
-    if not all([domain, email, token]):
-        return "Erreur : Identifiants Jira manquants dans la configuration (.env)."
-
-    url = f"https://{domain}/rest/api/3/issue/{issue_key}"
-    auth = (email, token)
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-
-    adf_doc = _markdown_to_adf(new_description)
-    adf_payload = {"fields": {"description": adf_doc}}
-
-    try:
-        response = requests.put(url, headers=headers, auth=auth, json=adf_payload)
-        if response.status_code in [200, 204]:
-            return f"Description du ticket {issue_key} mise à jour avec succès dans Jira."
-        else:
-            return f"Erreur lors de la mise à jour de {issue_key} ({response.status_code}) : {response.text}"
-    except Exception as e:
-        return f"Erreur lors de la mise à jour de {issue_key} : {str(e)}"
-
-
-@tool("Ajouter une pièce jointe à un ticket Jira")
 def add_jira_attachment(issue_key: str, file_path: str) -> str:
     """Attache un fichier local (ex: .patch) au ticket Jira spécifié."""
     domain = os.getenv("JIRA_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
@@ -374,77 +289,6 @@ def get_jira_issue_details(issue_key: str) -> str:
         return f"TICKET {issue_key}\nTitre: {summary}\nDescription: {desc}\n\n{epic_info}"
     except Exception as e:
         return f"Erreur : {str(e)}"
-
-
-def _markdown_to_adf(text: str) -> dict:
-    """Convertit une chaîne Markdown basique en structure Atlassian Document Format (ADF) multi-noeuds."""
-    content_nodes = []
-    lines = text.split("\n")
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        if not stripped:
-            i += 1
-            continue
-
-        if stripped.startswith("#"):
-            level = min(stripped.count("#", 0, 3), 6)
-            title_text = stripped.lstrip("#").strip()
-            content_nodes.append({
-                "type": "heading",
-                "attrs": {"level": level},
-                "content": [{"type": "text", "text": title_text}]
-            })
-        elif stripped.startswith("```"):
-            code_lines = []
-            i += 1
-            while i < len(lines) and not lines[i].strip().startswith("```"):
-                code_lines.append(lines[i])
-                i += 1
-            code_text = "\n".join(code_lines)
-            content_nodes.append({
-                "type": "codeBlock",
-                "content": [{"type": "text", "text": code_text}]
-            })
-        elif stripped.startswith(("- ", "* ")):
-            item_text = stripped[2:].strip()
-            content_nodes.append({
-                "type": "bulletList",
-                "content": [
-                    {
-                        "type": "listItem",
-                        "content": [
-                            {
-                                "type": "paragraph",
-                                "content": [{"type": "text", "text": item_text}]
-                            }
-                        ]
-                    }
-                ]
-            })
-        elif stripped == "---":
-            content_nodes.append({"type": "rule"})
-        else:
-            content_nodes.append({
-                "type": "paragraph",
-                "content": [{"type": "text", "text": stripped}]
-            })
-        i += 1
-
-    if not content_nodes:
-        content_nodes = [{
-            "type": "paragraph",
-            "content": [{"type": "text", "text": text}]
-        }]
-
-    return {
-        "type": "doc",
-        "version": 1,
-        "content": content_nodes
-    }
 
 
 def get_full_jira_issue_context(issue_key: str) -> dict:
@@ -553,7 +397,7 @@ def _adf_paragraph(text: str) -> dict:
 def _markdown_to_adf_rich(markdown: str) -> dict:
     """
     Markdown -> ADF avec tableaux, listes (y compris imbriquées et numérotées),
-    blocs de code et marques inline. _markdown_to_adf ne gère ni les tableaux ni les marques.
+    blocs de code et marques inline.
     """
     lines, out, i = markdown.split("\n"), [], 0
     while i < len(lines):
