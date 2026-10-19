@@ -19,7 +19,8 @@ from tools import db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
-    find_jira_issue_by_summary, get_epic_children, get_full_jira_issue_context, update_jira_release_note,
+    fetch_application_tickets, find_jira_issue_by_summary, get_epic_children, get_full_jira_issue_context,
+    get_issue_field_values, update_jira_release_note,
 )
 from tools.memory_tools import (
     get_capitalized_experience,
@@ -594,6 +595,7 @@ def main():
     parser.add_argument("--generate-cucumber", action="store_true", default=False, help="Réactiver ponctuellement la génération des tests Cucumber avec le patch")
     parser.add_argument("--skip-cucumber", dest="generate_cucumber", action="store_false", help="Désactiver la génération des tests Cucumber (comportement par défaut)")
     parser.add_argument("--db-schema", default="", help="Schéma de la base client consultable en lecture seule par l'agent (vide = pas d'accès base)")
+    parser.add_argument("--application", default="", help="Étape besoin : Projet / Application dont les tickets servent de référence, séparés par des virgules (défaut : valeur du champ JIRA_APPLICATION_FIELD du ticket)")
     parser.add_argument("--epic-task-type", default=os.getenv("JIRA_EPIC_TASK_ISSUE_TYPE", ""), help="Type des tâches créées sous une épopée (défaut : premier type existant du projet parmi Tâche, Task, Development, Story)")
 
     postmerge = parser.add_argument_group("Post-merge (--step generate-cucumber-postmerge, déclenché par webhook_server.py)")
@@ -769,8 +771,10 @@ def main():
         besoin_output = integration_tools.agent_output_path(target_issue)
         previous_besoin = integration_tools.load_state(target_issue)
         qa_block = integration_tools.previous_qa_block(previous_besoin)
+        app_block = build_application_block(target_issue, args.application)
         prompt = render_prompt("besoin", **prompt_values, output_file=besoin_output,
-                               previous_qa_block=f"{qa_block}\n" if qa_block else "")
+                               previous_qa_block=f"{qa_block}\n" if qa_block else "",
+                               application_block=f"{app_block}\n" if app_block else "")
     elif args.step == "patch":
         prompt = render_prompt("patch_cucumber" if args.generate_cucumber else "patch", **prompt_values)
     elif is_postmerge:
@@ -922,6 +926,34 @@ def main():
         print(f"\n=== Étape {args.step.upper()} interrompue pour {target_issue} (Code: {process.returncode}) ===")
         # Quota atteint : Claude peut sortir en code 0, on signale quand même l'échec
         sys.exit(process.returncode or 1)
+
+
+def build_application_block(issue_key: str, application_arg: str) -> str:
+    """
+    Tickets du même Projet / Application (champ JIRA_APPLICATION_FIELD) : écrits dans un fichier consulté par
+    l'agent, dont l'index est injecté dans le prompt. '' si aucun.
+    """
+    field_id = os.getenv("JIRA_APPLICATION_FIELD", "").strip()
+    if not field_id:
+        print("[BESOIN] JIRA_APPLICATION_FIELD non renseigné : pas de tickets de référence.")
+        return ""
+    applications = ([a.strip() for a in application_arg.split(",") if a.strip()]
+                    or get_issue_field_values(issue_key, field_id))
+    if not applications:
+        print(f"[BESOIN] Aucun Projet / Application ({field_id}) sur {issue_key} : pas de tickets de référence.")
+        return ""
+    try:
+        tickets = fetch_application_tickets(field_id, applications, issue_key,
+                                            _env_int("JIRA_APPLICATION_MAX_TICKETS", 300))
+    except (RuntimeError, requests.RequestException) as e:
+        print(f"[BESOIN] ⚠️ Tickets de référence indisponibles : {e}")
+        return ""
+    if not tickets:
+        print(f"[BESOIN] Aucun autre ticket pour {', '.join(applications)}.")
+        return ""
+    corpus_path = integration_tools.write_application_corpus(issue_key, applications, tickets)
+    print(f"[BESOIN] {len(tickets)} ticket(s) {', '.join(applications)} fournis comme référence ({corpus_path}).")
+    return integration_tools.application_block(applications, tickets, corpus_path)
 
 
 def finalize_besoin(issue_key: str, project_key: str, output_file: str, previous: dict, run_started_at: float) -> bool:

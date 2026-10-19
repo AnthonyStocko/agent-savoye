@@ -784,3 +784,83 @@ def update_jira_section(issue_key: str, title: str, markdown: str) -> None:
     response = requests.put(f"{api}/issue/{issue_key}", auth=auth, headers=headers, json=payload, timeout=30)
     if response.status_code not in (200, 204):
         raise RuntimeError(f"Mise à jour de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
+
+
+# ---------------------------------------------------------------------------
+# Tickets de référence d'un même Projet / Application (onglet Intégration)
+# ---------------------------------------------------------------------------
+
+def field_values(value) -> list:
+    """Valeurs d'un champ Jira : labels (liste), liste de sélection (option) ou texte."""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [v for item in value for v in field_values(item)]
+    if isinstance(value, dict):
+        return [str(value.get("value") or value.get("name") or "").strip()] if (value.get("value") or value.get("name")) else []
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def get_issue_field_values(issue_key: str, field_id: str) -> list:
+    """Valeurs du champ `field_id` sur un ticket ([] si absent ou illisible)."""
+    if not field_id:
+        return []
+    try:
+        api, auth = _jira_connection()
+        response = requests.get(f"{api}/issue/{issue_key}?fields={field_id}", auth=auth, timeout=15)
+    except (RuntimeError, requests.RequestException):
+        return []
+    if response.status_code != 200:
+        return []
+    return field_values(response.json().get("fields", {}).get(field_id))
+
+
+def _jql_field(field_id: str) -> str:
+    match = re.fullmatch(r"customfield_(\d+)", field_id)
+    return f"cf[{match.group(1)}]" if match else field_id
+
+
+def fetch_application_tickets(field_id: str, values: list, exclude_key: str = "", max_tickets: int = 300) -> list:
+    """
+    Tickets de tous les projets dont le champ `field_id` (ex. « Projet / Application ») contient l'une des
+    `values`, les plus récemment mis à jour d'abord. Chaque ticket : key, project, type, status, updated,
+    summary, description et commentaires (auteur, date, texte). Lève RuntimeError en cas d'échec.
+    """
+    if not (field_id and values):
+        return []
+    api, auth = _jira_connection()
+    quoted = ", ".join('"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"' for v in values)
+    jql = f"{_jql_field(field_id)} in ({quoted})"
+    if exclude_key:
+        jql += f" AND key != {exclude_key}"
+    tickets, token = [], None
+    while len(tickets) < max_tickets:
+        body = {"jql": jql + " ORDER BY updated DESC", "maxResults": min(100, max_tickets - len(tickets)),
+                "fields": ["summary", "description", "comment", "issuetype", "status", "project", "updated"]}
+        if token:
+            body["nextPageToken"] = token
+        response = requests.post(f"{api}/search/jql", auth=auth, json=body, timeout=60)
+        if response.status_code != 200:
+            raise RuntimeError(f"Recherche des tickets de {', '.join(values)} refusée par Jira "
+                               f"({response.status_code}) : {response.text[:300]}")
+        data = response.json()
+        for issue in data.get("issues", []):
+            f = issue["fields"]
+            tickets.append({
+                "key": issue["key"],
+                "project": (f.get("project") or {}).get("key", ""),
+                "type": (f.get("issuetype") or {}).get("name", ""),
+                "status": (f.get("status") or {}).get("name", ""),
+                "updated": (f.get("updated") or "")[:10],
+                "summary": f.get("summary", ""),
+                "description": _extract_adf_text(f.get("description")),
+                "comments": [
+                    {"author": (c.get("author") or {}).get("displayName", ""), "date": (c.get("created") or "")[:10],
+                     "text": _extract_adf_text(c.get("body"))}
+                    for c in (f.get("comment") or {}).get("comments", [])
+                ],
+            })
+        token = data.get("nextPageToken")
+        if not token or not data.get("issues"):
+            break
+    return tickets[:max_tickets]

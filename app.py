@@ -742,6 +742,17 @@ with tab_integration:
         if jira_domain:
             st.caption(f"[Ouvrir {integ_ticket} dans Jira](https://{jira_domain}/browse/{integ_ticket})")
 
+        application_field = os.getenv("JIRA_APPLICATION_FIELD", "").strip()
+        integ_application = st.text_input(
+            "Projet / Application des tickets de référence (optionnel) :",
+            key=f"integ_application_{integ_ticket}",
+            placeholder="Vide = valeur du champ Projet / Application du ticket",
+            disabled=not application_field,
+            help="L'agent consulte tous les tickets Jira (tous projets) de ce Projet / Application pour rédiger le "
+                 "besoin. Ex: CANSON. Plusieurs valeurs séparées par des virgules. "
+                 + ("" if application_field else "Renseignez JIRA_APPLICATION_FIELD dans l'onglet Configuration."),
+        ).strip()
+
         has_state = bool(integration_tools.load_state(integ_ticket))
         if st.button("📝 Rédaction du besoin" if not has_state else "📝 Rédiger à nouveau le besoin (avec les réponses)",
                      type="primary", use_container_width=True, key="integ_redaction",
@@ -752,7 +763,8 @@ with tab_integration:
                 sys.executable, "main.py",
                 "--issue", integ_ticket,
                 "--project", integ_project,
-                "--step", "besoin"
+                "--step", "besoin",
+                "--application", integ_application
             ])
             if returncode == 0:
                 st.success(f"Besoin reformulé et questions ajoutés à la description Jira de {integ_ticket}.")
@@ -938,6 +950,16 @@ with tab_config:
             env_values["JIRA_OPEN_EPICS_STATUS"] = st.text_input(
                 "JIRA_OPEN_EPICS_STATUS", value=os.getenv("JIRA_OPEN_EPICS_STATUS", ""),
                 help="Statut des épopées de cette recherche rapide. Ex: Ouvert")
+        with st.container(horizontal=True):
+            env_values["JIRA_APPLICATION_FIELD"] = st.text_input(
+                "JIRA_APPLICATION_FIELD", value=os.getenv("JIRA_APPLICATION_FIELD", ""),
+                help="Champ Jira « Projet / Application » (ex. customfield_10268). Onglet Intégration : l'agent "
+                     "consulte tous les tickets ayant la même valeur que le ticket (ex. CANSON). Vide = désactivé.")
+            application_max = st.number_input(
+                "JIRA_APPLICATION_MAX_TICKETS", min_value=0, step=50,
+                value=env_int("JIRA_APPLICATION_MAX_TICKETS", 300),
+                help="Nombre maximal de tickets de référence (les plus récemment mis à jour).")
+        env_values["JIRA_APPLICATION_MAX_TICKETS"] = str(int(application_max))
 
         st.markdown("---")
         st.markdown("#### 🎫 Tickets Jira créés par l'agent (tâches d'épopée, post-merge Cucumber)")
