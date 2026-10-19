@@ -253,7 +253,24 @@ def publish_release_note(issue_key: str, note_path: str, run_started_at: float) 
         return False
 
 
-def build_db_block(db_schema: str, python_exe: str, workspace_dir: str) -> str:
+# Formulations du bloc base propres à l'étape (défaut : cadrage, révision et patch d'un ticket)
+DB_BLOCK_WORDING = {
+    "default": {
+        "db_usage": "les données du cas décrit dans le ticket",
+        "db_findings_target": "la Partie 2 (Analyse Technique) du cadrage",
+        "db_private_targets": "dans le cadrage,\n  dans Jira ni dans le patch",
+    },
+    "generate-cucumber-client": {
+        "db_usage": "le paramétrage qui active ou conditionne chaque spécifique du client, ainsi que les valeurs de "
+                    "référence utiles aux jeux de données des scénarios",
+        "db_findings_target": "le récapitulatif de couverture (paramétrage constaté pour chaque spécifique), et "
+                              "appuie les jeux de données des scénarios sur ces valeurs réelles",
+        "db_private_targets": "dans les scénarios,\n  les Step Definitions, le patch ni le récapitulatif",
+    },
+}
+
+
+def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default") -> str:
     """Bloc de prompt de l'accès base en lecture seule ('' si non demandé ou non configuré)."""
     if not db_schema:
         return ""
@@ -273,7 +290,7 @@ def build_db_block(db_schema: str, python_exe: str, workspace_dir: str) -> str:
     else:
         schema_hint = f"Les noms de tables non qualifiés sont résolus dans le schéma {db_schema}."
     return "\n" + render_prompt("db_access", db_type=db_type, db_schema=db_schema, base_cmd=base_cmd,
-                                schema_hint=schema_hint)
+                                schema_hint=schema_hint, **DB_BLOCK_WORDING.get(step, DB_BLOCK_WORDING["default"]))
 
 
 def bitbucket_base_url(repo_url: str = "") -> str:
@@ -736,7 +753,8 @@ def main():
     run_started_at = time.time()
 
     # Accès base en lecture seule (cadrage, refine, patch) ; le mot de passe reste dans le .env
-    db_block = "" if is_postmerge or jira_only else build_db_block(args.db_schema.strip(), python_exe, workspace_dir)
+    db_block = "" if is_postmerge or jira_only else build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
+                                                                    step=args.step)
 
     # Contexte Jira injecté dans le cadrage : l'agent ne réinterroge Jira que si une information manque
     jira_context_block = format_jira_context(jira_context, _env_int("JIRA_CONTEXT_MAX_CHARS", 12000))
