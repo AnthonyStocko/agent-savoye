@@ -10,7 +10,7 @@ ${previous_qa_block}${application_block}
    - **Périmètre** : ce qui est inclus et, si l'expression le dit, ce qui est exclu.
    - **Règles de gestion** : liste numérotée des règles exprimées ou directement déductibles.
    - **Critères d'acceptation** : liste vérifiable (Étant donné / Quand / Alors si pertinent).
-   Intègre les réponses déjà obtenues comme des faits acquis. N'invente aucune règle : ce qui n'est pas spécifié devient une question.
+   Intègre les réponses déjà obtenues comme des faits acquis : chacune doit se retrouver dans la partie concernée (périmètre, règle de gestion ou critère d'acceptation), avec la référence de sa question (ex. « (Q2) »). N'invente aucune règle : ce qui n'est pas spécifié devient une question.
 4. Liste les questions ouvertes : uniquement celles dont la réponse est nécessaire pour réaliser ou tester le besoin et ne se trouve ni dans le ticket, ni dans l'Épopée, ni dans les COST, ni dans les tickets de référence du même Projet / Application, ni dans les réponses déjà obtenues. Une question par point, précise, formulée pour un interlocuteur métier, éventuellement avec les options envisageables. Ne repose jamais une question déjà répondue. Si une question précédente sans réponse est toujours pertinente, reprends-la avec son `id` ; sinon ne la reprends pas.
 5. Écris le résultat dans le fichier '${output_file}' (crée le dossier si besoin), au format JSON UTF-8 strict :
 {

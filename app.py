@@ -697,6 +697,17 @@ with tab_execution:
 # ---------------------------------------------------------
 # ONGLET 2 : INTÉGRATION — BESOIN REFORMULÉ ET QUESTIONS OUVERTES
 # ---------------------------------------------------------
+def run_besoin_step(issue_key: str, project: str, application: str) -> int:
+    """Rédaction (ou complément) du besoin par l'agent, journal affiché au fil de l'eau."""
+    return run_main_step([
+        sys.executable, "main.py",
+        "--issue", issue_key,
+        "--project", project,
+        "--step", "besoin",
+        "--application", application
+    ])
+
+
 def integration_option_label(ticket: dict) -> str:
     """'CLÉ - Titre [statut]', suivi du nombre de questions en attente s'il y en a."""
     label = f"{ticket['key']} - {ticket.get('summary', '')} [{ticket.get('status', '?')}]"
@@ -759,13 +770,7 @@ with tab_integration:
                      help="L'agent reformule le besoin et liste les questions sans réponse dans l'expression initiale. "
                           "Le résultat est ajouté à la description Jira (section « Intégration du besoin »)."):
             st.info(f"Rédaction du besoin de {integ_ticket} en cours...")
-            returncode = run_main_step([
-                sys.executable, "main.py",
-                "--issue", integ_ticket,
-                "--project", integ_project,
-                "--step", "besoin",
-                "--application", integ_application
-            ])
+            returncode = run_besoin_step(integ_ticket, integ_project, integ_application)
             if returncode == 0:
                 st.success(f"Besoin reformulé et questions ajoutés à la description Jira de {integ_ticket}.")
             else:
@@ -796,27 +801,40 @@ with tab_integration:
                             key=f"integ_answer_{integ_ticket}_{q['id']}_{version}",
                             label_visibility="collapsed", placeholder="Votre réponse…",
                         )
-                    save_answers = st.form_submit_button("💾 Enregistrer les réponses dans Jira", type="primary",
-                                                         use_container_width=True)
+                    save_answers = st.form_submit_button(
+                        "📨 Envoyer les réponses et compléter le besoin", type="primary", use_container_width=True,
+                        help="Les réponses sont ajoutées à la description Jira, puis l'agent complète le besoin "
+                             "reformulé avec ces réponses et ne garde que les questions restantes.")
                 if save_answers:
+                    changed = [q for q in questions if answers[q["id"]].strip() != q.get("reponse", "").strip()]
                     for q in questions:
                         q["reponse"] = answers[q["id"]].strip()
-                    integration_tools.save_state(integ_ticket, integ_state)
-                    try:
-                        with st.spinner(f"Mise à jour de la description de {integ_ticket}..."):
-                            integration_tools.publish_state(integ_ticket, integ_state)
-                        publish_error = None
-                    except Exception as e:
-                        publish_error = e
-                    if publish_error:
-                        st.error(f"Réponses enregistrées localement, mais la mise à jour Jira a échoué : {publish_error}")
+                    if not changed:
+                        st.info("Aucune réponse nouvelle ou modifiée : rien à envoyer.")
                     else:
-                        st.session_state["integ_saved"] = integ_ticket
-                        st.rerun()
-                if st.session_state.pop("integ_saved", None) == integ_ticket:
-                    st.success(f"Réponses ajoutées à la description Jira de {integ_ticket}.")
-                st.caption("Une fois les réponses saisies, relancez la rédaction : l'agent les intègre au besoin "
-                           "reformulé et ne pose que les questions restantes.")
+                        integration_tools.save_state(integ_ticket, integ_state)
+                        # Réponses publiées d'abord : elles restent dans Jira même si l'agent échoue ensuite
+                        try:
+                            with st.spinner(f"Ajout des réponses à la description de {integ_ticket}..."):
+                                integration_tools.publish_state(integ_ticket, integ_state)
+                            publish_error = None
+                        except Exception as e:
+                            publish_error = e
+                        if publish_error:
+                            st.error(f"Réponses enregistrées localement, mais la mise à jour Jira a échoué : {publish_error}")
+                        else:
+                            st.info(f"{len(changed)} réponse(s) ajoutée(s) à Jira. L'agent complète le besoin...")
+                            returncode = run_besoin_step(integ_ticket, integ_project, integ_application)
+                            if returncode == 0:
+                                st.session_state["integ_completed"] = integ_ticket
+                                st.rerun()
+                            st.error(f"Les réponses sont dans Jira, mais l'agent n'a pas pu compléter le besoin "
+                                     f"(code {returncode}). Relancez la rédaction ci-dessus.")
+                st.caption("Les réponses déjà envoyées restent dans la description Jira, sous leur question.")
+            if st.session_state.pop("integ_completed", None) == integ_ticket:
+                remaining = len(questions) - len(integration_tools.answered(integ_state))
+                st.success(f"Besoin de {integ_ticket} complété avec les réponses et mis à jour dans Jira. "
+                           + (f"{remaining} question(s) restent ouvertes." if remaining else "Plus aucune question ouverte."))
 
 
 # ---------------------------------------------------------
