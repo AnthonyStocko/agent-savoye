@@ -69,7 +69,7 @@ def _env_int(name: str, default: int) -> int:
 # ---------------------------------------------------------------------------
 
 TOKEN_USAGE_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tmp", "token_usage.csv")
-TOKEN_USAGE_FIELDS = ["date", "ticket", "etape", "modele", "tokens_entree", "cache_ecrit", "cache_lu",
+TOKEN_USAGE_FIELDS = ["date", "ticket", "etape", "modele", "effort", "tokens_entree", "cache_ecrit", "cache_lu",
                       "tokens_sortie", "tours", "duree_s", "cout_usd", "taille_prompt", "code_retour"]
 
 # Variable .env du modèle Claude par étape (vide = modèle par défaut de Claude Code)
@@ -83,6 +83,20 @@ CLAUDE_MODEL_ENV = {
     "cadrage-reponses": "CLAUDE_MODEL_REFINE",
     "generate-cucumber-client": "CLAUDE_MODEL_CUCUMBER",
 }
+
+# Variable .env de l'effort Claude par étape (vide = réglage de Claude Code sur le poste)
+CLAUDE_EFFORT_ENV = {step: name.replace("CLAUDE_MODEL_", "CLAUDE_EFFORT_") for step, name in CLAUDE_MODEL_ENV.items()}
+CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def claude_effort(*names: str) -> str:
+    """Première variable .env renseignée parmi `names` ; valeur hors CLAUDE_EFFORT_LEVELS : avertissement et vide."""
+    value = next((v for v in (os.getenv(n, "").strip().lower() for n in names) if v), "")
+    if value and value not in CLAUDE_EFFORT_LEVELS:
+        print(f"[CONFIG] ⚠️ Effort Claude '{value}' ({' / '.join(names)}) invalide, attendu : "
+              f"{', '.join(CLAUDE_EFFORT_LEVELS)}. Option --effort non envoyée.")
+        return ""
+    return value
 
 # ---------------------------------------------------------------------------
 # Modèles de prompts (prompts/*.md, personnalisables via PROMPTS_DIR)
@@ -192,7 +206,7 @@ def parse_claude_output(raw: str) -> tuple:
 
 
 def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
-               cwd: str = None) -> tuple:
+               cwd: str = None, effort: str = "") -> tuple:
     """
     Exécute `claude --print` sur le prompt (envoyé sur stdin) et affiche sa réponse.
     Renvoie (code retour, texte de la réponse, usage des tokens, quota atteint).
@@ -201,6 +215,11 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
     cmd = [claude_bin, "--print", "--output-format", "json"]
     if model:
         cmd.extend(["--model", model])
+    if effort in CLAUDE_EFFORT_LEVELS:
+        cmd.extend(["--effort", effort])
+    elif effort:
+        print(f"[CONFIG] ⚠️ Effort Claude '{effort}' invalide, attendu : {', '.join(CLAUDE_EFFORT_LEVELS)}. "
+              f"Option --effort non envoyée.")
     for directory in add_dirs:
         cmd.extend(["--add-dir", directory])
     cmd.extend(extra_args)
@@ -233,7 +252,8 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
     return process.returncode, stdout_output, token_usage, session_limit_hit
 
 
-def report_token_usage(issue: str, step: str, model: str, usage: dict, prompt_chars: int, returncode: int) -> None:
+def report_token_usage(issue: str, step: str, model: str, usage: dict, prompt_chars: int, returncode: int,
+                       effort: str = "") -> None:
     """Affiche la ligne [TOKENS] et l'ajoute à .tmp/token_usage.csv (ne fait jamais échouer l'étape)."""
     if not usage:
         print(f"\n[TOKENS] Usage indisponible (sortie de Claude Code non JSON) — prompt : {prompt_chars} caractères.")
@@ -243,16 +263,27 @@ def report_token_usage(issue: str, step: str, model: str, usage: dict, prompt_ch
     cost_label = f"{cost:.4f} $" if isinstance(cost, (int, float)) else "?"
     print(f"\n[TOKENS] entrée={usage['tokens_entree']} | cache écrit={usage['cache_ecrit']} | "
           f"cache lu={usage['cache_lu']} | sortie={usage['tokens_sortie']} | tours={usage['tours']} | "
-          f"coût={cost_label} | durée={usage['duree_s']} s | modèle={model_label} | prompt={prompt_chars} car.")
+          f"coût={cost_label} | durée={usage['duree_s']} s | modèle={model_label} | effort={effort or 'défaut'} | "
+          f"prompt={prompt_chars} car.")
     row = {
         "date": datetime.now().isoformat(timespec="seconds"), "ticket": issue, "etape": step,
-        "modele": model_label, "taille_prompt": prompt_chars, "code_retour": returncode,
+        "modele": model_label, "effort": effort, "taille_prompt": prompt_chars, "code_retour": returncode,
         **{k: usage.get(k, "") for k in ("tokens_entree", "cache_ecrit", "cache_lu", "tokens_sortie",
                                           "tours", "duree_s", "cout_usd")},
     }
     try:
         os.makedirs(os.path.dirname(TOKEN_USAGE_CSV), exist_ok=True)
         is_new = not os.path.exists(TOKEN_USAGE_CSV)
+        if not is_new:
+            with open(TOKEN_USAGE_CSV, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter=";")
+                old_rows = list(reader) if reader.fieldnames != TOKEN_USAGE_FIELDS else None
+            if old_rows is not None:
+                # Fichier d'une version précédente (sans colonne effort) : réécrit avec l'en-tête actuel
+                with open(TOKEN_USAGE_CSV, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=TOKEN_USAGE_FIELDS, delimiter=";", extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(old_rows)
         with open(TOKEN_USAGE_CSV, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=TOKEN_USAGE_FIELDS, delimiter=";")
             if is_new:
@@ -997,15 +1028,19 @@ def main():
     print(f"Dépôt Cucumber Std   : {local_cucumber_std_repo if local_cucumber_std_repo else ('Désactivé' if not args.generate_cucumber else 'Non configuré')}")
 
     claude_model = os.getenv(CLAUDE_MODEL_ENV[args.step], "").strip()
-    print(f"Modèle Claude        : {claude_model or 'défaut de Claude Code'}")
+    claude_effort_level = claude_effort(CLAUDE_EFFORT_ENV[args.step])
+    print(f"Modèle Claude        : {claude_model or 'défaut de Claude Code'} | "
+          f"Effort : {claude_effort_level or 'défaut de Claude Code'}")
     print(f"Taille du prompt     : {len(prompt)} caractères")
 
     add_dirs = [workspace_dir] + [d for d in (local_std_repo, local_client_repo, local_cucumber_std_repo)
                                   if d and os.path.exists(d)]
     returncode, stdout_output, token_usage, session_limit_hit = run_claude(
         prompt, claude_model, add_dirs,
-        ["Read", "Write", "Edit", "Grep", "Glob", "Bash", f"Bash({python_exe}:*)", "Bash(git:*)"])
-    report_token_usage(target_issue, args.step, claude_model, token_usage, len(prompt), returncode)
+        ["Read", "Write", "Edit", "Grep", "Glob", "Bash", f"Bash({python_exe}:*)", "Bash(git:*)"],
+        effort=claude_effort_level)
+    report_token_usage(target_issue, args.step, claude_model, token_usage, len(prompt), returncode,
+                       claude_effort_level)
 
     if returncode == 0 and not session_limit_hit:
         print(f"\n=== Étape {args.step.upper()} terminée avec succès pour {target_issue} ===")
@@ -1153,10 +1188,11 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
     if flagged:
         prompt = render_prompt("cucumber_client_review", **values, lot_label=label,
                                scenarios_signales=cucumber_verify.review_block(lot_specs, analysis, results))
+        effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
         returncode, output, usage, _ = run_claude(
             prompt, model, [cucumber_tools.STD_CACHE_DIR], ["Read", "Write", "Edit", "Grep", "Glob"],
-            extra_args=("--max-turns", str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8))), cwd=run_dir)
-        report_token_usage(work_key, "cucumber-review", model, usage, len(prompt), returncode)
+            extra_args=("--max-turns", str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8))), cwd=run_dir, effort=effort)
+        report_token_usage(work_key, "cucumber-review", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         review["decisions"] = cucumber_verify.parse_review(output)
         files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
@@ -1208,10 +1244,11 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
                 f" ; test Standard lié : '{linked[0].get('extrait', linked[0]['path'])}'" if linked else ""))
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
+        effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
         returncode, _, usage, limit_hit = run_claude(
             prompt, model, [cucumber_tools.STD_CACHE_DIR], ["Read", "Write", "Edit", "Grep", "Glob"],
-            extra_args=("--max-turns", str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))), cwd=run_dir)
-        report_token_usage(work_key, "cucumber-verify-fix", model, usage, len(prompt), returncode)
+            extra_args=("--max-turns", str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))), cwd=run_dir, effort=effort)
+        report_token_usage(work_key, "cucumber-verify-fix", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
             break
@@ -1277,10 +1314,11 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, cucumber_std_dir
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"]),
                                fichiers="\n".join(f"- {f}" for f in files))
+        effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
         returncode, _, usage, limit_hit = run_claude(
             prompt, model, [cucumber_tools.STD_CACHE_DIR], ["Read", "Write", "Edit", "Grep", "Glob"],
-            extra_args=("--max-turns", fix_turns), cwd=run_dir)
-        report_token_usage(work_key, "cucumber-fix", model, usage, len(prompt), returncode)
+            extra_args=("--max-turns", fix_turns), cwd=run_dir, effort=effort)
+        report_token_usage(work_key, "cucumber-fix", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
             return {**check, "quota": True}
@@ -1386,6 +1424,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "steps_example": std_java["steps_example"] or "aucune", "runner_example": std_java["runner_example"] or "aucun",
     }
     model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
+    effort = claude_effort("CLAUDE_EFFORT_CUCUMBER")
+    fix_effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
+    print(f"[CUCUMBER] Modèle Claude : {model} | Effort : {effort or 'défaut de Claude Code'} "
+          f"(correction et revue : {fix_effort or 'défaut de Claude Code'})")
     max_turns = str(_env_int("CUCUMBER_MAX_TURNS", 25))
     run_dir = cucumber_tools.cache_dir(client)
     # Variable absente : compilation par défaut ; présente mais vide : pas de compilation
@@ -1431,8 +1473,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             # Accès limité au dossier de travail du client (worktree, sources, extraits Jira) et aux catalogues
             returncode, output, usage, limit_hit = run_claude(
                 prompt, model, [cucumber_tools.STD_CACHE_DIR], tools_allowed,
-                extra_args=("--max-turns", max_turns), cwd=run_dir)
-            report_token_usage(work_key, "cucumber-lot", model, usage, len(prompt), returncode)
+                extra_args=("--max-turns", max_turns), cwd=run_dir, effort=effort)
+            report_token_usage(work_key, "cucumber-lot", model, usage, len(prompt), returncode, effort)
             lot["tokens"] = {}
             add_usage(lot, usage)
             results = cucumber_tools.parse_lot_result(output)

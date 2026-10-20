@@ -30,6 +30,20 @@ claude                                    # première exécution : connexion (/l
 
 L'agent utilise l'abonnement Claude de la CLI connectée. Pour passer par une clé API, renseignez `ANTHROPIC_API_KEY`.
 
+Le modèle et l'effort se règlent par étape dans le `.env` (ou l'onglet **⚙️ Configuration**) :
+
+| Étape | Modèle (`--model`) | Effort (`--effort`) |
+|---|---|---|
+| Cadrage, épopée | `CLAUDE_MODEL_CADRAGE` | `CLAUDE_EFFORT_CADRAGE` |
+| Révision, cadrage complété avec les réponses | `CLAUDE_MODEL_REFINE` | `CLAUDE_EFFORT_REFINE` |
+| Patch | `CLAUDE_MODEL_PATCH` | `CLAUDE_EFFORT_PATCH` |
+| Post-merge Cucumber | `CLAUDE_MODEL_POSTMERGE` | `CLAUDE_EFFORT_POSTMERGE` |
+| Rédaction du besoin | `CLAUDE_MODEL_BESOIN` | `CLAUDE_EFFORT_BESOIN` |
+| Lots Cucumber d'un client | `CLAUDE_MODEL_CUCUMBER` (vide = `sonnet`) | `CLAUDE_EFFORT_CUCUMBER` (`medium` proposé) |
+| Correction et revue des lots Cucumber | `CLAUDE_MODEL_CUCUMBER` | `CLAUDE_EFFORT_CUCUMBER_FIX` (`low` proposé ; vide = `CLAUDE_EFFORT_CUCUMBER`) |
+
+Modèle : alias (`sonnet`, `opus`, `haiku`) ou identifiant complet. Effort : `low`, `medium`, `high`, `xhigh` ou `max` ; une autre valeur est signalée et ignorée. Vide = réglage de Claude Code sur le poste. Le modèle et l'effort de chaque appel sont affichés dans le journal et enregistrés dans `.tmp/token_usage.csv` (colonnes `modele` et `effort`), avec les tokens et le coût, pour comparer les niveaux.
+
 ## Installation
 
 ```powershell

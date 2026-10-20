@@ -1562,7 +1562,24 @@ with tab_config:
             env_values["CLAUDE_MODEL_CUCUMBER"] = st.text_input("CLAUDE_MODEL_CUCUMBER", value=os.getenv("CLAUDE_MODEL_CUCUMBER", ""),
                                                                 help=model_help.replace("Vide = modèle par défaut de Claude Code.", "Vide = sonnet.")
                                                                 + " Utilisé par chaque lot de la génération des tests Cucumber d'un client (onglet Cucumber).")
-        st.caption("La consommation de chaque exécution est affichée (ligne [TOKENS]) et ajoutée à .tmp/token_usage.csv.")
+        effort_help = ("Niveau d'effort transmis avec --effort : low, medium, high, xhigh ou max. "
+                       "Vide = réglage de Claude Code sur le poste.")
+        with st.container(horizontal=True):
+            env_values["CLAUDE_EFFORT_CADRAGE"] = st.text_input("CLAUDE_EFFORT_CADRAGE", value=os.getenv("CLAUDE_EFFORT_CADRAGE", ""), help=effort_help)
+            env_values["CLAUDE_EFFORT_REFINE"] = st.text_input("CLAUDE_EFFORT_REFINE", value=os.getenv("CLAUDE_EFFORT_REFINE", ""), help=effort_help)
+        with st.container(horizontal=True):
+            env_values["CLAUDE_EFFORT_PATCH"] = st.text_input("CLAUDE_EFFORT_PATCH", value=os.getenv("CLAUDE_EFFORT_PATCH", ""), help=effort_help)
+            env_values["CLAUDE_EFFORT_POSTMERGE"] = st.text_input("CLAUDE_EFFORT_POSTMERGE", value=os.getenv("CLAUDE_EFFORT_POSTMERGE", ""), help=effort_help)
+        with st.container(horizontal=True):
+            env_values["CLAUDE_EFFORT_BESOIN"] = st.text_input("CLAUDE_EFFORT_BESOIN", value=os.getenv("CLAUDE_EFFORT_BESOIN", ""),
+                                                               help=effort_help + " Utilisé par la rédaction du besoin (onglet Intégration).")
+            env_values["CLAUDE_EFFORT_CUCUMBER"] = st.text_input("CLAUDE_EFFORT_CUCUMBER", value=os.getenv("CLAUDE_EFFORT_CUCUMBER", "medium"),
+                                                                 help=effort_help + " Utilisé par chaque lot de la génération des tests Cucumber d'un client.")
+        env_values["CLAUDE_EFFORT_CUCUMBER_FIX"] = st.text_input("CLAUDE_EFFORT_CUCUMBER_FIX", value=os.getenv("CLAUDE_EFFORT_CUCUMBER_FIX", "low"),
+                                                                 help=effort_help.replace("Vide = réglage de Claude Code sur le poste.", "Vide = CLAUDE_EFFORT_CUCUMBER.")
+                                                                 + " Utilisé par les appels de correction et de revue des lots Cucumber.")
+        st.caption("La consommation de chaque exécution est affichée (ligne [TOKENS]) et ajoutée à .tmp/token_usage.csv, "
+                   "avec le modèle et l'effort utilisés.")
 
         st.markdown("---")
         st.markdown("#### 🗄️ Connexion Base de données (lecture seule)")
