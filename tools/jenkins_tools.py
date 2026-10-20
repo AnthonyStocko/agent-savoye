@@ -122,3 +122,16 @@ def fetch_artifact(build_url: str, relative_path: str, target: str) -> bool:
         return True
     except (OSError, requests.RequestException):
         return False
+
+
+def failed_stage(build_url: str) -> str:
+    """Nom de la première étape en échec d'un build de pipeline (API wfapi) ; '' si inconnue ou aucune."""
+    _, auth = _jenkins()
+    try:
+        response = requests.get(f"{build_url}/wfapi/describe", auth=auth, timeout=20)
+        if response.status_code != 200:
+            return ""
+        return next((s.get("name", "") for s in response.json().get("stages") or []
+                     if s.get("status") in ("FAILED", "FAILURE")), "")
+    except (requests.RequestException, ValueError):
+        return ""

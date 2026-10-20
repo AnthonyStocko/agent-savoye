@@ -2,7 +2,10 @@
 // Aucun push : le patch du lot arrive en paramètre fichier, est appliqué sur une copie locale du dépôt Cucumber
 // client, superposée au Cucumber Standard, puis seuls les scénarios tagués sont joués sur un environnement DÉJÀ
 // démarré (pas de démarrage d'appli). Le rapport Cucumber JSON (et jacoco.exec si disponible) est archivé.
-// Paramètres attendus par l'agent (vérifiés avant usage) : PATCH (fichier), TAGS, ENV.
+// Paramètres attendus par l'agent (vérifiés avant usage) : PATCH (fichier), TAGS, ENV, CUCUMBER_SPEC_REPOSITORY ;
+// CUCUMBER_SPEC_COMMIT et CUCUMBER_STANDARD_COMMIT (recommandés) fixent les commits de base utilisés par l'agent.
+// Patch non applicable : verification-status.txt (PATCH_NON_APPLICABLE) est archivé et le build échoue à l'étape
+// Sources ; l'agent classe alors les scénarios « non vérifié », pas en échec.
 // Nécessite le plugin « File Parameters » (stashedFile) et un credential par environnement (ENV -> URL, compte).
 pipeline {
     agent { label 'maven' }
@@ -10,19 +13,39 @@ pipeline {
         stashedFile(name: 'PATCH', description: 'Patch git du lot (git diff depuis la base du dépôt Cucumber client)')
         string(name: 'TAGS', defaultValue: '', description: "Expression de tags Cucumber, ex. @agent_apparel_3_1 or @agent_apparel_3_2")
         string(name: 'ENV', defaultValue: '', description: 'Environnement cible déjà démarré (recette client ou Standard)')
-        string(name: 'CUCUMBER_SPEC_REPOSITORY', defaultValue: 'apparel-cucumber', description: 'Dépôt Cucumber client')
+        string(name: 'CUCUMBER_SPEC_REPOSITORY', defaultValue: '', description: 'Dépôt Cucumber client, ex. apparel-cucumber (obligatoire)')
         string(name: 'CUCUMBER_SPEC_BRANCH', defaultValue: 'integration', description: 'Branche de base du dépôt client')
+        string(name: 'CUCUMBER_SPEC_COMMIT', defaultValue: '', description: 'Commit de base du dépôt client (vide = dernier commit de la branche)')
         string(name: 'CUCUMBER_STANDARD_BRANCH', defaultValue: 'development', description: 'Branche du Cucumber Standard')
+        string(name: 'CUCUMBER_STANDARD_COMMIT', defaultValue: '', description: 'Commit du Cucumber Standard (vide = dernier commit de la branche)')
     }
     options { timeout(time: 60, unit: 'MINUTES') }
     stages {
         stage('Sources') {
             steps {
-                dir('standard') { git url: 'https://git.kiscloud.io/scm/component-qa/cucumber.git', branch: params.CUCUMBER_STANDARD_BRANCH, credentialsId: 'bitbucket' }
+                script {
+                    if (!params.CUCUMBER_SPEC_REPOSITORY?.trim()) {
+                        error('CUCUMBER_SPEC_REPOSITORY non renseigné')
+                    }
+                }
+                dir('standard') {
+                    git url: 'https://git.kiscloud.io/scm/component-qa/cucumber.git', branch: params.CUCUMBER_STANDARD_BRANCH, credentialsId: 'bitbucket'
+                    sh '''if [ -n "${CUCUMBER_STANDARD_COMMIT}" ]; then
+                              git fetch -q origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || true
+                              git checkout -q --detach "${CUCUMBER_STANDARD_COMMIT}"
+                          fi'''
+                }
                 dir('spec') {
                     git url: "https://git.kiscloud.io/scm/${params.CUCUMBER_SPEC_REPOSITORY.split('-')[0]}/${params.CUCUMBER_SPEC_REPOSITORY}.git", branch: params.CUCUMBER_SPEC_BRANCH, credentialsId: 'bitbucket'
+                    sh '''if [ -n "${CUCUMBER_SPEC_COMMIT}" ]; then
+                              git fetch -q origin '+refs/heads/*:refs/remotes/origin/*' || true
+                              git checkout -q --detach "${CUCUMBER_SPEC_COMMIT}"
+                          fi'''
                     unstash 'PATCH'
-                    sh 'git apply --whitespace=nowarn PATCH'
+                    sh '''git apply --3way --whitespace=nowarn PATCH || {
+                              echo PATCH_NON_APPLICABLE > ../verification-status.txt
+                              exit 1
+                          }'''
                 }
                 // Dépôt client en surcouche du Standard (comme la compilation locale de l'agent)
                 sh 'cp -r spec/src/. standard/src/'
@@ -42,7 +65,7 @@ pipeline {
     }
     post {
         always {
-            archiveArtifacts allowEmptyArchive: true, artifacts: 'standard/target/cucumber-reports/*.json,**/jacoco*.exec'
+            archiveArtifacts allowEmptyArchive: true, artifacts: 'standard/target/cucumber-reports/*.json,**/jacoco*.exec,verification-status.txt'
         }
     }
 }

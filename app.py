@@ -977,6 +977,10 @@ with tab_cucumber:
         )
         selected_ids = [row["id"] for row in edited if row["Traiter"]]
         linked = sum(1 for s in specs if s.get("tests_std"))
+        unresolved_steps = (inventory.get("catalogue_standard") or {}).get("nb_steps_non_resolus")
+        if unresolved_steps:
+            st.caption(f":orange[{unresolved_steps} step(s) du Cucumber Standard déclaré(s) par une constante non "
+                       f"résolue : absents du catalogue (voir le journal de l'inventaire).]")
         with st.expander(f"Tests Standard liés : {linked}/{len(specs)} spécifique(s) avec au moins un équivalent"):
             for s in specs:
                 tests = s.get("tests_std") or []
@@ -1096,12 +1100,17 @@ with tab_cucumber:
                      })
         sample = cucumber_verify.review_sample(cucumber_state)
         if sample:
-            with st.expander(f"Revue humaine : échantillon de {len(sample)} scénario(s) pertinent(s)", expanded=True):
+            unverified = sum(1 for item in sample if item["statut"] == "non_verifie")
+            with st.expander(f"Revue humaine : échantillon de {len(sample)} scénario(s), dont {unverified} non "
+                             f"vérifié(s) par l'exécution", expanded=True):
                 by_tag = {row["tag"]: row for row in verified_rows}
                 for item in sample:
                     row = by_tag.get(item["tag"], {})
                     with st.container(border=True):
-                        st.markdown(f"**{row.get('Scénario', item['id'])}** :gray[(lot {item['lot']}, {item['tag']})]")
+                        st.markdown(f"**{row.get('Scénario', item['id'])}** :gray[(lot {item['lot']}, {item['tag']}, "
+                                    f"{item['statut'].replace('_', ' ')})]")
+                        if item["statut"] == "non_verifie" and item.get("motif"):
+                            st.caption(f"Non vérifié : {item['motif']}")
                         st.caption(f"Différence avec le Standard : {row.get('Différence avec le Standard') or '—'} · "
                                    f"Source : {row.get('Source') or '—'} · "
                                    f"Inspiré de : {row.get('Inspiré du Standard') or '—'}")
@@ -1473,7 +1482,8 @@ with tab_config:
                 help="Appels de correction par lot pour les scénarios invalides ou faibles, avant leur retrait.")
             review_sample = st.number_input(
                 "CUCUMBER_REVIEW_SAMPLE", min_value=0, step=1, value=env_int("CUCUMBER_REVIEW_SAMPLE", 5),
-                help="Scénarios « pertinent » tirés au hasard pour la revue humaine de l'onglet Cucumber.")
+                help="Scénarios proposés à la revue humaine de l'onglet Cucumber : d'abord les « non vérifié », "
+                     "puis des « pertinent » tirés au hasard.")
         env_values["CUCUMBER_VERIFY_TIMEOUT"] = str(int(verify_timeout))
         env_values["CUCUMBER_VERIFY_FIX_ATTEMPTS"] = str(int(verify_fixes))
         env_values["CUCUMBER_REVIEW_SAMPLE"] = str(int(review_sample))
@@ -1482,6 +1492,11 @@ with tab_config:
             help="Environnement client lancé avec l'agent JaCoCo : part des classes de chaque spécifique exécutées "
                  "(jacoco.exec archivé par le job, ou CUCUMBER_JACOCO_EXEC en local).")
         env_values["CUCUMBER_JACOCO"] = "1" if jacoco else "0"
+        keep_tags = st.checkbox(
+            "CUCUMBER_KEEP_AGENT_TAGS", value=os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() == "1",
+            help="Conserve les tags de vérification @agent_<client>_<lot>[_<n>] dans le patch livré (par défaut, "
+                 "ils sont retirés du patch et gardés seulement dans le worktree).")
+        env_values["CUCUMBER_KEEP_AGENT_TAGS"] = "1" if keep_tags else "0"
         env_values["CUCUMBER_JACOCO_EXEC"] = st.text_input(
             "CUCUMBER_JACOCO_EXEC", value=os.getenv("CUCUMBER_JACOCO_EXEC", ""),
             help="Mode local : chemin du jacoco.exec produit par l'environnement client.")

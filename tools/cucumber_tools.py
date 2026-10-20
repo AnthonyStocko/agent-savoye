@@ -481,9 +481,90 @@ def export_sources(inventory: dict) -> None:
 # Catalogues Cucumber (Standard et client)
 # ---------------------------------------------------------------------------
 
+_JAVA_STRING = r'"(?:[^"\\]|\\.)*"'
+_STEP_OPERAND = rf'(?:{_JAVA_STRING}|(?:[A-Z]\w*\.)?[A-Z][A-Z0-9_]*)'
+# Argument d'une annotation de step : littéral, constante (CONSTANTE, Classe.CONSTANTE) ou concaténation des deux
+_STEP_ANNOTATION = re.compile(r'@(?:Given|When|Then|And|But|Soit|Quand|Alors|Et|Mais)\s*\(\s*(?:value\s*=\s*)?'
+                              rf'({_STEP_OPERAND}(?:\s*\+\s*{_STEP_OPERAND})*)\s*[,)]')
+
+
+def resolve_step_argument(argument: str, local: dict, class_constants) -> str:
+    """
+    Expression d'un argument d'annotation de step ('' si non résolue) : littéral tel quel, sinon constantes
+    `static final String` du fichier (`local`) ou de la classe référencée (class_constants(Classe) -> dict).
+    """
+    if re.fullmatch(_JAVA_STRING, argument):
+        return argument[1:-1]
+    shared = {}
+    for cls in dict.fromkeys(re.findall(r"\b([A-Z]\w*)\.[A-Z][A-Z0-9_]*\b", argument)):
+        shared.update(class_constants(cls))
+    # Constante qualifiée : celle de la classe nommée l'emporte sur un homonyme du fichier
+    qualified = {name for name in re.findall(r"\b[A-Z]\w*\.([A-Z][A-Z0-9_]*)\b", argument)}
+    resolved = _resolve(argument, {k: v for k, v in local.items() if k not in qualified}, shared)
+    return "" if not resolved or "{…}" in resolved else resolved
+
+
+def step_expressions(text: str, class_constants=lambda cls: {}, local: dict = None) -> tuple:
+    """
+    (expressions, arguments non résolus) des annotations de step d'un texte Java ; `local` : constantes du fichier
+    (par défaut celles de `text`).
+    """
+    found, unresolved = [], []
+    for match in _STEP_ANNOTATION.finditer(text):
+        argument = match.group(1)
+        if local is None and not re.fullmatch(_JAVA_STRING, argument):
+            local = _string_constants(text)
+        expr = resolve_step_argument(argument, local or {}, class_constants)
+        (found if expr else unresolved).append(expr or argument)
+    return found, unresolved
+
+
+def _class_constants_loader(repo_dir: str, ref: str, tree: dict):
+    """class_constants(Classe) -> {NOM: expression} lu dans <Classe>.java de `ref` (mis en cache)."""
+    by_class, cache = {}, {}
+    for path, blob in tree.items():
+        if path.endswith(".java"):
+            by_class.setdefault(path.rsplit("/", 1)[-1][:-5], blob)
+
+    def load(cls: str) -> dict:
+        if cls not in cache:
+            blob = by_class.get(cls)
+            cache[cls] = _string_constants(blob_texts(repo_dir, [blob]).get(blob, "")) if blob else {}
+        return cache[cls]
+    return load
+
+
+def disk_class_constants(root: str):
+    """class_constants(Classe) -> {NOM: expression} lu dans <Classe>.java sous `root` (sur disque, mis en cache)."""
+    by_class, cache = {}, {}
+    for directory, _, names in os.walk(root) if os.path.isdir(root) else ():
+        for name in names:
+            if name.endswith(".java"):
+                by_class.setdefault(name[:-5], os.path.join(directory, name))
+
+    def load(cls: str) -> dict:
+        if cls not in cache:
+            cache[cls] = _string_constants(_read_text_file(by_class[cls])) if cls in by_class else {}
+        return cache[cls]
+    return load
+
+
+def report_unresolved_steps(label: str, catalogue: dict) -> None:
+    """Journal des steps dont l'expression (constante) n'a pas pu être résolue."""
+    unresolved = catalogue.get("steps_non_resolus") or []
+    if unresolved:
+        print(f"[CUCUMBER] ⚠️ {label} : {len(unresolved)} step(s) par constante non résolu(s) : "
+              + ", ".join(f"{u['file'].rsplit('/', 1)[-1]}:{u['line']} {u['argument']}" for u in unresolved[:5])
+              + (" …" if len(unresolved) > 5 else ""))
+
+
 def extract_cucumber(repo_dir: str, ref: str) -> dict:
-    """Steps (expression, fichier:ligne) et features (titre, scénarios, tags) de `ref`, par git grep."""
-    steps = []
+    """
+    Steps (expression, fichier:ligne) et features (titre, scénarios, tags) de `ref`, par git grep. Steps déclarés par
+    constante (@Given(CONSTANTE), @Given(Classe.CONSTANTE)) : constante résolue dans le fichier ou la classe
+    référencée ; ceux qui ne le sont pas sont listés dans steps_non_resolus.
+    """
+    steps, unresolved, pending = [], [], []
     out = _git(repo_dir, "grep", "-nE", STEP_PATTERN, ref, "--", "*.java", "*.kt").stdout
     for line in out.splitlines():
         line = line[len(ref) + 1:] if line.startswith(f"{ref}:") else line
@@ -492,6 +573,26 @@ def extract_cucumber(repo_dir: str, ref: str) -> dict:
             expr = re.search(r'\(\s*"((?:[^"\\]|\\.)*)"', parts[2])
             if expr:
                 steps.append({"expr": expr.group(1), "file": parts[0], "line": int(parts[1])})
+            else:
+                pending.append(parts)
+    if pending:
+        tree = ls_tree(repo_dir, ref)
+        texts = blob_texts(repo_dir, [tree[p[0]] for p in pending if p[0] in tree])
+        class_constants = _class_constants_loader(repo_dir, ref, tree)
+        constants = {}
+        for path, number, content in pending:
+            match = _STEP_ANNOTATION.search(content)
+            if not match:
+                unresolved.append({"file": path, "line": int(number), "argument": content.strip()[:120]})
+                continue
+            if path not in constants:
+                constants[path] = _string_constants(texts.get(tree.get(path), ""))
+            expr = resolve_step_argument(match.group(1), constants[path], class_constants)
+            if expr:
+                steps.append({"expr": expr, "file": path, "line": int(number)})
+            else:
+                unresolved.append({"file": path, "line": int(number), "argument": match.group(1)})
+        steps.sort(key=lambda s: (s["file"], s["line"]))
     features = {}
     out = _git(repo_dir, "grep", "-nE", r"^\s*(@|Feature:|Fonctionnalité:|Scenario|Scénario)", ref,
                "--", "*.feature").stdout
@@ -510,7 +611,8 @@ def extract_cucumber(repo_dir: str, ref: str) -> dict:
             feature["feature"] = text.split(":", 1)[1].strip()
         elif ":" in text:
             feature["scenarios"].append(text.split(":", 1)[1].strip())
-    return {"ref": ref, "commit": rev_parse(repo_dir, ref), "steps": steps, "features": list(features.values())}
+    return {"ref": ref, "commit": rev_parse(repo_dir, ref), "steps": steps, "features": list(features.values()),
+            "steps_non_resolus": unresolved}
 
 
 def _step_prefix(expr: str) -> str:
@@ -534,6 +636,10 @@ def _features_md(title: str, features: list) -> str:
     return "\n".join(lines)
 
 
+# À incrémenter quand le contenu du catalogue change (steps par constante résolus) : invalide le cache
+STD_CATALOGUE_FORMAT = 2
+
+
 def standard_catalogue(cucumber_std_dir: str, odatio_version: str) -> dict:
     """
     Catalogue du Cucumber Standard, mis en cache par version Odatio et régénéré seulement si son HEAD change :
@@ -545,10 +651,12 @@ def standard_catalogue(cucumber_std_dir: str, odatio_version: str) -> dict:
              for name in ("catalogue_std", "steps_std", "features_std")}
     meta_file = os.path.join(STD_CACHE_DIR, f"catalogue_std_{version}.json")
     meta = _read_json(meta_file, {}) or {}
-    if meta.get("head") == head and all(os.path.exists(p) for p in paths.values()):
+    if meta.get("head") == head and meta.get("format") == STD_CATALOGUE_FORMAT and all(
+            os.path.exists(p) for p in paths.values()):
         return meta
     catalogue = extract_cucumber(cucumber_std_dir, "HEAD")
     steps, features = catalogue["steps"], catalogue["features"]
+    report_unresolved_steps("Cucumber Standard", catalogue)
     # Exemples : les deux features les plus courtes ayant au moins deux scénarios, de domaines différents
     examples, domains = [], set()
     for f in sorted((f for f in features if len(f["scenarios"]) >= 2 and 30 <= f["lines"] <= 150),
@@ -576,7 +684,9 @@ def standard_catalogue(cucumber_std_dir: str, odatio_version: str) -> dict:
     summary = [
         f"# Catalogue Cucumber Standard (Odatio {odatio_version}, commit {head[:10]})", "",
         f"## Steps réutilisables : {len(steps)} — détail dans '{paths['steps_std']}'",
-        "Cherche-y les steps par préfixe ou mot-clé (Grep), avant d'en créer un nouveau.", "",
+        "Cherche-y les steps par préfixe ou mot-clé (Grep), avant d'en créer un nouveau."
+        + (f" {len(catalogue['steps_non_resolus'])} step(s) déclarés par une constante non résolue n'y figurent pas."
+           if catalogue["steps_non_resolus"] else ""), "",
         "| Préfixe | Steps | Fichiers Step Definitions |", "|---|---|---|",
     ]
     summary += [f"| {p} | {n} | {', '.join(sorted(files)[:6])}{' …' if len(files) > 6 else ''} |"
@@ -590,8 +700,9 @@ def standard_catalogue(cucumber_std_dir: str, odatio_version: str) -> dict:
     _write_text(paths["steps_std"], _steps_md(f"Steps du Cucumber Standard (Odatio {odatio_version})", steps))
     _write_text(paths["features_std"], _features_md(f"Features du Cucumber Standard (Odatio {odatio_version})",
                                                     features))
-    meta = {"head": head, "version": odatio_version, "examples": examples, "nb_steps": len(steps),
-            "nb_features": len(features), **paths}
+    meta = {"head": head, "format": STD_CATALOGUE_FORMAT, "version": odatio_version, "examples": examples,
+            "nb_steps": len(steps),
+            "nb_steps_non_resolus": len(catalogue["steps_non_resolus"]), "nb_features": len(features), **paths}
     _write_json(meta_file, meta)
     return meta
 
@@ -599,6 +710,7 @@ def standard_catalogue(cucumber_std_dir: str, odatio_version: str) -> dict:
 def client_coverage(client_name: str, cucumber_repo_dir: str, ref: str) -> dict:
     """Catalogue du dépôt Cucumber client (couverture_existante.md)."""
     catalogue = extract_cucumber(cucumber_repo_dir, ref)
+    report_unresolved_steps(f"dépôt Cucumber {client_name}", catalogue)
     path = os.path.join(cache_dir(client_name), "couverture_existante.md")
     _write_text(path, _features_md(f"Features existantes du dépôt Cucumber {client_name} ({ref})",
                                    catalogue["features"]) + "\n\n"
@@ -630,7 +742,7 @@ def match_coverage(inventory: dict, catalogue: dict) -> None:
 # ---------------------------------------------------------------------------
 
 # À incrémenter quand le format de l'index change : invalide le cache
-STD_TESTS_FORMAT = 1
+STD_TESTS_FORMAT = 2
 DEFAULT_STD_MATCH_MIN = 0.4
 MAX_STD_TESTS = 3
 # Somme d'idf donnant l'évidence maximale des mots-clés : deux mots présents dans moins d'une feature sur dix
@@ -1350,7 +1462,7 @@ def _read_text_file(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 # À incrémenter quand le format du catalogue des endpoints change : invalide le cache
-ENDPOINTS_FORMAT = 2
+ENDPOINTS_FORMAT = 3
 _JAVA_MASK = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'', re.S)
 _METHOD_HEAD = re.compile(r"(?:(?:public|protected|private|static|final|synchronized|abstract)\s+)+"
                           r"(?:<[^>{;]*>\s*)?[\w<>\[\],.?\s]+?\s+(\w+)\s*\(")
@@ -1384,9 +1496,14 @@ def _matching(masked: str, start: int, opening: str = "{", closing: str = "}") -
     return len(masked)
 
 
-def _java_methods(text: str) -> list:
-    """Méthodes d'un fichier Java : [{name, body (texte original), steps (expressions des annotations de step)}]."""
+def _java_methods(text: str, class_constants=lambda cls: {}) -> list:
+    """
+    Méthodes d'un fichier Java : [{name, body (texte original), steps (expressions des annotations de step, constantes
+    résolues), steps_non_resolus}].
+    """
     masked, methods, pos, previous_end = _mask_java(text), [], 0, 0
+    constants = _string_constants(text) if re.search(r"@(?:Given|When|Then|And|But|Soit|Quand|Alors|Et|Mais)\s*\(\s*"
+                                                     r"(?:value\s*=\s*)?[A-Z]", text) else {}
     while True:
         match = _METHOD_HEAD.search(masked, pos)
         if not match:
@@ -1399,8 +1516,9 @@ def _java_methods(text: str) -> list:
         start = close + brace.end() - 1
         end = _matching(masked, start)
         before = text[previous_end:match.start()]
-        steps = re.findall(r'@(?:Given|When|Then|And|But|Soit|Quand|Alors|Et|Mais)\s*\(\s*"((?:[^"\\]|\\.)*)"', before)
-        methods.append({"name": match.group(1), "body": text[start:end], "masked": masked[start:end], "steps": steps})
+        steps, unresolved = step_expressions(before, class_constants, constants)
+        methods.append({"name": match.group(1), "body": text[start:end], "masked": masked[start:end], "steps": steps,
+                        "steps_non_resolus": unresolved})
         pos = previous_end = end
 
 
@@ -1473,7 +1591,7 @@ def extract_std_endpoints(files: dict) -> list:
         for name, value in values.items():
             shared.setdefault(name, value)
     classes = {p.rsplit("/", 1)[-1][:-5]: p for p in texts}
-    methods = {p: _java_methods(t) for p, t in texts.items()}
+    methods = {p: _java_methods(t, lambda cls: constants.get(classes.get(cls, ""), {})) for p, t in texts.items()}
     # Appels directs : (classe, méthode) -> {(MÉTHODE, chemin)}
     direct = {}
     for path, items in methods.items():
@@ -1692,14 +1810,99 @@ def commit_lot(worktree: str, client_name: str, lot_number: int) -> bool:
                 ).returncode == 0
 
 
-def write_patch(worktree: str, base: str, output: str) -> bool:
-    """Patch de tous les commits de la branche depuis `base`. Renvoie False s'il n'y en a aucun."""
-    result = _git(worktree, "format-patch", f"{base}..HEAD", "--stdout")
+def discard_lot(worktree: str) -> None:
+    """Lot en échec : fichiers suivis remis au dernier commit et fichiers non suivis supprimés (hors ignorés)."""
+    _git(worktree, "reset", "-q", "--hard", "HEAD")
+    _git(worktree, "clean", "-fdq")
+
+
+def strip_agent_tags(text: str, client_name: str, keep: set = frozenset()) -> str:
+    """
+    Feature sans les tags de vérification @agent_<client>_<lot>[_<n>] (sauf ceux de `keep`, déjà dans la base) ;
+    une ligne qui ne portait que ces tags disparaît.
+    """
+    pattern = re.compile(rf"^@agent_{re.escape(java_package_segment(client_name))}_\d+(?:_\d+)?$")
+    lines = []
+    for line in text.splitlines(keepends=True):
+        tokens = line.split()
+        if not tokens or not tokens[0].startswith("@"):
+            lines.append(line)
+            continue
+        kept = [t for t in tokens if t in keep or not pattern.match(t)]
+        if len(kept) == len(tokens):
+            lines.append(line)
+        elif kept:
+            indent = line[:len(line) - len(line.lstrip())]
+            lines.append(indent + " ".join(kept) + ("\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n")
+                                                    else ""))
+    return "".join(lines)
+
+
+def write_patch(worktree: str, base: str, output: str, client_name: str = "") -> bool:
+    """
+    Patch de tous les commits de la branche depuis `base` (un par lot). Les tags @agent_<client>_<lot>[_<n>] sont
+    retirés des .feature du livrable, sur une copie : le worktree les garde pour les reprises
+    (CUCUMBER_KEEP_AGENT_TAGS=1 : patch tel quel). Renvoie False s'il n'y a aucun commit.
+    """
+    head = rev_parse(worktree, "HEAD")
+    commits = _git(worktree, "rev-list", "--reverse", f"{base}..HEAD").stdout.split()
+    if not commits:
+        return False
+    tip = head
+    if client_name and os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() != "1":
+        tip = _commits_without_agent_tags(worktree, base, commits, client_name) or head
+    result = _git(worktree, "format-patch", f"{base}..{tip}", "--stdout")
     if result.returncode != 0 or not result.stdout.strip():
         return False
     with open(output, "w", encoding="utf-8", newline="\n") as f:
         f.write(result.stdout)
     return True
+
+
+def _commits_without_agent_tags(worktree: str, base: str, commits: list, client_name: str) -> str:
+    """
+    Recopie des commits du lot sans les tags @agent_ (chaque commit refait depuis son instantané complet, donc sans
+    conflit), dans un worktree temporaire. Renvoie le dernier commit recopié ('' en cas d'erreur).
+    """
+    export = os.path.join(os.path.dirname(worktree), "patch_export")
+    _git(worktree, "worktree", "remove", "--force", export)
+    shutil.rmtree(export, ignore_errors=True)
+    _git(worktree, "worktree", "prune")
+    if _git(worktree, "worktree", "add", "-q", "--detach", export, base).returncode != 0:
+        print("[CUCUMBER] ⚠️ Copie sans tags @agent_ impossible : patch produit avec les tags.")
+        return commits[-1]
+    parent = rev_parse(worktree, base)
+    try:
+        for commit in commits:
+            _git(export, "checkout", "-q", "--force", "--detach", commit)
+            changed = _git(export, "diff", "--name-only", base, commit, "--", "*.feature").stdout.split("\n")
+            for rel in filter(None, changed):
+                path = os.path.join(export, *rel.split("/"))
+                if not os.path.exists(path):
+                    continue
+                keep = set(re.findall(r"@agent_\w+", _git(export, "show", f"{base}:{rel}").stdout))
+                with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                    text = f.read()
+                stripped = strip_agent_tags(text, client_name, keep)
+                if stripped != text:
+                    with open(path, "w", encoding="utf-8", newline="") as f:
+                        f.write(stripped)
+            _git(export, "add", "-A", "--", ".", ":(exclude)target", ":(exclude)**/target/**")
+            tree = _git(export, "write-tree").stdout.strip()
+            author = _git(worktree, "log", "-1", "--format=%an%x00%ae%x00%aI", commit).stdout.strip().split("\0")
+            message = _git(worktree, "log", "-1", "--format=%B", commit).stdout
+            env = {**os.environ, **dict(zip(("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE"), author))}
+            created = subprocess.run(["git", "-C", export, "commit-tree", tree, "-p", parent, "-m", message.strip()],
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+            if created.returncode != 0 or not created.stdout.strip():
+                print(f"[CUCUMBER] ⚠️ Copie sans tags @agent_ impossible ({created.stderr.strip()[:200]}) : patch "
+                      f"produit avec les tags.")
+                return ""
+            parent = created.stdout.strip()
+        return parent
+    finally:
+        _git(worktree, "worktree", "remove", "--force", export)
+        shutil.rmtree(export, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

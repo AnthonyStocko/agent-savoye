@@ -19,7 +19,8 @@ import time
 from tools import jenkins_tools, memory_tools
 from tools.cucumber_tools import (_HTTP_CALL, _expression_regex, _first_argument, _git, _http_path, _java_methods,
                                   _read_text_file, _resolve, _step_prefix, _string_constants, _write_text,
-                                  WORKSPACE_DIR, blob_texts, extract_cucumber, java_package_segment, ls_tree)
+                                  WORKSPACE_DIR, blob_texts, disk_class_constants, extract_cucumber,
+                                  java_package_segment, ls_tree, report_unresolved_steps, step_expressions)
 
 # ---------------------------------------------------------------------------
 # Niveau 1 : contrôle statique (doublons, assertions, réutilisation, champs du JSON)
@@ -103,10 +104,10 @@ def _disk_steps(root: str, rel_paths=None) -> dict:
         base = os.path.join(root, "src", "test", "java")
         paths = [os.path.relpath(os.path.join(d, f), root).replace("\\", "/") for d, _, names in os.walk(base)
                  for f in names if f.endswith(".java")] if os.path.isdir(base) else []
-    found = {}
+    found, class_constants = {}, disk_class_constants(os.path.join(root, "src", "test", "java"))
     for rel in paths:
         text = _read_text_file(os.path.join(root, *rel.split("/")))
-        for expr in re.findall(r'@(?:Given|When|Then|And|But)\s*\(\s*"((?:[^"\\]|\\.)*)"', text):
+        for expr in step_expressions(text, class_constants)[0]:
             found.setdefault(expr.replace('\\"', '"'), rel)
     return found
 
@@ -117,9 +118,10 @@ def std_reference(cucumber_std_dir: str, std_endpoints: dict) -> dict:
     (titre, steps et tables) pour les doublons, endpoints par expression de step et par méthode Java.
     """
     catalogue = extract_cucumber(cucumber_std_dir, "HEAD")
+    report_unresolved_steps("Cucumber Standard", catalogue)
     tree = ls_tree(cucumber_std_dir, "HEAD")
     texts = blob_texts(cucumber_std_dir, [tree[f["path"]] for f in catalogue["features"] if f["path"] in tree])
-    scenarios = [{"path": f["path"], "titre": s["titre"], "steps": [_step_key(st) for st in s["steps"]]}
+    scenarios =[{"path": f["path"], "titre": s["titre"], "steps": [_step_key(st) for st in s["steps"]]}
                  for f in catalogue["features"] for s in parse_scenarios(texts.get(tree.get(f["path"]), ""))]
     by_step = {}
     for e in std_endpoints.get("endpoints", []):
@@ -197,11 +199,11 @@ def _declared(scenario: dict, results: list):
 
 def _client_step_endpoints(worktree: str, java_files: list, reference: dict) -> dict:
     """{expression de step client: [endpoints]} : helpers du Standard appelés, ou appels HTTP écrits dans la classe."""
-    found = {}
+    found, class_constants = {}, disk_class_constants(os.path.join(worktree, "src", "test", "java"))
     for rel in java_files:
         text = _read_text_file(os.path.join(worktree, *rel.split("/")))
         constants = _string_constants(text)
-        methods = _java_methods(text)
+        methods = _java_methods(text, class_constants)
         local = {m["name"]: m for m in methods}
         for method in methods:
             if not method["steps"]:
@@ -435,14 +437,26 @@ def tagged_scenarios(worktree: str, files: list, tags) -> dict:
 # Niveau 2 : exécution (job Jenkins dédié ou commande locale) et rapport Cucumber JSON
 # ---------------------------------------------------------------------------
 
-REQUIRED_JOB_PARAMETERS = ("PATCH", "TAGS", "ENV")
+REQUIRED_JOB_PARAMETERS = ("PATCH", "TAGS", "ENV", "CUCUMBER_SPEC_REPOSITORY")
+# Commits de base : sans eux, le job part du dernier commit des branches et le patch peut ne plus s'appliquer
+PINNING_JOB_PARAMETERS = ("CUCUMBER_SPEC_COMMIT", "CUCUMBER_STANDARD_COMMIT")
 NOT_VERIFIED = "pertinence non vérifiée par exécution"
+PATCH_NOT_APPLICABLE = "non vérifié : patch non applicable"
+# Marqueur archivé par le Jenkinsfile quand `git apply` échoue à l'étape Sources
+PATCH_STATUS_ARTIFACT = "verification-status.txt"
+
+
+def job_sources(cucumber_repo: str, base_branch: str, base_commit: str, standard_commit: str) -> dict:
+    """Paramètres du job désignant les sources de l'exécution locale : dépôt client, branche et commits de base."""
+    return {"CUCUMBER_SPEC_REPOSITORY": cucumber_repo, "CUCUMBER_SPEC_BRANCH": base_branch,
+            "CUCUMBER_SPEC_COMMIT": base_commit, "CUCUMBER_STANDARD_COMMIT": standard_commit}
 
 
 def execution_mode() -> tuple:
     """
-    ("jenkins" | "local" | "", message) : job CUCUMBER_VERIFY_JOB s'il accepte PATCH (fichier), TAGS et ENV,
-    sinon commande CUCUMBER_VERIFY_LOCAL_CMD, sinon aucun moyen d'exécution (niveau 1 seulement).
+    ("jenkins" | "local" | "", message) : job CUCUMBER_VERIFY_JOB s'il accepte PATCH (fichier), TAGS, ENV et
+    CUCUMBER_SPEC_REPOSITORY, sinon commande CUCUMBER_VERIFY_LOCAL_CMD, sinon aucun moyen d'exécution (niveau 1
+    seulement). Job sans CUCUMBER_SPEC_COMMIT / CUCUMBER_STANDARD_COMMIT : utilisable, avec un avertissement.
     """
     job = os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
     reasons = []
@@ -450,7 +464,10 @@ def execution_mode() -> tuple:
         parameters = jenkins_tools.job_parameters(job)
         missing = [p for p in REQUIRED_JOB_PARAMETERS if p not in parameters]
         if parameters and not missing and "File" in parameters["PATCH"]:
-            return "jenkins", f"job Jenkins {job}"
+            unpinned = [p for p in PINNING_JOB_PARAMETERS if p not in parameters]
+            return "jenkins", f"job Jenkins {job}" + (
+                f" (⚠️ paramètres {', '.join(unpinned)} absents du job : l'application du patch peut échouer si la "
+                f"branche a avancé depuis la base)" if unpinned else "")
         reasons.append(f"job {job} inutilisable (" + (f"paramètres absents : {', '.join(missing)}" if parameters
                                                       and missing else "PATCH n'est pas un paramètre fichier"
                                                       if parameters else "introuvable") + ")")
@@ -464,10 +481,24 @@ def _phase_of(keyword: str, previous: str) -> str:
     return _PHASES.get(keyword.strip().lower(), previous)
 
 
+_ASSERTION_FAILURE = re.compile(r"AssertionError|ComparisonFailure|AssertionFailedError|\bexpected\b|attendu|"
+                                r"but was|Expecting", re.I)
+_EXCEPTION_NAME = re.compile(r"\b((?:[a-z_]\w*\.)*[A-Z]\w*(?:Exception|Error|Failure))\b")
+
+
+def failure_kind(error_message: str) -> tuple:
+    """(assertion | technique, nom de l'exception) d'un message d'échec Cucumber."""
+    message = str(error_message or "")
+    exception = _EXCEPTION_NAME.search(message)
+    name = exception.group(1).rsplit(".", 1)[-1] if exception else ""
+    return ("assertion" if _ASSERTION_FAILURE.search(message) else "technique"), name
+
+
 def parse_cucumber_report(report: list) -> dict:
     """
-    Rapport Cucumber JSON -> {(fichier relatif, titre): {statut: passe|echoue|indefini, step, phase, message}} ;
-    Background rattaché au scénario qui le suit, exemples d'un Scenario Outline agrégés (le pire l'emporte).
+    Rapport Cucumber JSON -> {(fichier relatif, titre): {statut: passe|echoue|indefini, step, phase, message,
+    nature (assertion | technique, échec seulement), exception}} ; Background rattaché au scénario qui le suit,
+    exemples d'un Scenario Outline agrégés (le pire l'emporte).
     """
     rank = {"passe": 0, "indefini": 1, "echoue": 2}
     results = {}
@@ -488,9 +519,11 @@ def parse_cucumber_report(report: list) -> dict:
                 status = (step.get("result") or {}).get("status", "")
                 statuses.append(status)
                 if status == "failed" and not outcome:
+                    error = str((step.get("result") or {}).get("error_message", ""))
+                    nature, exception = failure_kind(error)
                     outcome = {"statut": "echoue", "step": f"{step.get('keyword', '').strip()} {step.get('name', '')}",
-                               "phase": phase, "message": " ".join(str((step.get("result") or {}).get(
-                                   "error_message", "")).split())[:300]}
+                               "phase": phase, "message": " ".join(error.split())[:300], "nature": nature,
+                               "exception": exception}
             if not outcome:
                 if any(s in ("undefined", "pending", "ambiguous") for s in statuses) or not statuses:
                     outcome = {"statut": "indefini", "step": "", "phase": "", "message": "step non défini ou ignoré"}
@@ -522,10 +555,12 @@ def _read_report(path: str) -> list:
         return []
 
 
-def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str, overrides: dict, label: str) -> dict:
+def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str, overrides: dict, label: str,
+             sources: dict = None) -> dict:
     """
     Exécute les scénarios filtrés par `tags` sur l'environnement `env` ; `overrides` {chemin relatif: texte}
-    remplace des .feature le temps de l'exécution (mutation). Renvoie {ok, message, build, resultats}.
+    remplace des .feature le temps de l'exécution (mutation) ; `sources` (job_sources) : paramètres du job Jenkins
+    désignant le dépôt et les commits de base. Renvoie {ok, message, build, resultats}.
     """
     started = time.time()
     if mode == "local":
@@ -565,11 +600,14 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
             _write_text(os.path.join(worktree, *rel.split("/")), text)
     patch_file = os.path.join(os.path.dirname(worktree), "verification", f"{label}.patch")
     _write_text(patch_file, patch)
+    parameters = {"TAGS": tags, "ENV": env, **{k: v for k, v in (sources or {}).items() if v}}
     queue = jenkins_tools.trigger_cucumber_job_with_file(
-        os.getenv("CUCUMBER_VERIFY_JOB", "").strip(), {"TAGS": tags, "ENV": env}, "PATCH", patch_file)
+        os.getenv("CUCUMBER_VERIFY_JOB", "").strip(), parameters, "PATCH", patch_file)
     if not queue:
         return {"ok": False, "message": "lancement du job Jenkins impossible", "build": "", "resultats": {}}
     build = jenkins_tools.wait_build_result(queue, _timeout())
+    if build["result"] not in ("SUCCESS", "UNSTABLE") and _patch_not_applicable(build, patch_file, label):
+        return {"ok": False, "message": PATCH_NOT_APPLICABLE, "build": build["url"], "resultats": {}}
     reports = [a for a in build["artifacts"] if a.lower().endswith(".json") and "cucumber" in a.lower()]
     report = []
     for artifact in reports:
@@ -581,6 +619,16 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
                 "resultats": {}}
     return {"ok": True, "message": f"build {build['result']}", "build": build["url"],
             "resultats": parse_cucumber_report(report), "artefacts": build["artifacts"]}
+
+
+def _patch_not_applicable(build: dict, patch_file: str, label: str) -> bool:
+    """Build en échec à l'étape Sources (patch non applicable) : marqueur archivé, à défaut étape en échec du pipeline."""
+    marker = next((a for a in build["artifacts"] if a.rsplit("/", 1)[-1] == PATCH_STATUS_ARTIFACT), "")
+    if marker:
+        target = os.path.join(os.path.dirname(patch_file), f"{label}-{PATCH_STATUS_ARTIFACT}")
+        if jenkins_tools.fetch_artifact(build["url"], marker, target):
+            return "PATCH_NON_APPLICABLE" in _read_text_file(target)
+    return bool(build["url"]) and jenkins_tools.failed_stage(build["url"]) == "Sources"
 
 
 def _timeout() -> int:
@@ -610,14 +658,21 @@ def _mutate_cell(value: str) -> str:
     return value.replace(stripped, stripped + "_MUT")
 
 
+_QUOTED = re.compile(r'"([^"]*)"')
+# En-tête de 1re colonne désignant le champ vérifié (pas une valeur attendue)
+_KEY_HEADER = re.compile(r"(?i)^(champs?|cl[ée]s?|keys?|fields?|names?|noms?|codes?|propri[ée]t[ée]s?|attributs?)$")
+
+
 def mutate_feature(text: str, tags: set) -> tuple:
     """
-    Copie d'une feature où les attendus des Then des scénarios portant l'un des `tags` sont faussés : chaînes entre
-    guillemets suffixées _MUT, une ligne de données sur deux des tables des Then modifiée (nombres +1, booléens
-    inversés, texte suffixé _MUT). Renvoie (texte muté, {tag: nombre de valeurs faussées}).
+    Copie d'une feature où les attendus des Then des scénarios portant l'un des `tags` sont faussés : seul le
+    dernier argument entre guillemets d'un Then (la valeur attendue, pas le nom du champ) est suffixé _MUT ; une
+    ligne de données sur deux des tables des Then est modifiée dans ses colonnes de valeurs (nombres +1, booléens
+    inversés, texte suffixé _MUT), sans la 1re colonne si son en-tête désigne un champ ou une clé.
+    Renvoie (texte muté, {tag: nombre de valeurs faussées}).
     """
     lines, counts = text.splitlines(), {}
-    current, phase, row, pending_tags = None, "given", 0, []
+    current, phase, row, pending_tags, skip_first = None, "given", 0, [], False
     for i, line in enumerate(lines):
         if line.strip().startswith("@"):
             pending_tags += line.split()
@@ -633,17 +688,21 @@ def mutate_feature(text: str, tags: set) -> tuple:
         if step:
             phase, row = _PHASES.get(step.group(1).lower(), phase), 0
             if current and phase == "then":
-                mutated = re.sub(r'"([^"]*)"', lambda m: f'"{m.group(1)}_MUT"', line)
-                if mutated != line:
+                quoted = list(_QUOTED.finditer(line))
+                if quoted:
+                    last = quoted[-1]
+                    lines[i] = f'{line[:last.start()]}"{last.group(1)}_MUT"{line[last.end():]}'
                     counts[current] = counts.get(current, 0) + 1
-                    lines[i] = mutated
             continue
         if current and phase == "then" and line.strip().startswith("|"):
             row += 1
+            cells = line.split("|")
+            if row == 1:
+                skip_first = len(cells) > 3 and bool(_KEY_HEADER.match(cells[1].strip()))
             # Ligne 1 : en-tête ; lignes de données paires (2e, 4e...) faussées : une sur deux
             if row >= 2 and row % 2 == 0:
-                cells = line.split("|")
-                mutated = "|".join([cells[0]] + [_mutate_cell(c) for c in cells[1:-1]] + [cells[-1]])
+                first = 2 if skip_first else 1
+                mutated = "|".join(cells[:first] + [_mutate_cell(c) for c in cells[first:-1]] + [cells[-1]])
                 if mutated != line:
                     counts[current] = counts.get(current, 0) + 1
                     lines[i] = mutated
@@ -654,8 +713,15 @@ def mutate_feature(text: str, tags: set) -> tuple:
 # Vérification d'un lot : 3 exécutions au plus (client, Standard pour les overrides, mutation)
 # ---------------------------------------------------------------------------
 
+PASSES_STILL = "passe encore"
+NO_VALUE_TO_MUTATE = "assertion sans valeur à vérifier en revue"
+
+
 def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple:
-    """(ok | ko | nv, détail) d'un niveau d'exécution."""
+    """
+    (ok | ko | nv, détail) d'un niveau d'exécution. Échec attendu (contre-épreuve, mutation) : seul un échec
+    d'assertion compte ; une exception technique, ou un échec avant les Then (`then_only`), n'est pas concluant (nv).
+    """
     if not result:
         return "nv", "non exécuté"
     status = result["statut"]
@@ -663,37 +729,43 @@ def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple
         return ("ok", "passe") if status == "passe" else (
             "ko", f"{status} : {result['step']} — {result['message']}".strip(" —:"))
     if status == "echoue":
+        if result.get("nature", "assertion") == "technique":
+            return "nv", f"non concluant : {result.get('exception') or 'exception technique'} ({result['step']})"
         if then_only and result["phase"] != "then":
-            return "ko", f"échec technique avant les Then ({result['step']}) : contre-épreuve non concluante"
+            return "nv", f"non concluant : échec avant les Then ({result['step']})"
         return "ok", f"échoue comme attendu ({result['step']})"
     if status == "passe":
-        return "ko", "passe encore"
+        return "ko", PASSES_STILL
     return "nv", result["message"] or status
 
 
 def final_status(levels: dict) -> tuple:
-    """(statut, motif) : pertinent, faible, invalide ou non_verifie à partir des niveaux client / standard / mutation."""
+    """
+    (statut, motif) : pertinent, faible, invalide ou non_verifie à partir des niveaux client / standard / mutation.
+    Faible seulement si le scénario passe sur le Standard ou passe avec mutation ; tout niveau nv : non_verifie.
+    """
     client, standard, mutation = levels.get("client", ("nv", "")), levels.get("standard"), levels.get("mutation",
                                                                                                          ("nv", ""))
     if client[0] == "nv":
         return "non_verifie", client[1]
     if client[0] == "ko":
         return "invalide", f"échoue sur le client : {client[1]}"
-    if standard and standard[0] == "ko":
-        return "faible", ("passe sur le Standard : le scénario ne prouve pas l'override" if standard[1] == "passe encore"
-                          else standard[1])
-    if mutation[0] == "ko":
-        return "faible", ("mutation non détectée : assertions à renforcer" if mutation[1] == "passe encore"
-                          else mutation[1])
-    if mutation[0] == "nv":
-        return "non_verifie", f"mutation non exécutée : {mutation[1]}"
+    if standard and standard[0] == "ko" and standard[1] == PASSES_STILL:
+        return "faible", "passe sur le Standard : le scénario ne prouve pas l'override"
+    if mutation[0] == "ko" and mutation[1] == PASSES_STILL:
+        return "faible", "mutation non détectée : assertions à renforcer"
+    if standard and standard[0] != "ok":
+        return "non_verifie", f"contre-épreuve Standard : {standard[1]}"
+    if mutation[0] != "ok":
+        return "non_verifie", mutation[1] if mutation[1] == NO_VALUE_TO_MUTATE else f"mutation : {mutation[1]}"
     return "pertinent", ""
 
 
 def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scenarios: dict, kinds: dict,
-               label: str) -> dict:
+               label: str, sources: dict = None) -> dict:
     """
-    Niveaux 2 et 3 pour les scénarios `scenarios` {tag: identifiant} d'un lot, `kinds` {tag: type du spécifique}.
+    Niveaux 2 et 3 pour les scénarios `scenarios` {tag: identifiant} d'un lot, `kinds` {tag: type du spécifique},
+    `sources` : paramètres du job Jenkins désignant le dépôt et les commits de base (job_sources).
     Au plus 3 exécutions : client (CUCUMBER_VERIFY_ENV), Standard pour les overrides (CUCUMBER_VERIFY_ENV_STD),
     mutation des attendus sur le client. Renvoie {tag: {id, statut, motif, niveaux, build}} et les builds.
     """
@@ -702,7 +774,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     key_of = {tag: (rel, s["titre"]) for tag, (rel, s) in found.items()}
     builds, out = [], {}
     client = run_tags(mode, worktree, base, build_fn, tags, os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), {},
-                      f"{label}-client")
+                      f"{label}-client", sources)
     builds.append({"execution": "client", "build": client["build"], "message": client["message"]})
     levels = {tag: {"client": _level(client["resultats"].get(key_of.get(tag, ("", ""))), False)
                     if client["ok"] else ("nv", client["message"])} for tag in scenarios}
@@ -710,7 +782,8 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     overrides = [t for t in passing if kinds.get(t) == "override"]
     std_env = os.getenv("CUCUMBER_VERIFY_ENV_STD", "").strip()
     if overrides and std_env:
-        standard = run_tags(mode, worktree, base, build_fn, " or ".join(overrides), std_env, {}, f"{label}-standard")
+        standard = run_tags(mode, worktree, base, build_fn, " or ".join(overrides), std_env, {}, f"{label}-standard",
+                            sources)
         builds.append({"execution": "standard", "build": standard["build"], "message": standard["message"]})
         for tag in overrides:
             levels[tag]["standard"] = _level(standard["resultats"].get(key_of.get(tag, ("", ""))), True, True) \
@@ -727,10 +800,10 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
         to_run = [t for t in passing if counts.get(t)]
         for tag in passing:
             if not counts.get(tag):
-                levels[tag]["mutation"] = ("ko", "aucun attendu à fausser dans les Then (assertions sans valeur)")
+                levels[tag]["mutation"] = ("nv", NO_VALUE_TO_MUTATE)
         if to_run:
             mutation = run_tags(mode, worktree, base, build_fn, " or ".join(to_run),
-                                os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), mutated, f"{label}-mutation")
+                                os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), mutated, f"{label}-mutation", sources)
             builds.append({"execution": "mutation", "build": mutation["build"], "message": mutation["message"]})
             for tag in to_run:
                 levels[tag]["mutation"] = _level(mutation["resultats"].get(key_of.get(tag, ("", ""))), True) \
@@ -859,14 +932,21 @@ def scenario_rows(state: dict) -> list:
 
 
 def review_sample(state: dict, size: int = None) -> list:
-    """Échantillon de CUCUMBER_REVIEW_SAMPLE scénarios « pertinent » (tirage stable pour une génération donnée)."""
+    """
+    Échantillon de CUCUMBER_REVIEW_SAMPLE scénarios à juger (tirage stable pour une génération donnée) : d'abord les
+    « non_verifie » (jamais retirés, l'exécution n'a pas tranché), puis des « pertinent ».
+    """
     if size is None:
         try:
             size = max(0, int(os.getenv("CUCUMBER_REVIEW_SAMPLE", "").strip() or 5))
         except ValueError:
             size = 5
-    pertinent = sorted((s for s in all_verified(state) if s["statut"] == "pertinent"), key=lambda s: s["tag"])
-    return random.Random(state.get("debut", "")).sample(pertinent, min(size, len(pertinent)))
+    pick = random.Random(state.get("debut", ""))
+    sample = []
+    for status in ("non_verifie", "pertinent"):
+        pool = sorted((s for s in all_verified(state) if s["statut"] == status), key=lambda s: s["tag"])
+        sample += pick.sample(pool, min(size - len(sample), len(pool)))
+    return sample
 
 
 def record_verdict(client_name: str, state: dict, item: dict, verdict: str, reason: str) -> None:

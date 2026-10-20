@@ -1172,9 +1172,10 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
 def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, base: str, files: list,
                          results: list, mode: str, mode_message: str, client: str, cucumber_std_dir: str,
                          compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
-                         on_usage) -> None:
+                         on_usage, sources: dict = None) -> None:
     """
-    Niveaux 2 et 3 (cucumber_verify) pour les scénarios tagués du lot, sans token. Scénarios invalides ou faibles :
+    Niveaux 2 et 3 (cucumber_verify) pour les scénarios tagués du lot, sans token ; `sources` : dépôt et commits de
+    base transmis au job Jenkins (cucumber_verify.job_sources). Scénarios invalides ou faibles :
     au plus CUCUMBER_VERIFY_FIX_ATTEMPTS appels de correction (cucumber_client_fix.md), recompilation, revérification
     de ces seuls scénarios ; ceux qui le restent sont retirés vers <client>-cucumber-a-revoir.patch.
     Résultat dans lot["execution"].
@@ -1188,7 +1189,8 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         result = cucumber_verify.not_verified(scenarios, kinds, mode_message)
         print(f"[LOT {label}] ⚪ {len(scenarios)} scénario(s) : {mode_message}.")
     else:
-        result = cucumber_verify.verify_lot(mode, worktree, base, build, files, scenarios, kinds, f"lot{number}")
+        result = cucumber_verify.verify_lot(mode, worktree, base, build, files, scenarios, kinds, f"lot{number}",
+                                            sources)
     builds = list(result["builds"])
     tests = {s["id"]: s.get("tests_std") or [] for s in lot_specs}
     spec_of = {cucumber_verify.scenario_id(s["fichier"], s["titre"]): s["spec"]
@@ -1225,7 +1227,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         if present:
             again = cucumber_verify.verify_lot(mode, worktree, base, build, files,
                                                {t: scenarios[t] for t in present}, kinds,
-                                               f"lot{number}-r{attempt + 1}")
+                                               f"lot{number}-r{attempt + 1}", sources)
             builds += again["builds"]
             result["scenarios"].update(again["scenarios"])
     still_bad = {t: v["motif"] for t, v in result["scenarios"].items() if v["statut"] in ("invalide", "faible")}
@@ -1369,6 +1371,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # Moyen d'exécution des niveaux 2 et 3 (job Jenkins dédié, commande locale, ou aucun)
     verify_mode, verify_message = cucumber_verify.execution_mode()
     print(f"[CUCUMBER] Vérification par exécution : {verify_message}.")
+    # Job Jenkins : même dépôt client et mêmes commits de base que l'exécution locale
+    verify_sources = cucumber_verify.job_sources(
+        args.cucumber_repo, args.cucumber_base_branch, cucumber_tools.rev_parse(worktree, state["base"]),
+        cucumber_tools.rev_parse(local_cucumber_std_repo, "HEAD"))
     fixed_values = {
         "client_name": client, "token_saving_rules": token_saving_rules,
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
@@ -1431,12 +1437,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             add_usage(lot, usage)
             results = cucumber_tools.parse_lot_result(output)
             if returncode != 0 or limit_hit or results is None:
-                lot.update(statut="echec", commit=cucumber_tools.commit_lot(worktree, client, lot["numero"]),
+                # Rien n'est commité : le worktree revient au dernier lot, la reprise repart d'un état propre
+                cucumber_tools.discard_lot(worktree)
+                lot.update(statut="echec", commit=lot.get("commit", False),
                            fin=datetime.now().isoformat(timespec="seconds"),
                            erreur=("quota atteint" if limit_hit else f"code {returncode}" if returncode != 0
                                    else "JSON final absent ou invalide"))
                 cucumber_tools.save_state(client, state)
-                print(f"[LOT {label}] ❌ Échec ({lot['erreur']}) : relancez avec « Reprendre ».")
+                print(f"[LOT {label}] ❌ Échec ({lot['erreur']}) : fichiers du lot annulés, relancez avec « Reprendre ».")
                 exit_code = 1
                 break
             files = cucumber_tools.lot_files(worktree, results)
@@ -1462,7 +1470,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             verify_execution_lot(lot, lot_specs, label, worktree, state["base"], files, results, verify_mode,
                                  verify_message, client, local_cucumber_std_repo, compile_cmd, dry_run_cmd,
                                  {**fixed_values, **java}, model, work_key, run_dir,
-                                 lambda usage: add_usage(lot, usage))
+                                 lambda usage: add_usage(lot, usage), verify_sources)
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         # Commit même en erreur de compilation, pour ne rien perdre
         committed = cucumber_tools.commit_lot(worktree, client, lot["numero"])
@@ -1496,7 +1504,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
 
     # 4. Patch et récapitulatif, produits en Python
     patch_file = cucumber_tools.patch_path(client)
-    if cucumber_tools.write_patch(worktree, state["base"], patch_file):
+    if cucumber_tools.write_patch(worktree, state["base"], patch_file, client):
         print(f"\n[CUCUMBER] Patch généré : {patch_file}")
     else:
         print("\n[CUCUMBER] Aucun test écrit : pas de patch.")
