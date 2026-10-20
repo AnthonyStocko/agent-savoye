@@ -6,7 +6,7 @@ import time
 import streamlit as st
 from dotenv import load_dotenv, set_key
 
-from tools import cucumber_tools, integration_tools
+from tools import cucumber_tools, cucumber_verify, integration_tools
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -958,19 +958,34 @@ with tab_cucumber:
                     f"{counts['partiel']} partiel(s) · {counts['deja_couvert']} déjà couvert(s)")
         table = [{"Traiter": s["couverture"] in ("non_couvert", "partiel"), "Spécifique": s["libelle"],
                   "Type": s["type"], "Fichiers": s["nb_fichiers"], "Couverture": s["couverture"],
-                  "Jira": bool(s.get("jira")), "id": s["id"]} for s in specs]
+                  "Tests Standard liés": len(s.get("tests_std") or []), "Jira": bool(s.get("jira")), "id": s["id"]}
+                 for s in specs]
         edited = st.data_editor(
             table, key=f"cucumber_selection_{cucumber_client}_{inventory['genere_le']}", hide_index=True,
             width="stretch", height=320,
-            disabled=["Spécifique", "Type", "Fichiers", "Couverture", "Jira", "id"],
+            disabled=["Spécifique", "Type", "Fichiers", "Couverture", "Tests Standard liés", "Jira", "id"],
             column_config={
                 "Traiter": st.column_config.CheckboxColumn("Traiter", width="small"),
                 "Fichiers": st.column_config.NumberColumn("Fichiers", width="small"),
+                "Tests Standard liés": st.column_config.NumberColumn(
+                    "Tests Standard liés", width="small",
+                    help="Features du Cucumber Standard rapprochées du spécifique (au plus 3, score ≥ "
+                         "CUCUMBER_STD_MATCH_MIN), dont l'agent part pour écrire ses tests. 0 = aucun équivalent."),
                 "Jira": st.column_config.CheckboxColumn("Jira", width="small", help="Tickets Jira associés"),
                 "id": st.column_config.TextColumn("id", width="small"),
             },
         )
         selected_ids = [row["id"] for row in edited if row["Traiter"]]
+        linked = sum(1 for s in specs if s.get("tests_std"))
+        with st.expander(f"Tests Standard liés : {linked}/{len(specs)} spécifique(s) avec au moins un équivalent"):
+            for s in specs:
+                tests = s.get("tests_std") or []
+                if not tests:
+                    st.markdown(f"- **{s['libelle']}** : :gray[aucun test Standard équivalent]")
+                    continue
+                st.markdown(f"- **{s['libelle']}**\n" + "\n".join(
+                    f"    - `{t['path'].split('features/', 1)[-1]}` — {t['feature']} :gray[(score {t['score']}, "
+                    f"{t['raison']})]" for t in tests))
         batch_size = max(1, env_int("CUCUMBER_BATCH_SIZE", 3))
         lot_count = -(-len(selected_ids) // batch_size)
         average = cucumber_tools.lot_cost_average(os.path.join(".tmp", "token_usage.csv"))
@@ -1018,16 +1033,98 @@ with tab_cucumber:
             tokens = lot.get("tokens") or {}
             total_tokens = sum(v for k, v in tokens.items() if k != "cout_usd" and isinstance(v, (int, float)))
             results = lot.get("resultats") or []
+            indicators = cucumber_tools.lot_indicators(lot)
             lot_rows.append({
                 "Lot": lot["numero"], "Statut": lot.get("statut", ""), "Spécifiques": len(lot["ids"]),
                 "Couverts": sum(1 for r in results if r.get("statut") == "couvert"),
+                "Scénarios": indicators.get("scenarios"),
+                "Steps Standard (%)": indicators.get("reutilisation"),
+                "Steps créés": indicators.get("steps_crees"),
+                "Signalés": indicators.get("signales"), "Supprimés": indicators.get("supprimes"),
                 "Tokens": total_tokens or None,
                 "Coût ($)": round(tokens["cout_usd"], 3) if isinstance(tokens.get("cout_usd"), (int, float)) else None,
                 "Erreur": lot.get("erreur", ""),
             })
         with st.expander(f"Lots de la dernière génération ({sum(1 for r in lot_rows if r['Statut'] == 'termine')}"
                          f"/{len(lot_rows)} terminés)", expanded=bool(pending)):
-            st.dataframe(lot_rows, hide_index=True, width="stretch")
+            controlled = [cucumber_tools.lot_indicators(lot) for lot in cucumber_state["lots"]]
+            controlled = [c for c in controlled if c]
+            std_steps = sum(c["steps_std"] for c in controlled)
+            all_steps = sum(c["steps_std"] + c["steps_client"] + c["non_definis"] for c in controlled)
+            if controlled:
+                st.caption(f"{sum(c['scenarios'] for c in controlled)} scénario(s) contrôlé(s) · réutilisation des "
+                           f"steps Standard : {round(100 * std_steps / all_steps) if all_steps else '—'} % · "
+                           f"{sum(c['signales'] for c in controlled)} signalé(s), "
+                           f"{sum(c['supprimes'] for c in controlled)} supprimé(s) à la revue")
+            st.dataframe(lot_rows, hide_index=True, width="stretch", column_config={
+                "Steps Standard (%)": st.column_config.NumberColumn(
+                    "Steps Standard (%)", help="Part des steps des nouveaux scénarios définis par le Cucumber Standard"),
+                "Signalés": st.column_config.NumberColumn(
+                    "Signalés", help="Scénarios signalés par les contrôles (doublon, sans assertion métier, "
+                                     "différence ou source absente), envoyés à la revue"),
+            })
+
+    # 3. Vérification par exécution et revue humaine des scénarios
+    verified_rows = cucumber_verify.scenario_rows(cucumber_state) if cucumber_state.get("lots") else []
+    if verified_rows:
+        indicators = cucumber_verify.verification_indicators(cucumber_state)
+        st.markdown("#### :material/fact_check: Vérification des scénarios")
+        if not indicators["verifies"]:
+            message = next((lot["execution"]["message"] for lot in cucumber_state["lots"] if lot.get("execution")), "")
+            st.warning(f"**Pertinence non vérifiée par exécution** : {message or 'aucun moyen d’exécution configuré'}. "
+                       "Configurez CUCUMBER_VERIFY_JOB ou CUCUMBER_VERIFY_LOCAL_CMD (onglet Configuration).",
+                       icon=":material/help:")
+        else:
+            def pct(value):
+                return "—" if value is None else f"{value} %"
+            st.caption(f"Pertinents : {pct(indicators['taux_pertinent'])} des {indicators['verifies']} vérifié(s) · "
+                       f"mutations détectées : {pct(indicators['taux_mutation'])} · overrides en échec sur le "
+                       f"Standard : {pct(indicators['taux_echec_standard'])} · {indicators['retires']} retiré(s) vers "
+                       f"le patch à revoir · validation humaine : {pct(indicators['taux_validation_humaine'])}")
+        st.dataframe([{k: v for k, v in row.items() if k != "tag"} for row in verified_rows], hide_index=True,
+                     width="stretch", column_config={
+                         "Build": st.column_config.LinkColumn("Build", display_text="Jenkins"),
+                         "Statut": st.column_config.TextColumn(
+                             "Statut", help="pertinent : passe sur le client, échoue sur le Standard (override) et "
+                                            "mutation détectée ; faible : mutation non détectée ou passe sur le "
+                                            "Standard ; invalide : échoue sur le client ; non_verifie : pas "
+                                            "d'exécution (jamais compté pertinent)"),
+                         "Client": st.column_config.TextColumn("Client", width="small"),
+                         "Standard": st.column_config.TextColumn("Standard", width="small"),
+                         "Mutation": st.column_config.TextColumn("Mutation", width="small"),
+                         "Statique": st.column_config.TextColumn("Statique", width="small"),
+                     })
+        sample = cucumber_verify.review_sample(cucumber_state)
+        if sample:
+            with st.expander(f"Revue humaine : échantillon de {len(sample)} scénario(s) pertinent(s)", expanded=True):
+                by_tag = {row["tag"]: row for row in verified_rows}
+                for item in sample:
+                    row = by_tag.get(item["tag"], {})
+                    with st.container(border=True):
+                        st.markdown(f"**{row.get('Scénario', item['id'])}** :gray[(lot {item['lot']}, {item['tag']})]")
+                        st.caption(f"Différence avec le Standard : {row.get('Différence avec le Standard') or '—'} · "
+                                   f"Source : {row.get('Source') or '—'} · "
+                                   f"Inspiré de : {row.get('Inspiré du Standard') or '—'}")
+                        verdict = (cucumber_state.get("verdicts") or {}).get(item["tag"])
+                        if verdict:
+                            st.markdown(f":gray[Verdict : **{verdict['verdict'].replace('_', ' ')}**"
+                                        + (f" — {verdict['motif']}" if verdict.get("motif") else "") + "]")
+                        with st.container(horizontal=True, vertical_alignment="bottom"):
+                            reason = st.text_input("Motif", key=f"verdict_motif_{item['tag']}",
+                                                   placeholder="Obligatoire si non pertinent")
+                            if st.button("Pertinent", key=f"verdict_ok_{item['tag']}", icon=":material/thumb_up:"):
+                                cucumber_verify.record_verdict(cucumber_client, cucumber_state, item, "pertinent",
+                                                               reason)
+                                cucumber_tools.save_state(cucumber_client, cucumber_state)
+                                st.rerun()
+                            if st.button("Non pertinent", key=f"verdict_ko_{item['tag']}",
+                                         icon=":material/thumb_down:", disabled=not reason.strip()):
+                                cucumber_verify.record_verdict(cucumber_client, cucumber_state, item,
+                                                               "non_pertinent", reason)
+                                cucumber_tools.save_state(cucumber_client, cucumber_state)
+                                st.rerun()
+                st.caption("Un verdict « Non pertinent » et son motif deviennent une consigne du projet, injectée "
+                           "dans les lots des prochaines générations.")
 
     # Derniers livrables du client (affichés aussi après un rechargement de la page)
     if cucumber_client and os.path.exists(cucumber_tools.patch_path(cucumber_client)):
@@ -1039,6 +1136,12 @@ with tab_cucumber:
             with open(patch_file, "rb") as f:
                 st.download_button("Télécharger le patch", f.read(), file_name=os.path.basename(patch_file),
                                    mime="text/x-diff", icon=":material/download:")
+            review_patch = cucumber_verify.a_revoir_path(cucumber_client)
+            if os.path.exists(review_patch):
+                with open(review_patch, "rb") as f:
+                    st.download_button("Scénarios retirés à revoir (patch séparé, avec leur motif)", f.read(),
+                                       file_name=os.path.basename(review_patch), mime="text/x-diff",
+                                       icon=":material/rule:")
             if os.path.exists(coverage_file):
                 with st.expander("Récapitulatif de couverture"):
                     with open(coverage_file, "r", encoding="utf-8", errors="replace") as f:
@@ -1296,6 +1399,92 @@ with tab_config:
             "CUCUMBER_PARAM_GLOBS", value=os.getenv("CUCUMBER_PARAM_GLOBS", ""),
             placeholder="Vide = *.properties, *i18n*, *messages*, *.sql, *param*.xml, *parameter*, *.csv",
             help="Motifs des fichiers classés « parametrage » (paramètres et messages).")
+        try:
+            match_min = float(os.getenv("CUCUMBER_STD_MATCH_MIN", "").strip() or cucumber_tools.DEFAULT_STD_MATCH_MIN)
+        except ValueError:
+            match_min = cucumber_tools.DEFAULT_STD_MATCH_MIN
+        env_values["CUCUMBER_STD_MATCH_MIN"] = str(st.number_input(
+            "CUCUMBER_STD_MATCH_MIN", min_value=0.0, max_value=1.0, step=0.05, value=match_min,
+            help="Score minimal d'une feature du Cucumber Standard pour être rapprochée d'un spécifique (au plus 3, "
+                 "dont l'agent part pour écrire ses tests). Plus haut = moins de rapprochements, plus sûrs. Pris en "
+                 "compte au prochain inventaire."))
+        try:
+            dup_threshold = float(os.getenv("CUCUMBER_DUP_THRESHOLD", "").strip()
+                                  or cucumber_verify.DEFAULT_DUP_THRESHOLD)
+        except ValueError:
+            dup_threshold = cucumber_verify.DEFAULT_DUP_THRESHOLD
+        with st.container(horizontal=True):
+            dup_value = st.number_input(
+                "CUCUMBER_DUP_THRESHOLD", min_value=0.5, max_value=1.0, step=0.05, value=dup_threshold,
+                help="Similarité (titre ou steps) au-delà de laquelle un scénario généré est signalé comme doublon "
+                     "d'un scénario Standard ou client, puis envoyé à la revue.")
+            review_turns = st.number_input(
+                "CUCUMBER_REVIEW_MAX_TURNS", min_value=3, step=1, value=env_int("CUCUMBER_REVIEW_MAX_TURNS", 8),
+                help="Nombre maximal de tours de l'appel de revue des scénarios signalés d'un lot (--max-turns).")
+        env_values["CUCUMBER_DUP_THRESHOLD"] = str(dup_value)
+        env_values["CUCUMBER_REVIEW_MAX_TURNS"] = str(int(review_turns))
+        env_values["CUCUMBER_COMPILE_CMD"] = st.text_input(
+            "CUCUMBER_COMPILE_CMD", value=os.getenv("CUCUMBER_COMPILE_CMD", cucumber_tools.DEFAULT_COMPILE_CMD),
+            placeholder="Vide = pas de compilation",
+            help="Commande de compilation lancée après chaque lot (en Python, sans token). Dépôt client sans pom.xml : "
+                 "compilé par-dessus une copie du Cucumber Standard. Hors ligne (-o) en échec faute de dépendances : "
+                 "relancée une fois en ligne.")
+        with st.container(horizontal=True):
+            fix_attempts = st.number_input(
+                "CUCUMBER_FIX_ATTEMPTS", min_value=0, step=1, value=env_int("CUCUMBER_FIX_ATTEMPTS", 2),
+                help="Appels de correction au plus par lot si la compilation échoue (0 = aucun).")
+            fix_turns = st.number_input(
+                "CUCUMBER_FIX_MAX_TURNS", min_value=3, step=1, value=env_int("CUCUMBER_FIX_MAX_TURNS", 10),
+                help="Nombre maximal de tours de l'agent par appel de correction (--max-turns).")
+        env_values["CUCUMBER_FIX_ATTEMPTS"] = str(int(fix_attempts))
+        env_values["CUCUMBER_FIX_MAX_TURNS"] = str(int(fix_turns))
+        dry_run = st.checkbox(
+            "CUCUMBER_DRY_RUN", value=os.getenv("CUCUMBER_DRY_RUN", "").strip() == "1",
+            help="Après une compilation réussie, dry-run Cucumber des features du lot : vérifie que chaque step a "
+                 "une définition (mvn test -Dcucumber.execution.dry-run=true), sans rien exécuter.")
+        env_values["CUCUMBER_DRY_RUN"] = "1" if dry_run else "0"
+        st.markdown("##### Vérification de la pertinence par exécution")
+        st.caption("Sans job ni commande locale, la génération s'arrête au contrôle statique et affiche « pertinence "
+                   "non vérifiée par exécution ».")
+        env_values["CUCUMBER_VERIFY_JOB"] = st.text_input(
+            "CUCUMBER_VERIFY_JOB", value=os.getenv("CUCUMBER_VERIFY_JOB", ""),
+            placeholder="Vide = pas de job (ex. CUCUMBER-VERIFY-PATCH)",
+            help="Job Jenkins dédié acceptant PATCH (fichier .patch du lot), TAGS et ENV, et archivant le rapport "
+                 "Cucumber JSON. Ses paramètres sont vérifiés avant chaque génération : aucun push n'est fait.")
+        with st.container(horizontal=True):
+            env_values["CUCUMBER_VERIFY_ENV"] = st.text_input(
+                "CUCUMBER_VERIFY_ENV", value=os.getenv("CUCUMBER_VERIFY_ENV", ""),
+                help="Environnement client (paramètre ENV du job, {env} de la commande locale).")
+            env_values["CUCUMBER_VERIFY_ENV_STD"] = st.text_input(
+                "CUCUMBER_VERIFY_ENV_STD", value=os.getenv("CUCUMBER_VERIFY_ENV_STD", ""),
+                help="Environnement Standard de même version, pour la contre-épreuve des overrides (vide = pas de "
+                     "contre-épreuve Standard).")
+        env_values["CUCUMBER_VERIFY_LOCAL_CMD"] = st.text_input(
+            "CUCUMBER_VERIFY_LOCAL_CMD", value=os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", ""),
+            placeholder='mvn -q test "-Dcucumber.filter.tags={tags}" -Denv={env}',
+            help="Repli local (si pas de job) : commande lancée dans le dossier de compilation ; {tags} et {env} "
+                 "sont remplacés ; le rapport target/**/cucumber*.json est lu.")
+        with st.container(horizontal=True):
+            verify_timeout = st.number_input(
+                "CUCUMBER_VERIFY_TIMEOUT", min_value=60, step=60, value=env_int("CUCUMBER_VERIFY_TIMEOUT", 3600),
+                help="Durée maximale d'une exécution (build Jenkins ou commande locale), en secondes.")
+            verify_fixes = st.number_input(
+                "CUCUMBER_VERIFY_FIX_ATTEMPTS", min_value=0, step=1, value=env_int("CUCUMBER_VERIFY_FIX_ATTEMPTS", 1),
+                help="Appels de correction par lot pour les scénarios invalides ou faibles, avant leur retrait.")
+            review_sample = st.number_input(
+                "CUCUMBER_REVIEW_SAMPLE", min_value=0, step=1, value=env_int("CUCUMBER_REVIEW_SAMPLE", 5),
+                help="Scénarios « pertinent » tirés au hasard pour la revue humaine de l'onglet Cucumber.")
+        env_values["CUCUMBER_VERIFY_TIMEOUT"] = str(int(verify_timeout))
+        env_values["CUCUMBER_VERIFY_FIX_ATTEMPTS"] = str(int(verify_fixes))
+        env_values["CUCUMBER_REVIEW_SAMPLE"] = str(int(review_sample))
+        jacoco = st.checkbox(
+            "CUCUMBER_JACOCO", value=os.getenv("CUCUMBER_JACOCO", "").strip() == "1",
+            help="Environnement client lancé avec l'agent JaCoCo : part des classes de chaque spécifique exécutées "
+                 "(jacoco.exec archivé par le job, ou CUCUMBER_JACOCO_EXEC en local).")
+        env_values["CUCUMBER_JACOCO"] = "1" if jacoco else "0"
+        env_values["CUCUMBER_JACOCO_EXEC"] = st.text_input(
+            "CUCUMBER_JACOCO_EXEC", value=os.getenv("CUCUMBER_JACOCO_EXEC", ""),
+            help="Mode local : chemin du jacoco.exec produit par l'environnement client.")
 
         st.markdown("---")
         st.markdown("#### 🔔 Post-merge Cucumber & écoute des merges")

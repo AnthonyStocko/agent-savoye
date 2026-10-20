@@ -125,6 +125,10 @@ def load_inventory(client_name: str) -> dict:
     return _read_json(inventory_path(client_name), {}) or {}
 
 
+def save_inventory(client_name: str, inventory: dict) -> None:
+    _write_json(inventory_path(client_name), inventory)
+
+
 def load_state(client_name: str) -> dict:
     return _read_json(state_path(client_name), {}) or {}
 
@@ -621,6 +625,316 @@ def match_coverage(inventory: dict, catalogue: dict) -> None:
         spec["scenarios_existants"] = [f"{path} ({title})" for score, path, title in scored[:5] if score >= 0.3]
 
 
+# ---------------------------------------------------------------------------
+# Tests Standard équivalents à chaque spécifique
+# ---------------------------------------------------------------------------
+
+# À incrémenter quand le format de l'index change : invalide le cache
+STD_TESTS_FORMAT = 1
+DEFAULT_STD_MATCH_MIN = 0.4
+MAX_STD_TESTS = 3
+# Somme d'idf donnant l'évidence maximale des mots-clés : deux mots présents dans moins d'une feature sur dix
+KEYWORD_EVIDENCE = 5.0
+MAX_EXTRACT_LINES = 150
+_GHERKIN_STEP = re.compile(r"^\s*(?:Given|When|Then|And|But|\*|Soit|Sachant que|[EÉ]tant donn[ée]e?s?|Quand|Lorsque|"
+                           r"Alors|Et|Mais)\s+(.+?)\s*$")
+_GHERKIN_BLOCK = re.compile(r"^\s*(Background|Contexte|Scenario Outline|Scenario Template|Scenario|Example|"
+                            r"Plan du [Ss]cénario|Scénario|Exemple)\s*:", re.I)
+# Suffixes et préfixes techniques retirés du nom d'une classe overridée pour retrouver son objet métier
+_CLASS_NOISE = re.compile(r"^(Spec|Abstract|Default)|(ServiceImpl|Service|Impl|UiRest|Rest|Action|Manager|Repository|"
+                          r"Helper|Controller|Validator|Builder|Mapper|V\d+(_\d+)*)+$")
+
+
+def _norm(text: str) -> str:
+    """Texte réduit à ses lettres et chiffres, en minuscules (recherche d'un nom collé : handlingunitdeclarative)."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _expression_regex(expr: str):
+    """Regex d'une expression de step (Cucumber expression ou regex ^...$), ou None si elle ne compile pas."""
+    if expr.startswith("^") or expr.endswith("$"):
+        pattern = expr.replace("\\\\", "\\")
+    else:
+        pattern = re.escape(expr.replace("\\\\", "\\"))
+        pattern = re.sub(r"\\\{(string)\\\}", r"(?:\"[^\"]*\"|'[^']*')", pattern)
+        pattern = re.sub(r"\\\{(int|long|short|byte|biginteger)\\\}", r"-?\\d+", pattern)
+        pattern = re.sub(r"\\\{(float|double|bigdecimal)\\\}", r"-?[\\d.,]+", pattern)
+        pattern = re.sub(r"\\\{word\\\}", r"\\S+", pattern)
+        pattern = re.sub(r"\\\{[^}]*\\\}", r".*", pattern)
+        pattern = re.sub(r"\\\(([^()]*)\\\)", r"(?:\1)?", pattern)  # texte optionnel : step(s)
+        pattern = re.sub(r"(\w+)/(\w+)", r"(?:\1|\2)", pattern)    # alternative : a/b
+    try:
+        return re.compile(f"^{pattern.strip('^$')}$")
+    except re.error:
+        return None
+
+
+def _step_class_vocabulary(cucumber_std_dir: str, step_files: set) -> dict:
+    """
+    Vocabulaire anglais de chaque classe Step Definitions : son nom, les classes cucumber.* qu'elle importe
+    (endpoints, POJO) et les chemins REST de ses endpoints. Fait le pont avec les noms Java des spécifiques.
+    """
+    tree = ls_tree(cucumber_std_dir, "HEAD")
+    texts = blob_texts(cucumber_std_dir, [tree[f] for f in step_files if f in tree])
+    step_texts = {f: texts.get(tree.get(f), "") for f in step_files}
+    imports = {f: re.findall(r"^import\s+(cucumber\.[\w.]+)\s*;", t, re.M) for f, t in step_texts.items()}
+    endpoint_paths = {i: "src/test/java/" + i.replace(".", "/") + ".java" for v in imports.values() for i in v
+                      if ".endPoints." in i or ".endpoints." in i}
+    endpoint_texts = blob_texts(cucumber_std_dir, [tree[p] for p in endpoint_paths.values() if p in tree])
+    vocabulary = {}
+    for f in step_files:
+        package = f.rsplit("/", 1)[0].split("src/test/java/", 1)[-1].replace("/", ".")
+        parts = [f.rsplit("/", 1)[-1][:-5]] + [i.rsplit(".", 1)[-1] for i in imports.get(f, [])]
+        for i in imports.get(f, []):
+            text = endpoint_texts.get(tree.get(endpoint_paths.get(i, "")), "")
+            parts += [s for s in re.findall(r'"([A-Za-z][\w./-]*/[\w./{}-]*)"', text)]
+        vocabulary[f] = {"package": package, "domain": package.rsplit(".", 1)[-1], "text": " ".join(parts)}
+    return vocabulary
+
+
+def std_test_index(cucumber_std_dir: str, odatio_version: str) -> dict:
+    """
+    Index des tests du Cucumber Standard pour le rapprochement (en cache par version Odatio et HEAD, comme le
+    catalogue) : par feature, ses mots (texte, données, vocabulaire des Step Definitions utilisées), ses domaines
+    dominants et ses Step Definitions ; domaines connus (packages des Step Definitions).
+    """
+    version = re.sub(r"[^\w.-]", "_", odatio_version or "inconnue")
+    head = rev_parse(cucumber_std_dir, "HEAD")
+    cache_file = os.path.join(STD_CACHE_DIR, f"tests_std_{version}.json")
+    cached = _read_json(cache_file, {}) or {}
+    if cached.get("head") == head and cached.get("format") == STD_TESTS_FORMAT:
+        return cached
+    catalogue = extract_cucumber(cucumber_std_dir, "HEAD")
+    by_prefix = {}
+    for step in catalogue["steps"]:
+        regex = _expression_regex(step["expr"])
+        if regex:
+            by_prefix.setdefault(_step_prefix(step["expr"]), []).append((regex, step["file"]))
+    tree = ls_tree(cucumber_std_dir, "HEAD")
+    texts = blob_texts(cucumber_std_dir, [tree[f["path"]] for f in catalogue["features"] if f["path"] in tree])
+    usage = {}
+    for feature in catalogue["features"]:
+        counts = {}
+        for line in texts.get(tree.get(feature["path"]), "").splitlines():
+            match = _GHERKIN_STEP.match(line)
+            if not match:
+                continue
+            step = match.group(1)
+            for regex, file in by_prefix.get(_step_prefix(step), []) + by_prefix.get("(sans préfixe)", []):
+                if regex.match(step):
+                    counts[file] = counts.get(file, 0) + 1
+                    break
+        usage[feature["path"]] = counts
+    vocabulary = _step_class_vocabulary(cucumber_std_dir, {f for c in usage.values() for f in c})
+    root = _most_common(v["package"].rsplit(".", 1)[0] for v in vocabulary.values())
+    features = []
+    for feature in catalogue["features"]:
+        text = texts.get(tree.get(feature["path"]), "")
+        counts = usage[feature["path"]]
+        steps_text = " ".join(vocabulary[f]["text"] for f in counts)
+        # Domaines dominants : packages de Step Definitions (hors racine commune) d'au moins 25 % des steps
+        domains = {}
+        for file, n in counts.items():
+            if vocabulary[file]["package"] != root:
+                domains[vocabulary[file]["domain"]] = domains.get(vocabulary[file]["domain"], 0) + n
+        total = sum(domains.values())
+        features.append({
+            "path": feature["path"], "feature": feature["feature"], "scenarios": feature["scenarios"],
+            "tags": feature["tags"], "lines": text.count("\n") + 1,
+            "words": sorted(set(_words(f"{feature['path']} {text} {steps_text}"))),
+            "norm": _norm(f"{feature['path']} {text} {steps_text}"),
+            "domains": sorted(d for d, n in domains.items() if total and n / total >= 0.25),
+            "step_definitions": [f for f, _ in sorted(counts.items(), key=lambda kv: -kv[1])],
+        })
+    index = {"head": head, "format": STD_TESTS_FORMAT, "version": odatio_version, "features": features,
+             "domains": sorted({v["domain"] for v in vocabulary.values() if v["package"] != root})}
+    _write_json(cache_file, index)
+    return index
+
+
+def _spec_name(name: str, client_name: str) -> str:
+    """Nom collé sans le préfixe spec ni le nom du client (specdeclarativecubing -> declarativecubing)."""
+    name = _norm(name)
+    for noise in (_norm(client_name), "spec"):
+        name = name.replace(noise, "") if noise else name
+    return name
+
+
+def _override_targets(spec: dict, client_name: str = "") -> list:
+    """
+    Noms collés de ce que le spécifique teste ou remplace : objet métier ou processus (dernier segment de son
+    dossier), processus Studio overridé, classes Java du Standard overridées.
+    """
+    parts = spec["dossier"].rsplit("/", 1)[-1].split("-")
+    targets = [_spec_name(parts[-1], client_name)]
+    if spec["nature"] == "processus":
+        targets.append(_spec_name("".join(parts[-2:]), client_name))
+    for f in spec["fichiers"]:
+        if f.get("kind") == "override" and ":" in f.get("standard", "") and f["path"].endswith(".java"):
+            name = f["standard"].rsplit("/", 1)[-1][:-5]
+            targets.append(_norm(_CLASS_NOISE.sub("", _CLASS_NOISE.sub("", name))))
+    return [t for t in dict.fromkeys(targets) if len(t) >= 6 and t not in _TECHNICAL_WORDS]
+
+
+# Mots techniques des noms Java / Studio, sans valeur pour rapprocher un test
+_TECHNICAL_WORDS = {"datautil", "datamodel", "transition", "transitions", "action", "load", "executor", "initializer",
+                    "listener", "event", "variable", "input", "output", "info", "request", "save", "manage", "check",
+                    "create", "from", "send", "handler", "interactive", "found", "after", "before", "with", "without",
+                    "into", "when", "then", "process"}
+
+
+def _segment(word: str, vocabulary: set) -> list:
+    """Découpe un nom collé en mots connus du Standard (handlingunitdeclarative -> handling unit declarative)."""
+    best = {0: []}
+    for end in range(1, len(word) + 1):
+        for start in range(max(0, end - 20), end - 3):
+            if start in best and word[start:end] in vocabulary and (end not in best or
+                                                                    len(best[start]) + 1 < len(best[end])):
+                best[end] = best[start] + [word[start:end]]
+    return best.get(len(word), [])
+
+
+def related_std_tests(spec: dict, catalogue: dict, java_std: list = None, min_score: float = None,
+                      client_name: str = "") -> list:
+    """
+    Features du Standard les plus proches d'un spécifique (au plus 3, score >= CUCUMBER_STD_MATCH_MIN), `catalogue`
+    étant l'index std_test_index. Score sur 1 : 0,6 x évidence des mots-clés trouvés dans la feature et ses Step
+    Definitions (somme de leurs idf / KEYWORD_EVIDENCE, plafonnée à 1), + jusqu'à 0,3 si l'objet métier ou l'élément
+    overridé y est nommé (selon sa rareté), + 0,1 si même domaine. `java_std` : domaines (défaut catalogue["domains"]).
+    """
+    if min_score is None:
+        try:
+            min_score = float(os.getenv("CUCUMBER_STD_MATCH_MIN", "").strip() or DEFAULT_STD_MATCH_MIN)
+        except ValueError:
+            min_score = DEFAULT_STD_MATCH_MIN
+    features = catalogue["features"]
+    for feature in features:
+        feature.setdefault("words_set", set(feature["words"]))
+    keywords = [k for k in dict.fromkeys(_spec_name(k, client_name) if len(k) >= 8 else k for k in spec["mots_cles"])
+                if len(k) >= 4 and k not in _TECHNICAL_WORDS]
+
+    if "vocabulary" not in catalogue:
+        catalogue["vocabulary"] = {w for f in features for w in f["words_set"]}
+    targets = _override_targets(spec, client_name)
+    expanded = []
+    for k in keywords:
+        # Nom collé absent du Standard : remplacé par ses mots connus
+        parts = _segment(k, catalogue["vocabulary"]) if len(k) >= 8 and k not in catalogue["vocabulary"] else []
+        expanded += [p for p in parts if p not in _TECHNICAL_WORDS] if len(parts) >= 2 else [k]
+    keywords = list(dict.fromkeys(expanded))
+
+    def compound(k):
+        # Nom collé fait d'autres mots-clés (activityreport = activity + report) : déjà compté par ses parties
+        rest = k
+        for other in sorted((o for o in keywords if o != k and o in k), key=len, reverse=True):
+            rest = rest.replace(other, "")
+        return len(k) >= 8 and len(rest) < 3
+    # Cibles (objet métier, élément overridé) comptées par leur propre bonus
+    keywords = [k for k in keywords if not compound(k) and k not in targets]
+    # Mot-clé présent : mot de la feature, ou nom collé (8 caractères et plus) dans son texte réduit
+    hits = {k: {i for i, f in enumerate(features) if k in f["words_set"] or (len(k) >= 8 and k in f["norm"])}
+            for k in keywords}
+    weights = {k: math.log((1 + len(features)) / len(found)) for k, found in hits.items() if found}
+    # Bonus de cible pondéré par sa rareté : preparationorder, présent partout, ne désigne aucun test en particulier
+    target_hits = {t: [i for i, f in enumerate(features) if t in f["norm"]] for t in targets}
+    target_bonus = {t: 0.3 * min(1.0, math.log((1 + len(features)) / len(found)) / 3) for t, found in
+                    target_hits.items() if found}
+    spec_text = _norm(" ".join([spec["depot"], spec["dossier"]] + [f["path"] for f in spec["fichiers"][:10]]))
+    domains = [d for d in (java_std or catalogue["domains"]) if len(d) >= 5 and _norm(d) in spec_text]
+    scored = []
+    for i, feature in enumerate(features):
+        found = [k for k in keywords if k in weights and i in hits[k]]
+        target = max((t for t in target_bonus if i in target_hits[t]), key=target_bonus.get, default="")
+        domain = next((d for d in domains if d in feature["domains"]), "")
+        # Évidence absolue : des mots génériques (preparation, unit, status...) ne suffisent jamais seuls
+        evidence = min(1.0, sum(weights[k] for k in found) / KEYWORD_EVIDENCE)
+        score = 0.6 * evidence + (target_bonus[target] if target else 0) + (0.1 if domain else 0)
+        if score >= min_score and (found or target):
+            reasons = ([f"mots-clés {', '.join(found)}"] if found else []) + (
+                [f"cible {target}"] if target else []) + ([f"domaine {domain}"] if domain else [])
+            # Départage : Step Definitions principales de la feature portant la cible ou un mot-clé (le cas testé
+            # est le sujet de la feature, pas une étape de mise en place)
+            terms = [t for t in [target] + found if len(t) >= 6]
+            focus = sum(1 for f in feature["step_definitions"][:3] if any(t in _norm(f.rsplit("/", 1)[-1])
+                                                                          for t in terms))
+            scored.append((round(score, 2), focus, len(found), -feature["lines"], feature, " ; ".join(reasons),
+                           found + [target]))
+    scored.sort(key=lambda s: s[:4], reverse=True)
+    # Une feature par dossier d'abord (variantes TOW-551-2/-3/-4 d'un même cas), complétée si besoin
+    folders, kept = set(), []
+    for entry in scored:
+        folder = entry[4]["path"].rsplit("/", 1)[0]
+        if folder not in folders and len(kept) < MAX_STD_TESTS:
+            folders.add(folder)
+            kept.append(entry)
+    kept += [e for e in scored if e not in kept][:MAX_STD_TESTS - len(kept)]
+    kept.sort(key=lambda s: s[:4], reverse=True)
+    return [{"path": f["path"], "feature": f["feature"], "scenarios": f["scenarios"], "score": score,
+             "raison": reason, "step_definitions": f["step_definitions"][:6], "_match": [m for m in match if m]}
+            for score, _, _, _, f, reason, match in kept]
+
+
+def _gherkin_extract(text: str, matches: list, max_lines: int = MAX_EXTRACT_LINES) -> str:
+    """
+    Feature bornée : entière si courte ; sinon en-tête, Background et scénarios dont le nom (à défaut le corps)
+    contient un mot-clé, dans la limite de `max_lines` lignes.
+    """
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    starts = [i for i, line in enumerate(lines) if _GHERKIN_BLOCK.match(line)]
+    if not starts:
+        return "\n".join(lines[:max_lines]) + "\n# … feature tronquée\n"
+    # Un bloc commence à ses tags et commentaires immédiatement au-dessus
+    bounds = []
+    for n, start in enumerate(starts):
+        begin = start
+        while begin > (starts[n - 1] + 1 if n else 0) and lines[begin - 1].strip().startswith(("@", "#")):
+            begin -= 1
+        bounds.append(begin)
+    blocks = [(lines[bounds[n]:bounds[n + 1] if n + 1 < len(bounds) else len(lines)]) for n in range(len(bounds))]
+    header, kept = lines[:bounds[0]], []
+    terms = [_norm(m) for m in matches if m]
+
+    def hit(block, whole):
+        target = _norm(" ".join(block) if whole else block[next(i for i, l in enumerate(block)
+                                                                  if _GHERKIN_BLOCK.match(l))])
+        return any(t in target for t in terms)
+    background = [b for b in blocks if re.match(r"^\s*(Background|Contexte)\s*:", "\n".join(
+        l for l in b if _GHERKIN_BLOCK.match(l)), re.I)]
+    scenarios = [b for b in blocks if b not in background]
+    selected = [b for b in scenarios if hit(b, False)] or [b for b in scenarios if hit(b, True)] or scenarios[:1]
+    budget = max_lines - len(header) - sum(len(b) for b in background)
+    for block in selected:
+        if len(block) <= budget or not kept:
+            kept.append(block[:max(budget, 20)])
+            budget -= len(block)
+    omitted = len(scenarios) - len(kept)
+    # Borne stricte, ligne d'avertissement comprise (Background très long, premier scénario tronqué)
+    out = (header + [l for b in background for l in b] + [l for b in kept for l in b])[:max_lines - 1]
+    out.append(f"# … extrait borné à {max_lines} lignes" + (f" : {omitted} autre(s) scénario(s) omis" if omitted
+                                                           else ""))
+    return "\n".join(out) + "\n"
+
+
+def attach_std_tests(inventory: dict, cucumber_std_dir: str, odatio_version: str) -> None:
+    """spec["tests_std"] de chaque spécifique, et extraits bornés des features retenues dans <client>/std/."""
+    index = std_test_index(cucumber_std_dir, odatio_version)
+    directory = os.path.join(cache_dir(inventory["client"]), "std")
+    shutil.rmtree(directory, ignore_errors=True)
+    tree = ls_tree(cucumber_std_dir, "HEAD")
+    for spec in inventory["specifiques"]:
+        tests = related_std_tests(spec, index, client_name=inventory["client"])
+        texts = blob_texts(cucumber_std_dir, [tree[t["path"]] for t in tests if t["path"] in tree])
+        for test in tests:
+            relative = test["path"].split("features/", 1)[-1]
+            # Un extrait par spécifique : le choix des scénarios dépend de ses mots-clés
+            target = os.path.join(directory, spec["id"], *relative.split("/"))
+            _write_text(target, _gherkin_extract(texts.get(tree.get(test["path"]), ""), test.pop("_match")))
+            test["extrait"] = target
+        spec["tests_std"] = tests
+
+
 def jira_extracts(inventory: dict, tickets: list, per_spec: int = 5, max_chars: int = 500) -> None:
     """Pour chaque spécifique, les tickets Jira qui citent ses mots-clés (jira_<id>.md), au plus `per_spec`."""
     directory = cache_dir(inventory["client"])
@@ -656,11 +970,666 @@ def jira_extracts(inventory: dict, tickets: list, per_spec: int = 5, max_chars: 
         spec["jira"] = path
 
 
+# ---------------------------------------------------------------------------
+# Catalogues Java (Standard et client) : signatures seulement, jamais les corps
+# ---------------------------------------------------------------------------
+
+_JAVA_NOISE = re.compile(r'//[^\n]*|/\*.*?\*/|"""(?:.|\n)*?"""|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'', re.S)
+_ANNOTATION = re.compile(r"@([\w.]+)\s*(?:\((?:[^()]|\([^()]*\))*\))?")
+_MODIFIERS = {"public", "protected", "private", "static", "final", "abstract", "synchronized", "default", "native",
+              "transient", "volatile", "strictfp", "sealed", "non-sealed"}
+STEP_ANNOTATIONS = {"Given", "When", "Then", "And", "But", "Soit", "Etantdonné", "Quand", "Alors", "Et", "Mais"}
+HOOK_ANNOTATIONS = {"Before", "After", "BeforeStep", "AfterStep", "BeforeAll", "AfterAll"}
+RUNNER_ANNOTATIONS = {"CucumberOptions", "Suite", "CucumberContextConfiguration"}
+INJECT_ANNOTATIONS = {"Autowired", "Inject", "Resource"}
+# À incrémenter quand le format de java_std.md change : invalide le cache
+JAVA_CATALOGUE_FORMAT = 2
+POJO_METHOD = re.compile(r"^(get|set|is|with|has)[A-Z]|^(equals|hashCode|toString|builder|build|canEqual)$")
+
+
+def _strip_java(text: str) -> str:
+    """Code sans commentaires, littéraux réduits à "" (les accolades des chaînes ne faussent plus la profondeur)."""
+    return _JAVA_NOISE.sub(lambda m: '""' if m.group(0)[0] in "\"'" else " ", text)
+
+
+def _annotations(header: str) -> tuple:
+    """(noms des annotations, en-tête sans annotations, espaces normalisés)."""
+    names = [n.rsplit(".", 1)[-1] for n in _ANNOTATION.findall(header)]
+    return names, " ".join(_ANNOTATION.sub(" ", header).split())
+
+
+def _member(header: str, class_name: str):
+    """Méthode ou constructeur d'un en-tête de membre ({...} ou ;) : dict, ou None (champ, initialiseur...)."""
+    annotations, header = _annotations(header)
+    match = re.match(r"^(.*?)\b(\w+)\s*\((.*)\)\s*(?:throws\b.*)?$", header, re.S)
+    if not match or "=" in match.group(1) or match.group(2) in ("if", "for", "while", "switch", "catch", "return"):
+        return None
+    words = match.group(1).split()
+    modifiers = [w for w in words if w in _MODIFIERS]
+    rest = " ".join(w for w in words if w not in _MODIFIERS)
+    rest = re.sub(r"^<.*?>\s*", "", rest)  # paramètres de type d'une méthode générique
+    params = ", ".join(" ".join(p.replace("final ", "").split()) for p in re.split(r",(?![^<]*>)", match.group(3))
+                       if p.strip())
+    return {"name": match.group(2), "returns": rest, "params": params, "modifiers": modifiers,
+            "annotations": annotations, "constructor": not rest and match.group(2) == class_name}
+
+
+def java_outline(text: str) -> dict:
+    """
+    Plan d'une classe Java (type de premier niveau) : package, nom, nature, extends / implements, annotations,
+    champs injectés, constructeurs et méthodes (signatures), constantes publiques. None si aucun type trouvé.
+    """
+    code = _strip_java(text)
+    package = re.search(r"^\s*package\s+([\w.]+)\s*;", code, re.M)
+    outline = {"package": package.group(1) if package else "", "imports_cucumber": "io.cucumber" in code,
+               "members": [], "injected": [], "constants": []}
+    depth, start, in_type, enum_head, parens = 0, 0, False, False, 0
+    for i, char in enumerate(code):
+        if char in "()":
+            parens += 1 if char == "(" else -1
+            continue
+        # Accolades et ; entre parenthèses : tableaux d'annotation, lambdas et classes anonymes en argument
+        if char not in "{};" or parens > 0:
+            continue
+        header = code[start:i]
+        start = i + 1
+        if enum_head and depth == 1:
+            # Premier segment d'une enum : ses constantes (arguments retirés)
+            enum_head = False
+            body = header
+            while re.search(r"\([^()]*\)", body):
+                body = re.sub(r"\([^()]*\)", "", body)
+            names = [n.strip() for n in body.split(",") if re.fullmatch(r"\s*[A-Z][A-Z0-9_]*\s*", n)]
+            if names:
+                outline["constants"] = names
+                if char != ";":
+                    depth += 1 if char == "{" else -1
+                    if depth == 0:
+                        break
+                continue
+        if char == "}":
+            depth -= 1
+            if depth == 0 and in_type:
+                break
+            continue
+        if depth == 0 and char == "{" and not in_type:
+            annotations, clean = _annotations(header.split(";")[-1])
+            match = re.search(r"\b(class|interface|enum|record)\s+(\w+)(.*)$", clean)
+            if match:
+                tail = match.group(3)
+                extends = re.search(r"\bextends\s+(.+?)(?=\bimplements\b|$)", tail)
+                implements = re.search(r"\bimplements\s+(.+)$", tail)
+                outline.update(kind=match.group(1), name=match.group(2), annotations=annotations,
+                               extends=" ".join(extends.group(1).split()) if extends else "",
+                               implements=" ".join(implements.group(1).split()) if implements else "",
+                               raw_annotations=" ".join(header.split()))
+                in_type, enum_head = True, match.group(1) == "enum"
+        elif depth == 1 and in_type:
+            member = _member(header, outline["name"])
+            if member:
+                outline["members"].append(member)
+            elif char == ";":
+                annotations, clean = _annotations(header)
+                words = clean.split("=")[0].split()
+                if set(annotations) & INJECT_ANNOTATIONS and len(words) >= 2:
+                    outline["injected"].append(" ".join(w for w in words if w not in _MODIFIERS))
+                elif {"public", "static", "final"} <= set(words) and len(words) >= 2:
+                    outline["constants"].append(words[-1])
+        if char == "{":
+            depth += 1
+    return outline if in_type else None
+
+
+def _visible(member: dict, kind: str) -> bool:
+    modifiers = member["modifiers"]
+    return ("public" in modifiers or "protected" in modifiers
+            or (kind == "interface" and "private" not in modifiers))
+
+
+def java_category(outline: dict, path: str) -> str:
+    """steps (@Given/@When/@Then), config (runner, contexte Cucumber, hooks), pojo (données) ou support."""
+    annotations = set(outline.get("annotations", []))
+    member_annotations = {a for m in outline["members"] for a in m["annotations"]}
+    if annotations & RUNNER_ANNOTATIONS or "Cucumber.class" in outline.get("raw_annotations", ""):
+        return "config"
+    if member_annotations & STEP_ANNOTATIONS:
+        return "steps"
+    if member_annotations & HOOK_ANNOTATIONS and outline["imports_cucumber"]:
+        return "config"
+    methods = [m for m in outline["members"] if not m["constructor"] and _visible(m, outline["kind"])]
+    if ".pojo" in f".{outline['package']}".lower() or "/pojo/" in path.lower() or (
+            outline["kind"] in ("class", "record") and methods and all(POJO_METHOD.match(m["name"]) for m in methods)):
+        return "pojo"
+    return "support"
+
+
+def java_classes(files: dict) -> list:
+    """Plans des classes de src/test/java ({chemin: texte}), avec leur catégorie et leur nombre de lignes."""
+    classes = []
+    for path, text in sorted(files.items()):
+        outline = java_outline(text)
+        if outline:
+            outline.update(path=path, lines=text.count("\n") + 1, category=java_category(outline, path))
+            outline["fqcn"] = f"{outline['package']}.{outline['name']}".lstrip(".")
+            classes.append(outline)
+    return classes
+
+
+def _signature(member: dict, class_name: str) -> str:
+    flags = [m for m in member["modifiers"] if m in ("static", "protected", "abstract")]
+    text = f"{class_name}{'' if member['constructor'] else '.' + member['name']}({member['params']})"
+    if member["returns"] and member["returns"] != "void":
+        text += f" : {member['returns']}"
+    return text + (f" [{' '.join(flags)}]" if flags else "")
+
+
+def _class_md(c: dict) -> list:
+    head = f"### {c['fqcn']}"
+    if c["extends"]:
+        head += f" extends {c['extends']}"
+    if c["implements"]:
+        head += f" implements {c['implements']}"
+    annotations = [a for a in c["annotations"] if a not in ("Override", "SuppressWarnings")]
+    lines = [head + (f" @{' @'.join(annotations)}" if annotations else "") + f" — {c['path']}"]
+    name = c["name"]
+    lines += [f"- {name} injecte {field}" for field in c["injected"]]
+    steps = [m for m in c["members"] if set(m["annotations"]) & STEP_ANNOTATIONS]
+    for member in c["members"]:
+        if member in steps or not _visible(member, c["kind"]):
+            continue
+        hook = [a for a in member["annotations"] if a in HOOK_ANNOTATIONS]
+        lines.append(f"- {'@' + hook[0] + ' ' if hook else ''}{_signature(member, name)}")
+    if steps:
+        lines.append(f"- {name} : {len(steps)} step(s), expressions dans le catalogue des steps")
+    if c["constants"]:
+        # Constantes d'enum toutes listées (clés de contexte...), constantes static final limitées à 40
+        limit = len(c["constants"]) if c["kind"] == "enum" else 40
+        lines.append(f"- {name} constantes : {', '.join(c['constants'][:limit])}"
+                     + (" …" if len(c["constants"]) > limit else ""))
+    return lines
+
+
+def java_catalogue_md(title: str, classes: list, intro: list = ()) -> str:
+    """Catalogue Java : une ligne par membre, préfixée du nom de classe (une recherche Grep se suffit à elle-même)."""
+    by_category = {}
+    for c in classes:
+        by_category.setdefault(c["category"], []).append(c)
+    lines = [f"# {title}", "Signatures seulement (jamais les corps). Une ligne par membre : Classe.méthode(paramètres) "
+             ": retour [static|protected|abstract]. À interroger par Grep (nom de classe, de méthode, mot-clé).", ""]
+    lines += list(intro)
+    labels = {"config": "Configuration (runners, contexte Cucumber, hooks)", "steps": "Step Definitions",
+              "support": "Classes d'appui (endpoints, helpers, contextes, builders, constantes)"}
+    for category in ("config", "steps", "support"):
+        if by_category.get(category):
+            lines += ["", f"## {labels[category]} : {len(by_category[category])}"]
+            for c in by_category[category]:
+                lines += _class_md(c)
+    pojos = by_category.get("pojo", [])
+    if pojos:
+        lines += ["", f"## POJO (données) : {len(pojos)}, une ligne par package"]
+        packages = {}
+        for c in pojos:
+            packages.setdefault(c["package"], []).append(c["name"] + (f"<{c['extends']}" if c["extends"] else ""))
+        lines += [f"- {package} : {', '.join(names)}" for package, names in sorted(packages.items())]
+    if not classes:
+        lines.append("Aucune classe Java.")
+    return "\n".join(lines) + "\n"
+
+
+def _test_java_files(repo_dir: str, ref: str) -> dict:
+    """{chemin: texte} des fichiers .java de src/test/java à `ref`, lus en un seul appel git."""
+    tree = {p: b for p, b in ls_tree(repo_dir, ref).items() if p.endswith(".java") and "src/test/java/" in f"/{p}"}
+    texts = blob_texts(repo_dir, tree.values())
+    return {p: texts.get(b, "") for p, b in tree.items()}
+
+
+def _runner_glue(c: dict, text: str, properties: str) -> list:
+    """Packages de glue d'un runner : glue = {...}, GLUE_PROPERTY_NAME, cucumber.glue, sinon son propre package."""
+    match = re.search(r"\bglue\s*=\s*\{?([^})]*)", text)
+    glue = re.findall(r'"([\w.]+)"', match.group(1)) if match else []
+    glue += re.findall(r'GLUE_PROPERTY_NAME\s*,\s*value\s*=\s*"([^"]+)"', text)
+    glue += [g.strip() for g in re.findall(r"^\s*cucumber\.glue\s*=\s*(.+)$", properties, re.M)
+             for g in g.split(",")]
+    return [g.strip() for g in glue if g.strip()] or [c["package"]]
+
+
+def _runners(repo_dir: str, ref: str, classes: list, files: dict) -> list:
+    tree = ls_tree(repo_dir, ref)
+    props = [b for p, b in tree.items() if p.rsplit("/", 1)[-1] in ("junit-platform.properties", "cucumber.properties")]
+    properties = "\n".join(blob_texts(repo_dir, props).values())
+    return [{"path": c["path"], "fqcn": c["fqcn"], "glue": _runner_glue(c, files[c["path"]], properties)}
+            for c in classes if c["category"] == "config"
+            and (set(c["annotations"]) & {"CucumberOptions", "Suite"} or "Cucumber.class" in c["raw_annotations"])]
+
+
+def _parent_package(package: str) -> str:
+    return package.rsplit(".", 1)[0] if "." in package else package
+
+
+def _most_common(values) -> str:
+    counts = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    return max(counts, key=lambda v: (counts[v], -len(v))) if counts else ""
+
+
+def java_package_segment(client_name: str) -> str:
+    segment = re.sub(r"[^a-z0-9_]", "", client_name.lower())
+    return segment if segment and not segment[0].isdigit() else f"c{segment}"
+
+
+def java_class_suffix(client_name: str) -> str:
+    """Nom du client en PascalCase (suffixe des classes, ex. novalia-2 -> Novalia2)."""
+    return "".join(p[:1].upper() + p[1:] for p in re.split(r"[^A-Za-z0-9]+", client_name) if p)
+
+
+def standard_java_catalogue(cucumber_std_dir: str, odatio_version: str) -> dict:
+    """
+    Catalogue Java du Cucumber Standard (java_std.md), en cache par version Odatio et régénéré seulement si son
+    HEAD change, avec une Step Definitions exemplaire et le runner copiés pour être lus une seule fois.
+    """
+    version = re.sub(r"[^\w.-]", "_", odatio_version or "inconnue")
+    head = rev_parse(cucumber_std_dir, "HEAD")
+    meta_file = os.path.join(STD_CACHE_DIR, f"java_std_{version}.json")
+    meta = _read_json(meta_file, {}) or {}
+    if meta.get("head") == head and meta.get("format") == JAVA_CATALOGUE_FORMAT             and os.path.exists(meta.get("java_std", "")):
+        return meta
+    files = _test_java_files(cucumber_std_dir, "HEAD")
+    classes = java_classes(files)
+    steps = [c for c in classes if c["category"] == "steps"]
+    base = _most_common(c["extends"] for c in steps if c["extends"])
+    examples_dir = os.path.join(STD_CACHE_DIR, f"exemples_java_{version}")
+    shutil.rmtree(examples_dir, ignore_errors=True)
+
+    def copy_example(c: dict) -> str:
+        if not c:
+            return ""
+        target = os.path.join(examples_dir, c["path"].rsplit("/", 1)[-1])
+        _write_text(target, files[c["path"]])
+        return target
+
+    # Step Definitions exemplaire : la plus courte héritant de la classe de base dominante, avec au moins 2 steps,
+    # de préférence passant par une classe d'appui et par le contexte partagé du scénario
+    def step_count(c):
+        return sum(1 for m in c["members"] if set(m["annotations"]) & STEP_ANNOTATIONS)
+
+    def representative(c):
+        text = files[c["path"]]
+        return bool(re.search(r"Context\(\)|Context\.", text)) and bool(re.search(r"\b[A-Z]\w+\.\w+\(", text))
+    candidates = sorted((c for c in steps if step_count(c) >= 2 and 30 <= c["lines"] <= 200),
+                        key=lambda c: (c["extends"] != base, not representative(c), c["lines"]))
+    runners = _runners(cucumber_std_dir, "HEAD", classes, files)
+    runner = next((c for c in classes if runners and c["path"] == runners[0]["path"]), None)
+    steps_example = copy_example(candidates[0] if candidates else (min(steps, key=lambda c: c["lines"])
+                                                                    if steps else None))
+    runner_example = copy_example(runner)
+    path = os.path.join(STD_CACHE_DIR, f"java_std_{version}.md")
+    support = [c for c in classes if c["category"] == "support"]
+    intro = [f"Classe de base des Step Definitions : {base or '(aucune)'} ; "
+             f"exemple : '{steps_example or 'aucun'}' ; runner : '{runner_example or 'aucun'}'."]
+    _write_text(path, java_catalogue_md(f"Classes Java du Cucumber Standard (Odatio {odatio_version}, commit "
+                                        f"{head[:10]})", classes, intro))
+    meta = {"head": head, "format": JAVA_CATALOGUE_FORMAT, "version": odatio_version, "java_std": path, "steps_example": steps_example,
+            "runner_example": runner_example, "base_steps": base, "runners": runners,
+            "steps_root": _most_common(_parent_package(c["package"]) for c in steps
+                                       if c["package"].count(".") >= 1 and c["extends"]),
+            "support_root": _most_common(_parent_package(c["package"]) for c in support if "." in c["package"]),
+            "nb_classes": len(classes)}
+    _write_json(meta_file, meta)
+    return meta
+
+
+def client_java_context(client_name: str, worktree: str, std_java: dict) -> dict:
+    """
+    Catalogue Java du dépôt Cucumber client (java_client.md), recalculé avant chaque lot depuis le HEAD du worktree
+    (classes des lots précédents comprises), packages cibles et état du runner / de la glue.
+    """
+    files = _test_java_files(worktree, "HEAD")
+    classes = java_classes(files)
+    segment, suffix = java_package_segment(client_name), java_class_suffix(client_name)
+    client_steps = [c["package"] for c in classes if c["category"] == "steps"]
+    client_support = [c["package"] for c in classes if c["category"] == "support"]
+    package_steps = _most_common(client_steps) or ".".join(
+        p for p in (std_java.get("steps_root") or "cucumber.features", segment) if p)
+    package_support = _most_common(client_support) or ".".join(
+        p for p in (std_java.get("support_root") or "cucumber.util", segment) if p)
+    # Dépôt client sans pom.xml : exécuté par-dessus le Standard, dont le runner et la glue s'appliquent aussi
+    overlay = not os.path.exists(os.path.join(worktree, "pom.xml"))
+    runners = _runners(worktree, "HEAD", classes, files) + (std_java.get("runners", []) if overlay else [])
+    covering = [r for r in runners if any(package_steps == g or package_steps.startswith(g + ".") for g in r["glue"])]
+    if covering:
+        runner_status = (f"le runner {covering[0]['fqcn']} (glue : {', '.join(covering[0]['glue'])}) couvre déjà "
+                         f"'{package_steps}' : n'en crée aucun.")
+    else:
+        runner_status = (f"aucun runner ne couvre '{package_steps}' : crée {package_steps}.Run{suffix}CucumberTest "
+                         f"sur le modèle du runner exemple (glue '{package_steps}' et celle du Standard, features "
+                         f"src/test/resources/cucumber/features/{client_name}), un seul pour toute l'exécution.")
+    path = os.path.join(cache_dir(client_name), "java_client.md")
+    intro = [f"Mode : {'surcouche du Cucumber Standard (pas de pom.xml)' if overlay else 'projet Maven autonome'}."]
+    _write_text(path, java_catalogue_md(f"Classes Java du dépôt Cucumber {client_name} (worktree)", classes, intro))
+    return {"java_client": path, "package_steps": package_steps, "package_support": package_support,
+            "runner_status": runner_status, "class_suffix": suffix, "overlay": overlay}
+
+
+def business_signatures(path: str, max_members: int = 20) -> list:
+    """Signatures publiques d'une classe métier (DTO : champs déduits des accesseurs ; enum : constantes)."""
+    outline = java_outline(_read_text_file(path))
+    if not outline:
+        return []
+    head = f"{outline['kind']} {outline['name']}"
+    head += f" extends {outline['extends']}" if outline["extends"] else ""
+    head += f" implements {outline['implements']}" if outline["implements"] else ""
+    # API publique seulement : ce qu'un test peut appeler ou construire
+    members = [m for m in outline["members"] if "public" in m["modifiers"]
+               or (outline["kind"] == "interface" and "private" not in m["modifiers"])]
+    lines = [head]
+    if outline["constants"]:
+        lines.append(f"constantes : {', '.join(outline['constants'][:30])}")
+    accessors = [m for m in members if POJO_METHOD.match(m["name"]) and not m["constructor"]]
+    if members and len(accessors) == len(members):
+        fields = dict.fromkeys(re.sub(r"^(get|set|is|with|has)", "", m["name"]) for m in accessors
+                               if re.match(r"^(get|is)[A-Z]", m["name"]))
+        lines.append(f"champs (accesseurs) : {', '.join(fields) or '—'}")
+        return lines
+    lines += [_signature(m, outline["name"]) for m in members[:max_members]]
+    if len(members) > max_members:
+        lines.append(f"… {len(members) - max_members} autre(s) méthode(s)")
+    return lines
+
+
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Endpoints : appels d'API du Cucumber Standard, contrôleurs du code client
+# ---------------------------------------------------------------------------
+
+# À incrémenter quand le format du catalogue des endpoints change : invalide le cache
+ENDPOINTS_FORMAT = 2
+_JAVA_MASK = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'', re.S)
+_METHOD_HEAD = re.compile(r"(?:(?:public|protected|private|static|final|synchronized|abstract)\s+)+"
+                          r"(?:<[^>{;]*>\s*)?[\w<>\[\],.?\s]+?\s+(\w+)\s*\(")
+# Helpers HTTP du Standard (EndPoints : sendGetRest, sendPostRestToDisplayList...) et RestAssured direct
+_HTTP_CALL = re.compile(r"\b(?:send(Get|Post|Put|Delete|Patch|Count)\w*|request\s*\.\s*(get|post|put|delete|patch))\s*\(")
+_REST_ANNOTATION = re.compile(r'@(GET|POST|PUT|DELETE|PATCH)\s*\(\s*(?:value\s*=\s*)?"([^"]*)"\s*\)')
+_SPRING_MAPPING = re.compile(r'@(Get|Post|Put|Delete|Patch|Request)Mapping\s*\(\s*(?:(?:value|path)\s*=\s*)?\{?\s*'
+                             r'"([^"]*)"')
+
+
+def _mask_java(text: str) -> str:
+    """Texte de même longueur : commentaires en espaces, contenu des chaînes en x (indices alignés sur l'original)."""
+    def mask(m):
+        s = m.group(0)
+        if s[0] in "\"'":
+            return s[0] + "x" * (len(s) - 2) + s[-1]
+        return re.sub(r"[^\n]", " ", s)
+    return _JAVA_MASK.sub(mask, text)
+
+
+def _matching(masked: str, start: int, opening: str = "{", closing: str = "}") -> int:
+    """Index juste après le délimiteur fermant celui ouvert en `start`."""
+    depth = 0
+    for i in range(start, len(masked)):
+        if masked[i] == opening:
+            depth += 1
+        elif masked[i] == closing:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return len(masked)
+
+
+def _java_methods(text: str) -> list:
+    """Méthodes d'un fichier Java : [{name, body (texte original), steps (expressions des annotations de step)}]."""
+    masked, methods, pos, previous_end = _mask_java(text), [], 0, 0
+    while True:
+        match = _METHOD_HEAD.search(masked, pos)
+        if not match:
+            return methods
+        close = _matching(masked, match.end() - 1, "(", ")")
+        brace = re.match(r"\s*(?:throws\s+[\w.,\s]+)?\{", masked[close:])
+        if not brace or match.group(1) in ("if", "for", "while", "switch", "catch", "return", "new"):
+            pos = match.end()
+            continue
+        start = close + brace.end() - 1
+        end = _matching(masked, start)
+        before = text[previous_end:match.start()]
+        steps = re.findall(r'@(?:Given|When|Then|And|But|Soit|Quand|Alors|Et|Mais)\s*\(\s*"((?:[^"\\]|\\.)*)"', before)
+        methods.append({"name": match.group(1), "body": text[start:end], "masked": masked[start:end], "steps": steps})
+        pos = previous_end = end
+
+
+def _string_constants(text: str) -> dict:
+    """Constantes String d'une classe : {NOM: expression d'origine} (résolues ensuite, concaténations comprises)."""
+    masked = _mask_java(text)
+    return {m.group(1): text[m.start(2):m.end(2)].strip()
+            for m in re.finditer(r"\bString\s+([A-Z][A-Z0-9_]*)\s*=\s*([^;]+);", masked)}
+
+
+def _resolve(expression: str, local: dict, shared: dict, depth: int = 0) -> str:
+    """
+    Chemin d'une expression d'URL : littéraux et constantes résolus, le reste remplacé par {…}. '' si aucune partie
+    littérale (URL entièrement variable : paramètre d'un helper générique).
+    """
+    if depth > 4:
+        return ""
+    masked = _mask_java(expression)
+    parts, level, start = [], 0, 0
+    for i, char in enumerate(masked + "+"):
+        if char in "([{":
+            level += 1
+        elif char in ")]}":
+            level -= 1
+        elif char == "+" and level == 0:
+            parts.append(expression[start:i].strip())
+            start = i + 1
+    path, literal = "", False
+    for part in parts:
+        constant = re.fullmatch(r"(?:\w+\.)?([A-Z][A-Z0-9_]*)", part)
+        if re.fullmatch(r'"(?:[^"\\]|\\.)*"', part):
+            path, literal = path + part[1:-1], True
+        elif constant and (constant.group(1) in local or constant.group(1) in shared):
+            value = _resolve(local.get(constant.group(1)) or shared[constant.group(1)], local, shared, depth + 1)
+            path, literal = path + (value or "{…}"), literal or bool(value)
+        elif part:
+            path += "{…}"
+    return path if literal else ""
+
+
+def _first_argument(masked: str, text: str, open_index: int) -> str:
+    level = 0
+    for i in range(open_index, len(masked)):
+        if masked[i] in "([{":
+            level += 1
+        elif masked[i] in ")]}":
+            level -= 1
+            if level == 0:
+                return text[open_index + 1:i]
+        elif masked[i] == "," and level == 1:
+            return text[open_index + 1:i]
+    return ""
+
+
+def _http_path(path: str) -> str:
+    path = re.sub(r"/{2,}", "/", "/" + path.strip().lstrip("/"))
+    return re.sub(r"\{…\}(?=/|$)", "{…}", path)
+
+
+def extract_std_endpoints(files: dict) -> list:
+    """
+    Endpoints appelés par le Cucumber Standard ({chemin: texte} de src/test/java) : méthode HTTP, chemin, méthodes
+    Java qui l'encapsulent (directement ou par appel interne) et expressions des steps qui les utilisent ;
+    et {Classe#méthode: ["MÉTHODE /chemin"]} des méthodes qui y mènent.
+    """
+    texts = {p: t for p, t in files.items() if "/pojo/" not in p.lower()}
+    constants = {p: _string_constants(t) for p, t in texts.items()}
+    shared = {}
+    for values in constants.values():
+        for name, value in values.items():
+            shared.setdefault(name, value)
+    classes = {p.rsplit("/", 1)[-1][:-5]: p for p in texts}
+    methods = {p: _java_methods(t) for p, t in texts.items()}
+    # Appels directs : (classe, méthode) -> {(MÉTHODE, chemin)}
+    direct = {}
+    for path, items in methods.items():
+        cls = path.rsplit("/", 1)[-1][:-5]
+        for method in items:
+            for call in _HTTP_CALL.finditer(method["masked"]):
+                verb = (call.group(1) or call.group(2)).upper()
+                verb = "GET" if verb == "COUNT" else verb
+                argument = _first_argument(method["masked"], method["body"], call.end() - 1)
+                resolved = _resolve(argument, constants[path], shared)
+                if resolved:
+                    direct.setdefault((cls, method["name"]), set()).add((verb, _http_path(resolved)))
+    # Appels indirects (méthode de la même classe ou Classe.méthode) jusqu'au point fixe
+    calls = {}
+    for path, items in methods.items():
+        cls = path.rsplit("/", 1)[-1][:-5]
+        names = {m["name"] for m in items}
+        for method in items:
+            targets = {(cls, n) for n in re.findall(r"(?<![.\w])(\w+)\s*\(", method["masked"]) if n in names}
+            targets |= {(c, n) for c, n in re.findall(r"\b([A-Z]\w+)\s*\.\s*(\w+)\s*\(", method["masked"])
+                        if c in classes}
+            calls[(cls, method["name"])] = targets - {(cls, method["name"])}
+    reach = {key: set(value) for key, value in direct.items()}
+    changed = True
+    while changed:
+        changed = False
+        for key, targets in calls.items():
+            gained = set().union(*(reach.get(t, set()) for t in targets)) if targets else set()
+            if gained - reach.get(key, set()):
+                reach.setdefault(key, set()).update(gained)
+                changed = True
+    endpoints = {}
+    for (cls, name), found in direct.items():
+        for endpoint in found:
+            endpoints.setdefault(endpoint, {"methode": endpoint[0], "chemin": endpoint[1], "java": [], "steps": []})[
+                "java"].append(f"{cls}#{name}")
+    for path, items in methods.items():
+        cls = path.rsplit("/", 1)[-1][:-5]
+        for method in items:
+            for endpoint in reach.get((cls, method["name"]), set()) if method["steps"] else ():
+                endpoints[endpoint]["steps"] += [s for s in method["steps"] if s not in endpoints[endpoint]["steps"]]
+    # Méthodes Java (Classe#méthode) menant à chaque endpoint, directement ou non : rattache un step client
+    # qui appelle un helper du Standard aux endpoints qu'il sollicite
+    callers = {f"{cls}#{name}": sorted(f"{verb} {path}" for verb, path in found)
+               for (cls, name), found in reach.items() if found}
+    return sorted(endpoints.values(), key=lambda e: (e["chemin"], e["methode"])), callers
+
+
+def _endpoint_line(e: dict, max_steps: int = 4) -> str:
+    steps = " ; ".join(e["steps"][:max_steps]) + (f" … (+{len(e['steps']) - max_steps})"
+                                                  if len(e["steps"]) > max_steps else "")
+    return f"{e['methode']} {e['chemin']} — {', '.join(e['java'][:3])} — steps : {steps or 'aucun (helper)'}"
+
+
+def standard_endpoints(cucumber_std_dir: str, odatio_version: str) -> dict:
+    """Catalogue des endpoints du Cucumber Standard (endpoints_std.md), en cache par version Odatio et HEAD."""
+    version = re.sub(r"[^\w.-]", "_", odatio_version or "inconnue")
+    head = rev_parse(cucumber_std_dir, "HEAD")
+    meta_file = os.path.join(STD_CACHE_DIR, f"endpoints_std_{version}.json")
+    meta = _read_json(meta_file, {}) or {}
+    if meta.get("head") == head and meta.get("format") == ENDPOINTS_FORMAT and os.path.exists(meta.get("fichier", "")):
+        return meta
+    endpoints, callers = extract_std_endpoints(_test_java_files(cucumber_std_dir, "HEAD"))
+    path = os.path.join(STD_CACHE_DIR, f"endpoints_std_{version}.md")
+    lines = [f"# Endpoints appelés par le Cucumber Standard (Odatio {odatio_version}, commit {head[:10]})",
+             "Une ligne par endpoint : MÉTHODE /chemin — Classe#méthode qui l'encapsule — steps qui l'utilisent. "
+             "{…} = partie variable. À interroger par Grep (chemin, objet métier, classe), jamais en entier.", ""]
+    lines += [f"- {_endpoint_line(e)}" for e in endpoints]
+    _write_text(path, "\n".join(lines) + "\n")
+    meta = {"head": head, "format": ENDPOINTS_FORMAT, "version": odatio_version, "fichier": path,
+            "endpoints": endpoints, "appelants": callers}
+    _write_json(meta_file, meta)
+    return meta
+
+
+def rest_endpoints(text: str) -> list:
+    """Endpoints exposés par un contrôleur (annotations Restx @POST("/...") ou Spring @PostMapping) : [(MÉTHODE, chemin, méthode Java)]."""
+    found, masked = [], _mask_java(text)
+    prefix = ""
+    head = re.search(r'@RequestMapping\s*\(\s*(?:(?:value|path)\s*=\s*)?\{?\s*"([^"]*)"[^)]*\)\s*(?:public\s+)?'
+                     r'(?:abstract\s+)?class', text)
+    if head:
+        prefix = head.group(1)
+    for regex, spring in ((_REST_ANNOTATION, False), (_SPRING_MAPPING, True)):
+        for match in regex.finditer(text):
+            if masked[match.start()] != "@" or (spring and head and match.start() == head.start()):
+                continue
+            verb = match.group(1).upper()
+            verb = "GET" if verb == "REQUEST" else verb
+            name = _METHOD_HEAD.search(masked, match.end())
+            found.append((verb, _http_path((prefix if spring else "") + "/" + match.group(2)),
+                          name.group(1) if name else ""))
+    return found
+
+
+def _path_key(path: str) -> list:
+    """Segments d'un chemin, paramètres (:id, {id}, {…}) remplacés par *."""
+    return ["*" if re.fullmatch(r":\w+|\{[^}]*\}", s) else s.lower() for s in path.strip("/").split("/") if s]
+
+
+def _same_path(a: str, b: str) -> bool:
+    """Même endpoint, à un préfixe de module près (/wms/preparationunits ~ /preparationunits)."""
+    ka, kb = _path_key(a), _path_key(b)
+    short, long_ = sorted((ka, kb), key=len)
+    literals = [s for s in short if s != "*"]
+    # Au moins un segment littéral discriminant ; un paramètre ne remplace jamais un segment littéral
+    if not short or short[0] == "*" or not literals or (len(literals) == 1 and len(literals[0]) < 8):
+        return False
+    return all(x == y or (x == "*" and y == "*") or x == "*" for x, y in zip(short, long_[len(long_) - len(short):]))
+
+
+def attach_endpoints(inventory: dict, std_root: str, std_endpoints: dict) -> None:
+    """
+    Endpoints de chaque spécifique : spec["endpoints_client"] (exposés par ses contrôleurs et absents du Standard)
+    et spec["endpoints_std"] (endpoints du Cucumber Standard que le spécifique expose, surcharge ou dont le chemin
+    nomme son objet métier), au plus 8, les plus utilisés par les steps d'abord.
+    """
+    std_repos = git_repos(std_root)
+    refs = {name: pick_ref(path, STD_REFS) for name, path in std_repos.items()}
+    catalogue = sorted(std_endpoints["endpoints"], key=lambda e: -len(e["steps"]))
+    for spec in inventory["specifiques"]:
+        exposed, standard_paths = [], set()
+        for f in spec["fichiers"]:
+            if not f["path"].endswith(".java") or "src/main/java/" not in f"/{f['path']}":
+                continue
+            endpoints = rest_endpoints(_read_text_file(f.get("local", "")))
+            cls = f["path"].rsplit("/", 1)[-1][:-5]
+            exposed += [(verb, path, f"{cls}#{name}") for verb, path, name in endpoints]
+            # Override d'un contrôleur du Standard : ses endpoints existent déjà côté Standard
+            if endpoints and f.get("kind") == "override" and ":" in f.get("standard", ""):
+                repo, std_path = f["standard"].split(":", 1)
+                if repo in std_repos and refs.get(repo):
+                    text = _git(std_repos[repo], "show", f"{refs[repo]}:{std_path}").stdout
+                    standard_paths |= {(verb, path) for verb, path, _ in rest_endpoints(text)}
+        targets = _override_targets(spec, inventory.get("client", ""))
+        related = []
+        for e in catalogue:
+            by_path = any(e["methode"] == verb and _same_path(e["chemin"], path) for verb, path, _ in exposed)
+            by_name = any(t in _norm(e["chemin"]) for t in targets)
+            if (by_path or by_name) and e not in related:
+                related.append(e)
+        spec["endpoints_std"] = [{"methode": e["methode"], "chemin": e["chemin"], "java": e["java"][:2],
+                                  "steps": e["steps"][:3]} for e in related[:8]]
+        spec["endpoints_client"] = [
+            {"methode": verb, "chemin": path, "java": java} for verb, path, java in exposed
+            if (verb, path) not in standard_paths
+            and not any(e["methode"] == verb and _same_path(e["chemin"], path) for e in catalogue)][:10]
+
+
 def prepare(client_name: str, client_root: str, std_root: str, cucumber_std_dir: str, odatio_version: str,
             cucumber_repo_dir: str, cucumber_ref: str, tickets: list) -> dict:
     """Pré-calculs complets (0 token) ; écrit inventaire.json et renvoie l'inventaire."""
     inventory = build_inventory(client_name, client_root, std_root)
     export_sources(inventory)
+    attach_std_tests(inventory, cucumber_std_dir, odatio_version)
+    attach_endpoints(inventory, std_root, standard_endpoints(cucumber_std_dir, odatio_version))
     inventory["catalogue_standard"] = standard_catalogue(cucumber_std_dir, odatio_version)
     coverage = client_coverage(client_name, cucumber_repo_dir, cucumber_ref)
     inventory["couverture_existante"] = coverage["fichier"]
@@ -715,8 +1684,8 @@ def prepare_worktree(cucumber_repo_dir: str, client_name: str, base: str, reset:
 
 
 def commit_lot(worktree: str, client_name: str, lot_number: int) -> bool:
-    """Commite les fichiers écrits par le lot. Renvoie True si un commit a été créé."""
-    _git(worktree, "add", "-A")
+    """Commite les fichiers écrits par le lot (hors sorties Maven). Renvoie True si un commit a été créé."""
+    _git(worktree, "add", "-A", "--", ".", ":(exclude)target", ":(exclude)**/target/**")
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return False
     return _git(worktree, "commit", "-m", f"Cucumber coverage of {client_name} specifics - lot {lot_number}"
@@ -734,6 +1703,132 @@ def write_patch(worktree: str, base: str, output: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Compilation et dry-run (Maven), après chaque lot
+# ---------------------------------------------------------------------------
+
+DEFAULT_COMPILE_CMD = "mvn -q -o test-compile"
+DEFAULT_DRY_RUN_CMD = "mvn -q -o test"
+MAX_BUILD_ERRORS = 30
+_OFFLINE_FAILURE = re.compile(r"offline mode|has not been downloaded|Could not resolve dependencies|"
+                              r"Could not find artifact|Non-resolvable|Plugin .* could not be resolved", re.I)
+_MVN_ERROR = re.compile(r"^\[ERROR\]\s+(.+?\.java):\[(\d+),(\d+)\]\s*(.*)$")
+
+
+def build_dir(client_name: str, worktree: str, cucumber_std_dir: str) -> str:
+    """
+    Dossier où compiler, à jour du worktree : le worktree lui-même s'il a un pom.xml ; sinon (dépôt client en
+    surcouche du Standard) un worktree détaché du Cucumber Standard, .tmp/cucumber/<client>/build, remis à son HEAD
+    puis recouvert des fichiers du dépôt client. target/ (ignoré par git) y est conservé. Lève RuntimeError.
+    """
+    if os.path.exists(os.path.join(worktree, "pom.xml")):
+        return worktree
+    path = os.path.join(cache_dir(client_name), "build")
+    head = rev_parse(cucumber_std_dir, "HEAD")
+    # Worktree d'un autre clone du Standard (dépôt changé) : recréé depuis le clone courant
+    common_dir = lambda repo: os.path.normcase(os.path.abspath(
+        _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip() or repo))
+    if os.path.exists(os.path.join(path, ".git")) and common_dir(path) == common_dir(cucumber_std_dir):
+        result = _git(path, "checkout", "-q", "--force", "--detach", head)
+        _git(path, "clean", "-fdq")
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+        _git(cucumber_std_dir, "worktree", "prune")
+        result = _git(cucumber_std_dir, "worktree", "add", "--detach", path, head)
+    if result.returncode != 0:
+        raise RuntimeError(f"Dossier de compilation {path} non préparé : {result.stderr.strip()[:300]}")
+    for rel in _git(worktree, "ls-files", "-co", "--exclude-standard", "-z").stdout.split("\0"):
+        if rel:
+            target = os.path.join(path, *rel.split("/"))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(os.path.join(worktree, *rel.split("/")), target)
+    return path
+
+
+def run_maven(command: str, cwd: str, timeout: int = 1800) -> tuple:
+    """
+    Lance une commande Maven : (code retour, sortie). Hors ligne (-o) en échec faute de dépendances en cache :
+    relancée une fois en ligne.
+    """
+    def run(cmd):
+        try:
+            result = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return 124, f"[ERROR] Délai de {timeout} s dépassé : {cmd}"
+        return result.returncode, f"{result.stdout}\n{result.stderr}"
+    code, output = run(command)
+    offline = re.compile(r"(?<!\S)-o(?!\S)")
+    if code != 0 and offline.search(command) and _OFFLINE_FAILURE.search(output):
+        code, output = run(" ".join(offline.sub(" ", command).split()))
+    return code, output
+
+
+def _relative(path: str, root: str) -> str:
+    path = re.sub(r"^/(?=[A-Za-z]:)", "", path.strip())
+    try:
+        rel = os.path.relpath(path, root)
+    except ValueError:
+        return path.replace("\\", "/")
+    return path.replace("\\", "/") if rel.startswith("..") else rel.replace("\\", "/")
+
+
+def compile_errors(output: str, root: str) -> list:
+    """Erreurs de compilation « fichier:ligne:colonne message (symbole) », dédupliquées, au plus 30."""
+    errors, lines = [], output.splitlines()
+    for i, line in enumerate(lines):
+        match = _MVN_ERROR.match(line.strip())
+        if not match:
+            continue
+        message = match.group(4).strip()
+        for following in lines[i + 1:i + 3]:
+            detail = re.sub(r"^\[ERROR\]\s*", "", following).strip()
+            if detail.startswith(("symbol", "location", "symbole", "emplacement")):
+                message += f" ({' '.join(detail.split())})"
+        error = f"{_relative(match.group(1), root)}:{match.group(2)}:{match.group(3)} {message}"
+        if error not in errors:
+            errors.append(error)
+    return errors[:MAX_BUILD_ERRORS]
+
+
+def dry_run_errors(output: str) -> list:
+    """Steps sans définition, ambigus et features illisibles signalés par un dry-run Cucumber."""
+    errors = [f"step non défini : {s}" for s in re.findall(r"The step ['\"](.+?)['\"] is undefined", output)]
+    errors += [" ".join(m.split()) for m in re.findall(
+        r"((?:AmbiguousStepDefinitionsException|DuplicateStepDefinitionException|ParserException|"
+        r"Failed to parse resource)[^\n]*)", output)]
+    return list(dict.fromkeys(errors))[:MAX_BUILD_ERRORS]
+
+
+def _last_errors(output: str, count: int = 8) -> list:
+    errors = [line.strip() for line in output.splitlines() if line.strip().startswith("[ERROR]") and line.strip()
+              != "[ERROR]"]
+    return list(dict.fromkeys(errors))[-count:] or [line for line in output.strip().splitlines()[-count:]]
+
+
+def verify_build(build: str, compile_cmd: str, features: list = None, dry_run_cmd: str = "") -> dict:
+    """
+    Compile le dossier de build, puis, si `dry_run_cmd` et des features sont donnés, vérifie en dry-run Cucumber
+    que leurs steps ont tous une définition. Renvoie {"ok", "etape", "erreurs", "environnement"} : environnement
+    = échec sans erreur exploitable dans le code (dépendances, Maven absent...), à ne pas soumettre à l'agent.
+    """
+    code, output = run_maven(compile_cmd, build)
+    if code != 0:
+        errors = compile_errors(output, build)
+        return {"ok": False, "etape": "compilation", "erreurs": errors or _last_errors(output),
+                "environnement": not errors}
+    if dry_run_cmd and features:
+        paths = ",".join(features)
+        code, output = run_maven(f'{dry_run_cmd} "-Dcucumber.features={paths}" -Dcucumber.execution.dry-run=true',
+                                 build)
+        errors = dry_run_errors(output)
+        if code != 0 or errors:
+            return {"ok": False, "etape": "dry-run", "erreurs": errors or _last_errors(output),
+                    "environnement": not errors}
+    return {"ok": True, "etape": "dry-run" if dry_run_cmd and features else "compilation", "erreurs": [],
+            "environnement": False}
+
+
+# ---------------------------------------------------------------------------
 # Lots
 # ---------------------------------------------------------------------------
 
@@ -741,6 +1836,12 @@ def make_lots(spec_ids: list, batch_size: int) -> list:
     size = max(1, batch_size)
     return [{"numero": i + 1, "ids": spec_ids[i * size:(i + 1) * size], "statut": "a_faire"}
             for i in range(math.ceil(len(spec_ids) / size))]
+
+
+def lot_example(specifics: list) -> str:
+    """Extrait de la feature Standard la mieux classée du lot ('' si aucun spécifique n'a de test équivalent)."""
+    tests = [t for spec in specifics for t in spec.get("tests_std") or [] if t.get("extrait")]
+    return max(tests, key=lambda t: t["score"])["extrait"] if tests else ""
 
 
 def lot_block(specifics: list) -> str:
@@ -754,6 +1855,24 @@ def lot_block(specifics: list) -> str:
             lines.append("- Scénarios existants à compléter plutôt que dupliquer : "
                          + " ; ".join(spec["scenarios_existants"]))
         lines.append(f"- Tickets Jira : '{spec['jira']}'" if spec.get("jira") else "- Tickets Jira : aucun trouvé")
+        if spec.get("tests_std"):
+            lines.append("- Tests Standard équivalents (à lire avant d'écrire) :")
+            for test in spec["tests_std"]:
+                scenarios = " ; ".join(test["scenarios"][:6]) + (" …" if len(test["scenarios"]) > 6 else "")
+                steps = ", ".join(f.rsplit("/", 1)[-1][:-5] for f in test.get("step_definitions", [])[:4])
+                lines.append(f"  - '{test.get('extrait', test['path'])}' — {test['feature']} / {scenarios} "
+                             f"(score {test['score']}, {test['raison']}"
+                             + (f" ; Step Definitions : {steps}" if steps else "") + ")")
+        else:
+            lines.append("- Tests Standard équivalents : aucun test Standard équivalent")
+        if spec.get("endpoints_std"):
+            lines.append("- Endpoints Standard liés (déjà appelés par ces steps / classes du Standard : à réutiliser) :")
+            lines += [f"  - {e['methode']} {e['chemin']} — {', '.join(e['java'])}"
+                      + (f" — steps : {' ; '.join(e['steps'])}" if e["steps"] else "") for e in spec["endpoints_std"]]
+        if spec.get("endpoints_client"):
+            lines.append("- Endpoints propres au client (aucun appel Cucumber Standard : nouveau code d'appel autorisé, "
+                         "sur le modèle des classes *EndPoints du Standard) :")
+            lines += [f"  - {e['methode']} {e['chemin']} — {e['java']}" for e in spec["endpoints_client"]]
         lines.append(f"- Fichiers ({spec['nb_fichiers']}, contenu à la version de référence) :")
         for f in spec["fichiers"]:
             detail = f"  - [{f['kind']}] '{f.get('local', f['path'])}'"
@@ -761,6 +1880,9 @@ def lot_block(specifics: list) -> str:
                 elements = ", ".join(f["diff"]["elements"]) or "—"
                 detail += f" — écart avec {f.get('standard', 'le Standard')} : {f['diff']['stat']} ; modifié : {elements}"
             lines.append(detail)
+            # Classes métier : signatures publiques données ici, le fichier n'est ouvert que si son corps est utile
+            if f["path"].endswith(".java") and "src/main/java/" in f"/{f['path']}" and f.get("local"):
+                lines += [f"    {line}" for line in business_signatures(f["local"])]
         if spec["nb_fichiers"] > len(spec["fichiers"]):
             lines.append(f"  - … {spec['nb_fichiers'] - len(spec['fichiers'])} autre(s) fichier(s) non listé(s)")
         lines.append("")
@@ -787,6 +1909,15 @@ def parse_lot_result(text: str):
     return None
 
 
+def lot_files(worktree: str, results: list) -> list:
+    """Fichiers écrits par le lot : modifiés ou nouveaux dans le worktree, plus ceux déclarés dans le JSON final."""
+    out = _git(worktree, "ls-files", "-mo", "--exclude-standard").stdout.splitlines()
+    declared = [p for r in results or [] for p in (r.get("fichiers") or []) + (r.get("classes_java") or [])
+                if isinstance(p, str)]
+    paths = (p.replace("\\", "/") for p in out + declared if p.strip())
+    return list(dict.fromkeys(p for p in paths if not re.search(r"(^|/)target/", p)))
+
+
 def lot_cost_average(usage_csv: str, step: str = "cucumber-lot") -> dict:
     """Moyenne des lots déjà exécutés (token_usage.csv) : {'lots', 'tokens', 'cout_usd'} ; lots=0 si inconnue."""
     import csv
@@ -809,25 +1940,107 @@ def lot_cost_average(usage_csv: str, step: str = "cucumber-lot") -> dict:
             "cout_usd": sum(num(r.get("cout_usd")) for r in rows) / len(rows)}
 
 
+def lot_indicators(lot: dict) -> dict:
+    """Indicateurs d'un lot pour l'IHM et le récapitulatif (vide si le lot n'a pas été contrôlé)."""
+    analysis, review = lot.get("indicateurs") or {}, lot.get("revue") or {}
+    if not analysis:
+        return {}
+    return {"scenarios": analysis.get("nb_scenarios", 0), "reutilisation": analysis.get("taux_reutilisation"),
+            "steps_std": analysis.get("steps_std", 0), "steps_client": analysis.get("steps_client", 0),
+            "steps_crees": analysis.get("steps_crees", 0), "non_definis": analysis.get("steps_non_definis", 0),
+            "signales": len(review.get("signales", [])), "supprimes": len(review.get("supprimes", []))}
+
+
+def _compilation_status(lot: dict) -> str:
+    check = lot.get("verification") or {}
+    if not check:
+        return "non compilé"
+    if check.get("environnement"):
+        return "non vérifié (environnement Maven)"
+    return f"{check.get('etape', 'compilation')} OK" if check.get("ok") else f"en erreur ({check.get('etape')})"
+
+
 def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> str:
-    """Récapitulatif <client>-cucumber-couverture.md, produit à partir de l'inventaire et des résultats des lots."""
+    """
+    Récapitulatif <client>-cucumber-couverture.md : indicateurs globaux (réutilisation des steps Standard,
+    scénarios supprimés à la revue), puis par spécifique ses scénarios, leur différence avec le Standard, leur
+    source, le test Standard d'inspiration, les steps réutilisés / créés, les endpoints et la compilation.
+    """
     specs = {s["id"]: s for s in inventory.get("specifiques", [])}
-    results = {r["id"]: r for lot in state.get("lots", []) for r in lot.get("resultats", []) or []}
-    selected = [i for lot in state.get("lots", []) for i in lot["ids"]]
+    lots = state.get("lots", [])
+    lot_of = {i: lot for lot in lots for i in lot["ids"]}
+    results = {r["id"]: r for lot in lots for r in lot.get("resultats", []) or []}
+    selected = [i for lot in lots for i in lot["ids"]]
     covered = [i for i in selected if results.get(i, {}).get("statut") == "couvert"]
+    analysed = [s for lot in lots for s in (lot.get("indicateurs") or {}).get("scenarios", [])]
+    deleted = [d for lot in lots for d in (lot.get("revue") or {}).get("supprimes", [])]
+    std_steps = sum(s["steps_std"] for s in analysed)
+    all_steps = sum(s["steps_std"] + s["steps_client"] + s["steps_non_definis"] for s in analysed)
+    reasons = {}
+    for d in deleted:
+        for motif in d["motifs"]:
+            key = re.sub(r" de \S+ / .*$| \(.*\)$", "", motif)
+            reasons[key] = reasons.get(key, 0) + 1
     lines = [f"# Couverture Cucumber des spécifiques {client_name}", "",
              f"{len(specs)} spécifique(s) inventorié(s), {len(selected)} traité(s), {len(covered)} couvert(s). "
              f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}.", "",
-             "## Spécifiques couverts", "", "| Spécifique | Fichier(s) source | Scénario(s) | Nouveau/Adapté |",
-             "|---|---|---|---|"]
+             f"- Scénarios contrôlés : {len(analysed)} ; réutilisation des steps Standard : "
+             + (f"{round(100 * std_steps / all_steps)} % ({std_steps}/{all_steps} steps)" if all_steps else "—")
+             + f" ; steps non définis : {sum(s['steps_non_definis'] for s in analysed)}",
+             f"- Scénarios supprimés à la revue : {len(deleted)}"
+             + (" — " + " ; ".join(f"{k} : {n}" for k, n in sorted(reasons.items(), key=lambda kv: -kv[1]))
+                if reasons else "")]
+    from tools.cucumber_verify import verification_indicators  # import local : cucumber_verify importe ce module
+    verif = verification_indicators(state)
+
+    def pct(value):
+        return "—" if value is None else f"{value} %"
+    if verif["scenarios"] and not verif["verifies"]:
+        lines.append("- ⚪ **Pertinence non vérifiée par exécution** : "
+                     + (next((lot["execution"]["message"] for lot in lots if lot.get("execution")), "")
+                        or "aucun moyen d'exécution configuré"))
+    elif verif["scenarios"]:
+        lines += [f"- Scénarios pertinents (exécution) : {pct(verif['taux_pertinent'])} ({verif['pertinents']}/"
+                  f"{verif['verifies']} vérifiés ; {verif['non_verifies']} non vérifié(s))",
+                  f"- Mutations des attendus détectées : {pct(verif['taux_mutation'])} ; overrides en échec sur le "
+                  f"Standard : {pct(verif['taux_echec_standard'])}",
+                  f"- Scénarios retirés vers {client_name}-cucumber-a-revoir.patch : {verif['retires']}"
+                  + (" — " + " ; ".join(f"{k} : {n}" for k, n in verif["motifs_retrait"].items())
+                     if verif["motifs_retrait"] else "")]
+    lines.append(f"- Validation humaine : {pct(verif['taux_validation_humaine'])} ({verif['verdicts']} verdict(s))")
+    coverage = {k: v for lot in lots for k, v in ((lot.get("execution") or {}).get("couverture_code") or {}).items()}
+    lines += ["", "## Spécifiques couverts", ""]
     for i in covered:
-        spec, result = specs.get(i, {"libelle": i, "fichiers": [], "couverture": ""}), results[i]
-        sources = ", ".join(f["path"].rsplit("/", 1)[-1] for f in spec["fichiers"][:4])
-        sources += " …" if len(spec["fichiers"]) > 4 else ""
-        scenarios = "<br>".join(result.get("scenarios") or []) or "—"
-        lines.append(f"| {spec['libelle']} | {sources} | {scenarios} | "
-                     f"{'Adapté' if spec.get('couverture') == 'partiel' else 'Nouveau'} |")
-    lines += ["", "## Spécifiques non couverts", ""]
+        spec, result, lot = specs.get(i, {"libelle": i, "fichiers": []}), results[i], lot_of.get(i, {})
+        mine = [s for s in (lot.get("indicateurs") or {}).get("scenarios", []) if s.get("spec") == i]
+        lines += [f"### {spec['libelle']} ({spec.get('type', '?')})",
+                  f"- Sources : {', '.join(f['path'].rsplit('/', 1)[-1] for f in spec['fichiers'][:4])}"
+                  + (" …" if len(spec["fichiers"]) > 4 else ""),
+                  f"- Inspiré du Standard : {' ; '.join(str(x) for x in result.get('inspire_de') or []) or '—'}",
+                  f"- Steps : {sum(s['steps_std'] for s in mine)} Standard réutilisé(s), "
+                  f"{sum(s['steps_client'] for s in mine)} client, {sum(s['steps_non_definis'] for s in mine)} non "
+                  f"défini(s) ; classes Java : {', '.join(c.rsplit('/', 1)[-1] for c in result.get('classes_java') or []) or '—'}",
+                  f"- Endpoints : {', '.join(dict.fromkeys(e for s in mine for e in s['endpoints'])) or '—'}",
+                  f"- Compilation (lot {lot.get('numero', '?')}) : {_compilation_status(lot)}"]
+        executed = [s for s in ((lot.get("execution") or {}).get("scenarios") or {}).values()
+                    if s["id"].split("::", 1)[0] in {m["fichier"] for m in mine}]
+        if executed:
+            statuses = {}
+            for s in executed:
+                statuses[s["statut"]] = statuses.get(s["statut"], 0) + 1
+            lines.append("- Vérification par exécution : " + ", ".join(f"{n} {k}" for k, n in statuses.items()))
+        if i in coverage:
+            rate = coverage[i]
+            lines.append(f"- Code spécifique exécuté (JaCoCo) : {rate['executees']}/{rate['classes']} classe(s)"
+                         + (" — ⚠️ non exercé" if not rate["executees"] else ""))
+        lines += ["",
+                  "| Scénario | Différence avec le Standard | Source |", "|---|---|---|"]
+        for declared in result.get("scenarios") or []:
+            obj = declared if isinstance(declared, dict) else {"nom": str(declared)}
+            lines.append(f"| {obj.get('nom', '—')} | {obj.get('difference_standard') or '—'} | "
+                         f"{obj.get('source') or '—'} |")
+        lines.append("")
+    lines += ["## Spécifiques non couverts", ""]
     not_covered = [i for i in selected if i not in covered]
     for i in not_covered:
         result = results.get(i)
@@ -835,6 +2048,24 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
         lines.append(f"- {specs.get(i, {}).get('libelle', i)} : {reason or 'raison non précisée'}")
     if not not_covered:
         lines.append("Aucun.")
+    if deleted:
+        lines += ["", "## Scénarios supprimés à la revue", ""]
+        lines += [f"- {d['fichier']} / {d['titre']} : {' ; '.join(d['motifs'])}"
+                  + (f" — {d['justification']}" if d.get("justification") else "") for d in deleted]
+    classes = list(dict.fromkeys(c for i in covered for c in results[i].get("classes_java") or []))
+    if classes:
+        lines += ["", "## Classes Java écrites", ""] + [f"- {c}" for c in classes]
+    unchecked = [lot for lot in state.get("lots", []) if lot.get("statut") == "erreur_compilation"
+                 or (lot.get("verification") or {}).get("environnement")]
+    if unchecked:
+        lines += ["", "## Compilation", ""]
+        for lot in unchecked:
+            check = lot.get("verification") or {}
+            label = ("non vérifié (environnement Maven)" if check.get("environnement")
+                     else f"en erreur ({check.get('etape', 'compilation')}), commité tel quel : « Reprendre » relance "
+                          f"la correction")
+            lines.append(f"- Lot {lot['numero']} : {label}")
+            lines += [f"  - `{e}`" for e in (check.get("erreurs") or [])[:10]]
     already = [s for s in specs.values() if s.get("couverture") == "deja_couvert" and s["id"] not in selected]
     if already:
         lines += ["", "## Déjà couverts (non traités)", ""]
