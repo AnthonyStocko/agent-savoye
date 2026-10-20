@@ -36,6 +36,8 @@ DEFAULT_EXCLUDE_GLOBS = (
 DEFAULT_PARAM_GLOBS = "*.properties,*i18n*,*messages*,*.sql,*param*.xml,*parameter*,*.csv"
 # Dépôts front (écrans AngularJS) : aucun step du Cucumber Standard ne pilote l'interface web
 DEFAULT_EXCLUDE_REPOS = "*-frontend,*-front,*-ui"
+# Ligne de journal de main.py lue par l'onglet Cucumber : référence Git retenue du Cucumber Standard
+STD_REF_LOG = "[CUCUMBER STD] Référence Git retenue :"
 
 STUDIO_FILES = re.compile(r"^(customized\.(xml|json)|original\.xml|i18n\..+\.txt)$")
 STEP_PATTERN = r"@(Given|When|Then|And|But)\("

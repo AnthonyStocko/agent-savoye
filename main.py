@@ -373,105 +373,161 @@ def detect_odatio_version(std_repo_path: str) -> str:
     return "dev"
 
 
-def ensure_cucumber_std_repo(repo_url: str, odatio_version: str) -> str:
+def _force_rmtree(path: str) -> None:
+    """Supprime un dossier, y compris les fichiers en lecture seule d'un .git sous Windows."""
+    def make_writable(func, target, _exc):
+        os.chmod(target, 0o700)
+        func(target)
+    shutil.rmtree(path, **({"onexc": make_writable} if sys.version_info >= (3, 12) else {"onerror": make_writable}))
+
+
+def _git_out(repo_dir: str, *args: str) -> str:
+    return subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True).stdout.strip()
+
+
+def _same_git_url(a: str, b: str) -> bool:
+    normalize = lambda url: re.sub(r"\.git$", "", url.strip().rstrip("/")).lower()
+    return normalize(a) == normalize(b)
+
+
+def cucumber_std_clone_dir(workspace_dir: str, clone_url: str) -> str:
+    """Un clone par dépôt : .tmp/cucumber_std/<slug-projet>_<slug-dépôt>."""
+    path = urlsplit(clone_url).path if "://" in clone_url else clone_url.split(":", 1)[-1]
+    parts = [p for p in path.split("/") if p and p != "scm"]
+    slug = lambda text: re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "x"
+    repo = re.sub(r"\.git$", "", parts[-1]) if parts else "cucumber"
+    project = parts[-2] if len(parts) >= 2 else "std"
+    return os.path.join(workspace_dir, ".tmp", "cucumber_std", f"{slug(project)}_{slug(repo)}")
+
+
+def checkout_cucumber_std_ref(repo_dir: str, odatio_version: str) -> str:
     """
-    Clone ou met à jour le dépôt Cucumber Standard et bascule sur la branche/tag
-    correspondant à la version Odatio, avec gestion intelligente des branches distantes.
+    Détache le clone sur la première référence existante : branches distantes et tags de la version Odatio, puis
+    origin/dev, origin/main, origin/master, origin/HEAD. Jamais une branche locale, qui peut être en retard sur le
+    distant. Renvoie la référence retenue ('' si aucune).
     """
-    if not repo_url or not repo_url.startswith("http"):
-        return ""
+    clean_ver = odatio_version.replace("-SNAPSHOT", "").strip()
+    candidates = [f"origin/release/{clean_ver}", f"origin/v{clean_ver}", f"origin/{clean_ver}",
+                  f"refs/tags/v{clean_ver}", f"refs/tags/{clean_ver}",
+                  "origin/dev", "origin/main", "origin/master", "origin/HEAD"]
+    for ref in candidates:
+        if not _git_out(repo_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"):
+            continue
+        res = subprocess.run(["git", "-C", repo_dir, "checkout", "-q", "--force", "--detach", ref],
+                             capture_output=True, text=True)
+        if res.returncode == 0:
+            return ref.removeprefix("refs/tags/")
+        print(f"⚠️ Checkout de '{ref}' impossible : {res.stderr.strip()[:300]}")
+    return ""
+
+
+def ensure_cucumber_std_repo(repo_url: str, odatio_version: str) -> tuple:
+    """
+    Prépare le dépôt Cucumber Standard et renvoie (dossier, "référence @ commit court") ; ("", "") si indisponible.
+    - chemin local d'un dépôt git : utilisé tel quel (fetch seulement, aucun checkout) ;
+    - URL (navigation Bitbucket, clonable ou projet Bitbucket) : un clone par dépôt, recloné si son origin diffère,
+      puis fetch et checkout détaché de la référence distante correspondant à la version Odatio.
+    """
+    repo_url = (repo_url or "").strip()
+    if not repo_url:
+        return "", ""
+
+    bitbucket_token = os.getenv("BITBUCKET_HTTP_TOKEN", "").strip()
+    git_env = os.environ.copy()
+    git_cmd_extra = ["-c", f"http.extraHeader=Authorization: Bearer {bitbucket_token}"] if bitbucket_token else []
+
+    def fetch(repo_dir: str) -> None:
+        res = subprocess.run(["git"] + git_cmd_extra + ["-C", repo_dir, "fetch", "--all", "--tags", "--force", "--prune"],
+                             capture_output=True, text=True, env=git_env)
+        if res.returncode != 0:
+            print(f"⚠️ git fetch du Cucumber Standard en échec : {res.stderr.strip()[:300]}")
+
+    def report(repo_dir: str, ref: str) -> tuple:
+        label = f"{ref} @ {_git_out(repo_dir, 'rev-parse', '--short', 'HEAD')}"
+        print(f"[CUCUMBER STD] Dossier : {repo_dir}")
+        print(f"{cucumber_tools.STD_REF_LOG} {label}")
+        print(f"==================================================\n")
+        return repo_dir, label
+
+    print(f"\n==================================================")
+    print(f"[CUCUMBER STD] Préparation des tests Cucumber Standard (Version cible Odatio : {odatio_version})...")
+
+    # Chemin local : le dépôt de l'utilisateur n'est ni cloné ni basculé de branche
+    if not repo_url.startswith(("http://", "https://", "git@", "file://")):
+        local_dir = os.path.abspath(repo_url)
+        if not os.path.exists(os.path.join(local_dir, ".git")):
+            print(f"❌ Dépôt Cucumber Standard '{repo_url}' : ni URL ni dossier git local.")
+            return "", ""
+        print(f"📂 Dépôt Cucumber Standard local utilisé tel quel : {local_dir}")
+        fetch(local_dir)
+        branch = _git_out(local_dir, "rev-parse", "--abbrev-ref", "HEAD")
+        return report(local_dir, branch if branch and branch != "HEAD" else "HEAD détaché")
 
     clean_url = repo_url.split("/browse")[0].rstrip("/")
     # URL de navigation Bitbucket (.../projects/COMPONENT-QA/repos/cucumber) -> URL clonable (.../scm/component-qa/cucumber.git)
     web_repo = re.match(r"^(https?://[^/]+)/projects/([^/]+)/repos/([^/]+)$", clean_url)
     if web_repo:
         clean_url = f"{web_repo.group(1)}/scm/{web_repo.group(2).lower()}/{web_repo.group(3)}.git"
-
-    workspace_dir = os.path.dirname(os.path.abspath(__file__))
-    target_dir = os.path.join(workspace_dir, ".tmp", "cucumber_std")
-    
-    bitbucket_token = os.getenv("BITBUCKET_HTTP_TOKEN", "").strip()
     bitbucket_url = bitbucket_base_url(clean_url)
-    git_env = os.environ.copy()
-    git_cmd_extra = ["-c", f"http.extraHeader=Authorization: Bearer {bitbucket_token}"] if bitbucket_token else []
 
     if "/projects/" in clean_url and "/repos/" not in clean_url and not clean_url.endswith(".git"):
         project_key = clean_url.split("/")[-1].upper()
-        print(f"\n==================================================")
         print(f"[CUCUMBER STD] Recherche du dépôt Cucumber dans le projet '{project_key}'...")
         api_url = f"{bitbucket_url}/rest/api/1.0/projects/{project_key}/repos?limit=100"
         headers = {"Authorization": f"Bearer {bitbucket_token}"} if bitbucket_token else {}
-        
         try:
             res = requests.get(api_url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                repos = res.json().get("values", [])
-                cuc_repo = next((r["slug"] for r in repos if "cucumber" in r["slug"].lower()), None)
-                if not cuc_repo:
-                    cuc_repo = next((r["slug"] for r in repos if "qa" in r["slug"].lower()), None)
-                if cuc_repo:
-                    clean_url = f"{bitbucket_url}/scm/{project_key}/{cuc_repo}.git"
-                    print(f"[CUCUMBER STD] Dépôt trouvé via API Bitbucket : {clean_url}")
-                else:
-                    print(f"[CUCUMBER STD] Aucun dépôt Cucumber trouvé dans le projet {project_key}.")
-                    return ""
+            repos = res.json().get("values", []) if res.status_code == 200 else []
         except Exception as e:
             print(f"[CUCUMBER STD] Erreur API Bitbucket ({e})")
-            return ""
+            return "", ""
+        cuc_repo = (next((r["slug"] for r in repos if "cucumber" in r["slug"].lower()), None)
+                    or next((r["slug"] for r in repos if "qa" in r["slug"].lower()), None))
+        if not cuc_repo:
+            print(f"[CUCUMBER STD] Aucun dépôt Cucumber trouvé dans le projet {project_key}.")
+            return "", ""
+        clean_url = f"{bitbucket_url}/scm/{project_key.lower()}/{cuc_repo}.git"
+        print(f"[CUCUMBER STD] Dépôt trouvé via API Bitbucket : {clean_url}")
 
     if not clean_url.endswith(".git") and "/scm/" in clean_url:
         clean_url += ".git"
-
-    print(f"\n==================================================")
-    print(f"[CUCUMBER STD] Préparation des tests Cucumber Standard (Version cible Odatio : {odatio_version})...")
     print(f"URL Git : {clean_url}")
-    
+
+    workspace_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.join(workspace_dir, ".tmp", "cucumber_std")
+    target_dir = cucumber_std_clone_dir(workspace_dir, clean_url)
+    # Ancienne disposition : un clone unique directement dans .tmp/cucumber_std
+    if os.path.exists(os.path.join(root_dir, ".git")):
+        print(f"🧹 Suppression de l'ancien clone unique {root_dir}...")
+        _force_rmtree(root_dir)
+
+    if os.path.exists(os.path.join(target_dir, ".git")):
+        origin = _git_out(target_dir, "remote", "get-url", "origin")
+        if not _same_git_url(origin, clean_url):
+            print(f"🧹 Clone {target_dir} issu d'un autre dépôt ({origin or 'origin absent'}) : reclonage.")
+            _force_rmtree(target_dir)
+
     if os.path.exists(os.path.join(target_dir, ".git")):
         print(f"🔄 Mise à jour du dépôt Cucumber Standard dans {target_dir}...")
-        subprocess.run(["git"] + git_cmd_extra + ["-C", target_dir, "fetch", "--all", "--tags", "--prune"], check=False, env=git_env)
+        fetch(target_dir)
     else:
         if os.path.exists(target_dir):
-            shutil.rmtree(target_dir, ignore_errors=True)
-        print(f"📥 Clonage du dépôt Cucumber Standard depuis {clean_url}...")
-        os.makedirs(target_dir, exist_ok=True)
-        res = subprocess.run(["git"] + git_cmd_extra + ["clone", clean_url, target_dir], capture_output=True, text=True, env=git_env)
+            _force_rmtree(target_dir)
+        print(f"📥 Clonage du dépôt Cucumber Standard depuis {clean_url} dans {target_dir}...")
+        os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+        res = subprocess.run(["git"] + git_cmd_extra + ["clone", "--no-checkout", clean_url, target_dir],
+                             capture_output=True, text=True, env=git_env)
         if res.returncode != 0:
             print(f"❌ Échec du clonage Cucumber Standard : {res.stderr.strip()}")
-            return ""
+            return "", ""
 
-    # Liste des candidats (tags, branches locales, branches distantes, branches par défaut)
-    clean_ver = odatio_version.replace("-SNAPSHOT", "").strip()
-    candidate_refs = [
-        f"v{clean_ver}",
-        clean_ver,
-        f"release/{clean_ver}",
-        f"origin/v{clean_ver}",
-        f"origin/{clean_ver}",
-        f"origin/release/{clean_ver}",
-        "dev",
-        "origin/dev",
-        "main",
-        "origin/main",
-        "master",
-        "origin/master"
-    ]
+    ref = checkout_cucumber_std_ref(target_dir, odatio_version)
+    if not ref:
+        print("❌ Aucune référence distante exploitable (version Odatio, dev, main, master) dans le Cucumber Standard.")
+        return "", ""
+    return report(target_dir, ref)
 
-    checked_out = False
-    for ref in candidate_refs:
-        checkout_res = subprocess.run(["git", "-C", target_dir, "checkout", ref], capture_output=True, text=True)
-        if checkout_res.returncode == 0:
-            print(f"✅ Dépôt Cucumber Standard aligné avec succès sur la référence Git '{ref}'.")
-            checked_out = True
-            break
 
-    if not checked_out:
-        print("⚠️ Aucune des branches spécifiques trouvée. Récupération de la branche distante par défaut...")
-        # Alignement sur la branche HEAD distante
-        subprocess.run(["git", "-C", target_dir, "checkout", "-b", "default_branch", "--track", "origin/HEAD"], capture_output=True, text=True)
-
-    print(f"==================================================\n")
-    return target_dir
-    
 def ensure_local_repo(repo_input: str, repo_label: str) -> str:
     """
     Si repo_input est une URL de projet Bitbucket, interroge l'API REST 
@@ -661,6 +717,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
     parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
     parser.add_argument("--client-name", default="", help="generate-cucumber-client : nom du client, qui donne le dépôt cible <client>-cucumber (défaut : déduit de --client-repo)")
+    parser.add_argument("--cucumber-std-repo", default="", help="Dépôt du Cucumber Standard : URL Bitbucket (navigation ou clonable) ou chemin d'un clone local (défaut : BITBUCKET_CUCUMBER_STD_REPO)")
     parser.add_argument("--feedback", default="", help="Remarques de l'utilisateur pour la révision")
     # Les tests Cucumber sont désormais traités après merge, par le ticket SPEC [CUCUMBER] (generate-cucumber-postmerge)
     parser.add_argument("--generate-cucumber", action="store_true", default=False, help="Réactiver ponctuellement la génération des tests Cucumber avec le patch")
@@ -740,8 +797,8 @@ def main():
         local_cucumber_std_repo = ""
         odatio_version = detect_odatio_version(local_std_repo)
         if args.generate_cucumber:
-            cucumber_std_url = os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "")
-            local_cucumber_std_repo = ensure_cucumber_std_repo(cucumber_std_url, odatio_version)
+            cucumber_std_url = args.cucumber_std_repo.strip() or os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "")
+            local_cucumber_std_repo, _ = ensure_cucumber_std_repo(cucumber_std_url, odatio_version)
         else:
             print("\n[CUCUMBER STD] Génération des tests Cucumber désactivée par l'utilisateur.")
 
@@ -867,7 +924,7 @@ def main():
             print("❌ Dépôt client non renseigné : passez --client-repo ou renseignez BITBUCKET_CLIENT_REPO_PATH.")
             sys.exit(2)
         if not local_cucumber_std_repo:
-            print("❌ Dépôt Cucumber Standard indisponible : vérifiez BITBUCKET_CUCUMBER_STD_REPO (URL clonable, ex. "
+            print("❌ Dépôt Cucumber Standard indisponible : vérifiez --cucumber-std-repo ou BITBUCKET_CUCUMBER_STD_REPO (URL, ex. "
                   "https://git.kiscloud.io/scm/component-qa/cucumber.git) et BITBUCKET_HTTP_TOKEN.")
             sys.exit(2)
         args.cucumber_repo, cucumber_repo_dir = resolve_client_cucumber_repo(client_name, local_client_repo,

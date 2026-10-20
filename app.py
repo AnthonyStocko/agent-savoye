@@ -871,6 +871,7 @@ with tab_cucumber:
     st.session_state.setdefault("cucumber_repo", os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""))
     st.session_state.setdefault("cucumber_db_schema", os.getenv("DB_SCHEMA", ""))
     st.session_state.setdefault("cucumber_application", "")
+    st.session_state.setdefault("cucumber_std_repo", os.getenv("BITBUCKET_CUCUMBER_STD_REPO", ""))
 
     cucumber_repo_input = st.text_input(
         "Dépôt Bitbucket du projet client :", key="cucumber_repo",
@@ -904,13 +905,35 @@ with tab_cucumber:
         st.caption(f"Dépôt cible : **{cucumber_client}-cucumber** · identifiant de travail "
                    f"**{cucumber_tools.work_id(cucumber_client)}**")
 
+    cucumber_std_input = st.text_input(
+        "Dépôt Bitbucket du Cucumber Standard :", key="cucumber_std_repo",
+        help="URL de navigation (.../projects/X/repos/Y/browse), URL clonable (.../scm/x/y.git) ou chemin d'un "
+             "clone local, utilisé tel quel. Défaut : BITBUCKET_CUCUMBER_STD_REPO (onglet Configuration).",
+    ).strip()
+    # Référence Git du Standard lue dans le journal de la dernière exécution (pour ce dépôt seulement)
+    std_ref_slot = st.empty()
+
+    def show_std_ref() -> None:
+        last = st.session_state.get("cucumber_std_ref") or {}
+        if last.get("repo") == cucumber_std_input and last.get("ref"):
+            std_ref_slot.caption(f"Référence Git utilisée lors de la dernière exécution : **{last['ref']}**")
+
+    def capture_std_ref(line: str) -> None:
+        if line.startswith(cucumber_tools.STD_REF_LOG):
+            ref = line[len(cucumber_tools.STD_REF_LOG):].strip()
+            st.session_state["cucumber_std_ref"] = {"repo": cucumber_std_input, "ref": ref}
+            show_std_ref()
+
+    show_std_ref()
+
     cucumber_cmd = [
         sys.executable, "main.py",
         "--step", "generate-cucumber-client",
         "--client-repo", cucumber_repo_input,
         "--client-name", cucumber_client,
         "--application", cucumber_application,
-        "--db-schema", cucumber_schema
+        "--db-schema", cucumber_schema,
+        "--cucumber-std-repo", cucumber_std_input,
     ]
     ready = bool(cucumber_repo_input and cucumber_client)
 
@@ -919,7 +942,7 @@ with tab_cucumber:
                  disabled=not ready, help="Prépare les dépôts, puis inventorie les spécifiques du client, les "
                                           "catalogues Cucumber et les extraits Jira. Aucun appel à Claude."):
         st.info(f"Inventaire des spécifiques {cucumber_client} en cours...")
-        if run_main_step(cucumber_cmd + ["--inventory-only"]) == 0:
+        if run_main_step(cucumber_cmd + ["--inventory-only"], on_line=capture_std_ref) == 0:
             st.success("Inventaire terminé.")
         else:
             st.error("L'inventaire a échoué : voir le journal ci-dessus.")
@@ -974,6 +997,7 @@ with tab_cucumber:
         progress = st.progress(0.0, text="Préparation (inventaire, catalogues, worktree)...")
 
         def show_lot_progress(line: str) -> None:
+            capture_std_ref(line)
             match = re.match(r"\[LOT (\d+)/(\d+)\]", line)
             if match:
                 current, total_lots = int(match.group(1)), int(match.group(2))
