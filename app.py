@@ -1000,19 +1000,37 @@ with tab_cucumber:
             estimate = "coût inconnu (aucun lot exécuté jusqu'ici)"
         st.caption(f"{len(selected_ids)} spécifique(s) coché(s) → {lot_count} lot(s) de {batch_size} · {estimate}")
 
-    # 2. Génération par lots (un appel Claude neuf par lot) et reprise
+    # 2. Génération par lots (un appel Claude neuf par lot), reprise et complément
     pending = cucumber_tools.pending_lots(cucumber_state)
-    col_generate, col_resume = st.columns([3, 1])
+    completable = cucumber_tools.completable_specifics(cucumber_state) if cucumber_state.get("lots") else []
+    # Une nouvelle génération repart de la base : les lots d'une génération existante sont écrasés
+    existing = bool(cucumber_state.get("lots")) and os.path.isdir(cucumber_tools.worktree_dir(cucumber_client))
+    overwrite = True
+    if existing:
+        st.warning(f"Une génération existe déjà ({len(cucumber_state['lots'])} lot(s)) : une nouvelle génération "
+                   f"repart de la base et **les lots précédents seront écrasés** (commits, patch, récapitulatif). "
+                   f"Pour ajouter des tests sans rien perdre, utilisez « Compléter la génération ».",
+                   icon=":material/warning:")
+        overwrite = st.checkbox("Je confirme : les lots précédents seront écrasés",
+                                key=f"cucumber_overwrite_{cucumber_client}")
+    col_generate, col_resume, col_complete = st.columns([2, 1, 1])
     with col_generate:
         generate = st.button("Génération des tests Cucumber", type="primary", use_container_width=True,
-                             icon=":material/science:", disabled=not (ready and selected_ids),
+                             icon=":material/science:", disabled=not (ready and selected_ids and overwrite),
                              help="Traite uniquement les spécifiques cochés. Lancez d'abord l'inventaire.")
     with col_resume:
         resume = st.button("Reprendre", use_container_width=True, icon=":material/play_arrow:",
                            disabled=not (ready and pending),
                            help=f"{len(pending)} lot(s) non terminé(s) lors de la dernière génération."
                            if pending else "Aucun lot à reprendre.")
-    if generate or resume:
+    with col_complete:
+        complete = st.button("Compléter la génération", use_container_width=True, icon=":material/playlist_add:",
+                             disabled=not (ready and completable),
+                             help=f"{len(completable)} spécifique(s) non couvert(s) faute de step, d'endpoint, "
+                                  f"d'interaction ou de vérification : repris dans de nouveaux lots (recettes de "
+                                  f"test, synonymes), sans effacer les lots ni les commits précédents."
+                             if completable else "Aucun spécifique à compléter.")
+    if generate or resume or complete:
         progress = st.progress(0.0, text="Préparation (inventaire, catalogues, worktree)...")
 
         def show_lot_progress(line: str) -> None:
@@ -1022,7 +1040,7 @@ with tab_cucumber:
                 current, total_lots = int(match.group(1)), int(match.group(2))
                 progress.progress(min((current - 1) / total_lots, 1.0), text=f"Lot {current}/{total_lots} en cours")
 
-        extra = ["--resume"] if resume else ["--specifics", ",".join(selected_ids)]
+        extra = ["--resume"] if resume else ["--complete"] if complete else ["--specifics", ",".join(selected_ids)]
         returncode = run_main_step(cucumber_cmd + extra, on_line=show_lot_progress)
         progress.progress(1.0, text="Terminé" if returncode == 0 else "Interrompu")
         if returncode == 0:
@@ -1041,6 +1059,7 @@ with tab_cucumber:
             lot_rows.append({
                 "Lot": lot["numero"], "Statut": lot.get("statut", ""), "Spécifiques": len(lot["ids"]),
                 "Couverts": sum(1 for r in results if r.get("statut") == "couvert"),
+                "Indirects": sum(1 for r in results if r.get("statut") == "couvert_indirectement"),
                 "Scénarios": indicators.get("scenarios"),
                 "Steps Standard (%)": indicators.get("reutilisation"),
                 "Steps créés": indicators.get("steps_crees"),
@@ -1061,6 +1080,9 @@ with tab_cucumber:
                            f"{sum(c['signales'] for c in controlled)} signalé(s), "
                            f"{sum(c['supprimes'] for c in controlled)} supprimé(s) à la revue")
             st.dataframe(lot_rows, hide_index=True, width="stretch", column_config={
+                "Indirects": st.column_config.NumberColumn(
+                    "Indirects", help="Spécifiques couverts indirectement (listener, événement) par le test d'un "
+                                      "autre spécifique couvert"),
                 "Steps Standard (%)": st.column_config.NumberColumn(
                     "Steps Standard (%)", help="Part des steps des nouveaux scénarios définis par le Cucumber Standard"),
                 "Signalés": st.column_config.NumberColumn(

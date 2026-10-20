@@ -746,6 +746,7 @@ def main():
     parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
+    parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
     parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
     parser.add_argument("--client-name", default="", help="generate-cucumber-client : nom du client, qui donne le dépôt cible <client>-cucumber (défaut : déduit de --client-repo)")
     parser.add_argument("--cucumber-std-repo", default="", help="Dépôt du Cucumber Standard : URL Bitbucket (navigation ou clonable) ou chemin d'un clone local (défaut : BITBUCKET_CUCUMBER_STD_REPO)")
@@ -1332,26 +1333,32 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     """
     Couverture Cucumber des spécifiques d'un client. Python fait tout le déterministe (inventaire, catalogues,
     extraits Jira, git, récapitulatif) ; Claude n'écrit que les tests, par lots, avec un appel neuf par lot.
-    Reprise : les lots terminés (etat.json) ne sont pas refaits. Renvoie le code de sortie.
+    Reprise : les lots terminés (etat.json) ne sont pas refaits. Complément (--complete) : nouveaux lots ajoutés à
+    la génération existante, sans repartir de la base. Renvoie le code de sortie.
     """
     client = args.client_name
     base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
     if not base:
         print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")
         return 2
-    resume_state = cucumber_tools.load_state(client) if args.resume else {}
-    if args.resume and not cucumber_tools.pending_lots(resume_state):
+    complete_state = cucumber_tools.load_state(client) if args.complete else {}
+    if args.complete and not complete_state.get("lots"):
+        print("❌ Aucune génération à compléter : lancez d'abord une génération.")
+        return 2
+    resume_state = cucumber_tools.load_state(client) if args.resume and not args.complete else {}
+    if args.resume and not args.complete and not cucumber_tools.pending_lots(resume_state):
         print("[CUCUMBER] Aucun lot à reprendre.")
         return 0
 
     # 1. Pré-calculs (0 token). Reprise ou sélection faite sur un inventaire : celui-ci est réutilisé tel quel
     subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
-    inventory = cucumber_tools.load_inventory(client) if (resume_state or args.specifics) else {}
+    inventory = cucumber_tools.load_inventory(client) if (resume_state or complete_state or args.specifics) else {}
     started = time.time()
     if inventory.get("specifiques"):
         print(f"[CUCUMBER] Inventaire du {inventory['genere_le'].replace('T', ' ')} réutilisé.")
-        # Inventaire antérieur au rapprochement avec les tests et endpoints Standard : complété sans le refaire
-        if any("tests_std" not in s for s in inventory["specifiques"]):
+        # Inventaire antérieur au rapprochement avec les tests et endpoints Standard : complété sans le refaire ;
+        # complément : rapprochement refait (synonymes, CUCUMBER_STD_MATCH_MIN à jour)
+        if complete_state or any("tests_std" not in s for s in inventory["specifiques"]):
             cucumber_tools.attach_std_tests(inventory, local_cucumber_std_repo, odatio_version)
         if any("endpoints_std" not in s for s in inventory["specifiques"]):
             cucumber_tools.attach_endpoints(inventory, local_std_repo, cucumber_tools.standard_endpoints(
@@ -1362,6 +1369,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         inventory = cucumber_tools.prepare(client, local_client_repo, local_std_repo, local_cucumber_std_repo,
                                            odatio_version, cucumber_repo_dir, base,
                                            cucumber_jira_tickets(client, args.application))
+    # Recettes de test applicables à chaque spécifique (0 token), recalculées à chaque exécution
+    with_recipes = cucumber_tools.attach_recipes(inventory, local_cucumber_std_repo)
+    cucumber_tools.save_inventory(client, inventory)
     specifics = {s["id"]: s for s in inventory["specifiques"]}
     counts = {}
     for spec in specifics.values():
@@ -1369,11 +1379,35 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     print(f"[CUCUMBER] {len(specifics)} spécifique(s) en {time.time() - started:.0f} s : "
           + ", ".join(f"{n} {k}" for k, n in sorted(counts.items()))
           + f" — {cucumber_tools.inventory_path(client)}")
+    recipes_file = cucumber_tools.recipes_path()
+    print(f"[CUCUMBER] Recettes de test : {with_recipes} spécifique(s) concerné(s)"
+          + (f" ({recipes_file})" if recipes_file else " (aucun fichier de recettes)"))
     if args.inventory_only:
         return 0
 
-    # 2. Lots : reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
-    if resume_state:
+    # 2. Lots : complément, reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
+    if complete_state:
+        state = complete_state
+        cucumber_tools.drop_excluded(state, specifics)
+        wanted = [i.strip() for i in args.specifics.split(",") if i.strip()] if args.specifics else \
+            cucumber_tools.completable_specifics(state)
+        unknown = [i for i in wanted if i not in specifics]
+        if unknown:
+            print(f"⚠️ Spécifiques inconnus ignorés : {', '.join(unknown)}")
+        wanted = [i for i in wanted if i in specifics]
+        if not wanted:
+            print("[CUCUMBER] Aucun spécifique à compléter.")
+            return 0
+        previous = cucumber_tools.latest_results(state)
+        print(f"[CUCUMBER] Complément : {len(wanted)} spécifique(s) à reprendre :")
+        for i in wanted:
+            reason = " ".join(((previous.get(i) or {}).get("raison") or "").split())
+            print(f"  - {i} — {specifics[i]['libelle']}" + (f" : {reason[:160]}" if reason else ""))
+        new_lots = cucumber_tools.add_completion_lots(state, wanted, _env_int("CUCUMBER_BATCH_SIZE", 3))
+        others = len(cucumber_tools.pending_lots(state)) - len(new_lots)
+        print(f"[CUCUMBER] Complément : lot(s) {new_lots[0]['numero']} à {new_lots[-1]['numero']} ajouté(s), lots "
+              f"précédents et commits conservés" + (f" ; {others} lot(s) non terminé(s) repris aussi." if others else "."))
+    elif resume_state:
         state = resume_state
         dropped = cucumber_tools.drop_excluded(state, specifics)
         if dropped:
@@ -1391,11 +1425,13 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             return 0
         state = {"client": client, "debut": datetime.now().isoformat(timespec="seconds"), "base": base,
                  "lots": cucumber_tools.make_lots(wanted, _env_int("CUCUMBER_BATCH_SIZE", 3))}
+        if cucumber_tools.load_state(client).get("lots"):
+            print("⚠️ Nouvelle génération : les lots précédents (worktree, commits, etat.json) sont écrasés.")
         # Nouvelle génération : le patch des scénarios à revoir repart de zéro
         if os.path.exists(cucumber_verify.a_revoir_path(client)):
             os.remove(cucumber_verify.a_revoir_path(client))
     try:
-        worktree = cucumber_tools.prepare_worktree(cucumber_repo_dir, client, state["base"], reset=not resume_state)
+        worktree = cucumber_tools.prepare_worktree(cucumber_repo_dir, client, state["base"], reset=not (resume_state or complete_state))
     except RuntimeError as e:
         print(f"❌ {e}")
         return 2
@@ -1419,6 +1455,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "features_std": catalogue["features_std"],
         "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",
         "couverture_existante": inventory["couverture_existante"], "cucumber_repo": args.cucumber_repo,
+        "inventaire": cucumber_tools.inventory_path(client),
         "worktree": worktree, "java_std": std_java["java_std"], "endpoints_std": std_endpoints["fichier"],
         "consignes": cucumber_verify.project_guidelines(client),
         "steps_example": std_java["steps_example"] or "aucune", "runner_example": std_java["runner_example"] or "aucun",
@@ -1539,12 +1576,19 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         lot["statut"] = "termine"
         cucumber_tools.save_state(client, state)
         done = sum(1 for r in results if r.get("statut") == "couvert")
+        indirect = sum(1 for r in results if r.get("statut") == "couvert_indirectement")
         verified = ("" if not (compile_cmd and files) else " — compilation non vérifiée (environnement Maven)"
                     if check.get("environnement") else f" — {check['etape']} OK")
         print(f"[LOT {label}] ✅ {done}/{len(lot_specs)} spécifique(s) couvert(s)"
-              f"{' — commit créé' if committed else ' — aucun fichier écrit'}{verified}.")
+              + (f", {indirect} indirectement" if indirect else "")
+              + f"{' — commit créé' if committed else ' — aucun fichier écrit'}{verified}.")
 
-    # 4. Patch et récapitulatif, produits en Python
+    # 4. Patch et récapitulatif, produits en Python ; « couvert_indirectement » vérifié sur l'ensemble des lots
+    requalified = cucumber_tools.requalify_indirect(state, inventory)
+    if requalified:
+        print(f"[CUCUMBER] {len(requalified)} spécifique(s) « couvert_indirectement » requalifié(s) non couvert(s) "
+              f"(spécifique cité non couvert) : {', '.join(requalified)}")
+    cucumber_tools.save_state(client, state)
     patch_file = cucumber_tools.patch_path(client)
     if cucumber_tools.write_patch(worktree, state["base"], patch_file, client):
         print(f"\n[CUCUMBER] Patch généré : {patch_file}")

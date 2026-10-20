@@ -14,6 +14,7 @@ ${token_saving_rules}
 - Runner du Standard (modèle, à lire seulement s'il faut créer un runner) : '${runner_example}'
 - Package des Step Definitions du client : ${package_steps} ; package des classes d'appui : ${package_support}
 - Couverture existante du dépôt Cucumber client (à interroger par Grep) : '${couverture_existante}'
+- Inventaire des spécifiques du client (ids, dossiers, fichiers ; à interroger par Grep, jamais en entier) : '${inventaire}'
 - Worktree où écrire les tests (branche dédiée, dépôt '${cucumber_repo}') : '${worktree}'
 
 ${consignes}
@@ -23,9 +24,11 @@ ${consignes}
 3. Pour chaque spécifique, comprends d'abord ce qui diffère du Standard : éléments modifiés (override), comportement nouveau (extension), effet du paramètre ou du libellé (paramétrage), tickets Jira.
 
 === ORDRE DE PRIORITÉ POUR ÉCRIRE ===
+0. Appliquer les « Recettes applicables » du lot (en tête du lot) : steps Standard à utiliser, exemple à suivre, statut attendu.
 1. Partir du test Standard équivalent (« Tests Standard équivalents » du lot, extraits bornés) : même structure, même Background, mêmes jeux de données, mêmes steps ; ne change que ce qui diffère chez le client. Indique en commentaire Gherkin `# Adapté de <chemin Standard> / <scénario>`. Sans test équivalent : reprends la structure et les steps des tests Standard du même domaine.
 2. Réutiliser, dans cet ordre : step Standard existant (Grep dans '${steps_std}') → step client existant (worktree, '${java_client}') → nouveau step qui appelle un helper ou un endpoint Standard existant (« Endpoints Standard liés » du lot, Grep dans '${endpoints_std}' et '${java_std}') → en dernier recours seulement, nouveau code d'appel, et uniquement pour un endpoint propre au client (« Endpoints propres au client »), sur le modèle des classes *EndPoints du Standard, dans le package ${package_support}.
-3. Coder comme le Standard : mêmes packages, nommage, classe de base, injection (constructeur), assertions, gestion du contexte partagé (clés de Context) et des données que la Step Definitions exemplaire ; même formalisme Gherkin (langue, préfixes de steps, tags, tables de données, `Scenario Outline` quand le Standard l'utilise pour le même cas).
+3. Vérifier un effet (champ, entité, statut) : relis l'objet par un endpoint REST Standard existant (Grep dans '${endpoints_std}' et '${java_std}'), en créant un step si besoin. Pas d'accès base dans les tests, sauf si le Standard en contient déjà un exemple (cite-le en commentaire Gherkin).
+4. Coder comme le Standard : mêmes packages, nommage, classe de base, injection (constructeur), assertions, gestion du contexte partagé (clés de Context) et des données que la Step Definitions exemplaire ; même formalisme Gherkin (langue, préfixes de steps, tags, tables de données, `Scenario Outline` quand le Standard l'utilise pour le même cas).
 
 === PERTINENCE : un scénario n'est écrit que s'il remplit TOUS ces critères ===
 - Il vérifie un comportement observable (réponse d'endpoint, donnée persistée, statut, message, document généré) qui diffère du Standard ou n'existe pas en Standard.
@@ -34,6 +37,11 @@ ${consignes}
 - Il a au moins une assertion métier (valeur, statut métier, contenu de message ou de document) : pas seulement « statut 200 », pas de `Then` vide.
 - Il s'appuie sur une source : le code du spécifique, et quand ils existent le ticket Jira ou le paramétrage réel, cités en commentaire (`# Source : <fichier>`, `# Jira : CLE-123`).
 Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites réellement introduits par le spécifique (règles, seuils, branches du code client). Aucun scénario de remplissage. Un spécifique sans comportement observable propre au client : n'écris rien et explique-le dans « raison ».
+
+=== AVANT DE CONCLURE « non_couvert » FAUTE DE STEP OU D'ENDPOINT ===
+- Applique les recettes du lot, puis cherche dans '${steps_std}' avec AU MOINS 3 formulations différentes : synonymes, anglais / français (repack / reconditionnement, slot / emplacement, screen / écran / interaction…), nom de l'objet métier.
+- Cite dans « raison » les recherches faites (motifs Grep et résultat) : une raison sans recherches citées n'est pas acceptée.
+- Un listener ou un événement qui ne fait que déclencher un process n'est pas « non_couvert » : réponds « couvert_indirectement » avec « couvert_par » (id du spécifique du process, Grep dans '${inventaire}').
 
 === FICHIERS ET CODE ===
 1. Écris les .feature dans le worktree uniquement, en respectant l'organisation existante du dépôt client, sinon celle du Standard (src/test/resources/cucumber/features/…), dans un dossier '${client_name}'.
@@ -48,12 +56,12 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 Ta réponse finale est UNIQUEMENT ce bloc JSON, sans aucun autre texte (cette règle remplace « Réponse finale : 10 lignes maximum ») :
 ```json
 [
-  {"id": "<id du spécifique>", "statut": "couvert|non_couvert",
+  {"id": "<id du spécifique>", "statut": "couvert|couvert_indirectement|non_couvert", "couvert_par": "<id du spécifique qui le couvre, si couvert_indirectement>",
    "scenarios": [{"nom": "<Feature> / <Scenario>", "fichier": "<chemin relatif au worktree du .feature>", "difference_standard": "<une phrase : ce qui diffère du Standard>", "source": "<fichier du spécifique, ticket Jira, paramètre>"}],
    "fichiers": ["<chemin relatif au worktree>"], "classes_java": ["<chemin relatif au worktree>"], "inspire_de": ["<chemin Standard> / <scénario>"], "raison": "<si non couvert, ou constat utile>"}
 ]
 ```
-Un objet par spécifique du lot, dans l'ordre. « fichiers » : les .feature ; « classes_java » : les classes Java créées ou complétées pour ce spécifique ; « inspire_de » : les scénarios Standard dont tu es parti (vide si aucun). « difference_standard » et « source » sont obligatoires pour chaque scénario.
+Un objet par spécifique du lot, dans l'ordre. « fichiers » : les .feature ; « classes_java » : les classes Java créées ou complétées pour ce spécifique ; « inspire_de » : les scénarios Standard dont tu es parti (vide si aucun). « difference_standard » et « source » sont obligatoires pour chaque scénario. « couvert_par » : seulement pour « couvert_indirectement » (pas de scénario propre).
 
 === LOT ${lot_label} ===
 ${lot_block}

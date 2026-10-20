@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import unicodedata
 from datetime import datetime
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -894,6 +895,39 @@ _TECHNICAL_WORDS = {"datautil", "datamodel", "transition", "transitions", "actio
                     "create", "from", "send", "handler", "interactive", "found", "after", "before", "with", "without",
                     "into", "when", "then", "process"}
 
+# Synonymes FR / EN (sans accents) : les noms Java et Studio du client sont en anglais, les features du Standard
+# souvent en français. Extensible par CUCUMBER_SYNONYMS (« a|b|c;d|e »)
+DEFAULT_SYNONYMS = ("interactif|interactive|interaction;processus|process;ecran|screen;emplacement|slot|location;"
+                    "quantite|quantity|qty;document|edition|report;repack|reconditionnement|reconditionner;"
+                    "contenu|content;reception|goodsin;expedition|shipping|dispatch;transporteur|carrier;"
+                    "fournisseur|supplier;produit|product;inventaire|stocktaking|inventory;etiquette|label;"
+                    "colis|parcel;statut|status;commande|order")
+
+
+def _unaccent(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
+
+
+def synonym_groups() -> list:
+    """Groupes de synonymes (ensembles de mots sans accents, en minuscules) : défaut puis CUCUMBER_SYNONYMS."""
+    groups = []
+    for text in (DEFAULT_SYNONYMS, os.getenv("CUCUMBER_SYNONYMS", "")):
+        for group in text.split(";"):
+            words = {_unaccent(w.strip().lower()) for w in group.split("|") if w.strip()}
+            if len(words) >= 2:
+                groups.append(words)
+    return groups
+
+
+def synonyms(word: str, groups: list = None) -> set:
+    """Le mot et ses synonymes (union des groupes qui le contiennent)."""
+    word = _unaccent(word.lower())
+    found = {word}
+    for group in synonym_groups() if groups is None else groups:
+        if word in group:
+            found |= group
+    return found
+
 
 def _segment(word: str, vocabulary: set) -> list:
     """Découpe un nom collé en mots connus du Standard (handlingunitdeclarative -> handling unit declarative)."""
@@ -920,13 +954,16 @@ def related_std_tests(spec: dict, catalogue: dict, java_std: list = None, min_sc
         except ValueError:
             min_score = DEFAULT_STD_MATCH_MIN
     features = catalogue["features"]
+    groups = synonym_groups()
     for feature in features:
-        feature.setdefault("words_set", set(feature["words"]))
-    keywords = [k for k in dict.fromkeys(_spec_name(k, client_name) if len(k) >= 8 else k for k in spec["mots_cles"])
-                if len(k) >= 4 and k not in _TECHNICAL_WORDS]
+        # Mots avec et sans accents : « ecran » (synonyme) retrouve « écran »
+        feature.setdefault("words_set", set(feature["words"]) | {_unaccent(w) for w in feature["words"]})
+    keywords = [k for k in dict.fromkeys(_unaccent(_spec_name(k, client_name) if len(k) >= 8 else k)
+                                         for k in spec["mots_cles"]) if len(k) >= 4 and k not in _TECHNICAL_WORDS]
 
     if "vocabulary" not in catalogue:
-        catalogue["vocabulary"] = {w for f in features for w in f["words_set"]}
+        # Les synonymes découpent aussi les noms collés : repackcontent -> repack content
+        catalogue["vocabulary"] = {w for f in features for w in f["words_set"]} | {w for g in groups for w in g}
     targets = _override_targets(spec, client_name)
     expanded = []
     for k in keywords:
@@ -943,10 +980,25 @@ def related_std_tests(spec: dict, catalogue: dict, java_std: list = None, min_sc
         return len(k) >= 8 and len(rest) < 3
     # Cibles (objet métier, élément overridé) comptées par leur propre bonus
     keywords = [k for k in keywords if not compound(k) and k not in targets]
-    # Mot-clé présent : mot de la feature, ou nom collé (8 caractères et plus) dans son texte réduit
-    hits = {k: {i for i, f in enumerate(features) if k in f["words_set"] or (len(k) >= 8 and k in f["norm"])}
-            for k in keywords}
-    weights = {k: math.log((1 + len(features)) / len(found)) for k, found in hits.items() if found}
+    # Un mot-clé et ses synonymes forment une seule notion, comptée une fois (le premier mot-clé la représente)
+    forms, concepts = {}, set()
+    for k in keywords:
+        group = synonyms(k, groups)
+        if not concepts & group:
+            forms[k] = group
+            concepts |= group
+    keywords = list(forms)
+    # Mot présent : mot de la feature, ou nom collé (8 caractères et plus) dans son texte réduit. Chaque synonyme a
+    # sa propre rareté : un mot-clé vaut, dans une feature, l'idf du plus rare de ses synonymes qui y figure
+    # (« slot » rare garde son poids, « emplacement » présent partout ne le dilue pas)
+    form_hits = {w: {i for i, f in enumerate(features) if w in f["words_set"] or (len(w) >= 8 and w in f["norm"])}
+                 for w in {w for k in keywords for w in forms[k]}}
+    form_weights = {w: math.log((1 + len(features)) / len(found)) for w, found in form_hits.items() if found}
+    hits = {k: set().union(*(form_hits[w] for w in forms[k])) for k in keywords}
+    weights = {k: True for k, found in hits.items() if found}
+
+    def weight(k, i):
+        return max(form_weights[w] for w in forms[k] if w in form_weights and i in form_hits[w])
     # Bonus de cible pondéré par sa rareté : preparationorder, présent partout, ne désigne aucun test en particulier
     target_hits = {t: [i for i, f in enumerate(features) if t in f["norm"]] for t in targets}
     target_bonus = {t: 0.3 * min(1.0, math.log((1 + len(features)) / len(found)) / 3) for t, found in
@@ -959,7 +1011,7 @@ def related_std_tests(spec: dict, catalogue: dict, java_std: list = None, min_sc
         target = max((t for t in target_bonus if i in target_hits[t]), key=target_bonus.get, default="")
         domain = next((d for d in domains if d in feature["domains"]), "")
         # Évidence absolue : des mots génériques (preparation, unit, status...) ne suffisent jamais seuls
-        evidence = min(1.0, sum(weights[k] for k in found) / KEYWORD_EVIDENCE)
+        evidence = min(1.0, sum(weight(k, i) for k in found) / KEYWORD_EVIDENCE)
         score = 0.6 * evidence + (target_bonus[target] if target else 0) + (0.1 if domain else 0)
         if score >= min_score and (found or target):
             reasons = ([f"mots-clés {', '.join(found)}"] if found else []) + (
@@ -970,7 +1022,7 @@ def related_std_tests(spec: dict, catalogue: dict, java_std: list = None, min_sc
             focus = sum(1 for f in feature["step_definitions"][:3] if any(t in _norm(f.rsplit("/", 1)[-1])
                                                                           for t in terms))
             scored.append((round(score, 2), focus, len(found), -feature["lines"], feature, " ; ".join(reasons),
-                           found + [target]))
+                           [w for k in found for w in sorted(forms[k])] + [target]))
     scored.sort(key=lambda s: s[:4], reverse=True)
     # Une feature par dossier d'abord (variantes TOW-551-2/-3/-4 d'un même cas), complétée si besoin
     folders, kept = set(), []
@@ -1045,6 +1097,124 @@ def attach_std_tests(inventory: dict, cucumber_std_dir: str, odatio_version: str
             _write_text(target, _gherkin_extract(texts.get(tree.get(test["path"]), ""), test.pop("_match")))
             test["extrait"] = target
         spec["tests_std"] = tests
+
+
+# ---------------------------------------------------------------------------
+# Recettes de test (prompts/cucumber_recettes.md) : cas connus et steps Standard à utiliser
+# ---------------------------------------------------------------------------
+
+RECIPES_FILE = "cucumber_recettes.md"
+_RECIPE_FIELDS = {"natures": "natures", "mots": "mots", "chemins": "chemins", "contenu": "contenu",
+                  "steps standard": "steps", "exemple": "exemple", "statut": "statut", "consigne": "consigne"}
+MAX_RECIPE_CONTENT = 300_000
+
+
+def recipes_path() -> str:
+    """cucumber_recettes.md de PROMPTS_DIR s'il existe, sinon celui du projet ('' si aucun)."""
+    custom_dir = os.getenv("PROMPTS_DIR", "").strip()
+    for directory in ([custom_dir] if custom_dir else []) + [os.path.join(WORKSPACE_DIR, "prompts")]:
+        candidate = os.path.join(directory, RECIPES_FILE)
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def load_recipes(path: str = None) -> list:
+    """
+    Recettes : une section « ## <titre> » par cas, avec des lignes « - Champ : valeur » (Natures, Mots, Chemins,
+    Contenu, Steps Standard, Exemple, Statut) et une « Consigne : » qui peut continuer sur les lignes suivantes.
+    """
+    path = recipes_path() if path is None else path
+    text = _read_text_file(path) if path else ""
+    recipes, current, field = [], None, ""
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current, field = {"titre": line[3:].strip()}, ""
+            recipes.append(current)
+            continue
+        if current is None:
+            continue
+        match = re.match(r"^\s*(?:-\s*)?([^:`]{3,20}?)\s*:\s*(.*)$", line)
+        key = _RECIPE_FIELDS.get(_unaccent(match.group(1).strip().lower())) if match else None
+        if key:
+            field, current[key] = key, match.group(2).strip()
+        elif field == "consigne" and line.strip():
+            current["consigne"] = f"{current['consigne']} {line.strip()}".strip()
+    for recipe in recipes:
+        for key in ("natures", "mots"):
+            recipe[key] = [_unaccent(v.strip().lower()) for v in re.split(r"[,|]", recipe.get(key, "")) if v.strip()]
+        for key in ("chemins", "contenu"):
+            recipe[key] = recipe.get(key, "").strip().strip("`")
+    return [r for r in recipes if r.get("consigne") or r.get("steps")]
+
+
+def _spec_tokens(spec: dict) -> tuple:
+    """Mots (sans accents, noms camelCase découpés) et texte réduit du spécifique : libellé, dossier, fichiers."""
+    text = " ".join([spec.get("libelle", ""), spec.get("dossier", "")] + list(spec.get("mots_cles", []))
+                    + [f["path"] for f in spec.get("fichiers", [])])
+    text = _unaccent(re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)).lower()
+    return {w for w in re.split(r"[^a-z0-9]+", text) if len(w) >= 3}, _norm(text)
+
+
+def matching_recipes(spec: dict, recipes: list, groups: list = None) -> list:
+    """
+    Recettes applicables au spécifique : sa nature fait partie de « Natures » (si renseigné) ET un de ses mots
+    (synonymes compris, même logique que related_std_tests), un de ses chemins ou le contenu d'un de ses fichiers
+    correspond (si au moins un de ces critères est renseigné).
+    """
+    groups = synonym_groups() if groups is None else groups
+    words, norm = _spec_tokens(spec)
+    contents = None
+    found = []
+    for recipe in recipes:
+        if recipe["natures"] and _unaccent(spec.get("nature", "").lower()) not in recipe["natures"]:
+            continue
+        criteria = recipe["mots"] or recipe["chemins"] or recipe["contenu"]
+        hit = not criteria
+        forms = {w for m in recipe["mots"] for w in synonyms(m, groups)}
+        hit = hit or any(w in words or (len(w) >= 8 and w in norm) for w in forms)
+        if not hit and recipe["chemins"]:
+            hit = any(re.search(recipe["chemins"], p, re.I) for p in [spec.get("dossier", "")]
+                      + [f["path"] for f in spec.get("fichiers", [])])
+        if not hit and recipe["contenu"]:
+            if contents is None:
+                contents = [_read_text_file(f["local"])[:MAX_RECIPE_CONTENT] for f in spec.get("fichiers", [])
+                            if f.get("local")]
+            hit = any(re.search(recipe["contenu"], c) for c in contents)
+        if hit:
+            found.append(recipe)
+    return found
+
+
+def export_recipe_examples(recipes: list, cucumber_std_dir: str) -> None:
+    """recipe["exemple_local"] : la feature Standard citée par « Exemple » (nom ou fin de chemin), copiée bornée."""
+    wanted = {r["exemple"].strip().strip("`'\"") for r in recipes if r.get("exemple", "").strip()}
+    if not wanted or not cucumber_std_dir:
+        return
+    tree = ls_tree(cucumber_std_dir, "HEAD")
+    paths = {w: next((p for p in tree if p.endswith(".feature") and (p == w or p.endswith("/" + w))), "")
+             for w in wanted}
+    texts = blob_texts(cucumber_std_dir, [tree[p] for p in paths.values() if p])
+    directory = os.path.join(STD_CACHE_DIR, "recettes")
+    for recipe in recipes:
+        path = paths.get(recipe.get("exemple", "").strip().strip("`'\""), "")
+        if not path:
+            continue
+        target = os.path.join(directory, path.rsplit("/", 1)[-1])
+        steps = re.findall(r"`([^`]+)`", recipe.get("steps", ""))
+        _write_text(target, _gherkin_extract(texts.get(tree[path], ""), [s.split("{")[0] for s in steps]))
+        recipe["exemple_local"], recipe["exemple_std"] = target, path
+
+
+def attach_recipes(inventory: dict, cucumber_std_dir: str) -> int:
+    """spec["recettes"] de chaque spécifique (recettes applicables, exemple exporté). Renvoie le nombre concerné."""
+    recipes = load_recipes()
+    export_recipe_examples(recipes, cucumber_std_dir)
+    groups = synonym_groups()
+    for spec in inventory.get("specifiques", []):
+        spec["recettes"] = [{k: r.get(k, "") for k in ("titre", "steps", "exemple_local", "exemple_std", "statut",
+                                                        "consigne")} for r in matching_recipes(spec, recipes, groups)]
+    return sum(1 for s in inventory.get("specifiques", []) if s["recettes"])
 
 
 def jira_extracts(inventory: dict, tickets: list, per_spec: int = 5, max_chars: int = 500) -> None:
@@ -1781,7 +1951,8 @@ def base_ref(cucumber_repo_dir: str, base_branch: str) -> str:
 def prepare_worktree(cucumber_repo_dir: str, client_name: str, base: str, reset: bool) -> str:
     """
     Worktree isolé du dépôt Cucumber client sur la branche cucumber_<client>_coverage. `reset` : repart de
-    `base` (nouvelle génération) ; sinon réutilise le worktree existant (reprise). Lève RuntimeError.
+    `base` (nouvelle génération) ; sinon réutilise le worktree existant (reprise, complément), ou à défaut la
+    branche et ses commits de lots. Lève RuntimeError.
     """
     path, branch = worktree_dir(client_name), f"cucumber_{client_name}_coverage"
     if os.path.isdir(path) and not reset:
@@ -1790,7 +1961,9 @@ def prepare_worktree(cucumber_repo_dir: str, client_name: str, base: str, reset:
         _git(cucumber_repo_dir, "worktree", "remove", "--force", path)
         shutil.rmtree(path, ignore_errors=True)
     _git(cucumber_repo_dir, "worktree", "prune")
-    result = _git(cucumber_repo_dir, "worktree", "add", "-B", branch, path, base)
+    keep = not reset and _git(cucumber_repo_dir, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0
+    result = _git(cucumber_repo_dir, "worktree", "add", path, branch) if keep else _git(
+        cucumber_repo_dir, "worktree", "add", "-B", branch, path, base)
     if result.returncode != 0:
         if "already" in result.stderr or "used by worktree" in result.stderr:
             raise RuntimeError(f"La branche {branch} est encore extraite dans un autre worktree (génération "
@@ -2041,6 +2214,73 @@ def make_lots(spec_ids: list, batch_size: int) -> list:
             for i in range(math.ceil(len(spec_ids) / size))]
 
 
+# Raisons de non-couverture qu'une recette, un nouveau step ou une relecture par endpoint peut lever
+COMPLETABLE_REASON = re.compile(r"step|endpoint|interact|v[ée]rifi", re.I)
+
+
+def latest_results(state: dict) -> dict:
+    """Dernier résultat connu de chaque spécifique (lots dans l'ordre : un complément remplace l'ancien lot)."""
+    return {r["id"]: r for lot in state.get("lots", []) for r in lot.get("resultats") or [] if r.get("id")}
+
+
+def completable_specifics(state: dict) -> list:
+    """
+    Spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification possible (raison), hors
+    ceux déjà repris par un lot de complément ou en attente dans un lot non terminé.
+    """
+    completed = {i for lot in state.get("lots", []) if lot.get("complement") for i in lot["ids"]}
+    queued = {i for lot in pending_lots(state) for i in lot["ids"]}
+    return [i for i, r in latest_results(state).items() if r.get("statut") == "non_couvert"
+            and COMPLETABLE_REASON.search(r.get("raison") or "") and i not in completed | queued]
+
+
+def add_completion_lots(state: dict, spec_ids: list, batch_size: int) -> list:
+    """
+    Complément d'une génération : nouveaux lots numérotés à la suite pour `spec_ids`, retirés de leurs anciens lots
+    (leurs résultats y sont gardés dans « historique », avec le lot qui les reprend). Renvoie les nouveaux lots.
+    """
+    start = max((lot["numero"] for lot in state.get("lots", [])), default=0)
+    new = make_lots(spec_ids, batch_size)
+    for lot in new:
+        lot.update(numero=lot["numero"] + start, complement=True)
+    taken = {i: lot["numero"] for lot in new for i in lot["ids"]}
+    for lot in state.get("lots", []):
+        moved = [i for i in lot["ids"] if i in taken]
+        if not moved:
+            continue
+        lot["ids"] = [i for i in lot["ids"] if i not in taken]
+        old = [r for r in lot.get("resultats") or [] if r.get("id") in taken]
+        lot.setdefault("historique", []).extend({**r, "repris_par_lot": taken[r["id"]]} for r in old)
+        if lot.get("resultats") is not None:
+            lot["resultats"] = [r for r in lot["resultats"] if r.get("id") not in taken]
+        if not lot["ids"] and lot.get("statut") != "termine":
+            lot["statut"] = "exclu"
+    state["lots"] = state.get("lots", []) + new
+    return new
+
+
+def requalify_indirect(state: dict, inventory: dict) -> list:
+    """
+    Statut « couvert_indirectement » (champ couvert_par) : gardé si le spécifique cité est couvert (par cette
+    génération, ou déjà couvert à l'inventaire), sinon requalifié « non_couvert » ; réévalué à chaque exécution
+    (statut déclaré gardé dans statut_declare). Renvoie les identifiants requalifiés.
+    """
+    already = {s["id"] for s in inventory.get("specifiques", []) if s.get("couverture") == "deja_couvert"}
+    results = latest_results(state)
+    requalified = []
+    for r in results.values():
+        if r.get("statut_declare") == "couvert_indirectement" or r.get("statut") == "couvert_indirectement":
+            r["statut_declare"] = "couvert_indirectement"
+            target = results.get(r.get("couvert_par") or "", {})
+            valid = target.get("statut") == "couvert" or r.get("couvert_par") in already
+            r["statut"] = "couvert_indirectement" if valid else "non_couvert"
+            r.pop("requalification", None)
+            if not valid:
+                r["requalification"] = f"couvert_par {r.get('couvert_par') or '(absent)'} non couvert"
+                requalified.append(r["id"])
+    return requalified
+
+
 def lot_example(specifics: list) -> str:
     """Extrait de la feature Standard la mieux classée du lot ('' si aucun spécifique n'a de test équivalent)."""
     tests = [t for spec in specifics for t in spec.get("tests_std") or [] if t.get("extrait")]
@@ -2048,8 +2288,24 @@ def lot_example(specifics: list) -> str:
 
 
 def lot_block(specifics: list) -> str:
-    """Partie variable du prompt : les spécifiques du lot."""
-    lines = []
+    """Partie variable du prompt : recettes applicables (une fois chacune), puis les spécifiques du lot."""
+    lines, recipes = [], {}
+    for spec in specifics:
+        for recipe in spec.get("recettes") or []:
+            recipes.setdefault(recipe["titre"], (recipe, []))[1].append(spec["id"])
+    if recipes:
+        lines += ["### Recettes applicables (à appliquer avant toute conclusion « non_couvert »)", ""]
+        for title, (recipe, ids) in recipes.items():
+            lines.append(f"#### {title} — spécifiques : {', '.join(ids)}")
+            if recipe.get("steps"):
+                lines.append(f"- Steps Standard : {recipe['steps']}")
+            if recipe.get("exemple_local"):
+                lines.append(f"- Exemple : '{recipe['exemple_local']}' (Standard : {recipe['exemple_std']})")
+            if recipe.get("statut"):
+                lines.append(f"- Statut attendu : {recipe['statut']}")
+            if recipe.get("consigne"):
+                lines.append(f"- Consigne : {recipe['consigne']}")
+            lines.append("")
     for spec in specifics:
         lines += [f"### Spécifique {spec['id']} — {spec['libelle']}",
                   f"- Type : {spec['type']} ({spec['nature']}) ; couverture actuelle : {spec.get('couverture', '?')}",
@@ -2175,6 +2431,7 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
     results = {r["id"]: r for lot in lots for r in lot.get("resultats", []) or []}
     selected = [i for lot in lots for i in lot["ids"]]
     covered = [i for i in selected if results.get(i, {}).get("statut") == "couvert"]
+    indirect = [i for i in selected if results.get(i, {}).get("statut") == "couvert_indirectement"]
     analysed = [s for lot in lots for s in (lot.get("indicateurs") or {}).get("scenarios", [])]
     deleted = [d for lot in lots for d in (lot.get("revue") or {}).get("supprimes", [])]
     std_steps = sum(s["steps_std"] for s in analysed)
@@ -2185,7 +2442,8 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
             key = re.sub(r" de \S+ / .*$| \(.*\)$", "", motif)
             reasons[key] = reasons.get(key, 0) + 1
     lines = [f"# Couverture Cucumber des spécifiques {client_name}", "",
-             f"{len(specs)} spécifique(s) inventorié(s), {len(selected)} traité(s), {len(covered)} couvert(s). "
+             f"{len(specs)} spécifique(s) inventorié(s), {len(selected)} traité(s), {len(covered)} couvert(s), "
+             f"{len(indirect)} couvert(s) indirectement. "
              f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}.", "",
              f"- Scénarios contrôlés : {len(analysed)} ; réutilisation des steps Standard : "
              + (f"{round(100 * std_steps / all_steps)} % ({std_steps}/{all_steps} steps)" if all_steps else "—")
@@ -2243,11 +2501,20 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
             lines.append(f"| {obj.get('nom', '—')} | {obj.get('difference_standard') or '—'} | "
                          f"{obj.get('source') or '—'} |")
         lines.append("")
+    if indirect:
+        lines += ["## Spécifiques couverts indirectement", ""]
+        for i in indirect:
+            target = results[i].get("couvert_par", "")
+            lines.append(f"- {specs.get(i, {}).get('libelle', i)} : par {specs.get(target, {}).get('libelle', target)}"
+                         + (f" — {results[i]['raison']}" if results[i].get("raison") else ""))
+        lines.append("")
     lines += ["## Spécifiques non couverts", ""]
-    not_covered = [i for i in selected if i not in covered]
+    not_covered = [i for i in selected if i not in covered and i not in indirect]
     for i in not_covered:
         result = results.get(i)
         reason = result.get("raison", "") if result else "lot non terminé"
+        if result and result.get("requalification"):
+            reason = f"{reason} (requalifié : {result['requalification']})"
         lines.append(f"- {specs.get(i, {}).get('libelle', i)} : {reason or 'raison non précisée'}")
     if not not_covered:
         lines.append("Aucun.")
