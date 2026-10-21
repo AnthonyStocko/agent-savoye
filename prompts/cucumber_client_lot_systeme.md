@@ -19,6 +19,10 @@ ${references_injectees}
 2. Les fichiers du spécifique (customized.xml, classes Java, paramètres) sont à ouvrir dès que leur comportement compte pour décider ou écrire un test : les parties modifiées des processus Studio et les signatures publiques des classes Java sont données dans le lot, ouvre le fichier pour le reste (par portions offset / limit au-delà de 400 lignes). Ne parcours aucun dépôt.
 3. Pour chaque spécifique, comprends d'abord ce qui diffère du Standard : éléments modifiés (override), comportement nouveau (extension), effet du paramètre ou du libellé (paramétrage), tickets Jira.
 
+=== ÉCRIRE TÔT ===
+- Dès qu'un spécifique est compris (ce qu'il change, test Standard de départ, steps candidats), écris une première version complète de son .feature et des Step Definitions nécessaires dans le worktree, puis améliore-la par Edit (assertions, cas aux limites, commentaires de source).
+- Tu disposes d'au plus ${max_turns} tours pour tout le lot. Compte tes tours : au tour ${tour_alerte} (75 %), arrête d'explorer et finalise — complète ce qui est écrit, n'ouvre plus de nouvelle piste, puis donne le JSON final. Un lot qui atteint la limite sans JSON final est perdu, même si des fichiers sont écrits.
+
 === ORDRE DE PRIORITÉ POUR ÉCRIRE ===
 0. Appliquer les « Recettes applicables » du lot (en tête du lot) : steps Standard à utiliser, exemple à suivre, statut attendu.
 1. Partir du test Standard équivalent (« Tests Standard équivalents » du lot, extraits bornés) : même structure, même Background, mêmes jeux de données, mêmes steps ; ne change que ce qui diffère chez le client. Indique en commentaire Gherkin `# Adapté de <chemin Standard> / <scénario>`. Sans test équivalent : reprends la structure et les steps des tests Standard du même domaine.

@@ -1412,8 +1412,9 @@ with tab_config:
                 "CUCUMBER_BATCH_SIZE", min_value=1, step=1, value=env_int("CUCUMBER_BATCH_SIZE", 3),
                 help="Nombre de spécifiques par lot : un appel Claude neuf par lot.")
             cucumber_turns = st.number_input(
-                "CUCUMBER_MAX_TURNS", min_value=5, step=5, value=env_int("CUCUMBER_MAX_TURNS", 25),
-                help="Nombre maximal de tours de l'agent par lot (--max-turns).")
+                "CUCUMBER_MAX_TURNS", min_value=5, step=5, value=env_int("CUCUMBER_MAX_TURNS", 40),
+                help="Nombre maximal de tours de l'agent par lot (--max-turns). À 75 %, l'agent est invité à "
+                     "finaliser ce qu'il a écrit et à rendre son JSON final.")
         env_values["CUCUMBER_BATCH_SIZE"] = str(int(cucumber_batch))
         env_values["CUCUMBER_MAX_TURNS"] = str(int(cucumber_turns))
         with st.container(horizontal=True):

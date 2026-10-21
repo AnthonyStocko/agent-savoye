@@ -279,3 +279,15 @@ def test_summary_notes_unreviewed_and_presorted(tmp_path, monkeypatch):
     assert "Scénarios signalés sans appel de revue" in text and "a.feature / T" in text
     assert "Tri automatique sans appel Claude : 0 listener(s) / événement(s) sans logique propre, 1 spécifique(s)" \
            in text
+
+
+def test_system_prompt_asks_to_write_early(main_module):
+    assert main_module.DEFAULT_CUCUMBER_MAX_TURNS == 40
+    assert main_module.warning_turn(40) == 30 and main_module.warning_turn(25) == 19
+    names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
+             "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
+             "class_suffix").split()
+    text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
+                                     tour_alerte=main_module.warning_turn(40))
+    assert "=== ÉCRIRE TÔT ===" in text and "au plus 40 tours" in text and "au tour 30 (75 %)" in text
+    assert "$" not in text.replace("$event", "")

@@ -1218,6 +1218,12 @@ def cucumber_jira_tickets(client_name: str, application_arg: str) -> list:
 
 
 CUCUMBER_TOOLS = ["Read", "Write", "Edit", "Grep", "Glob"]
+DEFAULT_CUCUMBER_MAX_TURNS = 40
+
+
+def warning_turn(max_turns: int) -> int:
+    """Tour (75 % de CUCUMBER_MAX_TURNS, arrondi au-dessus) où l'agent d'un lot doit cesser d'explorer et finaliser."""
+    return max(1, -(-3 * max_turns // 4))
 # Motifs du contrôle qui ne justifient pas un appel de revue : seulement un champ du JSON final non rempli
 EMPTY_FIELD_MOTIFS = {"« source » vide dans le JSON", "« difference_standard » vide dans le JSON"}
 
@@ -1575,7 +1581,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
           f"{fix_plan[0][1]}" + (f", dernière tentative {model}" if len(fix_plan) > 1 else "") + ")"
           f" | Session allégée : {'oui' if lean_session() else 'non (CLAUDE_LEAN_SESSION=0)'}"
           f" | Budget par appel : {budget + ' $' if budget else 'aucun'}")
-    max_turns = str(_env_int("CUCUMBER_MAX_TURNS", 25))
+    max_turns = str(_env_int("CUCUMBER_MAX_TURNS", DEFAULT_CUCUMBER_MAX_TURNS))
     run_dir = cucumber_tools.cache_dir(client)
     # Variable absente : compilation par défaut ; présente mais vide : pas de compilation
     compile_cmd = os.getenv("CUCUMBER_COMPILE_CMD")
@@ -1623,7 +1629,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                 catalogue["catalogue_std"], std_java["steps_example"], recipe_examples, inline_max)
             java_values = {k: java[k] for k in ("java_client", "package_steps", "package_support", "class_suffix")}
             system_prompt = render_prompt("cucumber_client_lot_systeme", **fixed_values, **java_values,
-                                          references_injectees=references)
+                                          references_injectees=references, max_turns=max_turns,
+                                          tour_alerte=warning_turn(int(max_turns)))
             system_file = os.path.join(run_dir, "prompt_systeme_lot.md")
             with open(system_file, "w", encoding="utf-8") as f:
                 f.write(system_prompt)
