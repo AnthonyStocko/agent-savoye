@@ -192,27 +192,53 @@ def parse_claude_output(raw: str) -> tuple:
     if not isinstance(text, str):
         text = f"[Claude Code] Fin sans réponse texte ({data.get('subtype', 'inconnu')})."
     u = data.get("usage") or {}
-    usage = {
-        "tokens_entree": u.get("input_tokens", 0) or 0,
-        "cache_ecrit": u.get("cache_creation_input_tokens", 0) or 0,
-        "cache_lu": u.get("cache_read_input_tokens", 0) or 0,
-        "tokens_sortie": u.get("output_tokens", 0) or 0,
+    keys = {"tokens_entree": ("input_tokens", "inputTokens"),
+            "cache_ecrit": ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+            "cache_lu": ("cache_read_input_tokens", "cacheReadInputTokens"),
+            "tokens_sortie": ("output_tokens", "outputTokens")}
+    usage = {key: u.get(name, 0) or 0 for key, (name, _) in keys.items()}
+    if not any(usage.values()):
+        # Arrêt sur budget (--max-budget-usd) : usage global à zéro, le détail reste dans modelUsage
+        models = (data.get("modelUsage") or {}).values()
+        usage = {key: sum((m.get(name) or 0) for m in models) for key, (_, name) in keys.items()}
+    usage.update({
         "tours": data.get("num_turns", ""),
         "duree_s": round((data.get("duration_ms") or 0) / 1000, 1),
         "cout_usd": data.get("total_cost_usd", ""),
         "modeles": ",".join((data.get("modelUsage") or {}).keys()),
-    }
+        "fin": data.get("subtype", ""),
+    })
     return text, usage
 
 
-def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
-               cwd: str = None, effort: str = "") -> tuple:
+def lean_session() -> bool:
+    """CLAUDE_LEAN_SESSION (défaut 1) : sessions Cucumber allégées (outils demandés seuls, sans MCP ni commandes)."""
+    return os.getenv("CLAUDE_LEAN_SESSION", "1").strip() != "0"
+
+
+def cucumber_budget() -> str:
+    """CUCUMBER_MAX_BUDGET_USD (par appel) si c'est un montant positif, sinon '' (pas de --max-budget-usd)."""
+    value = os.getenv("CUCUMBER_MAX_BUDGET_USD", "").strip().replace(",", ".")
+    try:
+        return value if value and float(value) > 0 else ""
+    except ValueError:
+        print(f"[CONFIG] ⚠️ CUCUMBER_MAX_BUDGET_USD='{value}' n'est pas un montant : pas de budget par appel.")
+        return ""
+
+
+def budget_hit(usage: dict) -> bool:
+    """L'appel s'est arrêté sur --max-budget-usd."""
+    return "budget" in str((usage or {}).get("fin", ""))
+
+
+def claude_command(model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (), effort: str = "",
+                   lean: bool = False, budget_usd: str = "") -> list:
     """
-    Exécute `claude --print` sur le prompt (envoyé sur stdin) et affiche sa réponse.
-    Renvoie (code retour, texte de la réponse, usage des tokens, quota atteint).
+    Ligne de commande `claude --print`. `lean` : seules les définitions des outils autorisés sont envoyées
+    (--tools, noms sans motif : Bash(python:*) -> Bash), sans serveur MCP, commandes ni skills, et les sections
+    propres au poste sorties du prompt système. `budget_usd` : --max-budget-usd.
     """
-    claude_bin = shutil.which("claude") or "claude"
-    cmd = [claude_bin, "--print", "--output-format", "json"]
+    cmd = [shutil.which("claude") or "claude", "--print", "--output-format", "json"]
     if model:
         cmd.extend(["--model", model])
     if effort in CLAUDE_EFFORT_LEVELS:
@@ -220,10 +246,26 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
     elif effort:
         print(f"[CONFIG] ⚠️ Effort Claude '{effort}' invalide, attendu : {', '.join(CLAUDE_EFFORT_LEVELS)}. "
               f"Option --effort non envoyée.")
+    if lean:
+        cmd.extend(["--tools", *dict.fromkeys(t.split("(", 1)[0] for t in allowed_tools)])
+        cmd.extend(["--strict-mcp-config", "--disable-slash-commands", "--exclude-dynamic-system-prompt-sections"])
+    if budget_usd:
+        cmd.extend(["--max-budget-usd", budget_usd])
     for directory in add_dirs:
         cmd.extend(["--add-dir", directory])
     cmd.extend(extra_args)
     cmd.extend(["--allowedTools", *allowed_tools])
+    return cmd
+
+
+def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
+               cwd: str = None, effort: str = "", lean: bool = False, budget_usd: str = "") -> tuple:
+    """
+    Exécute `claude --print` sur le prompt (envoyé sur stdin) et affiche sa réponse.
+    Renvoie (code retour, texte de la réponse, usage des tokens, quota atteint) ; usage["fin"] : subtype du résultat
+    (error_max_budget_usd si le budget est atteint, cf. budget_hit).
+    """
+    cmd = claude_command(model, add_dirs, allowed_tools, extra_args, effort, lean, budget_usd)
 
     # stderr séparé : la sortie standard doit rester du JSON exploitable
     process = subprocess.Popen(
@@ -249,6 +291,8 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
         print(stdout_output)
         if session_limit_hit:
             print("\n⚠️ QUOTA ATTEINT : La session Claude Code a atteint sa limite d'utilisation.")
+    if budget_hit(token_usage):
+        print(f"\n⚠️ BUDGET ATTEINT : arrêt de l'appel à --max-budget-usd {budget_usd}.")
     return process.returncode, stdout_output, token_usage, session_limit_hit
 
 
@@ -747,6 +791,7 @@ def main():
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
+    parser.add_argument("--max-lots", type=int, default=0, help="generate-cucumber-client : nombre maximal de lots traités par cette exécution (0 = tous), les suivants restent à reprendre")
     parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
     parser.add_argument("--client-name", default="", help="generate-cucumber-client : nom du client, qui donne le dépôt cible <client>-cucumber (défaut : déduit de --client-repo)")
     parser.add_argument("--cucumber-std-repo", default="", help="Dépôt du Cucumber Standard : URL Bitbucket (navigation ou clonable) ou chemin d'un clone local (défaut : BITBUCKET_CUCUMBER_STD_REPO)")
@@ -1172,11 +1217,47 @@ def cucumber_jira_tickets(client_name: str, application_arg: str) -> list:
     return tickets
 
 
+CUCUMBER_TOOLS = ["Read", "Write", "Edit", "Grep", "Glob"]
+# Motifs du contrôle qui ne justifient pas un appel de revue : seulement un champ du JSON final non rempli
+EMPTY_FIELD_MOTIFS = {"« source » vide dans le JSON", "« difference_standard » vide dans le JSON"}
+
+
+def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
+                        effort: str, system_file: str = "") -> tuple:
+    """
+    Appel Claude d'un lot Cucumber : session allégée (CLAUDE_LEAN_SESSION) et budget CUCUMBER_MAX_BUDGET_USD.
+    `system_file` : partie fixe ajoutée au prompt système (--append-system-prompt-file), identique d'un lot à
+    l'autre et donc lue depuis le cache ; un texte en tête du message ne l'est pas (un seul bloc par message).
+    """
+    extra = ("--max-turns", max_turns) + (("--append-system-prompt-file", system_file) if system_file else ())
+    return run_claude(prompt, model, [cucumber_tools.STD_CACHE_DIR], allowed_tools, extra_args=extra, cwd=run_dir,
+                      effort=effort, lean=lean_session(), budget_usd=cucumber_budget())
+
+
+def cucumber_fix_effort() -> str:
+    """Effort des corrections et de la revue : CLAUDE_EFFORT_CUCUMBER_FIX, défaut low."""
+    return claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX") or "low"
+
+
+def cucumber_fix_plan(lot_model: str, attempts: int) -> list:
+    """
+    (modèle, effort) de chaque correction de compilation / dry-run : `attempts` fois CLAUDE_MODEL_CUCUMBER_FIX
+    (défaut haiku) avec cucumber_fix_effort(), puis, si ce modèle diffère de celui du lot, une dernière tentative
+    avec le modèle et l'effort du lot.
+    """
+    fix_model = os.getenv("CLAUDE_MODEL_CUCUMBER_FIX", "").strip() or "haiku"
+    plan = [(fix_model, cucumber_fix_effort())] * attempts
+    if attempts and fix_model != lot_model:
+        plan.append((lot_model, claude_effort("CLAUDE_EFFORT_CUCUMBER")))
+    return plan
+
+
 def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, files: list, results: list,
                         reference: dict, values: dict, model: str, work_key: str, run_dir: str, on_usage) -> None:
     """
     Contrôles Python d'un lot (doublons, assertions, réutilisation des steps, champs du JSON) ; s'il y a des
-    scénarios signalés, un seul appel de revue (--max-turns CUCUMBER_REVIEW_MAX_TURNS) les corrige ou les supprime.
+    scénarios signalés, un seul appel de revue (--max-turns CUCUMBER_REVIEW_MAX_TURNS) les corrige ou les supprime,
+    sauf si leurs seuls motifs sont des champs du JSON vides (EMPTY_FIELD_MOTIFS : notés dans revue["sans_appel"]).
     Met à jour lot["indicateurs"], lot["revue"] et le JSON du lot (scénarios supprimés retirés).
     """
     analysis = cucumber_verify.analyse_lot(worktree, files, results, reference)
@@ -1186,13 +1267,16 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
           f"{len(flagged)} signalé(s).")
     review = {"signales": [{k: s[k] for k in ("fichier", "titre", "motifs")} for s in flagged], "decisions": [],
               "supprimes": []}
-    if flagged:
+    if flagged and all(set(s["motifs"]) <= EMPTY_FIELD_MOTIFS for s in flagged):
+        review["sans_appel"] = review["signales"]
+        print(f"[LOT {label}] Revue non lancée : seuls des champs « source » / « difference_standard » vides "
+              f"({len(flagged)} scénario(s), noté(s) dans le récapitulatif).")
+    elif flagged:
         prompt = render_prompt("cucumber_client_review", **values, lot_label=label,
                                scenarios_signales=cucumber_verify.review_block(lot_specs, analysis, results))
-        effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
-        returncode, output, usage, _ = run_claude(
-            prompt, model, [cucumber_tools.STD_CACHE_DIR], ["Read", "Write", "Edit", "Grep", "Glob"],
-            extra_args=("--max-turns", str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8))), cwd=run_dir, effort=effort)
+        effort = cucumber_fix_effort()
+        returncode, output, usage, _ = run_cucumber_claude(
+            prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8)), run_dir, effort)
         report_token_usage(work_key, "cucumber-review", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         review["decisions"] = cucumber_verify.parse_review(output)
@@ -1245,10 +1329,9 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
                 f" ; test Standard lié : '{linked[0].get('extrait', linked[0]['path'])}'" if linked else ""))
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
-        effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
-        returncode, _, usage, limit_hit = run_claude(
-            prompt, model, [cucumber_tools.STD_CACHE_DIR], ["Read", "Write", "Edit", "Grep", "Glob"],
-            extra_args=("--max-turns", str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))), cwd=run_dir, effort=effort)
+        effort = cucumber_fix_effort()
+        returncode, _, usage, limit_hit = run_cucumber_claude(
+            prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort)
         report_token_usage(work_key, "cucumber-verify-fix", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
@@ -1291,10 +1374,12 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, cucumber_std_dir
                         on_usage) -> dict:
     """
     Compilation (et dry-run) du worktree après un lot, en Python ; en cas d'erreurs dans le code, au plus
-    CUCUMBER_FIX_ATTEMPTS appels de correction limités (erreurs, fichiers du lot, catalogue Java). Renvoie le dernier
-    résultat de cucumber_tools.verify_build, avec "quota" si la limite de session a été atteinte.
+    CUCUMBER_FIX_ATTEMPTS appels de correction limités (erreurs, fichiers du lot, catalogue Java) avec le modèle de
+    correction, puis une dernière avec le modèle du lot (cucumber_fix_plan). Renvoie le dernier résultat de
+    cucumber_tools.verify_build, avec "quota" si la limite de session a été atteinte.
     """
-    attempts = _env_int("CUCUMBER_FIX_ATTEMPTS", 2)
+    plan = cucumber_fix_plan(model, _env_int("CUCUMBER_FIX_ATTEMPTS", 2))
+    attempts = len(plan)
     fix_turns = str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))
     for attempt in range(attempts + 1):
         features = [f for f in files if f.endswith(".feature")]
@@ -1311,15 +1396,14 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, cucumber_std_dir
             print("\n".join(f"    {e}" for e in check["erreurs"]))
         if check["ok"] or check["environnement"] or attempt == attempts:
             return check
-        print(f"[LOT {label}] Correction {attempt + 1}/{attempts}...")
+        fix_model, effort = plan[attempt]
+        print(f"[LOT {label}] Correction {attempt + 1}/{attempts} ({fix_model}, effort {effort or 'défaut'})...")
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"]),
                                fichiers="\n".join(f"- {f}" for f in files))
-        effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
-        returncode, _, usage, limit_hit = run_claude(
-            prompt, model, [cucumber_tools.STD_CACHE_DIR], ["Read", "Write", "Edit", "Grep", "Glob"],
-            extra_args=("--max-turns", fix_turns), cwd=run_dir, effort=effort)
-        report_token_usage(work_key, "cucumber-fix", model, usage, len(prompt), returncode, effort)
+        returncode, _, usage, limit_hit = run_cucumber_claude(prompt, fix_model, CUCUMBER_TOOLS, fix_turns, run_dir,
+                                                              effort)
+        report_token_usage(work_key, "cucumber-fix", fix_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
             return {**check, "quota": True}
@@ -1369,8 +1453,15 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         inventory = cucumber_tools.prepare(client, local_client_repo, local_std_repo, local_cucumber_std_repo,
                                            odatio_version, cucumber_repo_dir, base,
                                            cucumber_jira_tickets(client, args.application))
-    # Recettes de test applicables à chaque spécifique (0 token), recalculées à chaque exécution
+    # Recettes de test applicables et steps Standard candidats de chaque spécifique (0 token), recalculés à chaque
+    # exécution
     with_recipes = cucumber_tools.attach_recipes(inventory, local_cucumber_std_repo)
+    std_endpoints = cucumber_tools.standard_endpoints(local_cucumber_std_repo, odatio_version)
+    with_candidates = cucumber_tools.attach_candidate_steps(inventory, inventory["catalogue_standard"]["steps_std"],
+                                                            std_endpoints)
+    # Parties modifiées des customized.xml, injectées dans le prompt des lots (0 token)
+    with_studio = cucumber_tools.attach_studio_excerpts(
+        inventory, _env_int("CUCUMBER_INLINE_STUDIO_LINES", cucumber_tools.DEFAULT_INLINE_STUDIO_LINES))
     cucumber_tools.save_inventory(client, inventory)
     specifics = {s["id"]: s for s in inventory["specifiques"]}
     counts = {}
@@ -1382,6 +1473,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     recipes_file = cucumber_tools.recipes_path()
     print(f"[CUCUMBER] Recettes de test : {with_recipes} spécifique(s) concerné(s)"
           + (f" ({recipes_file})" if recipes_file else " (aucun fichier de recettes)"))
+    print(f"[CUCUMBER] Steps Standard candidats : {with_candidates} spécifique(s) concerné(s) ; parties modifiées "
+          f"de processus Studio : {with_studio} fichier(s)")
     if args.inventory_only:
         return 0
 
@@ -1403,7 +1496,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         for i in wanted:
             reason = " ".join(((previous.get(i) or {}).get("raison") or "").split())
             print(f"  - {i} — {specifics[i]['libelle']}" + (f" : {reason[:160]}" if reason else ""))
-        new_lots = cucumber_tools.add_completion_lots(state, wanted, _env_int("CUCUMBER_BATCH_SIZE", 3))
+        new_lots = cucumber_tools.add_completion_lots(state, wanted, _env_int("CUCUMBER_BATCH_SIZE", 3), specifics)
         others = len(cucumber_tools.pending_lots(state)) - len(new_lots)
         print(f"[CUCUMBER] Complément : lot(s) {new_lots[0]['numero']} à {new_lots[-1]['numero']} ajouté(s), lots "
               f"précédents et commits conservés" + (f" ; {others} lot(s) non terminé(s) repris aussi." if others else "."))
@@ -1423,8 +1516,18 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         if not wanted:
             print("[CUCUMBER] Aucun spécifique à traiter.")
             return 0
+        # Tri Python (0 token) : listeners / événements sans logique propre, spécifiques purement techniques
+        remaining, sorted_out = cucumber_tools.presort(wanted, specifics)
+        if sorted_out:
+            indirect = sum(1 for r in sorted_out if r["statut"] == "couvert_indirectement")
+            print(f"[CUCUMBER] Tri sans appel Claude : {indirect} couvert(s) indirectement (listener / événement "
+                  f"sans logique propre), {len(sorted_out) - indirect} technique(s) non couvert(s).")
+        # Lots regroupés par test Standard principal puis par domaine ; libellés réunis en un seul lot
+        lots = cucumber_tools.make_lots(remaining, _env_int("CUCUMBER_BATCH_SIZE", 3), specifics)
+        if sorted_out:
+            lots.append(cucumber_tools.presort_lot(sorted_out, len(lots) + 1))
         state = {"client": client, "debut": datetime.now().isoformat(timespec="seconds"), "base": base,
-                 "lots": cucumber_tools.make_lots(wanted, _env_int("CUCUMBER_BATCH_SIZE", 3))}
+                 "lots": lots}
         if cucumber_tools.load_state(client).get("lots"):
             print("⚠️ Nouvelle génération : les lots précédents (worktree, commits, etat.json) sont écrasés.")
         # Nouvelle génération : le patch des scénarios à revoir repart de zéro
@@ -1439,7 +1542,6 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
 
     catalogue = inventory["catalogue_standard"]
     std_java = cucumber_tools.standard_java_catalogue(local_cucumber_std_repo, odatio_version)
-    std_endpoints = cucumber_tools.standard_endpoints(local_cucumber_std_repo, odatio_version)
     # Référence des contrôles de pertinence (steps, scénarios et endpoints du Standard), calculée une fois
     reference = cucumber_verify.std_reference(local_cucumber_std_repo, std_endpoints)
     # Moyen d'exécution des niveaux 2 et 3 (job Jenkins dédié, commande locale, ou aucun)
@@ -1460,11 +1562,19 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "consignes": cucumber_verify.project_guidelines(client),
         "steps_example": std_java["steps_example"] or "aucune", "runner_example": std_java["runner_example"] or "aucun",
     }
+    # Contenu injecté : partie fixe (en tête, identique pour tous les lots) et extraits du lot, chacun borné
+    inline_max = _env_int("CUCUMBER_INLINE_MAX_CHARS", cucumber_tools.DEFAULT_INLINE_MAX_CHARS)
+    recipe_examples = [r["exemple_local"] for s in specifics.values() for r in s.get("recettes") or []
+                       if r.get("exemple_local")]
     model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
     effort = claude_effort("CLAUDE_EFFORT_CUCUMBER")
-    fix_effort = claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX", "CLAUDE_EFFORT_CUCUMBER")
+    fix_plan = cucumber_fix_plan(model, 1)
+    budget = cucumber_budget()
     print(f"[CUCUMBER] Modèle Claude : {model} | Effort : {effort or 'défaut de Claude Code'} "
-          f"(correction et revue : {fix_effort or 'défaut de Claude Code'})")
+          f"(revue : {cucumber_fix_effort()} ; correction de compilation : {fix_plan[0][0]}, effort "
+          f"{fix_plan[0][1]}" + (f", dernière tentative {model}" if len(fix_plan) > 1 else "") + ")"
+          f" | Session allégée : {'oui' if lean_session() else 'non (CLAUDE_LEAN_SESSION=0)'}"
+          f" | Budget par appel : {budget + ' $' if budget else 'aucun'}")
     max_turns = str(_env_int("CUCUMBER_MAX_TURNS", 25))
     run_dir = cucumber_tools.cache_dir(client)
     # Variable absente : compilation par défaut ; présente mais vide : pas de compilation
@@ -1484,9 +1594,15 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                 tokens[key] = (tokens.get(key) or 0) + value
 
     # 3. Un appel Claude neuf par lot, puis compilation (et correction) en Python ; commit après chaque lot
+    processed = 0
     for lot in lots:
         if lot.get("statut") in ("termine", "exclu"):
             continue
+        if args.max_lots and processed >= args.max_lots:
+            print(f"\n[CUCUMBER] --max-lots {args.max_lots} atteint : {len(cucumber_tools.pending_lots(state))} lot(s) "
+                  f"restant(s), à reprendre.")
+            break
+        processed += 1
         lot_specs = [specifics[i] for i in lot["ids"] if i in specifics]
         label = f"{lot['numero']}/{len(lots)}"
         print(f"\n[LOT {label}] " + " ; ".join(s["libelle"] for s in lot_specs))
@@ -1502,16 +1618,26 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             # Exemple du lot : la feature Standard la mieux classée, à défaut les exemples globaux
             example = cucumber_tools.lot_example(lot_specs)
             values = {**fixed_values, "examples": f"'{example}'"} if example else fixed_values
-            prompt = render_prompt("cucumber_client_lot", **values, java_client=java["java_client"],
-                                   package_steps=java["package_steps"], package_support=java["package_support"],
-                                   class_suffix=java["class_suffix"], runner_status=java["runner_status"],
-                                   lot_block=cucumber_tools.lot_block(lot_specs), lot_label=label, db_block=db_block)
-            tools_allowed = ["Read", "Write", "Edit", "Grep", "Glob"] + ([f"Bash({python_exe}:*)"] if db_block else [])
+            # Partie fixe (prompt système, en cache d'un lot à l'autre) puis partie propre au lot (message)
+            references, inlined = cucumber_tools.fixed_references(
+                catalogue["catalogue_std"], std_java["steps_example"], recipe_examples, inline_max)
+            java_values = {k: java[k] for k in ("java_client", "package_steps", "package_support", "class_suffix")}
+            system_prompt = render_prompt("cucumber_client_lot_systeme", **fixed_values, **java_values,
+                                          references_injectees=references)
+            system_file = os.path.join(run_dir, "prompt_systeme_lot.md")
+            with open(system_file, "w", encoding="utf-8") as f:
+                f.write(system_prompt)
+            prompt = render_prompt("cucumber_client_lot", **values, **java_values, runner_status=java["runner_status"],
+                                   runner_block=cucumber_tools.runner_block(std_java["runner_example"],
+                                                                            java["runner_status"], inline_max),
+                                   lot_block=cucumber_tools.lot_block(lot_specs, inline_max, inlined),
+                                   lot_label=label, db_block=db_block)
+            tools_allowed = CUCUMBER_TOOLS + ([f"Bash({python_exe}:*)"] if db_block else [])
             # Accès limité au dossier de travail du client (worktree, sources, extraits Jira) et aux catalogues
-            returncode, output, usage, limit_hit = run_claude(
-                prompt, model, [cucumber_tools.STD_CACHE_DIR], tools_allowed,
-                extra_args=("--max-turns", max_turns), cwd=run_dir, effort=effort)
-            report_token_usage(work_key, "cucumber-lot", model, usage, len(prompt), returncode, effort)
+            returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, tools_allowed, max_turns,
+                                                                       run_dir, effort, system_file)
+            report_token_usage(work_key, "cucumber-lot", model, usage, len(system_prompt) + len(prompt), returncode,
+                               effort)
             lot["tokens"] = {}
             add_usage(lot, usage)
             results = cucumber_tools.parse_lot_result(output)
@@ -1520,11 +1646,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                 cucumber_tools.discard_lot(worktree)
                 lot.update(statut="echec", commit=lot.get("commit", False),
                            fin=datetime.now().isoformat(timespec="seconds"),
-                           erreur=("quota atteint" if limit_hit else f"code {returncode}" if returncode != 0
-                                   else "JSON final absent ou invalide"))
+                           erreur=("quota atteint" if limit_hit else "budget atteint" if budget_hit(usage)
+                                   else f"code {returncode}" if returncode != 0 else "JSON final absent ou invalide"))
                 cucumber_tools.save_state(client, state)
                 print(f"[LOT {label}] ❌ Échec ({lot['erreur']}) : fichiers du lot annulés, relancez avec « Reprendre ».")
                 exit_code = 1
+                # Budget : propre à cet appel, les lots suivants sont tentés ; sinon (quota, erreur) arrêt
+                if lot["erreur"] == "budget atteint":
+                    continue
                 break
             files = cucumber_tools.lot_files(worktree, results)
             # Contrôles de pertinence en Python, puis une revue bornée des seuls scénarios signalés

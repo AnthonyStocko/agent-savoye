@@ -1066,7 +1066,7 @@ with tab_cucumber:
                 "Signalés": indicators.get("signales"), "Supprimés": indicators.get("supprimes"),
                 "Tokens": total_tokens or None,
                 "Coût ($)": round(tokens["cout_usd"], 3) if isinstance(tokens.get("cout_usd"), (int, float)) else None,
-                "Erreur": lot.get("erreur", ""),
+                "Erreur": lot.get("erreur", "") or ("tri Python, sans appel Claude" if lot.get("tri") else ""),
             })
         with st.expander(f"Lots de la dernière génération ({sum(1 for r in lot_rows if r['Statut'] == 'termine')}"
                          f"/{len(lot_rows)} terminés)", expanded=bool(pending)):
@@ -1416,6 +1416,30 @@ with tab_config:
                 help="Nombre maximal de tours de l'agent par lot (--max-turns).")
         env_values["CUCUMBER_BATCH_SIZE"] = str(int(cucumber_batch))
         env_values["CUCUMBER_MAX_TURNS"] = str(int(cucumber_turns))
+        with st.container(horizontal=True):
+            env_values["CUCUMBER_MAX_BUDGET_USD"] = st.text_input(
+                "CUCUMBER_MAX_BUDGET_USD", value=os.getenv("CUCUMBER_MAX_BUDGET_USD", ""), placeholder="Vide = aucun",
+                help="Budget maximal par appel Claude d'un lot, d'une correction ou d'une revue (--max-budget-usd). "
+                     "Dépassement : lot en échec « budget atteint », fichiers annulés, repris par « Reprendre ».")
+            inline_max = st.number_input(
+                "CUCUMBER_INLINE_MAX_CHARS", min_value=0, step=2000,
+                value=env_int("CUCUMBER_INLINE_MAX_CHARS", cucumber_tools.DEFAULT_INLINE_MAX_CHARS),
+                help="Taille maximale (caractères) du contenu injecté dans le prompt d'un lot au lieu d'être lu par "
+                     "l'agent : partie fixe (sommaire du catalogue, Step Definitions exemplaire, exemples des "
+                     "recettes, runner à créer) et, séparément, extraits Standard et Jira du lot. Au-delà, le "
+                     "chemin est donné pour lecture. 0 = rien d'injecté.")
+        env_values["CUCUMBER_INLINE_MAX_CHARS"] = str(int(inline_max))
+        env_values["CUCUMBER_INLINE_STUDIO_LINES"] = str(int(st.number_input(
+            "CUCUMBER_INLINE_STUDIO_LINES", min_value=0, step=10,
+            value=env_int("CUCUMBER_INLINE_STUDIO_LINES", cucumber_tools.DEFAULT_INLINE_STUDIO_LINES),
+            help="Lignes au plus, par customized.xml, des parties modifiées (nœuds modifiés et leur contexte) "
+                 "injectées dans le prompt du lot. Le reste du fichier est lu à la demande. 0 = rien d'injecté.")))
+        lean = st.checkbox(
+            "CLAUDE_LEAN_SESSION", value=os.getenv("CLAUDE_LEAN_SESSION", "1").strip() != "0",
+            help="Sessions Cucumber allégées : seules les définitions des outils autorisés sont envoyées (--tools), "
+                 "sans serveur MCP (--strict-mcp-config), commandes ni skills (--disable-slash-commands), sections "
+                 "propres au poste hors du prompt système. Décoché = comportement antérieur.")
+        env_values["CLAUDE_LEAN_SESSION"] = "1" if lean else "0"
         env_values["CUCUMBER_EXCLUDE_GLOBS"] = st.text_input(
             "CUCUMBER_EXCLUDE_GLOBS", value=os.getenv("CUCUMBER_EXCLUDE_GLOBS", ""),
             placeholder="Vide = exclusions par défaut (pom.xml, tests unitaires, ressources statiques…)",
@@ -1584,6 +1608,11 @@ with tab_config:
             env_values["CLAUDE_MODEL_CUCUMBER"] = st.text_input("CLAUDE_MODEL_CUCUMBER", value=os.getenv("CLAUDE_MODEL_CUCUMBER", ""),
                                                                 help=model_help.replace("Vide = modèle par défaut de Claude Code.", "Vide = sonnet.")
                                                                 + " Utilisé par chaque lot de la génération des tests Cucumber d'un client (onglet Cucumber).")
+        env_values["CLAUDE_MODEL_CUCUMBER_FIX"] = st.text_input("CLAUDE_MODEL_CUCUMBER_FIX", value=os.getenv("CLAUDE_MODEL_CUCUMBER_FIX", ""),
+                                                                placeholder="Vide = haiku",
+                                                                help=model_help.replace("Vide = modèle par défaut de Claude Code.", "Vide = haiku.")
+                                                                + " Utilisé par les corrections de compilation et de dry-run des lots Cucumber ; si elles échouent, "
+                                                                  "une dernière tentative est faite avec CLAUDE_MODEL_CUCUMBER.")
         effort_help = ("Niveau d'effort transmis avec --effort : low, medium, high, xhigh ou max. "
                        "Vide = réglage de Claude Code sur le poste.")
         with st.container(horizontal=True):
@@ -1598,7 +1627,7 @@ with tab_config:
             env_values["CLAUDE_EFFORT_CUCUMBER"] = st.text_input("CLAUDE_EFFORT_CUCUMBER", value=os.getenv("CLAUDE_EFFORT_CUCUMBER", "medium"),
                                                                  help=effort_help + " Utilisé par chaque lot de la génération des tests Cucumber d'un client.")
         env_values["CLAUDE_EFFORT_CUCUMBER_FIX"] = st.text_input("CLAUDE_EFFORT_CUCUMBER_FIX", value=os.getenv("CLAUDE_EFFORT_CUCUMBER_FIX", "low"),
-                                                                 help=effort_help.replace("Vide = réglage de Claude Code sur le poste.", "Vide = CLAUDE_EFFORT_CUCUMBER.")
+                                                                 help=effort_help.replace("Vide = réglage de Claude Code sur le poste.", "Vide = low.")
                                                                  + " Utilisé par les appels de correction et de revue des lots Cucumber.")
         st.caption("La consommation de chaque exécution est affichée (ligne [TOKENS]) et ajoutée à .tmp/token_usage.csv, "
                    "avec le modèle et l'effort utilisés.")

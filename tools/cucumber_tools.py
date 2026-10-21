@@ -1217,6 +1217,115 @@ def attach_recipes(inventory: dict, cucumber_std_dir: str) -> int:
     return sum(1 for s in inventory.get("specifiques", []) if s["recettes"])
 
 
+# ---------------------------------------------------------------------------
+# Steps candidats : les steps Standard les plus proches de chaque spécifique, donnés dans le prompt du lot
+# ---------------------------------------------------------------------------
+
+MAX_CANDIDATE_STEPS = 15
+_STEP_LINE = re.compile(r"^- (.+) — (\S+?):(\d+)\s*$")
+
+
+def std_steps(steps_md: str, std_endpoints: dict = None) -> list:
+    """
+    Steps du Standard lus dans steps_std.md (une ligne « - expression — fichier:ligne »), avec leur classe, les
+    endpoints qu'ils appellent (catalogue standard_endpoints), leurs mots et leur regex.
+    """
+    called = {}
+    for e in (std_endpoints or {}).get("endpoints", []):
+        for expr in e["steps"]:
+            called.setdefault(expr, []).append(f"{e['methode']} {e['chemin']}")
+    steps = []
+    for line in _read_text_file(steps_md).splitlines():
+        match = _STEP_LINE.match(line)
+        if not match:
+            continue
+        expr, file = match.group(1), match.group(2)
+        cls = file.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        endpoints = list(dict.fromkeys(called.get(expr, [])))
+        text = f"{expr} {cls} {' '.join(endpoints)}"
+        words = set(_words(text))
+        steps.append({"expr": expr, "classe": cls, "fichier": file, "endpoints": endpoints,
+                      "words": words | {_unaccent(w) for w in words}, "norm": _norm(_unaccent(text)),
+                      "prefix": _step_prefix(expr), "regex": _expression_regex(expr)})
+    return steps
+
+
+def _used_steps(spec: dict, steps: list) -> dict:
+    """Steps Standard utilisés par les extraits des tests équivalents du spécifique : {expression: poids}."""
+    by_prefix = {}
+    for step in steps:
+        if step["regex"]:
+            by_prefix.setdefault(step["prefix"], []).append(step)
+    used = {}
+    for test in spec.get("tests_std") or []:
+        for line in _read_text_file(test.get("extrait", "")).splitlines():
+            match = _GHERKIN_STEP.match(line)
+            if not match:
+                continue
+            text = match.group(1)
+            for step in by_prefix.get(_step_prefix(text), []) + by_prefix.get("(sans préfixe)", []):
+                if step["regex"].match(text):
+                    used[step["expr"]] = max(used.get(step["expr"], 0), test.get("score") or 0.5)
+                    break
+    return used
+
+
+def candidate_steps(spec: dict, steps: list, groups: list = None, client_name: str = "",
+                    limit: int = MAX_CANDIDATE_STEPS) -> list:
+    """
+    Les `limit` steps Standard les plus proches du spécifique : steps des recettes applicables (+3), steps
+    utilisés par ses tests Standard équivalents (+2 x score du test), mots-clés et synonymes présents dans
+    l'expression, la classe ou l'endpoint (idf), cible (objet métier, élément overridé) nommée (idf), classe
+    Step Definitions d'un test équivalent (+0,5). [{"expr", "classe", "endpoints"}].
+    """
+    if not steps:
+        return []
+    groups = synonym_groups() if groups is None else groups
+    vocabulary = {w for s in steps for w in s["words"]} | {w for g in groups for w in g}
+    keywords = []
+    for k in spec.get("mots_cles", []):
+        k = _unaccent(_spec_name(k, client_name) if len(k) >= 8 else k)
+        if len(k) < 4 or k in _TECHNICAL_WORDS:
+            continue
+        parts = _segment(k, vocabulary) if len(k) >= 8 and k not in vocabulary else []
+        keywords += [p for p in parts if p not in _TECHNICAL_WORDS] if len(parts) >= 2 else [k]
+    forms = {k: synonyms(k, groups) for k in dict.fromkeys(keywords)}
+    targets = _override_targets(spec, client_name)
+
+    def idf(found: int) -> float:
+        return math.log((1 + len(steps)) / found) if found else 0.0
+    form_idf = {w: idf(sum(1 for s in steps if w in s["words"] or (len(w) >= 8 and w in s["norm"])))
+                for w in {w for f in forms.values() for w in f}}
+    target_idf = {t: idf(sum(1 for s in steps if t in s["norm"])) for t in targets}
+    recipe_steps = {" ".join(s.split()) for r in spec.get("recettes") or []
+                    for s in re.findall(r"`([^`]+)`", r.get("steps", ""))}
+    used = _used_steps(spec, steps)
+    test_classes = {f.rsplit("/", 1)[-1].rsplit(".", 1)[0] for t in spec.get("tests_std") or []
+                    for f in t.get("step_definitions", [])}
+    scored = []
+    for n, step in enumerate(steps):
+        score = sum(max((form_idf[w] for w in group if w in step["words"] or (len(w) >= 8 and w in step["norm"])),
+                        default=0.0) for group in forms.values())
+        score += sum(v for t, v in target_idf.items() if t in step["norm"])
+        score += 3.0 if " ".join(step["expr"].split()) in recipe_steps else 0.0
+        score += 2.0 * used.get(step["expr"], 0)
+        if score > 0 and step["classe"] in test_classes:
+            score += 0.5
+        if score > 0:
+            scored.append((-score, n, step))
+    scored.sort(key=lambda s: s[:2])
+    return [{"expr": s["expr"], "classe": s["classe"], "endpoints": s["endpoints"][:2]} for _, _, s in scored[:limit]]
+
+
+def attach_candidate_steps(inventory: dict, steps_md: str, std_endpoints: dict) -> int:
+    """spec["steps_candidats"] de chaque spécifique (0 token). Renvoie le nombre de spécifiques concernés."""
+    steps = std_steps(steps_md, std_endpoints)
+    groups = synonym_groups()
+    for spec in inventory.get("specifiques", []):
+        spec["steps_candidats"] = candidate_steps(spec, steps, groups, inventory.get("client", ""))
+    return sum(1 for s in inventory.get("specifiques", []) if s["steps_candidats"])
+
+
 def jira_extracts(inventory: dict, tickets: list, per_spec: int = 5, max_chars: int = 500) -> None:
     """Pour chaque spécifique, les tickets Jira qui citent ses mots-clés (jira_<id>.md), au plus `per_spec`."""
     directory = cache_dir(inventory["client"])
@@ -2208,10 +2317,261 @@ def verify_build(build: str, compile_cmd: str, features: list = None, dry_run_cm
 # Lots
 # ---------------------------------------------------------------------------
 
-def make_lots(spec_ids: list, batch_size: int) -> list:
+def _lot_domain(spec: dict) -> str:
+    """Domaine d'un spécifique pour regrouper les lots : dépôt et deux premiers mots du processus, ou du dossier."""
+    if spec.get("nature") == "processus":
+        name = re.sub(r"^(spec|ref)-", "", spec.get("dossier", "").rsplit("/", 1)[-1])
+        return f"{spec.get('depot', '')}:{'-'.join(name.split('-')[:2])}"
+    return f"{spec.get('depot', '')}:{spec.get('dossier', '').split('/')[0]}"
+
+
+def order_specifics(spec_ids: list, specifics: dict) -> list:
+    """Spécifiques regroupés par test Standard principal (tests_std[0]), puis par domaine ; sans test à la fin."""
+    def key(item):
+        n, i = item
+        spec = specifics.get(i) or {}
+        tests = spec.get("tests_std") or []
+        return (0 if tests else 1, tests[0]["path"] if tests else "", _lot_domain(spec), n)
+    return [i for _, i in sorted(enumerate(spec_ids), key=key)]
+
+
+def make_lots(spec_ids: list, batch_size: int, specifics: dict = None) -> list:
+    """
+    Lots de `batch_size` spécifiques. Avec `specifics` : regroupés par test Standard principal puis par domaine
+    (order_specifics), et les spécifiques de libellés réunis en un seul lot, à la fin.
+    """
     size = max(1, batch_size)
-    return [{"numero": i + 1, "ids": spec_ids[i * size:(i + 1) * size], "statut": "a_faire"}
-            for i in range(math.ceil(len(spec_ids) / size))]
+    labels = [i for i in spec_ids if (specifics or {}).get(i, {}).get("nature") == "libellés"]
+    others = [i for i in spec_ids if i not in labels]
+    if specifics:
+        others = order_specifics(others, specifics)
+    groups = [others[i * size:(i + 1) * size] for i in range(math.ceil(len(others) / size))]
+    groups += [labels] if labels else []
+    return [{"numero": n + 1, "ids": ids, "statut": "a_faire"} for n, ids in enumerate(groups)]
+
+
+# ---------------------------------------------------------------------------
+# Tri Python avant les lots (0 token)
+# ---------------------------------------------------------------------------
+
+_EVENT_ROOT = re.compile(r"<execution-event-(listener-)?definition\b([^>]*)>", re.S)
+_EVENT_NAME = re.compile(r"(^|-)(listener|event)(-|$)")
+TECHNICAL_REASON = ("technique : ni code Java, ni processus Studio, ni paramètre — aucun comportement observable "
+                    "propre à tester (tri automatique, sans appel Claude)")
+
+
+def studio_event(spec: dict) -> dict:
+    """
+    Listener ou événement Studio du spécifique (un seul customized.xml, libellés mis à part) :
+    {"type": "listener"|"event", "nom", "on_event", "execute", "logique"} ; {} sinon. Un listener a une logique
+    propre s'il a une condition (<if>…) ou un mapping autre que `$event.champ` ; un événement, s'il déclare
+    autre chose que des variables.
+    """
+    name = spec.get("dossier", "").rsplit("/", 1)[-1]
+    if spec.get("nature") != "processus" or not _EVENT_NAME.search(name):
+        return {}
+    xml = [f for f in spec.get("fichiers", []) if f["path"].rsplit("/", 1)[-1] == "customized.xml"]
+    others = [f for f in spec.get("fichiers", []) if f not in xml and not _is_label_file(f["path"])]
+    if len(xml) != 1 or others or spec.get("nb_fichiers", 0) > len(spec.get("fichiers", [])):
+        return {}
+    text = _read_text_file(xml[0].get("local", ""))
+    root = _EVENT_ROOT.search(text)
+    if not root:
+        return {}
+    attributes = dict(re.findall(r'([\w-]+)="([^"]*)"', root.group(2)))
+    tags = set(re.findall(r"<([\w-]+)", text[root.end():]))
+    if root.group(1):
+        inputs = re.findall(r"<input\b[^>]*>(.*?)</input>", text, re.S)
+        logic = bool(tags - {"mappings", "input"}) or any(
+            not re.fullmatch(r"\$event(\.\w+)*", i.strip()) for i in inputs)
+        return {"type": "listener", "nom": name, "on_event": attributes.get("on-event", "").rsplit("/", 1)[-1],
+                "execute": attributes.get("execute", "").rsplit("/", 1)[-1], "logique": logic}
+    return {"type": "event", "nom": name, "on_event": "", "execute": "",
+            "logique": bool(tags - {"variable", "variables", "description"})}
+
+
+def _is_technical(spec: dict) -> bool:
+    """Ni fichier Java, ni processus Studio, ni paramètre (et tous ses fichiers sont listés)."""
+    files = spec.get("fichiers", [])
+    return bool(files) and spec.get("nb_fichiers", len(files)) <= len(files) and spec.get("nature") != "processus" \
+        and not any(f["path"].endswith(".java") or STUDIO_FILES.match(f["path"].rsplit("/", 1)[-1])
+                    or f.get("kind") == "parametrage" for f in files)
+
+
+def presort(spec_ids: list, specifics: dict) -> tuple:
+    """
+    Tri sans token des spécifiques sélectionnés. Renvoie (identifiants laissés aux lots, résultats déjà conclus) :
+    listener ou événement sans logique propre -> « couvert_indirectement » par le processus qu'il déclenche, si
+    celui-ci est sélectionné (ou déjà couvert) ; spécifique purement technique -> « non_couvert » (TECHNICAL_REASON).
+    """
+    selected = set(spec_ids)
+    processes = {s["dossier"].rsplit("/", 1)[-1]: s for s in specifics.values() if s.get("nature") == "processus"}
+    events = {i: studio_event(s) for i, s in specifics.items() if s.get("nature") == "processus"}
+    listeners = [e for e in events.values() if e.get("type") == "listener"]
+
+    def target(process_name: str):
+        process = processes.get(process_name)
+        if process and (process["id"] in selected or process.get("couverture") == "deja_couvert") \
+                and not events.get(process["id"]):
+            return process
+        return None
+    remaining, results = [], []
+    for i in spec_ids:
+        spec, event = specifics[i], events.get(i) or {}
+        result = None
+        if event and not event["logique"]:
+            via = [(event["nom"], event["execute"])] if event["type"] == "listener" else [
+                (e["nom"], e["execute"]) for e in listeners if e["on_event"] == event["nom"]]
+            found = next(((name, target(process)) for name, process in via if target(process)), None)
+            if found:
+                listener, process = found
+                how = (f"listener sans logique propre (aucune condition, mappings $event.* seuls) qui déclenche "
+                       f"{process['dossier']}" if event["type"] == "listener" else
+                       f"événement sans logique propre (variables seules), déclenché vers {process['dossier']} "
+                       f"par {listener}")
+                result = {"id": i, "statut": "couvert_indirectement", "couvert_par": process["id"],
+                          "raison": f"{how} (tri automatique, sans appel Claude)"}
+        elif _is_technical(spec):
+            result = {"id": i, "statut": "non_couvert", "raison": TECHNICAL_REASON}
+        if result:
+            results.append({"scenarios": [], "fichiers": [], "classes_java": [], "inspire_de": [], "tri": True,
+                            **result})
+        else:
+            remaining.append(i)
+    return remaining, results
+
+
+def presort_lot(results: list, number: int) -> dict:
+    """Lot terminé sans appel Claude, portant les résultats du tri Python."""
+    return {"numero": number, "ids": [r["id"] for r in results], "statut": "termine", "tri": True,
+            "resultats": results, "commit": False, "fin": datetime.now().isoformat(timespec="seconds")}
+
+
+# ---------------------------------------------------------------------------
+# Contenu injecté dans le prompt (au lieu d'être lu par l'agent)
+# ---------------------------------------------------------------------------
+
+DEFAULT_INLINE_MAX_CHARS = 24_000
+DEFAULT_INLINE_STUDIO_LINES = 150
+STUDIO_CONTEXT_LINES = 3
+
+
+def studio_excerpt(original: str, customized: str, max_lines: int = DEFAULT_INLINE_STUDIO_LINES) -> str:
+    """
+    Parties modifiées d'un customized.xml : blocs ajoutés ou modifiés par rapport à la référence, avec
+    STUDIO_CONTEXT_LINES lignes de contexte (numéros de ligne du fichier client), dans la limite de `max_lines`.
+    Sans référence (processus nouveau) : le début du fichier.
+    """
+    lines = customized.splitlines()
+    if not original:
+        kept = [f"{n + 1:>5}  {l}" for n, l in enumerate(lines[:max_lines])]
+        return "\n".join(kept + ([f"# … {len(lines) - max_lines} ligne(s) suivante(s) à lire si nécessaire"]
+                                 if len(lines) > max_lines else []))
+    out, used = [], 0
+    matcher = difflib.SequenceMatcher(None, original.splitlines(), lines, autojunk=False)
+    for group in matcher.get_grouped_opcodes(STUDIO_CONTEXT_LINES):
+        start, end = group[0][3], group[-1][4]
+        removed = sum(i2 - i1 for tag, i1, i2, _, _ in group if tag in ("delete", "replace"))
+        header = f"# lignes {start + 1}-{end}" + (f" ({removed} ligne(s) du Standard retirée(s) ou remplacée(s))"
+                                                   if removed else "")
+        block = [header] + [f"{n + 1:>5}  {lines[n]}" for n in range(start, end)]
+        if used + len(block) > max_lines:
+            out.append(f"# … autres parties modifiées non affichées (borne de {max_lines} lignes) : lire le fichier")
+            break
+        out += block
+        used += len(block)
+    return "\n".join(out)
+
+
+def attach_studio_excerpts(inventory: dict, max_lines: int = DEFAULT_INLINE_STUDIO_LINES) -> int:
+    """
+    f["extrait_studio"] des customized.xml de chaque spécifique : fichier <client>/studio/<id>/<nom>.txt des
+    parties modifiées (studio_excerpt), la référence étant original.xml du dépôt client ou le fichier du Standard.
+    Renvoie le nombre de fichiers concernés (0 token, recalculé à chaque exécution).
+    """
+    directory = os.path.join(cache_dir(inventory["client"]), "studio")
+    shutil.rmtree(directory, ignore_errors=True)
+    if max_lines <= 0:
+        return 0
+    client_repos, std_repos = git_repos(inventory["depot_client"]), git_repos(inventory["standard"])
+    refs = inventory.get("references", {})
+    count = 0
+    for spec in inventory["specifiques"]:
+        for f in spec["fichiers"]:
+            f.pop("extrait_studio", None)
+            if f["path"].rsplit("/", 1)[-1] != "customized.xml" or not f.get("local"):
+                continue
+            original = ""
+            standard = f.get("standard", "")
+            if f.get("kind") == "override" and standard.startswith("original"):
+                repo_dir, ref = client_repos.get(f["repo"]), refs.get(f["repo"], {}).get("ref")
+                if repo_dir and ref:
+                    original = _git(repo_dir, "show", f"{ref}:{f['path'][:-len('customized.xml')]}original.xml").stdout
+            elif f.get("kind") == "override" and ":" in standard:
+                repo, path = standard.split(":", 1)
+                ref = pick_ref(std_repos[repo], STD_REFS) if repo in std_repos else ""
+                if ref:
+                    original = _git(std_repos[repo], "show", f"{ref}:{path}").stdout
+            excerpt = studio_excerpt(original, _read_text_file(f["local"]), max_lines)
+            if not excerpt.strip():
+                continue
+            target = os.path.join(directory, spec["id"], f["path"].replace("/", "__") + ".txt")
+            _write_text(target, f"# Parties modifiées de {f['path']} ("
+                                + ("par rapport à " + standard.split(' (')[0] if original else "processus nouveau")
+                                + f") ; fichier complet : '{f['local']}'\n{excerpt}\n")
+            f["extrait_studio"] = target
+            count += 1
+    return count
+
+
+def _inline_documents(documents: list, max_chars: int) -> tuple:
+    """
+    `documents` : [(chemin, intitulé)], dans l'ordre de priorité. Contenu des documents tant que le total reste
+    sous `max_chars` (un document trop gros est sauté, les suivants peuvent entrer). Renvoie (texte, chemins
+    injectés, [(chemin, intitulé)] non injectés).
+    """
+    parts, inlined, skipped, used = [], set(), [], 0
+    for path, label in documents:
+        if not path or path in inlined:
+            continue
+        text = _read_text_file(path).strip()
+        if text and used + len(text) <= max_chars:
+            parts.append(f"--- '{path}' ({label}) ---\n{text}\n--- fin ---")
+            inlined.add(path)
+            used += len(text)
+        elif text:
+            skipped.append((path, label))
+    return "\n".join(parts), inlined, skipped
+
+
+def fixed_references(catalogue_std: str, steps_example: str, recipe_examples: list, max_chars: int) -> tuple:
+    """
+    Références de la partie fixe des lots (prompt système, identique pour tous les lots, donc lue depuis le cache
+    à partir du 2e lot) : sommaire du catalogue Standard, Step Definitions exemplaire, exemples des recettes. Au
+    plus `max_chars` caractères ; au-delà, le chemin est donné pour lecture. Renvoie (texte, chemins injectés).
+    """
+    documents = [(catalogue_std, "sommaire du catalogue Cucumber Standard"),
+                 (steps_example, "Step Definitions exemplaire du Standard")]
+    documents += [(p, "exemple de recette") for p in sorted(set(recipe_examples))]
+    text, inlined, skipped = _inline_documents(documents, max_chars)
+    lines = ["=== RÉFÉRENCES INJECTÉES (contenu complet, identique pour tous les lots : NE RELIS PAS ces fichiers) ==="]
+    lines += [text] if text else ["(aucune)"]
+    lines += [f"- Non injecté (taille), à lire une seule fois si nécessaire : '{p}' ({label})" for p, label in skipped]
+    lines.append("=== FIN DES RÉFÉRENCES INJECTÉES ===")
+    return "\n".join(lines), inlined
+
+
+def needs_runner(runner_status: str) -> bool:
+    """runner_status de client_java_context : faut-il créer un runner ?"""
+    return runner_status.startswith("aucun runner")
+
+
+def runner_block(runner_example: str, runner_status: str, max_chars: int) -> str:
+    """Runner du Standard injecté dans la partie variable du lot, seulement s'il faut en créer un ('' sinon)."""
+    if not (runner_example and needs_runner(runner_status)):
+        return ""
+    text, _, _ = _inline_documents([(runner_example, "runner du Standard, modèle du runner à créer")], max_chars)
+    return text or f"- Runner du Standard à prendre pour modèle (à lire) : '{runner_example}'"
 
 
 # Raisons de non-couverture qu'une recette, un nouveau step ou une relecture par endpoint peut lever
@@ -2234,13 +2594,13 @@ def completable_specifics(state: dict) -> list:
             and COMPLETABLE_REASON.search(r.get("raison") or "") and i not in completed | queued]
 
 
-def add_completion_lots(state: dict, spec_ids: list, batch_size: int) -> list:
+def add_completion_lots(state: dict, spec_ids: list, batch_size: int, specifics: dict = None) -> list:
     """
     Complément d'une génération : nouveaux lots numérotés à la suite pour `spec_ids`, retirés de leurs anciens lots
     (leurs résultats y sont gardés dans « historique », avec le lot qui les reprend). Renvoie les nouveaux lots.
     """
     start = max((lot["numero"] for lot in state.get("lots", [])), default=0)
-    new = make_lots(spec_ids, batch_size)
+    new = make_lots(spec_ids, batch_size, specifics)
     for lot in new:
         lot.update(numero=lot["numero"] + start, complement=True)
     taken = {i: lot["numero"] for lot in new for i in lot["ids"]}
@@ -2287,8 +2647,28 @@ def lot_example(specifics: list) -> str:
     return max(tests, key=lambda t: t["score"])["extrait"] if tests else ""
 
 
-def lot_block(specifics: list) -> str:
-    """Partie variable du prompt : recettes applicables (une fois chacune), puis les spécifiques du lot."""
+def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) -> str:
+    """
+    Partie variable du prompt : recettes applicables (une fois chacune), puis les spécifiques du lot (steps
+    candidats compris). `inline_max` > 0 : contenu des extraits Standard et des extraits Jira du lot injecté à la
+    fin, dans cette limite de caractères (au-delà, le chemin reste à lire), ainsi que les parties modifiées des
+    customized.xml (extrait_studio, déjà bornées en lignes, hors de cette limite). `inlined` : chemins déjà
+    injectés dans la partie fixe (exemples de recettes).
+    """
+    studio = [f["extrait_studio"] for spec in specifics for f in spec["fichiers"] if f.get("extrait_studio")]
+    studio_text, studio_here, _ = _inline_documents([(p, "parties modifiées du processus Studio") for p in studio],
+                                                    10 ** 9) if inline_max > 0 else ("", set(), [])
+    documents = []
+    for rank in range(MAX_STD_TESTS):
+        documents += [(spec["tests_std"][rank]["extrait"], f"test Standard équivalent de {spec['id']}")
+                      for spec in specifics if len(spec.get("tests_std") or []) > rank
+                      and spec["tests_std"][rank].get("extrait")]
+    documents += [(spec["jira"], f"extraits Jira de {spec['id']}") for spec in specifics if spec.get("jira")]
+    injected, here, _ = _inline_documents(documents, inline_max) if inline_max > 0 else ("", set(), [])
+
+    def ref(path: str) -> str:
+        return (f"'{path}' (injecté plus bas)" if path in here else
+                f"'{path}' (dans les références injectées)" if path in inlined else f"'{path}'")
     lines, recipes = [], {}
     for spec in specifics:
         for recipe in spec.get("recettes") or []:
@@ -2300,7 +2680,7 @@ def lot_block(specifics: list) -> str:
             if recipe.get("steps"):
                 lines.append(f"- Steps Standard : {recipe['steps']}")
             if recipe.get("exemple_local"):
-                lines.append(f"- Exemple : '{recipe['exemple_local']}' (Standard : {recipe['exemple_std']})")
+                lines.append(f"- Exemple : {ref(recipe['exemple_local'])} (Standard : {recipe['exemple_std']})")
             if recipe.get("statut"):
                 lines.append(f"- Statut attendu : {recipe['statut']}")
             if recipe.get("consigne"):
@@ -2313,17 +2693,21 @@ def lot_block(specifics: list) -> str:
         if spec.get("scenarios_existants"):
             lines.append("- Scénarios existants à compléter plutôt que dupliquer : "
                          + " ; ".join(spec["scenarios_existants"]))
-        lines.append(f"- Tickets Jira : '{spec['jira']}'" if spec.get("jira") else "- Tickets Jira : aucun trouvé")
+        lines.append(f"- Tickets Jira : {ref(spec['jira'])}" if spec.get("jira") else "- Tickets Jira : aucun trouvé")
         if spec.get("tests_std"):
             lines.append("- Tests Standard équivalents (à lire avant d'écrire) :")
             for test in spec["tests_std"]:
                 scenarios = " ; ".join(test["scenarios"][:6]) + (" …" if len(test["scenarios"]) > 6 else "")
                 steps = ", ".join(f.rsplit("/", 1)[-1][:-5] for f in test.get("step_definitions", [])[:4])
-                lines.append(f"  - '{test.get('extrait', test['path'])}' — {test['feature']} / {scenarios} "
+                lines.append(f"  - {ref(test.get('extrait', test['path']))} — {test['feature']} / {scenarios} "
                              f"(score {test['score']}, {test['raison']}"
                              + (f" ; Step Definitions : {steps}" if steps else "") + ")")
         else:
             lines.append("- Tests Standard équivalents : aucun test Standard équivalent")
+        if spec.get("steps_candidats"):
+            lines.append("- Steps candidats (Standard, les plus proches, à réutiliser tels quels) :")
+            lines += [f"  - `{s['expr']}` — {s['classe']}" + (f" — {' ; '.join(s['endpoints'])}" if s["endpoints"]
+                                                               else "") for s in spec["steps_candidats"]]
         if spec.get("endpoints_std"):
             lines.append("- Endpoints Standard liés (déjà appelés par ces steps / classes du Standard : à réutiliser) :")
             lines += [f"  - {e['methode']} {e['chemin']} — {', '.join(e['java'])}"
@@ -2334,7 +2718,8 @@ def lot_block(specifics: list) -> str:
             lines += [f"  - {e['methode']} {e['chemin']} — {e['java']}" for e in spec["endpoints_client"]]
         lines.append(f"- Fichiers ({spec['nb_fichiers']}, contenu à la version de référence) :")
         for f in spec["fichiers"]:
-            detail = f"  - [{f['kind']}] '{f.get('local', f['path'])}'"
+            detail = f"  - [{f['kind']}] '{f.get('local', f['path'])}'" + (
+                " (parties modifiées injectées plus bas)" if f.get("extrait_studio") in studio_here else "")
             if f.get("diff"):
                 elements = ", ".join(f["diff"]["elements"]) or "—"
                 detail += f" — écart avec {f.get('standard', 'le Standard')} : {f['diff']['stat']} ; modifié : {elements}"
@@ -2345,6 +2730,11 @@ def lot_block(specifics: list) -> str:
         if spec["nb_fichiers"] > len(spec["fichiers"]):
             lines.append(f"  - … {spec['nb_fichiers'] - len(spec['fichiers'])} autre(s) fichier(s) non listé(s)")
         lines.append("")
+    if studio_text:
+        lines += ["### Parties modifiées des processus Studio du lot (le reste du fichier : à lire si nécessaire)",
+                  studio_text]
+    if injected:
+        lines += ["### Contenu injecté du lot (extraits Standard et Jira : NE RELIS PAS ces fichiers)", injected]
     return "\n".join(lines).rstrip()
 
 
@@ -2451,6 +2841,18 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
              f"- Scénarios supprimés à la revue : {len(deleted)}"
              + (" — " + " ; ".join(f"{k} : {n}" for k, n in sorted(reasons.items(), key=lambda kv: -kv[1]))
                 if reasons else "")]
+    unreviewed = [s for lot in lots for s in (lot.get("revue") or {}).get("sans_appel", [])]
+    if unreviewed:
+        lines.append(f"- Scénarios signalés sans appel de revue (seuls « source » / « difference_standard » vides "
+                     f"dans le JSON) : {len(unreviewed)} — "
+                     + " ; ".join(f"{s['fichier']} / {s['titre']}" for s in unreviewed[:20])
+                     + (" …" if len(unreviewed) > 20 else ""))
+    sorted_out = [r for lot in lots if lot.get("tri") for r in lot.get("resultats") or []]
+    if sorted_out:
+        lines.append(f"- Tri automatique sans appel Claude : "
+                     f"{sum(1 for r in sorted_out if r.get('statut_declare', r['statut']) == 'couvert_indirectement')}"
+                     f" listener(s) / événement(s) sans logique propre, "
+                     f"{sum(1 for r in sorted_out if r.get('raison') == TECHNICAL_REASON)} spécifique(s) technique(s)")
     from tools.cucumber_verify import verification_indicators  # import local : cucumber_verify importe ce module
     verif = verification_indicators(state)
 
