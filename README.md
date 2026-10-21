@@ -28,7 +28,7 @@ irm https://claude.ai/install.ps1 | iex   # ou : npm install -g @anthropic-ai/cl
 claude                                    # première exécution : connexion (/login)
 ```
 
-L'agent utilise l'abonnement Claude de la CLI connectée. Pour passer par une clé API, renseignez `ANTHROPIC_API_KEY`.
+L'agent utilise l'abonnement Claude de la CLI connectée. Si plusieurs comptes sont connectés sur le poste (un dossier de configuration par compte, ex. `~/.claude` et `~/.claude-pro`), choisissez celui à utiliser avec `CLAUDE_CONFIG_DIR` (onglet Configuration, section « Compte Claude ») ; vide = compte du shell de lancement, sinon `~/.claude`. Pour passer par une clé API, renseignez `ANTHROPIC_API_KEY`.
 
 Le modèle et l'effort se règlent par étape dans le `.env` (ou l'onglet **⚙️ Configuration**) :
 

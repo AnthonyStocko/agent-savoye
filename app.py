@@ -1,10 +1,13 @@
+import glob
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import streamlit as st
-from dotenv import load_dotenv, set_key
+from dotenv import dotenv_values, load_dotenv, set_key
 
 from tools import cucumber_tools, cucumber_verify, integration_tools
 from tools.epic_tools import load_epic_manifest
@@ -47,6 +50,32 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name, "").strip() or default)
     except ValueError:
         return default
+
+
+def claude_config_dirs() -> list:
+    """Dossiers de configuration Claude Code du poste (un par compte) : ~/.claude et ~/.claude-*."""
+    home = os.path.expanduser("~")
+    dirs = [os.path.join(home, ".claude")] + sorted(glob.glob(os.path.join(home, ".claude-*")))
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def claude_account(config_dir: str) -> str:
+    """Compte connecté dans ce dossier de configuration (`claude auth status`), ou '' s'il est inconnu."""
+    env = os.environ.copy()
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config_dir)
+    try:
+        result = subprocess.run([shutil.which("claude") or "claude", "auth", "status"], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", env=env, timeout=20,
+                                shell=(os.name == "nt"))
+        status = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    if not status.get("loggedIn"):
+        return "non connecté"
+    return " · ".join(v for v in (status.get("email"), status.get("orgName")) if v)
 
 
 def show_release_note(ticket: str, since: float) -> None:
@@ -190,7 +219,11 @@ if not os.path.exists(ENV_PATH):
 
 # override=True : Streamlit ré-exécute ce script à chaque interaction ; on recharge donc la
 # configuration enregistrée (onglet ⚙️) au lieu de garder les valeurs du démarrage.
+# CLAUDE_CONFIG_DIR vide dans le .env : on garde celui du shell de lancement (mémorisé au premier passage).
+os.environ.setdefault("AGENT_SHELL_CLAUDE_CONFIG_DIR", os.environ.get("CLAUDE_CONFIG_DIR", ""))
 load_dotenv(ENV_PATH, override=True)
+if not os.getenv("CLAUDE_CONFIG_DIR", "").strip():
+    os.environ["CLAUDE_CONFIG_DIR"] = os.environ["AGENT_SHELL_CLAUDE_CONFIG_DIR"]
 
 st.title("🤖 Tableau de bord - Agent Scrum Master")
 
@@ -1575,10 +1608,29 @@ with tab_config:
                                                        help="Mode webhook uniquement (python webhook_server.py).")
 
         st.markdown("---")
-        st.markdown("#### 🔑 Clé API Anthropic")
+        st.markdown("#### 🔑 Compte Claude")
+        # Valeur du .env seule : celle héritée du shell n'est pas enregistrée par défaut
+        saved_config_dir = (dotenv_values(ENV_PATH).get("CLAUDE_CONFIG_DIR") or "").strip()
+        config_dir_options = [""] + claude_config_dirs()
+        if saved_config_dir and saved_config_dir not in config_dir_options:
+            config_dir_options.append(saved_config_dir)
+        shell_config_dir = os.environ.get("AGENT_SHELL_CLAUDE_CONFIG_DIR", "")
+
+        def config_dir_label(config_dir: str) -> str:
+            label = config_dir or ("Défaut du poste" + (f" ({shell_config_dir})" if shell_config_dir else " (~/.claude)"))
+            account = claude_account(config_dir or shell_config_dir)
+            return f"{label} — {account}" if account else label
+
+        env_values["CLAUDE_CONFIG_DIR"] = st.selectbox(
+            "CLAUDE_CONFIG_DIR", config_dir_options, index=config_dir_options.index(saved_config_dir),
+            format_func=config_dir_label, accept_new_options=True,
+            help="Dossier de configuration de Claude Code du compte à utiliser (abonnement Pro / Max / Team). "
+                 "Proposés : ~/.claude et ~/.claude-* du poste ; saisissez un autre chemin si besoin. "
+                 "Pour connecter un nouveau compte : CLAUDE_CONFIG_DIR=<dossier> puis `claude auth login`.")
         env_values["ANTHROPIC_API_KEY"] = st.text_input(
-            "ANTHROPIC_API_KEY (Laissez vide pour utiliser Claude Pro CLI)",
-            value=os.getenv("ANTHROPIC_API_KEY", ""), type="password")
+            "ANTHROPIC_API_KEY (Laissez vide pour utiliser le compte Claude ci-dessus)",
+            value=os.getenv("ANTHROPIC_API_KEY", ""), type="password",
+            help="Renseignée, la clé API est utilisée à la place du compte Claude.")
 
         st.markdown("---")
         st.markdown("#### 💸 Optimisation des tokens")

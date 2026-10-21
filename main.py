@@ -258,6 +258,18 @@ def claude_command(model: str, add_dirs: list, allowed_tools: list, extra_args: 
     return cmd
 
 
+def claude_env() -> dict:
+    """
+    Environnement des appels `claude` : CLAUDE_CONFIG_DIR (onglet Configuration) choisit le compte Claude,
+    c.-à-d. le dossier de configuration et d'identifiants de la CLI. Vide = compte par défaut (~/.claude).
+    """
+    env = os.environ.copy()
+    config_dir = env.pop("CLAUDE_CONFIG_DIR", "").strip()
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config_dir)
+    return env
+
+
 def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
                cwd: str = None, effort: str = "", lean: bool = False, budget_usd: str = "") -> tuple:
     """
@@ -278,6 +290,7 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
         errors="replace",
         shell=(os.name == "nt"),
         cwd=cwd,
+        env=claude_env(),
     )
 
     raw_stdout, raw_stderr = process.communicate(input=prompt)

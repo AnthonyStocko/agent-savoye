@@ -2,6 +2,7 @@
 import importlib
 import io
 import json
+import os
 import sys
 
 import pytest
@@ -291,3 +292,10 @@ def test_system_prompt_asks_to_write_early(main_module):
                                      tour_alerte=main_module.warning_turn(40))
     assert "=== ÉCRIRE TÔT ===" in text and "au plus 40 tours" in text and "au tour 30 (75 %)" in text
     assert "$" not in text.replace("$event", "")
+
+
+def test_claude_env_config_dir(main_module, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/.claude-pro")
+    assert main_module.claude_env()["CLAUDE_CONFIG_DIR"] == os.path.expanduser("~/.claude-pro")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", " ")
+    assert "CLAUDE_CONFIG_DIR" not in main_module.claude_env()
