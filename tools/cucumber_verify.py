@@ -37,6 +37,8 @@ _SCENARIO_LINE = re.compile(r"^\s*(Scenario Outline|Scenario Template|Scenario|E
 _BACKGROUND_LINE = re.compile(r"^\s*(Background|Contexte)\s*:", re.I)
 _SETUP_TITLE = re.compile(r"^(contexte|initialisation|r[ée]initialisation|description|purge|cr[ée]ation du contexte|"
                           r"mise en place)\b")
+# Mise en place exécutée avec les scénarios du lot qui la suivent (tag_scenarios)
+_SETUP_TAG = re.compile(r"^@agent_\w+_\d+_0$")
 # Then sans valeur métier : statut HTTP, « succès », « sans erreur »
 _GENERIC_THEN = re.compile(r"(?i)\b(code|statut|status)\b[^\"]*\b[1-5]\d\d\b|^\W*[1-5]\d\d\b|\b(réponse|response|requête|"
                            r"appel)\b.*\b(ok|succès|success|réussie?|valide)\s*$|\bsans erreur\b|\bs'exécute\b")
@@ -386,10 +388,27 @@ def lot_tag(client_name: str, lot_number: int) -> str:
     return f"@agent_{java_package_segment(client_name)}_{lot_number}"
 
 
+def _add_tags(lines: list, index: int, tags: tuple) -> None:
+    """Ajoute `tags` à la ligne de tags du scénario de la ligne `index` (0-based), créée au besoin."""
+    indent = re.match(r"^\s*", lines[index]).group(0)
+    if index > 0 and lines[index - 1].strip().startswith("@"):
+        lines[index - 1] = lines[index - 1].rstrip() + " " + " ".join(
+            t for t in tags if t not in lines[index - 1].split())
+    else:
+        lines.insert(index, f"{indent}{' '.join(tags)}")
+
+
+def is_setup_scenario(title: str, tags=()) -> bool:
+    """Scénario de mise en place (« Contexte… », « Initialisation… ») ou tagué comme tel (@agent_<client>_<lot>_0)."""
+    return bool(_SETUP_TITLE.match(_title_key(title))) or any(_SETUP_TAG.match(t) for t in tags)
+
+
 def tag_scenarios(worktree: str, scenarios: list, client_name: str, lot_number: int) -> dict:
     """
     Ajoute à chaque scénario nouveau du lot (analyse du niveau 1) le tag du lot et son tag propre
-    (@agent_<client>_<lot>_<n>), pour l'exécuter seul. Renvoie {tag du scénario: identifiant}.
+    (@agent_<client>_<lot>_<n>), pour l'exécuter seul. Les scénarios de mise en place qui les précèdent dans la
+    même feature reçoivent @agent_<client>_<lot>_0 (s'ils n'ont pas déjà un tel tag) : ils sont exécutés avec eux.
+    Renvoie {tag du scénario: identifiant} (sans les mises en place).
     """
     base, tagged, by_file = lot_tag(client_name, lot_number), {}, {}
     for scenario in scenarios:
@@ -399,10 +418,15 @@ def tag_scenarios(worktree: str, scenarios: list, client_name: str, lot_number: 
     for rel, items in by_file.items():
         path = os.path.join(worktree, *rel.split("/"))
         lines = _read_text_file(path).splitlines()
-        current = {s["titre"]: s for s in parse_scenarios("\n".join(lines))}
-        for scenario in sorted(items, key=lambda s: -current.get(s["titre"], s)["ligne"]):
-            found = current.get(scenario["titre"])
-            if not found:
+        parsed = parse_scenarios("\n".join(lines))
+        current = {s["titre"]: s for s in parsed}
+        targets = [current[s["titre"]] for s in items if s["titre"] in current]
+        last = max((s["ligne"] for s in targets), default=0)
+        setups = [s for s in parsed if s["ligne"] < last and is_setup_scenario(s["titre"])
+                  and not any(_SETUP_TAG.match(t) for t in s["tags"]) and s not in targets]
+        for found in sorted(targets + setups, key=lambda s: -s["ligne"]):
+            if found in setups:
+                _add_tags(lines, found["ligne"] - 1, (f"{base}_0",))
                 continue
             own = next((t for t in found["tags"] if t.startswith(base + "_")), "")
             if not own:
@@ -410,16 +434,19 @@ def tag_scenarios(worktree: str, scenarios: list, client_name: str, lot_number: 
                     counter += 1
                 own = f"{base}_{counter}"
                 used.add(own)
-                index = found["ligne"] - 1
-                indent = re.match(r"^\s*", lines[index]).group(0)
-                if index > 0 and lines[index - 1].strip().startswith("@"):
-                    lines[index - 1] = lines[index - 1].rstrip() + " " + " ".join(
-                        t for t in (base, own) if t not in lines[index - 1].split())
-                else:
-                    lines.insert(index, f"{indent}{base} {own}")
+                _add_tags(lines, found["ligne"] - 1, (base, own))
             tagged[own] = scenario_id(rel, found["titre"])
         _write_text(path, "\n".join(lines) + "\n")
     return tagged
+
+
+def setup_tags(worktree: str, files: list, tags) -> set:
+    """Tags @agent_…_0 des mises en place des features qui contiennent les scénarios `tags`, à exécuter avec eux."""
+    out = set()
+    for rel, _ in tagged_scenarios(worktree, files, tags).values():
+        for scenario in parse_scenarios(_read_text_file(os.path.join(worktree, *rel.split("/")))):
+            out |= {t for t in scenario["tags"] if _SETUP_TAG.match(t)}
+    return out
 
 
 def tagged_scenarios(worktree: str, files: list, tags) -> dict:
@@ -486,27 +513,36 @@ _ASSERTION_FAILURE = re.compile(r"AssertionError|ComparisonFailure|AssertionFail
 _EXCEPTION_NAME = re.compile(r"\b((?:[a-z_]\w*\.)*[A-Z]\w*(?:Exception|Error|Failure))\b")
 
 
+# Environnement de test incomplet : donnée de référence absente (« Site non trouvé(e) avec code VDA »), route absente
+_ENVIRONMENT_FAILURE = re.compile(r"non\s+trouv[ée]+(?:\(e\))?s?\s+avec\s+(?:le\s+)?code|No route found|"
+                                  r"\b404\s*-\s*\w", re.I)
+ENV_NOT_VERIFIED = "non vérifié — environnement"
+
+
 def failure_kind(error_message: str) -> tuple:
-    """(assertion | technique, nom de l'exception) d'un message d'échec Cucumber."""
+    """(environnement | assertion | technique, nom de l'exception) d'un message d'échec Cucumber."""
     message = str(error_message or "")
     exception = _EXCEPTION_NAME.search(message)
     name = exception.group(1).rsplit(".", 1)[-1] if exception else ""
+    if _ENVIRONMENT_FAILURE.search(message):
+        return "environnement", name
     return ("assertion" if _ASSERTION_FAILURE.search(message) else "technique"), name
 
 
 def parse_cucumber_report(report: list) -> dict:
     """
-    Rapport Cucumber JSON -> {(fichier relatif, titre): {statut: passe|echoue|indefini, step, phase, message,
-    nature (assertion | technique, échec seulement), exception}} ; Background rattaché au scénario qui le suit,
-    exemples d'un Scenario Outline agrégés (le pire l'emporte).
+    Rapport Cucumber JSON -> {(fichier relatif, titre): {statut: passe|echoue|indefini|cascade, step, phase, message,
+    nature (environnement | assertion | technique, échec seulement), exception}} ; Background rattaché au scénario
+    qui le suit, exemples d'un Scenario Outline agrégés (le pire l'emporte). Après l'échec d'un scénario de mise en
+    place, les scénarios suivants de la feature qui ne passent pas sont « cascade » (cause : nature de cet échec).
     """
-    rank = {"passe": 0, "indefini": 1, "echoue": 2}
+    rank = {"passe": 0, "indefini": 1, "cascade": 2, "echoue": 3}
     results = {}
     for feature in report if isinstance(report, list) else []:
         uri = str(feature.get("uri", "")).replace("\\", "/")
         rel = "src/test/resources/" + uri.split("src/test/resources/", 1)[1] if "src/test/resources/" in uri else \
             re.sub(r"^(file|classpath):/*", "", uri)
-        background = []
+        background, setup_failed = [], None
         for element in feature.get("elements") or []:
             if element.get("type") == "background":
                 background = element.get("steps") or []
@@ -531,7 +567,14 @@ def parse_cucumber_report(report: list) -> dict:
                     outcome = {"statut": "passe", "step": "", "phase": "", "message": ""}
                 else:
                     outcome = {"statut": "indefini", "step": "", "phase": "", "message": "steps ignorés"}
-            key = (rel, str(element.get("name", "")).strip())
+            title = str(element.get("name", "")).strip()
+            if setup_failed and outcome["statut"] != "passe":
+                outcome = {**outcome, "statut": "cascade", "cause": setup_failed[2],
+                           "message": f"mise en place « {setup_failed[0]} » en échec : {setup_failed[1]}"[:300]}
+            elif outcome["statut"] == "echoue" and is_setup_scenario(
+                    title, [t.get("name", "") for t in element.get("tags") or [] if isinstance(t, dict)]):
+                setup_failed = (title, f"{outcome['step']} — {outcome['message']}"[:200], outcome["nature"])
+            key = (rel, title)
             if key not in results or rank[outcome["statut"]] > rank[results[key]["statut"]]:
                 results[key] = outcome
     return results
@@ -725,11 +768,16 @@ def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple
     if not result:
         return "nv", "non exécuté"
     status = result["statut"]
+    if status == "cascade":
+        # Mise en place en échec : le scénario n'a pas été jugé sur ses propres steps
+        return ("nv" if expect_failure else "cascade"), result["message"]
     if not expect_failure:
+        if status == "echoue" and result.get("nature") == "environnement":
+            return "env", f"{result['step']} — {result['message']}".strip(" —")
         return ("ok", "passe") if status == "passe" else (
             "ko", f"{status} : {result['step']} — {result['message']}".strip(" —:"))
     if status == "echoue":
-        if result.get("nature", "assertion") == "technique":
+        if result.get("nature", "assertion") in ("technique", "environnement"):
             return "nv", f"non concluant : {result.get('exception') or 'exception technique'} ({result['step']})"
         if then_only and result["phase"] != "then":
             return "nv", f"non concluant : échec avant les Then ({result['step']})"
@@ -741,13 +789,19 @@ def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple
 
 def final_status(levels: dict) -> tuple:
     """
-    (statut, motif) : pertinent, faible, invalide ou non_verifie à partir des niveaux client / standard / mutation.
-    Faible seulement si le scénario passe sur le Standard ou passe avec mutation ; tout niveau nv : non_verifie.
+    (statut, motif) : pertinent, faible, invalide, non_verifie, environnement ou cascade à partir des niveaux client /
+    standard / mutation. Faible seulement si le scénario passe sur le Standard ou passe avec mutation ; tout niveau
+    nv : non_verifie. Environnement (donnée de référence, route absente) et cascade (mise en place en échec) : le
+    scénario n'est ni corrigé pour cela ni retiré.
     """
     client, standard, mutation = levels.get("client", ("nv", "")), levels.get("standard"), levels.get("mutation",
                                                                                                          ("nv", ""))
     if client[0] == "nv":
         return "non_verifie", client[1]
+    if client[0] == "env":
+        return "environnement", f"{ENV_NOT_VERIFIED} : {client[1]}"
+    if client[0] == "cascade":
+        return "cascade", client[1]
     if client[0] == "ko":
         return "invalide", f"échoue sur le client : {client[1]}"
     if standard and standard[0] == "ko" and standard[1] == PASSES_STILL:
@@ -767,14 +821,18 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     Niveaux 2 et 3 pour les scénarios `scenarios` {tag: identifiant} d'un lot, `kinds` {tag: type du spécifique},
     `sources` : paramètres du job Jenkins désignant le dépôt et les commits de base (job_sources).
     Au plus 3 exécutions : client (CUCUMBER_VERIFY_ENV), Standard pour les overrides (CUCUMBER_VERIFY_ENV_STD),
-    mutation des attendus sur le client. Renvoie {tag: {id, statut, motif, niveaux, build}} et les builds.
+    mutation des attendus sur le client. Les mises en place (@agent_…_0) des features concernées sont exécutées
+    avec les scénarios. Renvoie {tag: {id, statut, motif, niveaux, build, cause}} et les builds ; cause : nature
+    de l'échec de la mise en place pour un scénario « cascade ».
     """
-    tags = " or ".join(sorted(scenarios))
     found = tagged_scenarios(worktree, files, scenarios)
     key_of = {tag: (rel, s["titre"]) for tag, (rel, s) in found.items()}
+
+    def expression(selected):
+        return " or ".join(sorted(set(selected) | setup_tags(worktree, files, selected)))
     builds, out = [], {}
-    client = run_tags(mode, worktree, base, build_fn, tags, os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), {},
-                      f"{label}-client", sources)
+    client = run_tags(mode, worktree, base, build_fn, expression(scenarios),
+                      os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), {}, f"{label}-client", sources)
     builds.append({"execution": "client", "build": client["build"], "message": client["message"]})
     levels = {tag: {"client": _level(client["resultats"].get(key_of.get(tag, ("", ""))), False)
                     if client["ok"] else ("nv", client["message"])} for tag in scenarios}
@@ -782,7 +840,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     overrides = [t for t in passing if kinds.get(t) == "override"]
     std_env = os.getenv("CUCUMBER_VERIFY_ENV_STD", "").strip()
     if overrides and std_env:
-        standard = run_tags(mode, worktree, base, build_fn, " or ".join(overrides), std_env, {}, f"{label}-standard",
+        standard = run_tags(mode, worktree, base, build_fn, expression(overrides), std_env, {}, f"{label}-standard",
                             sources)
         builds.append({"execution": "standard", "build": standard["build"], "message": standard["message"]})
         for tag in overrides:
@@ -802,7 +860,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
             if not counts.get(tag):
                 levels[tag]["mutation"] = ("nv", NO_VALUE_TO_MUTATE)
         if to_run:
-            mutation = run_tags(mode, worktree, base, build_fn, " or ".join(to_run),
+            mutation = run_tags(mode, worktree, base, build_fn, expression(to_run),
                                 os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), mutated, f"{label}-mutation", sources)
             builds.append({"execution": "mutation", "build": mutation["build"], "message": mutation["message"]})
             for tag in to_run:
@@ -821,13 +879,39 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
         status, reason = final_status(levels[tag])
         out[tag] = {"id": identifier, "statut": status, "motif": reason, "type": kinds.get(tag, ""),
                     "niveaux": {k: list(v) for k, v in levels[tag].items()},
-                    "build": next((b["build"] for b in builds if b["execution"] == "client"), "")}
+                    "build": next((b["build"] for b in builds if b["execution"] == "client"), ""),
+                    "cause": (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get("cause", "")
+                    if status == "cascade" else ""}
     return {"scenarios": out, "builds": builds, "classes_executees": executed}
 
 
-def not_verified(scenarios: dict, kinds: dict, message: str) -> dict:
-    """Résultat d'un lot sans moyen d'exécution : tout est non_verifie, jamais compté pertinent."""
-    return {"scenarios": {tag: {"id": identifier, "statut": "non_verifie", "motif": message,
+def init_tags() -> str:
+    """CUCUMBER_INIT_TAGS : expression de tags de l'initialisation du client (ex. @INIT_APPAREL_WMS), '' si aucune."""
+    return os.getenv("CUCUMBER_INIT_TAGS", "").strip()
+
+
+def run_init(mode: str, worktree: str, base: str, build_fn, tags: str, sources: dict = None) -> dict:
+    """
+    Exécute une fois, avant de juger les lots, l'initialisation `tags` sur CUCUMBER_VERIFY_ENV. Renvoie {ok, message,
+    build} : ok faux si l'exécution échoue ou si un scénario de l'initialisation ne passe pas.
+    """
+    run = run_tags(mode, worktree, base, build_fn, tags, os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), {}, "init",
+                   sources)
+    failed = [f"{title} : {r['step']} — {r['message']}".strip(" —") for (_, title), r in run["resultats"].items()
+              if r["statut"] != "passe"]
+    if not run["ok"] or not run["resultats"] or failed:
+        reason = (failed[0] if failed else run["message"] if not run["ok"] else f"aucun scénario pour {tags}")[:300]
+        return {"ok": False, "message": f"environnement non initialisé ({tags}) : {reason}", "build": run["build"]}
+    return {"ok": True, "message": f"initialisation {tags} : {len(run['resultats'])} scénario(s) OK",
+            "build": run["build"]}
+
+
+def not_verified(scenarios: dict, kinds: dict, message: str, status: str = "non_verifie") -> dict:
+    """
+    Résultat d'un lot non exécuté : tout est `status` (non_verifie sans moyen d'exécution, environnement si
+    l'initialisation CUCUMBER_INIT_TAGS a échoué), jamais compté pertinent.
+    """
+    return {"scenarios": {tag: {"id": identifier, "statut": status, "motif": message,
                                 "type": kinds.get(tag, ""), "niveaux": {"client": ["nv", message]}, "build": ""}
                           for tag, identifier in scenarios.items()}, "builds": []}
 
@@ -901,7 +985,9 @@ def all_verified(state: dict) -> list:
             for tag, item in ((lot.get("execution") or {}).get("scenarios") or {}).items()]
 
 
-LEVEL_ICONS = {"ok": "✅", "ko": "❌", "nv": "⚪"}
+LEVEL_ICONS = {"ok": "✅", "ko": "❌", "nv": "⚪", "env": "🌐", "cascade": "⛓️"}
+# Statuts hors jugement du test : l'exécution n'a pas pu trancher (moyen d'exécution, environnement, mise en place)
+UNJUDGED = ("non_verifie", "environnement", "cascade")
 
 
 def scenario_rows(state: dict) -> list:
@@ -1041,7 +1127,7 @@ def specific_coverage(specifics: list, executed: set) -> dict:
 def verification_indicators(state: dict) -> dict:
     """Indicateurs d'exécution de la génération (récapitulatif et IHM)."""
     items = all_verified(state)
-    verified = [s for s in items if s["statut"] != "non_verifie"]
+    verified = [s for s in items if s["statut"] not in UNJUDGED]
     mutations = [s for s in items if (s["niveaux"].get("mutation") or ["nv"])[0] in ("ok", "ko")]
     standards = [s for s in items if (s["niveaux"].get("standard") or ["nv"])[0] in ("ok", "ko")]
     removed = [r for lot in state.get("lots", []) for r in (lot.get("execution") or {}).get("retires", [])]
@@ -1054,6 +1140,8 @@ def verification_indicators(state: dict) -> dict:
     def rate(part, whole):
         return round(100 * part / whole) if whole else None
     return {"scenarios": len(items), "verifies": len(verified), "non_verifies": len(items) - len(verified),
+            "environnement": sum(1 for s in items if s["statut"] == "environnement"),
+            "cascade": sum(1 for s in items if s["statut"] == "cascade"),
             "pertinents": sum(1 for s in verified if s["statut"] == "pertinent"),
             "taux_pertinent": rate(sum(1 for s in verified if s["statut"] == "pertinent"), len(verified)),
             "taux_mutation": rate(sum(1 for s in mutations if s["niveaux"]["mutation"][0] == "ok"), len(mutations)),

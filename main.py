@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_init, cucumber_tools, cucumber_verify, db_tools, integration_tools
+from tools import cucumber_checks, cucumber_init, cucumber_tools, cucumber_verify, db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -807,6 +807,7 @@ def main():
     parser.add_argument("--max-lots", type=int, default=0, help="generate-cucumber-client : nombre maximal de lots traités par cette exécution (0 = tous), les suivants restent à reprendre")
     parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
     parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : patch d'initialisation du client (copie des Init_<MODULE> du Cucumber Standard pour ses modules), sans appel à Claude")
+    parser.add_argument("--health-only", action="store_true", help="generate-cucumber-client : bilan de santé du dépôt <client>-cucumber avant génération (emplacement et tags des features, fichiers de données manquants, compilation et dry-run de toutes ses features), sans appel à Claude")
     parser.add_argument("--init-modules", default="", help="generate-cucumber-client --init-only : modules retenus parmi WMS, TMS, OMS, séparés par des virgules (défaut : détectés dans les dépôts et l'inventaire du client)")
     parser.add_argument("--client-name", default="", help="generate-cucumber-client : nom du client, qui donne le dépôt cible <client>-cucumber (défaut : déduit de --client-repo)")
     parser.add_argument("--cucumber-std-repo", default="", help="Dépôt du Cucumber Standard : URL Bitbucket (navigation ou clonable) ou chemin d'un clone local (défaut : BITBUCKET_CUCUMBER_STD_REPO)")
@@ -1314,10 +1315,12 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
 def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, base: str, files: list,
                          results: list, mode: str, mode_message: str, client: str, cucumber_std_dir: str,
                          compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
-                         on_usage, sources: dict = None) -> None:
+                         on_usage, sources: dict = None, unverified_status: str = "non_verifie") -> None:
     """
     Niveaux 2 et 3 (cucumber_verify) pour les scénarios tagués du lot, sans token ; `sources` : dépôt et commits de
-    base transmis au job Jenkins (cucumber_verify.job_sources). Scénarios invalides ou faibles :
+    base transmis au job Jenkins (cucumber_verify.job_sources) ; sans `mode`, tous les scénarios prennent le statut
+    `unverified_status` (environnement si l'initialisation a échoué). Scénarios invalides, faibles, ou en cascade
+    d'une mise en place en échec hors environnement :
     au plus CUCUMBER_VERIFY_FIX_ATTEMPTS appels de correction (cucumber_client_fix.md), recompilation, revérification
     de ces seuls scénarios ; ceux qui le restent sont retirés vers <client>-cucumber-a-revoir.patch.
     Résultat dans lot["execution"].
@@ -1328,8 +1331,9 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     def build():
         return cucumber_tools.build_dir(client, worktree, cucumber_std_dir)
     if not mode:
-        result = cucumber_verify.not_verified(scenarios, kinds, mode_message)
-        print(f"[LOT {label}] ⚪ {len(scenarios)} scénario(s) : {mode_message}.")
+        result = cucumber_verify.not_verified(scenarios, kinds, mode_message, unverified_status)
+        print(f"[LOT {label}] {'🌐' if unverified_status == 'environnement' else '⚪'} {len(scenarios)} scénario(s) : "
+              f"{mode_message}.")
     else:
         result = cucumber_verify.verify_lot(mode, worktree, base, build, files, scenarios, kinds, f"lot{number}",
                                             sources)
@@ -1338,7 +1342,9 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     spec_of = {cucumber_verify.scenario_id(s["fichier"], s["titre"]): s["spec"]
                for s in (lot.get("indicateurs") or {}).get("scenarios", [])}
     for attempt in range(_env_int("CUCUMBER_VERIFY_FIX_ATTEMPTS", 1) if mode else 0):
-        bad = {t: v for t, v in result["scenarios"].items() if v["statut"] in ("invalide", "faible")}
+        # Cascade d'une mise en place en échec pour une raison de test (pas d'environnement) : à corriger aussi
+        bad = {t: v for t, v in result["scenarios"].items() if v["statut"] in ("invalide", "faible")
+               or (v["statut"] == "cascade" and v.get("cause") != "environnement")}
         if not bad:
             break
         print(f"[LOT {label}] Correction après exécution {attempt + 1} : {len(bad)} scénario(s) invalide(s) "
@@ -1358,11 +1364,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         if limit_hit:
             break
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
-        if compile_cmd:
-            check = verify_cucumber_lot(client, label, worktree, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
-                                        values, model, work_key, run_dir, on_usage)
-            if not check["ok"] and not check.get("environnement"):
-                break
+        check = verify_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
+                                    values, model, work_key, run_dir, on_usage, inspired_of(results))
+        if not check["ok"] and not check.get("environnement"):
+            break
         present = cucumber_verify.tagged_scenarios(worktree, files, bad)
         for tag in set(bad) - set(present):
             result["scenarios"][tag].update(statut="supprime", motif="supprimé par la correction")
@@ -1390,11 +1395,47 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             lot_specs, set(result["classes_executees"]))
 
 
-def verify_cucumber_lot(client: str, label: str, worktree: str, cucumber_std_dir: str, files: list,
-                        compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
-                        on_usage) -> dict:
+def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumber_std_dir: str, files: list,
+                       compile_cmd: str, dry_run_cmd: str, inspired: list = ()) -> dict:
     """
-    Compilation (et dry-run) du worktree après un lot, en Python ; en cas d'erreurs dans le code, au plus
+    Contrôles du worktree après un lot, sans token : fichiers des features (emplacement, casse du tag client,
+    fichiers de données, copiés du Standard s'il les a), puis compilation (et dry-run) si `compile_cmd`.
+    Renvoie un résultat au format de cucumber_tools.verify_build.
+    """
+    started = time.time()
+    files_check = cucumber_checks.check_lot_files(worktree, base, files, client, cucumber_std_dir, inspired)
+    for target, source in files_check["copies"]:
+        print(f"[LOT {label}] Fichier de données copié du Standard : {target} (depuis {source})")
+    if files_check["erreurs"]:
+        print(f"[LOT {label}] Fichiers : {len(files_check['erreurs'])} erreur(s) ({time.time() - started:.0f} s)")
+        return {"ok": False, "etape": "fichiers", "erreurs": files_check["erreurs"], "environnement": False}
+    if not compile_cmd:
+        return {"ok": True, "etape": "fichiers", "erreurs": [], "environnement": False}
+    features = [f for f in files if f.endswith(".feature")]
+    try:
+        build = cucumber_tools.build_dir(client, worktree, cucumber_std_dir)
+    except RuntimeError as e:
+        return {"ok": False, "etape": "compilation", "erreurs": [str(e)], "environnement": True}
+    check = cucumber_tools.verify_build(build, compile_cmd, features, dry_run_cmd)
+    status = "OK" if check["ok"] else (
+        "échec hors code (environnement)" if check["environnement"] else f"{len(check['erreurs'])} erreur(s)")
+    print(f"[LOT {label}] {check['etape'].capitalize()} : {status} ({time.time() - started:.0f} s)")
+    if check["environnement"]:
+        print("\n".join(f"    {e}" for e in check["erreurs"]))
+    return check
+
+
+def inspired_of(results: list) -> list:
+    """Scénarios Standard dont le lot s'inspire (« inspire_de » du JSON final) : guident la copie des fichiers."""
+    return [str(p) for r in results or [] for p in r.get("inspire_de") or [] if p]
+
+
+def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumber_std_dir: str, files: list,
+                        compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
+                        on_usage, inspired: list = ()) -> dict:
+    """
+    Contrôles des fichiers (check_cucumber_lot, fichiers de données du Standard copiés), puis compilation (et
+    dry-run) si `compile_cmd`, en Python ; en cas d'erreurs dans les fichiers ou le code, au plus
     CUCUMBER_FIX_ATTEMPTS appels de correction limités (erreurs, fichiers du lot, catalogue Java) avec le modèle de
     correction, puis une dernière avec le modèle du lot (cucumber_fix_plan). Renvoie le dernier résultat de
     cucumber_tools.verify_build, avec "quota" si la limite de session a été atteinte.
@@ -1403,18 +1444,8 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, cucumber_std_dir
     attempts = len(plan)
     fix_turns = str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))
     for attempt in range(attempts + 1):
-        features = [f for f in files if f.endswith(".feature")]
-        started = time.time()
-        try:
-            build = cucumber_tools.build_dir(client, worktree, cucumber_std_dir)
-        except RuntimeError as e:
-            return {"ok": False, "etape": "compilation", "erreurs": [str(e)], "environnement": True}
-        check = cucumber_tools.verify_build(build, compile_cmd, features, dry_run_cmd)
-        status = "OK" if check["ok"] else (
-            "échec hors code (environnement)" if check["environnement"] else f"{len(check['erreurs'])} erreur(s)")
-        print(f"[LOT {label}] {check['etape'].capitalize()} : {status} ({time.time() - started:.0f} s)")
-        if check["environnement"]:
-            print("\n".join(f"    {e}" for e in check["erreurs"]))
+        check = check_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
+                                   inspired)
         if check["ok"] or check["environnement"] or attempt == attempts:
             return check
         fix_model, effort = plan[attempt]
@@ -1475,6 +1506,32 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     return 0
 
 
+def run_cucumber_health(client: str, local_cucumber_std_repo: str, cucumber_repo_dir: str, base: str) -> int:
+    """
+    Bilan de santé du dépôt client (0 token, cucumber_checks.health_report) : compilation et dry-run avec les
+    commandes de la génération (CUCUMBER_COMPILE_CMD, dry-run toujours lancé). Renvoie 0 si le dépôt est sain, 1 sinon.
+    """
+    compile_cmd = os.getenv("CUCUMBER_COMPILE_CMD")
+    compile_cmd = cucumber_tools.DEFAULT_COMPILE_CMD if compile_cmd is None else compile_cmd.strip()
+    subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
+    print(f"[CUCUMBER SANTÉ] Bilan de {client}-cucumber à {base}" + ("" if compile_cmd else
+                                                                     " (sans compilation : CUCUMBER_COMPILE_CMD vide)"))
+    try:
+        report = cucumber_checks.health_report(client, cucumber_repo_dir, base, local_cucumber_std_repo, compile_cmd,
+                                               cucumber_tools.DEFAULT_DRY_RUN_CMD)
+    except RuntimeError as e:
+        print(f"[CUCUMBER SANTÉ] ❌ {e}")
+        return 2
+    for title, errors in report["sections"].items():
+        print(f"[CUCUMBER SANTÉ] {'✅' if not errors else '⚠️'} {title} : {len(errors)}")
+        print("\n".join(f"    {e}" for e in errors[:10]))
+    if report["decale"]:
+        print("[CUCUMBER SANTÉ] ⚠️ Le projet client est décalé du Standard : ses features existantes ne compilent pas "
+              "ou ont des steps non définis ou ambigus.")
+    print(f"[CUCUMBER SANTÉ] Rapport : {report['fichier']}")
+    return 0 if report["ok"] else 1
+
+
 def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_repo: str,
                         local_cucumber_std_repo: str, odatio_version: str, cucumber_repo_dir: str,
                         token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
@@ -1491,6 +1548,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         return 2
     if args.init_only:
         return run_cucumber_init(args, local_client_repo, local_cucumber_std_repo, cucumber_repo_dir, base)
+    if args.health_only:
+        return run_cucumber_health(client, local_cucumber_std_repo, cucumber_repo_dir, base)
     complete_state = cucumber_tools.load_state(client) if args.complete else {}
     if args.complete and not complete_state.get("lots"):
         print("❌ Aucune génération à compléter : lancez d'abord une génération.")
@@ -1613,10 +1672,20 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # Moyen d'exécution des niveaux 2 et 3 (job Jenkins dédié, commande locale, ou aucun)
     verify_mode, verify_message = cucumber_verify.execution_mode()
     print(f"[CUCUMBER] Vérification par exécution : {verify_message}.")
+    unverified_status = "non_verifie"
     # Job Jenkins : même dépôt client et mêmes commits de base que l'exécution locale
     verify_sources = cucumber_verify.job_sources(
         args.cucumber_repo, args.cucumber_base_branch, cucumber_tools.rev_parse(worktree, state["base"]),
         cucumber_tools.rev_parse(local_cucumber_std_repo, "HEAD"))
+    # Initialisation du client (CUCUMBER_INIT_TAGS), une fois par génération : en échec, les lots ne sont pas jugés
+    if verify_mode and cucumber_verify.init_tags() and cucumber_tools.pending_lots(state):
+        init = cucumber_verify.run_init(verify_mode, worktree, state["base"],
+                                        lambda: cucumber_tools.build_dir(client, worktree, local_cucumber_std_repo),
+                                        cucumber_verify.init_tags(), verify_sources)
+        print(f"[CUCUMBER] {'✅' if init['ok'] else '🌐'} {init['message']}" + (f" ({init['build']})" if init["build"]
+                                                                               else ""))
+        if not init["ok"]:
+            verify_mode, verify_message, unverified_status = "", init["message"], "environnement"
     fixed_values = {
         "client_name": client, "token_saving_rules": token_saving_rules,
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
@@ -1627,6 +1696,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "worktree": worktree, "java_std": std_java["java_std"], "endpoints_std": std_endpoints["fichier"],
         "consignes": cucumber_verify.project_guidelines(client),
         "steps_example": std_java["steps_example"] or "aucune", "runner_example": std_java["runner_example"] or "aucun",
+        # Conventions du dépôt client (contrôlées après chaque lot par cucumber_checks)
+        "features_root": cucumber_checks.client_features_root(worktree, state["base"], client, local_cucumber_std_repo),
+        "client_tag": cucumber_checks.client_tag(worktree, state["base"], client),
     }
     # Contenu injecté : partie fixe (en tête, identique pour tous les lots) et extraits du lot, chacun borné
     inline_max = _env_int("CUCUMBER_INLINE_MAX_CHARS", cucumber_tools.DEFAULT_INLINE_MAX_CHARS)
@@ -1735,24 +1807,25 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
 
         check = {"ok": True}
-        if compile_cmd and files:
-            check = verify_cucumber_lot(client, label, worktree, local_cucumber_std_repo, files, compile_cmd,
-                                        dry_run_cmd, {**fixed_values, **java}, model, work_key, run_dir,
-                                        lambda usage: add_usage(lot, usage))
+        if files:
+            # Fichiers des features (0 token, données du Standard copiées), puis compilation si configurée
+            check = verify_cucumber_lot(client, label, worktree, state["base"], local_cucumber_std_repo, files,
+                                        compile_cmd, dry_run_cmd, {**fixed_values, **java}, model, work_key, run_dir,
+                                        lambda usage: add_usage(lot, usage), inspired_of(results))
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         # Niveaux 2 et 3 : exécution sur le client, contre-épreuves, correction bornée, retrait des scénarios faibles
         if lot.get("tags") and (check["ok"] or check.get("environnement")):
             verify_execution_lot(lot, lot_specs, label, worktree, state["base"], files, results, verify_mode,
                                  verify_message, client, local_cucumber_std_repo, compile_cmd, dry_run_cmd,
                                  {**fixed_values, **java}, model, work_key, run_dir,
-                                 lambda usage: add_usage(lot, usage), verify_sources)
+                                 lambda usage: add_usage(lot, usage), verify_sources, unverified_status)
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         # Commit même en erreur de compilation, pour ne rien perdre
         committed = cucumber_tools.commit_lot(worktree, client, lot["numero"])
         lot.update(resultats=results, fichiers=files, commit=committed or lot.get("commit", False),
                    fin=datetime.now().isoformat(timespec="seconds"),
-                   verification={k: check.get(k) for k in ("ok", "etape", "erreurs", "environnement")} if compile_cmd
-                   and files else None)
+                   verification={k: check.get(k) for k in ("ok", "etape", "erreurs", "environnement")} if files
+                   else None)
         if not check["ok"] and not check.get("environnement"):
             lot.update(statut="erreur_compilation", erreur=f"{check['etape']} : {check['erreurs'][0]}"[:300])
             cucumber_tools.save_state(client, state)
@@ -1773,7 +1846,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         cucumber_tools.save_state(client, state)
         done = sum(1 for r in results if r.get("statut") == "couvert")
         indirect = sum(1 for r in results if r.get("statut") == "couvert_indirectement")
-        verified = ("" if not (compile_cmd and files) else " — compilation non vérifiée (environnement Maven)"
+        verified = ("" if not files else " — compilation non vérifiée (environnement Maven)"
                     if check.get("environnement") else f" — {check['etape']} OK")
         print(f"[LOT {label}] ✅ {done}/{len(lot_specs)} spécifique(s) couvert(s)"
               + (f", {indirect} indirectement" if indirect else "")

@@ -45,7 +45,9 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 - Un listener ou un événement qui ne fait que déclencher un process n'est pas « non_couvert » : réponds « couvert_indirectement » avec « couvert_par » (id du spécifique du process, Grep dans '${inventaire}').
 
 === FICHIERS ET CODE ===
-1. Écris les .feature dans le worktree uniquement, en respectant l'organisation existante du dépôt client, sinon celle du Standard (src/test/resources/cucumber/features/…), dans un dossier '${client_name}'.
+1. Écris les .feature dans le worktree uniquement, TOUJOURS sous la racine des features du client '${features_root}' (sinon elles s'exécutent hors de son initialisation) : jamais directement dans l'arborescence du Standard. Pour reprendre un dossier du Standard, reproduis-le SOUS cette racine (features/WMS/07-Stock/02-Fabrication/ → ${features_root}WMS/07-Stock/02-Fabrication/).
+   - Tag du client : ${client_tag}, exactement avec cette casse (jamais une autre graphie) ; les autres tags comme le Standard.
+   - Fichiers de données et règles : un step les lit dans src/test/resources/cucumber/files/ (règles : rules/, fichier <nom>.json) + le dossier de la feature sous features/ + le nom donné. Le dépôt client n'a pas les fichiers du Standard à l'exécution : chaque fichier cité doit exister à ce chemin dans le worktree. Ceux qui existent au Standard sous le même nom sont copiés automatiquement après le lot ; crée seulement les fichiers propres au client.
 2. Chaque lot livre aussi TOUTES les classes Java nécessaires à l'exécution de ses .feature, qui doivent compiler :
    a. Step Definitions : chaque step d'un .feature absent de '${steps_std}' et du worktree a sa méthode, dans une classe du package ${package_steps} (src/test/java/…), une classe par domaine fonctionnel nommée <Domaine>${class_suffix}Steps. Complète la classe du domaine si un lot précédent l'a déjà créée.
    b. Ne crée une classe d'appui (package ${package_support}) que si rien d'équivalent n'existe dans '${java_std}' ou '${java_client}'. Imports explicites, aucune dépendance Maven nouvelle.

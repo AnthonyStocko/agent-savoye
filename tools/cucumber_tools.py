@@ -2878,11 +2878,15 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
 
     def pct(value):
         return "—" if value is None else f"{value} %"
-    if verif["scenarios"] and not verif["verifies"]:
+    if verif["environnement"] or verif["cascade"]:
+        lines.append(f"- 🌐 Non vérifiés — environnement : {verif['environnement']} (donnée de référence ou route "
+                     f"absente) ; ⛓️ en cascade d'une mise en place en échec : {verif['cascade']} — ni corrigés ni "
+                     f"retirés")
+    if verif["scenarios"] and not verif["verifies"] and not (verif["environnement"] or verif["cascade"]):
         lines.append("- ⚪ **Pertinence non vérifiée par exécution** : "
                      + (next((lot["execution"]["message"] for lot in lots if lot.get("execution")), "")
                         or "aucun moyen d'exécution configuré"))
-    elif verif["scenarios"]:
+    elif verif["verifies"]:
         lines += [f"- Scénarios pertinents (exécution) : {pct(verif['taux_pertinent'])} ({verif['pertinents']}/"
                   f"{verif['verifies']} vérifiés ; {verif['non_verifies']} non vérifié(s))",
                   f"- Mutations des attendus détectées : {pct(verif['taux_mutation'])} ; overrides en échec sur le "

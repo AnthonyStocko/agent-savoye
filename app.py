@@ -9,7 +9,7 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import cucumber_init, cucumber_tools, cucumber_verify, integration_tools
+from tools import cucumber_checks, cucumber_init, cucumber_tools, cucumber_verify, integration_tools
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -980,6 +980,33 @@ with tab_cucumber:
         else:
             st.error("L'inventaire a échoué : voir le journal ci-dessus.")
 
+    # 1 ter. Bilan de santé du dépôt client avant génération (aucun token)
+    if st.button("Bilan de santé du dépôt client", use_container_width=True, icon=":material/health_and_safety:",
+                 disabled=not ready,
+                 help="Contrôle le dépôt <client>-cucumber tel quel : emplacement et casse du tag client de ses "
+                      "features, fichiers de données manquants (le dépôt client n'a pas ceux du Standard à "
+                      "l'exécution), puis compilation et dry-run de toutes ses features (steps non définis ou "
+                      "ambigus). Aucun appel à Claude."):
+        st.info(f"Bilan de santé de {cucumber_client}-cucumber en cours...")
+        code = run_main_step(cucumber_cmd + ["--health-only"], on_line=capture_std_ref)
+        if code == 0:
+            st.success("Dépôt client sain.")
+        elif code == 1:
+            st.warning("Le dépôt client a des défauts : voir le rapport ci-dessous. Les échecs qu'ils provoquent à "
+                       "l'exécution ne viendront pas des tests générés.", icon=":material/warning:")
+        else:
+            st.error("Le bilan de santé a échoué : voir le journal ci-dessus.")
+    health_file = cucumber_checks.health_path(cucumber_client) if cucumber_client else ""
+    if health_file and os.path.exists(health_file):
+        with open(health_file, "r", encoding="utf-8", errors="replace") as f:
+            health = f.read()
+        drifted = "décalé du Standard" in health
+        with st.expander(("⚠️ Le projet client est décalé du Standard — " if drifted else "") + "Bilan de santé du "
+                         "dépôt client " + time.strftime("(%d/%m/%Y %H:%M)",
+                                                         time.localtime(os.path.getmtime(health_file))),
+                         expanded=drifted):
+            st.markdown(health)
+
     inventory = cucumber_tools.load_inventory(cucumber_client) if cucumber_client else {}
 
     # 1 bis. Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token)
@@ -1153,12 +1180,23 @@ with tab_cucumber:
     if verified_rows:
         indicators = cucumber_verify.verification_indicators(cucumber_state)
         st.markdown("#### :material/fact_check: Vérification des scénarios")
-        if not indicators["verifies"]:
+        if indicators["environnement"] or indicators["cascade"]:
+            st.warning(f"**{indicators['environnement']} scénario(s) non vérifié(s) — environnement** (donnée de "
+                       f"référence ou route absente, initialisation en échec) et **{indicators['cascade']} en "
+                       f"cascade** d'une mise en place en échec : ils ne sont ni corrigés ni retirés pour cela. "
+                       f"Corrigez l'environnement (initialisation du client, bilan de santé) puis relancez.",
+                       icon=":material/public:")
+            with st.expander("Scénarios non jugés : environnement et cascade"):
+                st.dataframe([{k: row[k] for k in ("Lot", "Scénario", "Statut", "Motif", "Build")}
+                              for row in verified_rows if row["Statut"] in ("environnement", "cascade")],
+                             hide_index=True, width="stretch",
+                             column_config={"Build": st.column_config.LinkColumn("Build", display_text="Jenkins")})
+        if not indicators["verifies"] and not (indicators["environnement"] or indicators["cascade"]):
             message = next((lot["execution"]["message"] for lot in cucumber_state["lots"] if lot.get("execution")), "")
             st.warning(f"**Pertinence non vérifiée par exécution** : {message or 'aucun moyen d’exécution configuré'}. "
                        "Configurez CUCUMBER_VERIFY_JOB ou CUCUMBER_VERIFY_LOCAL_CMD (onglet Configuration).",
                        icon=":material/help:")
-        else:
+        elif indicators["verifies"]:
             def pct(value):
                 return "—" if value is None else f"{value} %"
             st.caption(f"Pertinents : {pct(indicators['taux_pertinent'])} des {indicators['verifies']} vérifié(s) · "
@@ -1172,7 +1210,9 @@ with tab_cucumber:
                              "Statut", help="pertinent : passe sur le client, échoue sur le Standard (override) et "
                                             "mutation détectée ; faible : mutation non détectée ou passe sur le "
                                             "Standard ; invalide : échoue sur le client ; non_verifie : pas "
-                                            "d'exécution (jamais compté pertinent)"),
+                                            "d'exécution (jamais compté pertinent) ; environnement : donnée de "
+                                            "référence ou route absente sur l'environnement ; cascade : une mise "
+                                            "en place de la feature a échoué avant lui"),
                          "Client": st.column_config.TextColumn("Client", width="small"),
                          "Standard": st.column_config.TextColumn("Standard", width="small"),
                          "Mutation": st.column_config.TextColumn("Mutation", width="small"),
@@ -1583,6 +1623,11 @@ with tab_config:
                 "CUCUMBER_VERIFY_ENV_STD", value=os.getenv("CUCUMBER_VERIFY_ENV_STD", ""),
                 help="Environnement Standard de même version, pour la contre-épreuve des overrides (vide = pas de "
                      "contre-épreuve Standard).")
+        env_values["CUCUMBER_INIT_TAGS"] = st.text_input(
+            "CUCUMBER_INIT_TAGS", value=os.getenv("CUCUMBER_INIT_TAGS", ""), placeholder="Ex. @INIT_APPAREL_WMS",
+            help="Initialisation du client, exécutée une fois par génération avant de juger les lots. En échec : "
+                 "la vérification s'arrête, les scénarios sont « non vérifiés — environnement non initialisé ». "
+                 "Vide = pas d'initialisation préalable.")
         env_values["CUCUMBER_VERIFY_LOCAL_CMD"] = st.text_input(
             "CUCUMBER_VERIFY_LOCAL_CMD", value=os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", ""),
             placeholder='mvn -q test "-Dcucumber.filter.tags={tags}" -Denv={env}',

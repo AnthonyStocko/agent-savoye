@@ -141,3 +141,103 @@ def test_run_tags_sends_sources_and_detects_unapplicable_patch(monkeypatch, repo
     assert not result["ok"] and result["message"] == cv.PATCH_NOT_APPLICABLE
     level = ("nv", result["message"])
     assert cv.final_status({"client": level}) == ("non_verifie", cv.PATCH_NOT_APPLICABLE)
+
+
+def _feature_report(*elements):
+    return [{"uri": "src/test/resources/cucumber/features/apparel/b.feature", "elements": [
+        {"type": "scenario", "name": name, "tags": [{"name": t} for t in tags],
+         "steps": [{"keyword": "Given ", "name": "un step",
+                    "result": {"status": "passed"} if not error else {"status": "failed", "error_message": error}}]}
+        for name, tags, error in elements]}]
+
+
+def test_failure_kind_environment():
+    assert cv.failure_kind("java.lang.AssertionError: 404 - Site non trouvé(e) avec code VDA")[0] == "environnement"
+    assert cv.failure_kind("Donneur d'ordres non trouvé(e) avec code SO-1")[0] == "environnement"
+    assert cv.failure_kind("No route found for \"GET /api/v1/x\"")[0] == "environnement"
+    # Un statut HTTP attendu dans une assertion reste une assertion
+    assert cv.failure_kind("AssertionError: expected status <200> but was <404>")[0] == "assertion"
+
+
+def test_environment_failure_is_not_invalid():
+    result = _result("Given", "", "java.lang.RuntimeException: 404 - Site non trouvé(e) avec code VDA")
+    level = cv._level(result, expect_failure=False)
+    assert level[0] == "env"
+    status, reason = cv.final_status({"client": level})
+    assert status == "environnement" and reason.startswith(cv.ENV_NOT_VERIFIED) and "VDA" in reason
+    # Contre-épreuve : un échec d'environnement n'est pas concluant
+    assert cv._level(result, expect_failure=True)[0] == "nv"
+
+
+def test_failed_setup_puts_following_scenarios_in_cascade():
+    parsed = cv.parse_cucumber_report(_feature_report(
+        ("Contexte", [], "404 - Site non trouvé(e) avec code VDA"),
+        ("Test A", ["@agent_apparel_1_1"], "java.lang.AssertionError: expected X"),
+        ("Test B", ["@agent_apparel_1_2"], "")))
+    rel = "src/test/resources/cucumber/features/apparel/b.feature"
+    assert parsed[(rel, "Contexte")]["statut"] == "echoue"
+    cascade = parsed[(rel, "Test A")]
+    assert cascade["statut"] == "cascade" and cascade["cause"] == "environnement"
+    assert "Contexte" in cascade["message"]
+    assert parsed[(rel, "Test B")]["statut"] == "passe"
+    level = cv._level(cascade, expect_failure=False)
+    assert level[0] == "cascade" and cv.final_status({"client": level})[0] == "cascade"
+    assert cv._level(cascade, expect_failure=True)[0] == "nv"
+
+
+def test_setup_detected_by_agent_tag_and_test_cause():
+    parsed = cv.parse_cucumber_report(_feature_report(
+        ("Préparer les données", ["@agent_apparel_1_0"], "java.lang.NullPointerException"),
+        ("Test A", ["@agent_apparel_1_1"], "java.lang.AssertionError: expected X")))
+    cascade = parsed[("src/test/resources/cucumber/features/apparel/b.feature", "Test A")]
+    assert cascade["statut"] == "cascade" and cascade["cause"] == "technique"
+
+
+def test_failure_without_setup_failure_is_not_cascade():
+    parsed = cv.parse_cucumber_report(_feature_report(
+        ("Test A", [], "java.lang.AssertionError: expected X"), ("Test B", [], "java.lang.AssertionError: expected Y")))
+    assert {r["statut"] for r in parsed.values()} == {"echoue"}
+
+
+def test_tag_scenarios_tags_preceding_setup(tmp_path):
+    rel = "src/test/resources/cucumber/features/apparel/c.feature"
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    path.write_text("Feature: F\n\n  Scenario: Contexte\n    Given INIT- Purge\n\n"
+                    "  Scenario: Test A\n    Then le champ vaut \"X\"\n", encoding="utf-8")
+    tagged = cv.tag_scenarios(str(tmp_path), [{"fichier": rel, "titre": "Test A"}], "apparel", 3)
+    assert tagged == {"@agent_apparel_3_1": f"{rel}::Test A"}
+    text = path.read_text(encoding="utf-8")
+    assert "  @agent_apparel_3_0\n  Scenario: Contexte" in text
+    assert cv.setup_tags(str(tmp_path), [rel], tagged) == {"@agent_apparel_3_0"}
+    # Un second lot ne retague pas la mise en place ; le tag de mise en place est retiré du patch
+    cv.tag_scenarios(str(tmp_path), [{"fichier": rel, "titre": "Test A"}], "apparel", 4)
+    assert path.read_text(encoding="utf-8").count("_0") == 1
+    from tools.cucumber_tools import strip_agent_tags
+    assert "@agent_" not in strip_agent_tags(path.read_text(encoding="utf-8"), "apparel")
+
+
+def test_unjudged_statuses_counted_apart():
+    state = {"lots": [{"numero": 1, "execution": {"scenarios": {
+        "@a_1": {"id": "f::A", "statut": "environnement", "motif": "", "niveaux": {"client": ["env", ""]}},
+        "@a_2": {"id": "f::B", "statut": "cascade", "motif": "", "niveaux": {"client": ["cascade", ""]}},
+        "@a_3": {"id": "f::C", "statut": "pertinent", "motif": "", "niveaux": {"client": ["ok", ""]}}}}}]}
+    indicators = cv.verification_indicators(state)
+    assert (indicators["verifies"], indicators["environnement"], indicators["cascade"]) == (1, 1, 1)
+    assert indicators["taux_pertinent"] == 100
+
+
+def test_not_verified_with_environment_status():
+    result = cv.not_verified({"@a_1": "f::A"}, {}, "environnement non initialisé", "environnement")
+    assert result["scenarios"]["@a_1"]["statut"] == "environnement"
+
+
+def test_run_init_stops_on_failed_initialisation(monkeypatch):
+    def fake(mode, worktree, base, build_fn, tags, env, overrides, label, sources=None):
+        return {"ok": True, "message": "build SUCCESS", "build": "http://jenkins/1", "resultats": {
+            ("f", "Intégration des données"): {"statut": "echoue", "step": "Given INIT-",
+                                               "message": "Donneur d'ordres non trouvé(e) avec code SO-1"}}}
+    monkeypatch.setattr(cv, "run_tags", fake)
+    init = cv.run_init("jenkins", "", "", None, "@INIT_APPAREL_WMS")
+    assert not init["ok"] and init["message"].startswith("environnement non initialisé (@INIT_APPAREL_WMS)")
+    assert "SO-1" in init["message"]
