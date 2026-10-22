@@ -3,6 +3,7 @@ Les règles, les références injectées et le format de la réponse finale sont
 ${consignes}
 - Exemple de .feature du Standard pour ce lot (formalisme à reproduire) : ${examples}
 - Runner et glue : ${runner_status}
+${init_block}
 ${runner_block}
 ${lot_block}
 ${db_block}

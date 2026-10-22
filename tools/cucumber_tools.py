@@ -1378,7 +1378,7 @@ HOOK_ANNOTATIONS = {"Before", "After", "BeforeStep", "AfterStep", "BeforeAll", "
 RUNNER_ANNOTATIONS = {"CucumberOptions", "Suite", "CucumberContextConfiguration"}
 INJECT_ANNOTATIONS = {"Autowired", "Inject", "Resource"}
 # À incrémenter quand le format de java_std.md change : invalide le cache
-JAVA_CATALOGUE_FORMAT = 2
+JAVA_CATALOGUE_FORMAT = 3
 POJO_METHOD = re.compile(r"^(get|set|is|with|has)[A-Z]|^(equals|hashCode|toString|builder|build|canEqual)$")
 
 
@@ -1588,13 +1588,115 @@ def _runner_glue(c: dict, text: str, properties: str) -> list:
     return [g.strip() for g in glue if g.strip()] or [c["package"]]
 
 
+def _option_values(text: str, properties: str, option: str, constant: str, prop: str) -> list:
+    """Valeurs d'une option d'un runner : @CucumberOptions(option = ...), @ConfigurationParameter, propriétés."""
+    match = re.search(rf"\b{option}\s*=\s*(\{{[^}}]*\}}|\"[^\"]*\")", text)
+    values = re.findall(r'"([^"]*)"', match.group(1)) if match else []
+    values += re.findall(rf'{constant}\s*,\s*value\s*=\s*"([^"]+)"', text)
+    values += [v for line in re.findall(rf"^\s*{re.escape(prop)}\s*=\s*(.+)$", properties, re.M)
+               for v in line.split(",")]
+    return [v.strip() for v in values if v.strip()]
+
+
+def runner_entries(classes: list, files: dict, properties: str = "") -> list:
+    """Runners Cucumber parmi `classes` : chemin, classe, glue, chemins de features, filtres de tags, plugins."""
+    out = []
+    for c in classes:
+        if c["category"] != "config" or not (set(c["annotations"]) & {"CucumberOptions", "Suite"}
+                                             or "Cucumber.class" in c["raw_annotations"]):
+            continue
+        text = files[c["path"]]
+        out.append({"path": c["path"], "fqcn": c["fqcn"], "glue": _runner_glue(c, text, properties),
+                    "features": _option_values(text, properties, "features", "FEATURES_PROPERTY_NAME",
+                                               "cucumber.features"),
+                    "tags": _option_values(text, properties, "tags", "FILTER_TAGS_PROPERTY_NAME",
+                                           "cucumber.filter.tags"),
+                    "plugins": _option_values(text, properties, "plugin", "PLUGIN_PROPERTY_NAME", "cucumber.plugin")})
+    return out
+
+
 def _runners(repo_dir: str, ref: str, classes: list, files: dict) -> list:
     tree = ls_tree(repo_dir, ref)
     props = [b for p, b in tree.items() if p.rsplit("/", 1)[-1] in ("junit-platform.properties", "cucumber.properties")]
-    properties = "\n".join(blob_texts(repo_dir, props).values())
-    return [{"path": c["path"], "fqcn": c["fqcn"], "glue": _runner_glue(c, files[c["path"]], properties)}
-            for c in classes if c["category"] == "config"
-            and (set(c["annotations"]) & {"CucumberOptions", "Suite"} or "Cucumber.class" in c["raw_annotations"])]
+    return runner_entries(classes, files, "\n".join(blob_texts(repo_dir, props).values()))
+
+
+def tags_match(expression: str, tags) -> bool:
+    """Une expression de tags Cucumber (and, or, not, parenthèses) sélectionne-t-elle un scénario portant `tags` ?"""
+    tokens = re.findall(r"\(|\)|@[^\s()]+|\band\b|\bor\b|\bnot\b", expression or "")
+    position = 0
+
+    def take():
+        nonlocal position
+        position += 1
+        return tokens[position - 1] if position <= len(tokens) else ""
+
+    def peek():
+        return tokens[position] if position < len(tokens) else ""
+
+    def factor():
+        token = take()
+        if token == "not":
+            return not factor()
+        if token == "(":
+            value = disjunction()
+            take()
+            return value
+        return token in tags
+
+    def conjunction():
+        value = factor()
+        while peek() == "and":
+            take()
+            value = factor() and value
+        return value
+
+    def disjunction():
+        value = conjunction()
+        while peek() == "or":
+            take()
+            value = conjunction() or value
+        return value
+    return disjunction() if tokens else True
+
+
+def _feature_dir(path: str) -> str:
+    """Chemin de features d'un runner rapporté au dépôt (classpath: -> src/test/resources/), terminé par '/'."""
+    path = path.strip().replace("\\", "/")
+    path = "src/test/resources/" + path[len("classpath:"):].lstrip("/") if path.startswith("classpath:") else path
+    return re.sub(r"^\./", "", path).rstrip("/") + "/"
+
+
+def runner_gaps(runner: dict, package_steps: str, conventions: dict) -> list:
+    """
+    Écarts d'un runner pour les tests du client : glue sans le package des steps, chemin de features qui n'inclut
+    pas la racine du client ou son init, filtre de tags qui ne sélectionne pas le tag client, pas de rapport JSON.
+    `conventions` : {"features_root", "client_tag", "init": [chemins], "init_tags": [tags]}.
+    """
+    gaps = []
+    if not any(package_steps == g or package_steps.startswith(g + ".") for g in runner["glue"]):
+        gaps.append(f"ajoute la glue '{package_steps}' (glue actuelle : {', '.join(runner['glue'])})")
+    root = conventions.get("features_root", "")
+    dirs = [_feature_dir(p) for p in runner.get("features") or []]
+    for needed in [root] + list(conventions.get("init") or []):
+        if needed and dirs and not any(needed.startswith(d) for d in dirs):
+            gaps.append(f"ajoute le chemin de features '{root}' (actuel : {', '.join(runner['features'])}) pour "
+                        f"inclure {needed}")
+            break
+    client_tag = conventions.get("client_tag", "")
+    for expression in runner.get("tags") or []:
+        if client_tag and not tags_match(expression, {client_tag}):
+            gaps.append(f"le filtre de tags « {expression} » ne sélectionne pas {client_tag} : ajoute « or "
+                        f"{client_tag} »")
+    if not any(p.startswith("json:") for p in runner.get("plugins") or []):
+        gaps.append("ajoute le plugin \"json:target/cucumber-reports/Cucumber.json\" (rapport JSON lu par la "
+                    "vérification par exécution)")
+    return gaps
+
+
+def depends_on_std_test_jar(worktree: str) -> bool:
+    """pom.xml du dépôt client avec une dépendance test-jar (le Cucumber Standard)."""
+    return "<type>test-jar</type>" in _read_text_file(os.path.join(worktree, "pom.xml"))
 
 
 def _parent_package(package: str) -> str:
@@ -1674,10 +1776,44 @@ def standard_java_catalogue(cucumber_std_dir: str, odatio_version: str) -> dict:
     return meta
 
 
-def client_java_context(client_name: str, worktree: str, std_java: dict) -> dict:
+def runner_status_for(package_steps: str, client_runners: list, std_runners: list, suffix: str,
+                      conventions: dict) -> tuple:
+    """
+    (consigne sur le runner, runner cible) : un runner client existant est complété au besoin (runner_gaps), jamais
+    doublé ; en surcouche du Standard (`std_runners`), son runner s'applique ; sinon un seul runner est à créer.
+    """
+    root = conventions.get("features_root") or "src/test/resources/cucumber/features/"
+    covering = [r for r in client_runners if any(package_steps == g or package_steps.startswith(g + ".")
+                                                 for g in r["glue"])]
+    target = (covering or client_runners or [None])[0]
+    if target:
+        gaps = runner_gaps(target, package_steps, conventions)
+        if gaps:
+            return (f"complète le runner {target['fqcn']} ({target['path']}) par une modification minimale (Edit), "
+                    f"sur le modèle du runner du Standard : {' ; '.join(gaps)}. N'en crée JAMAIS un second : Surefire "
+                    f"les exécuterait tous (double exécution)."), target
+        return (f"le runner {target['fqcn']} (glue : {', '.join(target['glue'])}) couvre déjà '{package_steps}' et "
+                f"les features du client : n'en crée aucun."), target
+    std = next((r for r in std_runners if any(package_steps == g or package_steps.startswith(g + ".")
+                                             for g in r["glue"])), None)
+    if std:
+        return (f"le dépôt client s'exécute en surcouche du Cucumber Standard : le runner du Standard {std['fqcn']} "
+                f"(features : {', '.join(std.get('features') or ['défaut'])} ; glue : {', '.join(std['glue'])}) "
+                f"exécute ses features, filtrées par -Dcucumber.filter.tags. N'en crée aucun (double exécution)."), std
+    init = ", ".join(conventions.get("init") or []) or "aucune détectée"
+    tag = conventions.get("client_tag") or "le tag du client"
+    return (f"aucun runner ne couvre '{package_steps}' : crée {package_steps}.Run{suffix}CucumberTest sur le modèle du "
+            f"runner exemple (glue '{package_steps}' et celle du Standard, features {root} — qui contient "
+            f"l'initialisation du client : {init} —, tags sans filtre ou sélectionnant {tag}, plugin "
+            f"\"json:target/cucumber-reports/Cucumber.json\"), un seul pour toute l'exécution."), None
+
+
+def client_java_context(client_name: str, worktree: str, std_java: dict, conventions: dict = None) -> dict:
     """
     Catalogue Java du dépôt Cucumber client (java_client.md), recalculé avant chaque lot depuis le HEAD du worktree
-    (classes des lots précédents comprises), packages cibles et état du runner / de la glue.
+    (classes des lots précédents comprises), packages cibles et état du runner / de la glue (runner_status_for).
+    Dépôt client sans pom.xml, ou sans runner propre et dépendant du test-jar du Standard : exécuté en surcouche du
+    Standard, dont le runner s'applique. `conventions` : racine des features, tag et init du client (runner_gaps).
     """
     files = _test_java_files(worktree, "HEAD")
     classes = java_classes(files)
@@ -1690,20 +1826,45 @@ def client_java_context(client_name: str, worktree: str, std_java: dict) -> dict
         p for p in (std_java.get("support_root") or "cucumber.util", segment) if p)
     # Dépôt client sans pom.xml : exécuté par-dessus le Standard, dont le runner et la glue s'appliquent aussi
     overlay = not os.path.exists(os.path.join(worktree, "pom.xml"))
-    runners = _runners(worktree, "HEAD", classes, files) + (std_java.get("runners", []) if overlay else [])
-    covering = [r for r in runners if any(package_steps == g or package_steps.startswith(g + ".") for g in r["glue"])]
-    if covering:
-        runner_status = (f"le runner {covering[0]['fqcn']} (glue : {', '.join(covering[0]['glue'])}) couvre déjà "
-                         f"'{package_steps}' : n'en crée aucun.")
-    else:
-        runner_status = (f"aucun runner ne couvre '{package_steps}' : crée {package_steps}.Run{suffix}CucumberTest "
-                         f"sur le modèle du runner exemple (glue '{package_steps}' et celle du Standard, features "
-                         f"src/test/resources/cucumber/features/{client_name}), un seul pour toute l'exécution.")
+    client_runners = _runners(worktree, "HEAD", classes, files)
+    # Sans runner propre et dépendant du test-jar du Standard : exécuté lui aussi en surcouche du Standard
+    overlay_run = overlay or (not client_runners and depends_on_std_test_jar(worktree))
+    conventions = {"features_root": f"src/test/resources/cucumber/features/{segment}/", **(conventions or {})}
+    runner_status, runner = runner_status_for(package_steps, client_runners,
+                                              std_java.get("runners", []) if overlay_run else [], suffix, conventions)
     path = os.path.join(cache_dir(client_name), "java_client.md")
-    intro = [f"Mode : {'surcouche du Cucumber Standard (pas de pom.xml)' if overlay else 'projet Maven autonome'}."]
-    _write_text(path, java_catalogue_md(f"Classes Java du dépôt Cucumber {client_name} (worktree)", classes, intro))
+    mode = ("surcouche du Cucumber Standard (pas de pom.xml)" if overlay else
+            "surcouche du Cucumber Standard à l'exécution (test-jar, pas de runner propre)" if overlay_run else
+            "projet Maven autonome")
+    _write_text(path, java_catalogue_md(f"Classes Java du dépôt Cucumber {client_name} (worktree)", classes,
+                                        [f"Mode : {mode}."]))
     return {"java_client": path, "package_steps": package_steps, "package_support": package_support,
-            "runner_status": runner_status, "class_suffix": suffix, "overlay": overlay}
+            "runner_status": runner_status, "class_suffix": suffix, "overlay": overlay, "overlay_run": overlay_run,
+            "runner": runner}
+
+
+def lot_runner_errors(worktree: str, base: str, files: list, java: dict, conventions: dict) -> list:
+    """
+    Runners écrits par un lot : un second runner (un runner client existe à `base`, ou le runner du Standard
+    s'applique en surcouche) est une erreur ; un runner créé faute d'en avoir doit couvrir la glue, la racine et
+    l'init du client, son tag, et produire le rapport JSON (runner_gaps).
+    """
+    texts = {f: _read_text_file(os.path.join(worktree, *f.split("/"))) for f in files
+             if f.endswith(".java") and os.path.exists(os.path.join(worktree, *f.split("/")))}
+    existing = {r["path"] for r in _runners(worktree, base, java_classes(_test_java_files(worktree, base)),
+                                            _test_java_files(worktree, base))}
+    created = [r for r in runner_entries(java_classes(texts), texts) if r["path"] not in existing]
+    reference = (java or {}).get("runner")
+    errors = []
+    for runner in created:
+        if existing or (java or {}).get("overlay_run"):
+            other = sorted(existing)[0] if existing else (reference or {}).get("fqcn", "le runner du Standard")
+            errors.append(f"{runner['path']} : second runner (Surefire exécuterait les deux : double exécution) ; "
+                          f"supprime-le et complète {other} si besoin")
+        else:
+            errors += [f"{runner['path']} : {gap}" for gap in runner_gaps(runner, java.get("package_steps", ""),
+                                                                           conventions)]
+    return errors
 
 
 def business_signatures(path: str, max_members: int = 20) -> list:
@@ -2586,11 +2747,17 @@ def needs_runner(runner_status: str) -> bool:
     return runner_status.startswith("aucun runner")
 
 
+def runner_to_complete(runner_status: str) -> bool:
+    """runner_status de client_java_context : faut-il compléter le runner existant ?"""
+    return runner_status.startswith("complète le runner")
+
+
 def runner_block(runner_example: str, runner_status: str, max_chars: int) -> str:
-    """Runner du Standard injecté dans la partie variable du lot, seulement s'il faut en créer un ('' sinon)."""
-    if not (runner_example and needs_runner(runner_status)):
+    """Runner du Standard injecté dans la partie variable du lot, s'il faut créer ou compléter un runner ('' sinon)."""
+    if not (runner_example and (needs_runner(runner_status) or runner_to_complete(runner_status))):
         return ""
-    text, _, _ = _inline_documents([(runner_example, "runner du Standard, modèle du runner à créer")], max_chars)
+    purpose = "modèle du runner à créer" if needs_runner(runner_status) else "modèle des options à compléter"
+    text, _, _ = _inline_documents([(runner_example, f"runner du Standard, {purpose}")], max_chars)
     return text or f"- Runner du Standard à prendre pour modèle (à lire) : '{runner_example}'"
 
 

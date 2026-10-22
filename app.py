@@ -1020,9 +1020,11 @@ with tab_cucumber:
     if st.button("Générer l'initialisation client", use_container_width=True, icon=":material/play_circle:",
                  disabled=not ready,
                  help="Copie, dans <client>-cucumber, l'initialisation du Cucumber Standard (features/<MODULE>/"
-                      "01-Contexte et ses fichiers de données) de chaque module coché, au nom du client "
-                      "(tag @INIT_<CLIENT>_<MODULE>). Une initialisation par module : chacune purge l'environnement, "
-                      "à lancer séparément. Les steps restent ceux du Standard. Aucun appel à Claude."):
+                      "01-Contexte et ses fichiers de données) de chaque module coché, au nom du client (tag "
+                      "@INIT_<CLIENT>_<MODULE>), sous features/<client>/01-Contexte/<MODULE>/ pour s'exécuter avant "
+                      "ses autres features. Purge par le clear CUCUMBER_CLEAR_NAME (step client ajouté). Une "
+                      "initialisation par module : chacune purge l'environnement, à lancer séparément. Aucun appel "
+                      "à Claude."):
         if not init_modules:
             st.error("Aucun module WMS, TMS ou OMS coché : pas de patch d'initialisation.")
         else:
@@ -1627,7 +1629,12 @@ with tab_config:
             "CUCUMBER_INIT_TAGS", value=os.getenv("CUCUMBER_INIT_TAGS", ""), placeholder="Ex. @INIT_APPAREL_WMS",
             help="Initialisation du client, exécutée une fois par génération avant de juger les lots. En échec : "
                  "la vérification s'arrête, les scénarios sont « non vérifiés — environnement non initialisé ». "
-                 "Vide = pas d'initialisation préalable.")
+                 "Désigne aussi les features d'init dont les codes créés sont imposés aux lots (défaut : tag "
+                 "@INIT_*, dossier 0x-Contexte). Vide = pas d'initialisation préalable.")
+        env_values["CUCUMBER_CLEAR_NAME"] = st.text_input(
+            "CUCUMBER_CLEAR_NAME", value=os.getenv("CUCUMBER_CLEAR_NAME", "") or "init-data-rest-clear-main-wms",
+            help="Seul clear autorisé pour purger l'environnement : utilisé par « Générer l'initialisation client » "
+                 "(step client « INIT- Purge de l'environnement par le clear ») et cité dans le prompt des lots.")
         env_values["CUCUMBER_VERIFY_LOCAL_CMD"] = st.text_input(
             "CUCUMBER_VERIFY_LOCAL_CMD", value=os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", ""),
             placeholder='mvn -q test "-Dcucumber.filter.tags={tags}" -Denv={env}',

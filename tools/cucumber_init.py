@@ -5,8 +5,10 @@ Dans le Cucumber Standard, chaque module a son initialisation : features/<MOD>/0
 (tag @INIT_<MOD>) et ses fichiers de données files/<MOD>/01-Contexte/, chargés par le step « INIT- Initialisation
 globale par fichiers via l'écran » depuis le dossier qui correspond à celui de la feature. Chaque initialisation
 purge tout l'environnement : ce sont des profils exclusifs, non cumulables. Le client reçoit donc une copie fidèle
-de l'initialisation de chacun de ses modules, à lancer séparément par son tag @INIT_<CLIENT>_<MOD>. Les steps
-restent ceux du Standard (dépendance test-jar du dépôt <client>-cucumber) : aucun code Java n'est copié.
+de l'initialisation de chacun de ses modules, à lancer séparément par son tag @INIT_<CLIENT>_<MOD>, sous
+features/<client>/01-Contexte/<MOD>/ : Cucumber trie les features par chemin, l'initialisation passe ainsi avant
+toutes les autres features du client. La purge utilise le clear CUCUMBER_CLEAR_NAME par un step client (seul code
+Java ajouté, aucun step du Standard ne prend de clear nommé) ; les autres steps restent ceux du Standard.
 """
 import os
 import re
@@ -18,6 +20,9 @@ from tools.cucumber_tools import (_git, add_worktree, cache_dir, format_patch, g
 INIT_MODULES = ("WMS", "TMS", "OMS")
 RESOURCES_DIR = "src/test/resources/cucumber"
 INIT_DIR = "01-Contexte"
+DEFAULT_CLEAR_NAME = "init-data-rest-clear-main-wms"
+STD_PURGE_STEP = "INIT- Purge de l'environnement"
+CLEAR_STEP = "INIT- Purge de l'environnement par le clear"
 _MODULE_TOKEN = re.compile(r"[^a-z0-9]+")
 
 
@@ -71,25 +76,84 @@ def std_init_files(cucumber_std_dir: str) -> dict:
     return result
 
 
+def clear_name() -> str:
+    """CUCUMBER_CLEAR_NAME : seul clear autorisé pour purger l'environnement (défaut init-data-rest-clear-main-wms)."""
+    return os.getenv("CUCUMBER_CLEAR_NAME", "").strip() or DEFAULT_CLEAR_NAME
+
+
 def client_path(std_path: str, client_name: str) -> str:
-    """Chemin client d'un fichier d'initialisation : features/<MOD>/... -> features/<client>/<MOD>/... (idem files)."""
+    """
+    Chemin client d'un fichier d'initialisation : features/<MOD>/01-Contexte/... ->
+    features/<client>/01-Contexte/<MOD>/... (idem files), trié avant les autres features du client.
+    """
     segment = java_package_segment(client_name)
     for kind in ("features", "files"):
         prefix = f"{RESOURCES_DIR}/{kind}/"
         if std_path.startswith(prefix):
+            module, _, rest = std_path[len(prefix):].partition("/")
+            if rest.startswith(INIT_DIR + "/"):
+                return f"{prefix}{segment}/{INIT_DIR}/{module}/{rest[len(INIT_DIR) + 1:]}"
             return f"{prefix}{segment}/{std_path[len(prefix):]}"
     return std_path
+
+
+def clear_step_path(client_name: str) -> str:
+    """Classe Java du step de purge par clear nommé, dans le package des Step Definitions du client."""
+    return (f"src/test/java/cucumber/features/{java_package_segment(client_name)}/"
+            f"Init{java_class_suffix(client_name)}Steps.java")
+
+
+def clear_step_java(client_name: str) -> str:
+    """Step client « INIT- Purge de l'environnement par le clear {string} » : même séquence que la purge Standard."""
+    segment, suffix = java_package_segment(client_name), java_class_suffix(client_name)
+    return f"""package cucumber.features.{segment};
+
+import cucumber.endPoints.KIS.KISEndPoints;
+import cucumber.features.BaseStep;
+import cucumber.features.kis.QAFileIntegrationStep;
+import cucumber.util.context.TestContext;
+import io.cucumber.java.en.Given;
+
+public class Init{suffix}Steps extends BaseStep {{
+
+    private final QAFileIntegrationStep fileIntegration;
+
+    public Init{suffix}Steps(TestContext testContext) {{
+        super(testContext);
+        fileIntegration = new QAFileIntegrationStep(testContext);
+    }}
+
+    /**
+     * Purge de l'environnement par un clear nommé (ex. {DEFAULT_CLEAR_NAME}), comme « {STD_PURGE_STEP} » :
+     * données d'initialisation autorisées, jobs suspendus le temps du clear.
+     */
+    @Given("{CLEAR_STEP} {{string}}")
+    public void purgeParClear(String clearName) throws Exception {{
+        fileIntegration.enableInitData();
+        KISEndPoints.disableAllJobs();
+        try {{
+            KISEndPoints.clear(clearName);
+        }} finally {{
+            KISEndPoints.enableAllJobs();
+        }}
+    }}
+}}
+"""
 
 
 def adapt_feature(text: str, module: str, client_name: str) -> str:
     """
     Feature d'initialisation au nom du client : tag @INIT_<MOD> -> @INIT_<CLIENT>_<MOD> plus le tag @<CLIENT> (pour
-    ne pas être lancée avec l'initialisation Standard), titre préfixé du client comme ses autres features.
-    Le contenu (steps, données) reste celui du Standard.
+    ne pas être lancée avec l'initialisation Standard), titre préfixé du client comme ses autres features, purge
+    Standard remplacée par le clear CUCUMBER_CLEAR_NAME. Les autres steps et les données restent ceux du Standard.
     """
     client_tag = java_package_segment(client_name).upper()
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
+        if line.strip().split(" ", 1)[-1] == STD_PURGE_STEP:
+            keyword = line.strip().split(" ", 1)[0]
+            lines[i] = line[:len(line) - len(line.lstrip())] + f'{keyword} {CLEAR_STEP} "{clear_name()}"' + _eol(line)
+            continue
         tokens = line.split()
         if tokens and tokens[0].startswith("@") and f"@INIT_{module}" in tokens:
             tokens = [f"@INIT_{client_tag}_{module}" if t == f"@INIT_{module}" else t for t in tokens]
@@ -99,7 +163,6 @@ def adapt_feature(text: str, module: str, client_name: str) -> str:
         elif line.lstrip().startswith("Feature:"):
             title = line.split("Feature:", 1)[1].strip()
             lines[i] = line.split("Feature:", 1)[0] + f"Feature: {java_class_suffix(client_name)} - {title}" + _eol(line)
-            break
     return "".join(lines)
 
 
@@ -131,7 +194,13 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
             else:
                 shutil.copyfile(source, target)
             result["fichiers"].append(client_path(rel, client_name))
-    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files")
+    java = clear_step_path(client_name)
+    target = os.path.join(worktree, *java.split("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clear_step_java(client_name))
+    result["fichiers"].append(java)
+    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java)
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return result
     commit = _git(worktree, "commit", "-m", f"Cucumber initialisation of {client_name} ({', '.join(kept)})")

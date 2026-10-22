@@ -79,7 +79,9 @@ def test_std_init_files_by_module(std_dir):
 def test_wms_only_client_gets_nothing_from_tms_oms(std_dir, client_cucumber, isolated_cache):
     result = ci.build_client_init(client_cucumber, std_dir, "apparel", "integration", {"WMS"})
     assert result["modules"] == ["WMS"]
-    assert result["fichiers"] and all("/apparel/WMS/01-Contexte/" in p for p in result["fichiers"])
+    data = [p for p in result["fichiers"] if not p.endswith(".java")]
+    assert data and all("/apparel/01-Contexte/WMS/" in p for p in data)
+    assert [p for p in result["fichiers"] if p.endswith(".java")] == [ci.clear_step_path("apparel")]
     changed = git(ci.init_worktree_dir("apparel"), "diff", "--name-only", "integration..HEAD").splitlines()
     assert sorted(changed) == sorted(result["fichiers"])
     assert not any("/TMS/" in p or "/OMS/" in p for p in changed)
@@ -91,9 +93,22 @@ def test_client_renaming_in_tags_title_and_paths():
     first, second = adapted.splitlines()[:2]
     assert first == "@INIT_APPAREL2_TMS @APPAREL2 @TMS @PERFORMANCE"
     assert second == "Feature: Apparel2 - 01 - Initialisation des données"
-    assert "\r\n" in adapted and "Given INIT- Purge de l'environnement" in adapted
-    # Le dossier client (segment de package Java) précède le module, comme les features client existantes
-    assert ci.client_path(f"{RES}/files/TMS/01-Contexte/a.csv", "Apparel-2") == f"{RES}/files/apparel2/TMS/01-Contexte/a.csv"
+    assert "\r\n" in adapted
+    # Purge Standard (clear « full ») remplacée par le clear nommé, par le step client
+    assert f'Given {ci.CLEAR_STEP} "{ci.DEFAULT_CLEAR_NAME}"\r\n' in adapted
+    assert "Given INIT- Purge de l'environnement\r\n" not in adapted
+    # Sous <client>/01-Contexte/<MODULE>/ : trié avant les autres features du client (Cucumber trie par chemin)
+    assert ci.client_path(f"{RES}/files/TMS/01-Contexte/a.csv", "Apparel-2") == f"{RES}/files/apparel2/01-Contexte/TMS/a.csv"
+    assert ci.client_path(f"{RES}/features/WMS/01-Contexte/x.feature", "apparel") < f"{RES}/features/apparel/EXC/a.feature"
+
+
+def test_clear_name_from_environment(monkeypatch):
+    monkeypatch.setenv("CUCUMBER_CLEAR_NAME", "mon-clear")
+    adapted = ci.adapt_feature(INIT_FEATURE.format(m="WMS"), "WMS", "apparel")
+    assert f'Given {ci.CLEAR_STEP} "mon-clear"' in adapted
+    java = ci.clear_step_java("apparel")
+    assert "package cucumber.features.apparel;" in java and "public class InitApparelSteps extends BaseStep" in java
+    assert f'@Given("{ci.CLEAR_STEP} {{string}}")' in java and "KISEndPoints.clear(clearName)" in java
 
 
 def test_patch_applies_on_base(std_dir, client_cucumber, isolated_cache, tmp_path):
@@ -112,13 +127,14 @@ def test_patch_applies_on_base(std_dir, client_cucumber, isolated_cache, tmp_pat
     git(clone, "config", "core.autocrlf", "false")
     git(clone, "apply", "--check", result["patch"])
     git(clone, "am", "-q", result["patch"])
-    csv = os.path.join(clone, RES, "files", "apparel", "WMS", "01-Contexte", "01-WMSSiteDraft.csv")
-    xlsm = os.path.join(clone, RES, "files", "apparel", "OMS", "01-Contexte", "02-OMSBayDraft.xlsm")
+    csv = os.path.join(clone, RES, "files", "apparel", "01-Contexte", "WMS", "01-WMSSiteDraft.csv")
+    xlsm = os.path.join(clone, RES, "files", "apparel", "01-Contexte", "OMS", "02-OMSBayDraft.xlsm")
     with open(csv, "rb") as f:
         assert f.read() == LATIN1_CSV
     with open(xlsm, "rb") as f:
         assert f.read() == XLSM
-    with open(os.path.join(clone, RES, "features", "apparel", "WMS", "01-Contexte", "01-Initialisation.feature"),
+    assert os.path.exists(os.path.join(clone, *ci.clear_step_path("apparel").split("/")))
+    with open(os.path.join(clone, RES, "features", "apparel", "01-Contexte", "WMS", "01-Initialisation.feature"),
               encoding="utf-8") as f:
         assert f.readline().strip() == "@INIT_APPAREL_WMS @APPAREL @WMS @PERFORMANCE"
 
