@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_tools, cucumber_verify, db_tools, integration_tools
+from tools import cucumber_init, cucumber_tools, cucumber_verify, db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -806,6 +806,8 @@ def main():
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
     parser.add_argument("--max-lots", type=int, default=0, help="generate-cucumber-client : nombre maximal de lots traités par cette exécution (0 = tous), les suivants restent à reprendre")
     parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
+    parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : patch d'initialisation du client (copie des Init_<MODULE> du Cucumber Standard pour ses modules), sans appel à Claude")
+    parser.add_argument("--init-modules", default="", help="generate-cucumber-client --init-only : modules retenus parmi WMS, TMS, OMS, séparés par des virgules (défaut : détectés dans les dépôts et l'inventaire du client)")
     parser.add_argument("--client-name", default="", help="generate-cucumber-client : nom du client, qui donne le dépôt cible <client>-cucumber (défaut : déduit de --client-repo)")
     parser.add_argument("--cucumber-std-repo", default="", help="Dépôt du Cucumber Standard : URL Bitbucket (navigation ou clonable) ou chemin d'un clone local (défaut : BITBUCKET_CUCUMBER_STD_REPO)")
     parser.add_argument("--feedback", default="", help="Remarques de l'utilisateur pour la révision")
@@ -1430,6 +1432,49 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, cucumber_std_dir
     return check
 
 
+def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str, cucumber_repo_dir: str,
+                      base: str) -> int:
+    """
+    Patch d'initialisation du client (0 token) : Init_<MODULE> du Cucumber Standard copiées pour les modules
+    --init-modules, à défaut ceux détectés dans les dépôts et l'inventaire du client. Renvoie le code de sortie.
+    """
+    client = args.client_name
+    if args.init_modules.strip():
+        modules = {m.strip().upper() for m in args.init_modules.split(",") if m.strip()}
+        unknown = modules - set(cucumber_init.INIT_MODULES)
+        if unknown:
+            print(f"❌ Module(s) inconnu(s) : {', '.join(sorted(unknown))} (attendus : "
+                  f"{', '.join(cucumber_init.INIT_MODULES)}).")
+            return 2
+        print(f"[CUCUMBER INIT] Modules choisis : {', '.join(sorted(modules))}")
+    else:
+        modules = cucumber_init.client_modules(local_client_repo, cucumber_tools.load_inventory(client))
+        print(f"[CUCUMBER INIT] Modules détectés : {', '.join(sorted(modules)) or 'aucun'}")
+    if not modules:
+        print("[CUCUMBER INIT] ❌ Aucun module WMS, TMS ou OMS : cochez les modules du client. Aucun patch produit.")
+        return 2
+    subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
+    try:
+        result = cucumber_init.build_client_init(cucumber_repo_dir, local_cucumber_std_repo, client, base, modules)
+    except RuntimeError as e:
+        print(f"[CUCUMBER INIT] ❌ {e}")
+        return 1
+    if result["absents"]:
+        print(f"[CUCUMBER INIT] ⚠️ Pas d'initialisation Standard pour : {', '.join(result['absents'])}")
+    if not result["modules"]:
+        print("[CUCUMBER INIT] ❌ Aucune initialisation Standard pour ces modules. Aucun patch produit.")
+        return 1
+    print(f"[CUCUMBER INIT] Modules retenus : {', '.join(result['modules'])} ({len(result['fichiers'])} fichier(s))")
+    if not result["patch"]:
+        print(f"[CUCUMBER INIT] Le dépôt {args.cucumber_repo} contient déjà cette initialisation : aucun patch produit.")
+        return 0
+    tags = ", ".join(f"@INIT_{cucumber_tools.java_package_segment(client).upper()}_{m}" for m in result["modules"])
+    print(f"[CUCUMBER INIT] Patch : {result['patch']}")
+    print(f"[CUCUMBER INIT] Une initialisation par module, chacune purge l'environnement : lancez-les séparément "
+          f"({tags}).")
+    return 0
+
+
 def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_repo: str,
                         local_cucumber_std_repo: str, odatio_version: str, cucumber_repo_dir: str,
                         token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
@@ -1444,6 +1489,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     if not base:
         print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")
         return 2
+    if args.init_only:
+        return run_cucumber_init(args, local_client_repo, local_cucumber_std_repo, cucumber_repo_dir, base)
     complete_state = cucumber_tools.load_state(client) if args.complete else {}
     if args.complete and not complete_state.get("lots"):
         print("❌ Aucune génération à compléter : lancez d'abord une génération.")

@@ -80,6 +80,10 @@ def patch_path(client_name: str) -> str:
     return os.path.join(WORKSPACE_DIR, f"{client_name}-cucumber.patch")
 
 
+def init_patch_path(client_name: str) -> str:
+    return os.path.join(WORKSPACE_DIR, f"{client_name}-cucumber-init.patch")
+
+
 def coverage_path(client_name: str) -> str:
     return os.path.join(WORKSPACE_DIR, f"{client_name}-cucumber-couverture.md")
 
@@ -2063,7 +2067,14 @@ def prepare_worktree(cucumber_repo_dir: str, client_name: str, base: str, reset:
     `base` (nouvelle génération) ; sinon réutilise le worktree existant (reprise, complément), ou à défaut la
     branche et ses commits de lots. Lève RuntimeError.
     """
-    path, branch = worktree_dir(client_name), f"cucumber_{client_name}_coverage"
+    return add_worktree(cucumber_repo_dir, worktree_dir(client_name), f"cucumber_{client_name}_coverage", base, reset)
+
+
+def add_worktree(cucumber_repo_dir: str, path: str, branch: str, base: str, reset: bool) -> str:
+    """
+    Worktree `path` du dépôt Cucumber client sur `branch`. `reset` : branche recréée depuis `base` ; sinon worktree
+    existant réutilisé, ou à défaut la branche existante. Lève RuntimeError.
+    """
     if os.path.isdir(path) and not reset:
         return path
     if os.path.isdir(path):
@@ -2133,10 +2144,19 @@ def write_patch(worktree: str, base: str, output: str, client_name: str = "") ->
     tip = head
     if client_name and os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() != "1":
         tip = _commits_without_agent_tags(worktree, base, commits, client_name) or head
-    result = _git(worktree, "format-patch", f"{base}..{tip}", "--stdout")
+    return format_patch(worktree, f"{base}..{tip}", output)
+
+
+def format_patch(worktree: str, revisions: str, output: str) -> bool:
+    """
+    `git format-patch --binary` de `revisions` dans `output`, en octets : fichiers binaires et encodages autres
+    qu'UTF-8 (CSV, .xlsm) restent intacts. Renvoie False si le patch est vide ou en erreur.
+    """
+    result = subprocess.run(["git", "-C", worktree, "format-patch", "--binary", revisions, "--stdout"],
+                            capture_output=True)
     if result.returncode != 0 or not result.stdout.strip():
         return False
-    with open(output, "w", encoding="utf-8", newline="\n") as f:
+    with open(output, "wb") as f:
         f.write(result.stdout)
     return True
 

@@ -9,7 +9,7 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import cucumber_tools, cucumber_verify, integration_tools
+from tools import cucumber_init, cucumber_tools, cucumber_verify, integration_tools
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -981,6 +981,31 @@ with tab_cucumber:
             st.error("L'inventaire a échoué : voir le journal ci-dessus.")
 
     inventory = cucumber_tools.load_inventory(cucumber_client) if cucumber_client else {}
+
+    # 1 bis. Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token)
+    detected_modules = cucumber_init.client_modules(inventory.get("depot_client", ""), inventory) if inventory else set()
+    with st.container(horizontal=True, vertical_alignment="center"):
+        init_modules = [m for m in cucumber_init.INIT_MODULES
+                        if st.checkbox(m, value=m in detected_modules, disabled=not ready,
+                                       key=f"cucumber_init_{m}_{cucumber_client}_{inventory.get('genere_le', '')}")]
+        st.caption(f"Modules détectés : {', '.join(sorted(detected_modules))}" if detected_modules else
+                   "Aucun module détecté : lancez l'inventaire ou cochez les modules du client.")
+    if st.button("Générer l'initialisation client", use_container_width=True, icon=":material/play_circle:",
+                 disabled=not ready,
+                 help="Copie, dans <client>-cucumber, l'initialisation du Cucumber Standard (features/<MODULE>/"
+                      "01-Contexte et ses fichiers de données) de chaque module coché, au nom du client "
+                      "(tag @INIT_<CLIENT>_<MODULE>). Une initialisation par module : chacune purge l'environnement, "
+                      "à lancer séparément. Les steps restent ceux du Standard. Aucun appel à Claude."):
+        if not init_modules:
+            st.error("Aucun module WMS, TMS ou OMS coché : pas de patch d'initialisation.")
+        else:
+            st.info(f"Initialisation {cucumber_client} ({', '.join(init_modules)}) en cours...")
+            if run_main_step(cucumber_cmd + ["--init-only", "--init-modules", ",".join(init_modules)],
+                             on_line=capture_std_ref) == 0:
+                st.success("Initialisation générée : voir le journal ci-dessus et les derniers livrables.")
+            else:
+                st.error("La génération de l'initialisation a échoué : voir le journal ci-dessus.")
+
     cucumber_state = cucumber_tools.load_state(cucumber_client) if cucumber_client else {}
     selected_ids = []
     if inventory.get("specifiques"):
@@ -1191,6 +1216,16 @@ with tab_cucumber:
                            "dans les lots des prochaines générations.")
 
     # Derniers livrables du client (affichés aussi après un rechargement de la page)
+    if cucumber_client and os.path.exists(cucumber_tools.init_patch_path(cucumber_client)):
+        init_patch = cucumber_tools.init_patch_path(cucumber_client)
+        generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(init_patch)))
+        with st.container(border=True):
+            st.markdown(f"**:material/description: Patch d'initialisation** `{init_patch}` "
+                        f":gray[(généré le {generated_at})]")
+            with open(init_patch, "rb") as f:
+                st.download_button("Télécharger le patch d'initialisation", f.read(),
+                                   file_name=os.path.basename(init_patch), mime="text/x-diff",
+                                   icon=":material/download:")
     if cucumber_client and os.path.exists(cucumber_tools.patch_path(cucumber_client)):
         patch_file = cucumber_tools.patch_path(cucumber_client)
         coverage_file = cucumber_tools.coverage_path(cucumber_client)
