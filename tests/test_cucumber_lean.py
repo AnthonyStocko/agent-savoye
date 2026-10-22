@@ -22,7 +22,7 @@ def main_module():
         sys.stdout, sys.stderr = saved
 
 
-LISTENER = ('<execution-event-listener-definition on-event="apparel/{event}" execute="apparel/{process}">\n'
+LISTENER = ('<execution-event-listener-definition on-event="clientx/{event}" execute="clientx/{process}">\n'
             '  {condition}<mappings><input to="id">\n    $event.wmsGoodsInFolderId\n  </input></mappings>\n'
             '</execution-event-listener-definition>\n')
 EVENT = ('<execution-event-definition name="x">\n  <variable name="wmsGoodsInFolderId" type="java.util.UUID" '
@@ -55,7 +55,7 @@ def test_presort_listener_event_and_technical(tmp_path):
                 LISTENER.format(event="trigger", process=process, condition="<if>$event.name != null</if>")),
         # Process déclenché non sélectionné : listener laissé à Claude
         _studio(tmp_path, "sp-orphan", "spec-wms-preparation-listener-render-btocinvoice",
-                LISTENER.format(event="e", process="spec-wms-preparation-process-render-btocapparel", condition="")),
+                LISTENER.format(event="e", process="spec-wms-preparation-process-render-btocclientx", condition="")),
         {"id": "sp-tech", "libelle": "wms · config", "type": "extension", "nature": "objet métier", "depot": "wms",
          "dossier": "config", "nb_fichiers": 1, "mots_cles": [],
          "fichiers": [{"path": "src/main/resources/config/beans.xml", "kind": "extension"}]},
@@ -137,7 +137,7 @@ def test_candidate_steps(tmp_path):
             "tests_std": [{"path": "features/TOW-1.feature", "extrait": str(extract), "score": 0.8,
                            "step_definitions": []}],
             "recettes": [{"titre": "Process interactif", "steps": "`KIS- Ouvrir une interaction {string}` ; `KIS- Fermer cette interaction`"}]}
-    found = ct.candidate_steps(spec, steps, client_name="apparel")
+    found = ct.candidate_steps(spec, steps, client_name="clientx")
     exprs = [s["expr"] for s in found]
     # Steps du test équivalent (dont celui qui nomme l'objet métier) et de la recette d'abord ; le step sans lien
     # n'est pas proposé
@@ -147,9 +147,9 @@ def test_candidate_steps(tmp_path):
     assert found[exprs.index("REC- Contrôle dossier d'arrivage {string}")] == {
         "expr": "REC- Contrôle dossier d'arrivage {string}", "classe": "GoodsInFolderStep",
         "endpoints": ["POST /wms/goodsinfolders"]}
-    assert len(ct.candidate_steps(spec, steps, client_name="apparel", limit=2)) == 2
+    assert len(ct.candidate_steps(spec, steps, client_name="clientx", limit=2)) == 2
 
-    inventory = {"client": "apparel", "specifiques": [spec]}
+    inventory = {"client": "clientx", "specifiques": [spec]}
     assert ct.attach_candidate_steps(inventory, str(steps_md), endpoints) == 1
     spec.update(libelle="studio · controlandvalidate", type="extension", couverture="non_couvert", nb_fichiers=0)
     for test in spec["tests_std"]:
@@ -181,11 +181,11 @@ def test_fixed_references_respect_budget(tmp_path):
 
 def test_studio_excerpt_keeps_modified_nodes_with_context():
     original = "\n".join(f"<step id=\"s{n}\"/>" for n in range(40))
-    customized = original.replace('<step id="s20"/>', '<step id="s20" spec="1"/>\n<action name="apparel/x"/>')
+    customized = original.replace('<step id="s20"/>', '<step id="s20" spec="1"/>\n<action name="clientx/x"/>')
     excerpt = ct.studio_excerpt(original, customized, 150)
     lines = excerpt.splitlines()
     assert lines[0].startswith("# lignes 18-") and "1 ligne(s) du Standard retirée(s) ou remplacée(s)" in lines[0]
-    assert any('<action name="apparel/x"/>' in l for l in lines) and any('s17' in l for l in lines)
+    assert any('<action name="clientx/x"/>' in l for l in lines) and any('s17' in l for l in lines)
     assert not any('"s5"' in l for l in lines)
     # Borne en lignes ; processus nouveau : début du fichier
     assert len(ct.studio_excerpt("", customized, 10).splitlines()) == 11
@@ -276,7 +276,7 @@ def test_summary_notes_unreviewed_and_presorted(tmp_path, monkeypatch):
                       ct.presort_lot(results, 2)]}
     inventory = {"specifiques": [{"id": "sp-1", "libelle": "un", "fichiers": []},
                                  {"id": "sp-t", "libelle": "tech", "fichiers": []}]}
-    text = open(ct.write_coverage_summary("apparel", inventory, state), encoding="utf-8").read()
+    text = open(ct.write_coverage_summary("clientx", inventory, state), encoding="utf-8").read()
     assert "Scénarios signalés sans appel de revue" in text and "a.feature / T" in text
     assert "Tri automatique sans appel Claude : 0 listener(s) / événement(s) sans logique propre, 1 spécifique(s)" \
            in text

@@ -12,7 +12,7 @@ Deux modes :
       --interval 300                  période en secondes (défaut POLL_INTERVAL_SECONDS ou 300)
       --since "2026-10-01 14:00"      traite aussi les merges depuis cette date (rattrapage) ; sinon seuls
                                       les merges postérieurs au premier lancement sont traités.
-      --projects "NOVALIA,OSCARO"     projets écoutés (remplace POLL_REPOSITORIES)
+      --projects "CLIENT,AUTRE"     projets écoutés (remplace POLL_REPOSITORIES)
       --from-now                      ignore les merges survenus pendant l'arrêt de l'écoute
   En mode --poll, l'écoute se pilote depuis l'IHM (onglet "Écoute des merges") : démarrage, arrêt, journal.
 
@@ -129,7 +129,7 @@ def parse_bitbucket_event(event_key: str, payload: dict) -> list:
             "merge_commit": merge_commit,
             "base_commit": "",  # 1er parent du merge
             "title": pr.get("title", ""),
-            # Le titre prime : une branche peut être réutilisée pour un autre ticket (ex: PR "SPEC-1999 …" depuis novalia_test_cucumber_SPEC-1982)
+            # Le titre prime : une branche peut être réutilisée pour un autre ticket (ex: PR "PROJ-2 …" depuis client_test_cucumber_PROJ-1)
             "ticket": extract_ticket(pr.get("title", ""), from_ref.get("displayId", ""), pr.get("description", "")),
         })
     elif event_key == "repo:refs_changed":
@@ -497,7 +497,7 @@ def main() -> None:
     parser.add_argument("--poll", action="store_true", help="Interroger l'API Bitbucket au lieu d'attendre un webhook")
     parser.add_argument("--interval", type=int, default=int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
     parser.add_argument("--since", default="", help="Rattrapage : date ISO, ex. '2026-10-01 14:00'")
-    parser.add_argument("--projects", default="", help="Remplace POLL_REPOSITORIES, ex. 'NOVALIA,OSCARO/odatio-oscaro'")
+    parser.add_argument("--projects", default="", help="Remplace POLL_REPOSITORIES, ex. 'CLIENT,AUTRE/odatio-autre'")
     parser.add_argument("--from-now", action="store_true", help="Ignorer les merges survenus pendant l'arrêt de l'écoute")
     args = parser.parse_args()
 
@@ -507,7 +507,7 @@ def main() -> None:
         if args.projects:
             os.environ["POLL_REPOSITORIES"] = args.projects
         if not os.getenv("POLL_REPOSITORIES", "").strip():
-            sys.exit("Aucun projet à écouter : renseignez POLL_REPOSITORIES ou --projects (ex. 'NOVALIA,OSCARO/odatio-oscaro').")
+            sys.exit("Aucun projet à écouter : renseignez POLL_REPOSITORIES ou --projects (ex. 'CLIENT,AUTRE/odatio-autre').")
 
     os.makedirs(WEBHOOK_DIR, exist_ok=True)
     threading.Thread(target=worker, daemon=True).start()

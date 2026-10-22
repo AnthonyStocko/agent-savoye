@@ -58,8 +58,8 @@ STOPWORDS = {
 def client_name_from_repo(repo: str) -> str:
     """
     Nom du client déduit du dépôt saisi, en minuscules :
-    https://git.kiscloud.io/projects/NOVALIA -> novalia ; .../scm/novalia/odatio-novalia.git -> novalia ;
-    clone local .tmp/client_NOVALIA ou C:/dev/novalia -> novalia.
+    https://git.kiscloud.io/projects/CLIENT -> client ; .../scm/client/odatio-client.git -> client ;
+    clone local .tmp/client_CLIENT ou C:/dev/client -> client.
     """
     repo = (repo or "").strip().rstrip("/\\")
     if not repo:
@@ -1716,7 +1716,7 @@ def java_package_segment(client_name: str) -> str:
 
 
 def java_class_suffix(client_name: str) -> str:
-    """Nom du client en PascalCase (suffixe des classes, ex. novalia-2 -> Novalia2)."""
+    """Nom du client en PascalCase (suffixe des classes, ex. client-2 -> Client2)."""
     return "".join(p[:1].upper() + p[1:] for p in re.split(r"[^A-Za-z0-9]+", client_name) if p)
 
 
@@ -1827,9 +1827,12 @@ def client_java_context(client_name: str, worktree: str, std_java: dict, convent
     # Dépôt client sans pom.xml : exécuté par-dessus le Standard, dont le runner et la glue s'appliquent aussi
     overlay = not os.path.exists(os.path.join(worktree, "pom.xml"))
     client_runners = _runners(worktree, "HEAD", classes, files)
-    # Sans runner propre et dépendant du test-jar du Standard : exécuté lui aussi en surcouche du Standard
-    overlay_run = overlay or (not client_runners and depends_on_std_test_jar(worktree))
-    conventions = {"features_root": f"src/test/resources/cucumber/features/{segment}/", **(conventions or {})}
+    conventions = {"features_root": f"src/test/resources/cucumber/features/{segment}/",
+                   **{k: v for k, v in (conventions or {}).items() if v}}
+    # Sans runner propre et dépendant du test-jar du Standard (ou déclaré en surcouche dans le profil client) :
+    # exécuté lui aussi en surcouche du Standard
+    overlay_run = overlay or (not client_runners and (depends_on_std_test_jar(worktree)
+                                                      or bool((conventions.get("runner") or {}).get("surcouche"))))
     runner_status, runner = runner_status_for(package_steps, client_runners,
                                               std_java.get("runners", []) if overlay_run else [], suffix, conventions)
     path = os.path.join(cache_dir(client_name), "java_client.md")
@@ -3045,11 +3048,12 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
 
     def pct(value):
         return "—" if value is None else f"{value} %"
-    if verif["environnement"] or verif["cascade"]:
-        lines.append(f"- 🌐 Non vérifiés — environnement : {verif['environnement']} (donnée de référence ou route "
-                     f"absente) ; ⛓️ en cascade d'une mise en place en échec : {verif['cascade']} — ni corrigés ni "
-                     f"retirés")
-    if verif["scenarios"] and not verif["verifies"] and not (verif["environnement"] or verif["cascade"]):
+    if verif["hors_test"]:
+        lines.append(f"- Échecs hors test, ni corrigés ni retirés : 🌐 environnement {verif['environnement']} (route, "
+                     f"champ exigé, version) ; 📭 donnée de référence absente {verif['donnee_reference']} ; 🐞 bug "
+                     f"applicatif probable {verif['bug_applicatif']} ; ⛓️ cascade d'une mise en place en échec "
+                     f"{verif['cascade']}")
+    if verif["scenarios"] and not verif["verifies"] and not verif["hors_test"]:
         lines.append("- ⚪ **Pertinence non vérifiée par exécution** : "
                      + (next((lot["execution"]["message"] for lot in lots if lot.get("execution")), "")
                         or "aucun moyen d'exécution configuré"))

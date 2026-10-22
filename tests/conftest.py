@@ -6,6 +6,15 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Client fictif des tests : ces valeurs ne doivent jamais apparaître dans le code (test_no_client_literals)
+CLIENT = "clientx"
+CLIENT_TAG = "@CLIENTX"
+CLEAR = "clear-x"
+SITES = ("SITEA", "SITEB")
+OWNERS = ("DO-1", "DO-2")
+SECTORS = ("SECT_1", "SECT_MVT", "SECT_STOCK")
+FICTIVE_VALUES = (CLIENT, CLIENT_TAG, CLEAR, *SITES, *OWNERS, *SECTORS)
+
 
 def git(repo, *args):
     result = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8")

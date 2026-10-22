@@ -20,14 +20,16 @@ from tools.cucumber_tools import _read_text_file, _write_json, cache_dir
 CATEGORIES = (("sites", re.compile(r"RefSite(?!Group)", re.I)),
               ("donneurs_ordres", re.compile(r"RefStockOwner", re.I)),
               ("secteurs", re.compile(r"WmsSector", re.I)),
+              ("partenaires", re.compile(r"(Exc|Ref)Partner", re.I)),
               ("zones", re.compile(r"(Wms|Ref)LocationArea", re.I)),
               ("emplacements", re.compile(r"(Wms|Ref)Location(Creation)?Draft", re.I)))
-LABELS = {"sites": "sites", "donneurs_ordres": "donneurs d'ordres", "secteurs": "secteurs", "zones": "zones",
-          "emplacements": "emplacements"}
+LABELS = {"sites": "sites", "donneurs_ordres": "donneurs d'ordres", "secteurs": "secteurs",
+          "partenaires": "partenaires", "zones": "zones", "emplacements": "emplacements"}
 # Catégorie d'une table de step de création d'après le texte du step
 STEP_CATEGORIES = (("sites", re.compile(r"\bsites?\b", re.I)),
                    ("donneurs_ordres", re.compile(r"donneurs? d'ordres?|stock ?owner", re.I)),
                    ("secteurs", re.compile(r"secteurs?|sectors?", re.I)),
+                   ("partenaires", re.compile(r"partenaires?|partners?", re.I)),
                    ("zones", re.compile(r"\bzones?\b", re.I)),
                    ("emplacements", re.compile(r"emplacements?", re.I)))
 _CREATION_STEP = re.compile(r"cr[ée]ation|cr[ée]er|int[ée]gration|initialisation", re.I)
@@ -61,7 +63,7 @@ def is_init_feature(rel: str, text: str, wanted_tags: set) -> bool:
 
 
 def init_tags_wanted(expression: str) -> set:
-    """Tags positifs d'une expression CUCUMBER_INIT_TAGS (ex. « @INIT_APPAREL_WMS or @INIT_APPAREL_TMS »)."""
+    """Tags positifs d'une expression CUCUMBER_INIT_TAGS (ex. « @INIT_CLIENT_WMS or @INIT_CLIENT_TMS »)."""
     return set(_TAG_TOKEN.findall(re.sub(r"\bnot\s+@[\w-]+", "", expression or "")))
 
 
@@ -288,8 +290,11 @@ def init_block(init: dict, clear_name: str, max_codes: int = MAX_PROMPT_CODES) -
 # Colonnes de tables qui utilisent un code de site ou de donneur d'ordres
 USAGE_COLUMNS = (("sites", re.compile(r"(^|\.)(refSite\.code|refSiteCode|siteCode)$", re.I)),
                  ("donneurs_ordres", re.compile(r"(^|\.)(refStockOwner\.code|refStockOwnerCode|stockOwnerCode)$",
-                                                re.I)))
-USAGE_LABELS = {"sites": "site", "donneurs_ordres": "donneur d'ordres"}
+                                                re.I)),
+                 ("secteurs", re.compile(r"(^|\.)((wms|ref)Sector\.code|(wms|ref)?SectorCode)$", re.I)),
+                 ("partenaires", re.compile(r"(^|\.)((exc|ref)Partner\.code|(exc|ref)?PartnerCode)$", re.I)))
+USAGE_LABELS = {"sites": "site", "donneurs_ordres": "donneur d'ordres", "secteurs": "secteur",
+                "partenaires": "partenaire"}
 _PURGE_OR_INIT = re.compile(r"^INIT- (Purge\b|Initialisation globale)")
 
 
@@ -320,8 +325,8 @@ def feature_created_codes(worktree: str, rel: str, text: str, present: set) -> d
 
 def check_init_codes(worktree: str, features: list, init: dict) -> list:
     """
-    Codes de site / de donneur d'ordres utilisés par les features, absents de l'init du client et non créés dans la
-    feature : une erreur par code. Une catégorie sans code extrait de l'init n'est pas contrôlée.
+    Codes de site, de donneur d'ordres, de secteur ou de partenaire utilisés par les features, absents de l'init du
+    client (codes de référence du profil) et non créés dans la feature : une erreur par code. Une catégorie sans code extrait de l'init n'est pas contrôlée.
     """
     known, paths, present, errors = (init or {}).get("codes") or {}, init_paths(init), repo_files(worktree), []
     for rel in (f for f in features if f not in paths):

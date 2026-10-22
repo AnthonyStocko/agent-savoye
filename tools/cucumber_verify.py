@@ -135,10 +135,62 @@ def std_reference(cucumber_std_dir: str, std_endpoints: dict) -> dict:
     for scenario in scenarios:
         key = _title_key(scenario["titre"])
         counts[key] = counts.get(key, 0) + 1
-    return {"steps": [s["expr"] for s in catalogue["steps"]], "scenarios": scenarios, "endpoints_par_step": by_step,
+    steps = [s["expr"] for s in catalogue["steps"]]
+    columns = table_columns_by_step(steps, texts.values())
+    return {"steps": steps, "scenarios": scenarios, "endpoints_par_step": by_step, "colonnes_par_step": columns,
             "appelants": std_endpoints.get("appelants", {}),
             "titres_structurels": sorted(k for k, n in counts.items() if n >= 10 and re.search(
                 r"contexte|description|initialisation|r[ée]initialisation|purge", k))}
+
+
+def step_tables(text: str) -> list:
+    """[(ligne, texte du step, colonnes d'en-tête)] des steps à DataTable d'une feature (Background compris)."""
+    out, pending = [], None
+    for number, line in enumerate(text.splitlines(), 1):
+        step = _STEP_LINE.match(line)
+        if step:
+            pending = (number, step.group(2))
+            continue
+        stripped = line.strip()
+        if stripped.startswith("|") and pending:
+            out.append((pending[0], pending[1], [c.strip() for c in stripped.strip("|").split("|")]))
+            pending = None
+        elif stripped and not stripped.startswith("#"):
+            pending = None
+    return out
+
+
+def table_columns_by_step(expressions: list, texts) -> dict:
+    """{expression de step: [colonnes]} : en-têtes des DataTables utilisés pour chaque step dans les features."""
+    match, columns = step_matcher(expressions), {}
+    for text in texts:
+        for _, step, header in step_tables(text):
+            expr = match(step)
+            if expr:
+                columns.setdefault(expr, set()).update(c for c in header if c)
+    return {expr: sorted(cols) for expr, cols in columns.items()}
+
+
+def check_table_columns(worktree: str, base: str, features: list, reference: dict) -> list:
+    """
+    Colonnes des DataTables des features du lot jamais vues au Standard pour le même step (ex. syntaxe d'enum ou
+    chemin de filtre refusés par l'application) : une erreur par colonne, avec la colonne du Standard la plus proche.
+    Les tables déjà présentes à `base` et les steps sans table au Standard ne sont pas contrôlés.
+    """
+    known = (reference or {}).get("colonnes_par_step") or {}
+    match, errors = step_matcher(list(known)), []
+    for rel in features:
+        before = {(step, tuple(header)) for _, step, header in step_tables(_git(worktree, "show", f"{base}:{rel}").stdout)}
+        for number, step, header in step_tables(_read_text_file(os.path.join(worktree, *rel.split("/")))):
+            expr = match(step)
+            if not expr or (step, tuple(header)) in before:
+                continue
+            for column in (c for c in header if c and "<" not in c and c not in known[expr]):
+                closest = difflib.get_close_matches(column, known[expr], n=1, cutoff=0.0)
+                errors.append(f"{rel}:{number} colonne « {column} » jamais utilisée au Standard pour le step "
+                              f"« {expr} »" + (f" : colonne la plus proche « {closest[0]} »" if closest else "")
+                              + " (syntaxe du Standard actuel)")
+    return errors
 
 
 def _step_key(step: dict) -> str:
@@ -513,20 +565,47 @@ _ASSERTION_FAILURE = re.compile(r"AssertionError|ComparisonFailure|AssertionFail
 _EXCEPTION_NAME = re.compile(r"\b((?:[a-z_]\w*\.)*[A-Z]\w*(?:Exception|Error|Failure))\b")
 
 
-# Environnement de test incomplet : donnée de référence absente (« Site non trouvé(e) avec code VDA »), route absente
-_ENVIRONMENT_FAILURE = re.compile(r"non\s+trouv[ée]+(?:\(e\))?s?\s+avec\s+(?:le\s+)?code|No route found|"
-                                  r"\b404\s*-\s*\w", re.I)
+# Donnée de référence absente de l'environnement (« Site non trouvé(e) avec code XXX »)
+_REFERENCE_FAILURE = re.compile(r"non\s+trouv[ée]+(?:\(e\))?s?\s+avec\s+(?:le\s+)?code", re.I)
+# Écart de version entre la bibliothèque de steps et le serveur : route absente, champ exigé ou inconnu du POJO
+_ENVIRONMENT_FAILURE = re.compile(r"No route found|\b404\s*-\s*\w|UnrecognizedPropertyException|Unrecognized field|"
+                                  r"must not be (?:null|blank|empty)|ne doit pas être (?:nul|vide)|is required|"
+                                  r"est obligatoire|required (?:field|property)|champ obligatoire", re.I)
+# Erreur du test lui-même : colonne ou chemin de champ refusé, fichier de données absent
+_TEST_FAILURE = re.compile(r"No such path|Invalid path|FileNotFoundException|NoSuchFileException", re.I)
+# Erreur serveur : bug applicatif probable
+_APPLICATION_FAILURE = re.compile(r"Internal Server Error|\bHTTP[/ ]?\d?\.?\d?\s*5\d\d\b|status(?: code)?\D{0,12}5\d\d\b",
+                                  re.I)
 ENV_NOT_VERIFIED = "non vérifié — environnement"
+REFERENCE_NOT_VERIFIED = "non vérifié — donnée de référence absente"
+APPLICATION_BUG = "bug applicatif probable"
+# Natures d'échec qui ne viennent pas du test : le scénario n'est ni corrigé pour cela ni retiré
+NOT_TEST_NATURES = ("environnement", "donnee_reference", "bug_applicatif")
 
 
 def failure_kind(error_message: str) -> tuple:
-    """(environnement | assertion | technique, nom de l'exception) d'un message d'échec Cucumber."""
+    """
+    (nature, nom de l'exception) d'un message d'échec Cucumber : donnee_reference, environnement (version, route,
+    champ exigé), bug_applicatif (erreur serveur), sinon échec du test : technique (colonne, chemin, fichier, code
+    du step) ou assertion.
+    """
     message = str(error_message or "")
     exception = _EXCEPTION_NAME.search(message)
     name = exception.group(1).rsplit(".", 1)[-1] if exception else ""
+    if _REFERENCE_FAILURE.search(message):
+        return "donnee_reference", name
     if _ENVIRONMENT_FAILURE.search(message):
         return "environnement", name
+    if _TEST_FAILURE.search(message):
+        return "technique", name
+    if _APPLICATION_FAILURE.search(message):
+        return "bug_applicatif", name
     return ("assertion" if _ASSERTION_FAILURE.search(message) else "technique"), name
+
+
+def failure_category(nature: str) -> str:
+    """Catégorie d'un échec : environnement, donnee_reference, bug_applicatif, cascade ou test (assertion, technique)."""
+    return nature if nature in NOT_TEST_NATURES or nature == "cascade" else "test"
 
 
 def parse_cucumber_report(report: list) -> dict:
@@ -772,12 +851,13 @@ def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple
         # Mise en place en échec : le scénario n'a pas été jugé sur ses propres steps
         return ("nv" if expect_failure else "cascade"), result["message"]
     if not expect_failure:
-        if status == "echoue" and result.get("nature") == "environnement":
-            return "env", f"{result['step']} — {result['message']}".strip(" —")
+        if status == "echoue" and result.get("nature") in NOT_TEST_NATURES:
+            code = {"environnement": "env", "donnee_reference": "ref", "bug_applicatif": "bug"}[result["nature"]]
+            return code, f"{result['step']} — {result['message']}".strip(" —")
         return ("ok", "passe") if status == "passe" else (
             "ko", f"{status} : {result['step']} — {result['message']}".strip(" —:"))
     if status == "echoue":
-        if result.get("nature", "assertion") in ("technique", "environnement"):
+        if result.get("nature", "assertion") != "assertion":
             return "nv", f"non concluant : {result.get('exception') or 'exception technique'} ({result['step']})"
         if then_only and result["phase"] != "then":
             return "nv", f"non concluant : échec avant les Then ({result['step']})"
@@ -789,10 +869,11 @@ def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple
 
 def final_status(levels: dict) -> tuple:
     """
-    (statut, motif) : pertinent, faible, invalide, non_verifie, environnement ou cascade à partir des niveaux client /
-    standard / mutation. Faible seulement si le scénario passe sur le Standard ou passe avec mutation ; tout niveau
-    nv : non_verifie. Environnement (donnée de référence, route absente) et cascade (mise en place en échec) : le
-    scénario n'est ni corrigé pour cela ni retiré.
+    (statut, motif) : pertinent, faible, invalide, non_verifie, environnement, donnee_reference, bug_applicatif ou
+    cascade à partir des niveaux client / standard / mutation. Faible seulement si le scénario passe sur le Standard
+    ou passe avec mutation ; tout niveau nv : non_verifie. Seuls invalide et faible (échecs du test) peuvent être
+    corrigés puis retirés ; environnement, donnée de référence absente, bug applicatif probable et cascade (mise en
+    place en échec) ne le sont pas.
     """
     client, standard, mutation = levels.get("client", ("nv", "")), levels.get("standard"), levels.get("mutation",
                                                                                                          ("nv", ""))
@@ -800,6 +881,10 @@ def final_status(levels: dict) -> tuple:
         return "non_verifie", client[1]
     if client[0] == "env":
         return "environnement", f"{ENV_NOT_VERIFIED} : {client[1]}"
+    if client[0] == "ref":
+        return "donnee_reference", f"{REFERENCE_NOT_VERIFIED} : {client[1]}"
+    if client[0] == "bug":
+        return "bug_applicatif", f"{APPLICATION_BUG} : {client[1]}"
     if client[0] == "cascade":
         return "cascade", client[1]
     if client[0] == "ko":
@@ -886,7 +971,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
 
 
 def init_tags() -> str:
-    """CUCUMBER_INIT_TAGS : expression de tags de l'initialisation du client (ex. @INIT_APPAREL_WMS), '' si aucune."""
+    """CUCUMBER_INIT_TAGS : expression de tags de l'initialisation du client (ex. @INIT_CLIENT_WMS), '' si aucune."""
     return os.getenv("CUCUMBER_INIT_TAGS", "").strip()
 
 
@@ -985,9 +1070,11 @@ def all_verified(state: dict) -> list:
             for tag, item in ((lot.get("execution") or {}).get("scenarios") or {}).items()]
 
 
-LEVEL_ICONS = {"ok": "✅", "ko": "❌", "nv": "⚪", "env": "🌐", "cascade": "⛓️"}
+LEVEL_ICONS = {"ok": "✅", "ko": "❌", "nv": "⚪", "env": "🌐", "ref": "📭", "bug": "🐞", "cascade": "⛓️"}
 # Statuts hors jugement du test : l'exécution n'a pas pu trancher (moyen d'exécution, environnement, mise en place)
-UNJUDGED = ("non_verifie", "environnement", "cascade")
+UNJUDGED = ("non_verifie", "environnement", "donnee_reference", "bug_applicatif", "cascade")
+# Statuts affichés à part dans l'IHM et le récapitulatif : l'échec ne vient pas du test
+NOT_TEST_STATUSES = ("environnement", "donnee_reference", "bug_applicatif", "cascade")
 
 
 def scenario_rows(state: dict) -> list:
@@ -1141,7 +1228,10 @@ def verification_indicators(state: dict) -> dict:
         return round(100 * part / whole) if whole else None
     return {"scenarios": len(items), "verifies": len(verified), "non_verifies": len(items) - len(verified),
             "environnement": sum(1 for s in items if s["statut"] == "environnement"),
+            "donnee_reference": sum(1 for s in items if s["statut"] == "donnee_reference"),
+            "bug_applicatif": sum(1 for s in items if s["statut"] == "bug_applicatif"),
             "cascade": sum(1 for s in items if s["statut"] == "cascade"),
+            "hors_test": sum(1 for s in items if s["statut"] in NOT_TEST_STATUSES),
             "pertinents": sum(1 for s in verified if s["statut"] == "pertinent"),
             "taux_pertinent": rate(sum(1 for s in verified if s["statut"] == "pertinent"), len(verified)),
             "taux_mutation": rate(sum(1 for s in mutations if s["niveaux"]["mutation"][0] == "ok"), len(mutations)),

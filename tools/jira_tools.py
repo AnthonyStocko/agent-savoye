@@ -589,10 +589,15 @@ def set_jira_description_markdown(issue_key: str, markdown: str) -> None:
 EPIC_TASK_TYPES = ("Tâche", "Task", "Development", "Story")
 
 
+def std_only_projects() -> set:
+    """Projets Jira analysés sur le socle Standard seul (branche dev), sans dépôt client : STD_ONLY_PROJECTS."""
+    return {p.strip().upper() for p in os.getenv("STD_ONLY_PROJECTS", "").split(",") if p.strip()}
+
+
 def resolve_epic_task_type(project_key: str, wanted: str = "") -> str:
     """
     Type des tâches créées sous une épopée : `wanted` s'il existe dans le projet, sinon le premier type
-    disponible parmi EPIC_TASK_TYPES (OXY : « Tâche », SPEC : « Development »). '' si l'API ne répond pas.
+    disponible parmi EPIC_TASK_TYPES (selon les projets « Tâche » ou « Development »). '' si l'API ne répond pas.
     """
     try:
         api, auth = _jira_connection()

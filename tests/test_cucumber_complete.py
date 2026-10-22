@@ -4,7 +4,7 @@ import os
 from tests.conftest import git, write
 from tools import cucumber_tools as ct
 
-FEATURE_REL = "src/test/resources/cucumber/features/apparel/commande.feature"
+FEATURE_REL = "src/test/resources/cucumber/features/clientx/commande.feature"
 
 
 def _feature(path, title, words):
@@ -35,10 +35,10 @@ def _spec(**extra):
 def test_synonyms_bring_interactive_repack_feature(monkeypatch):
     monkeypatch.delenv("CUCUMBER_SYNONYMS", raising=False)
     # « processus interactif de reconditionnement » : interactif -> interaction (steps KIS-)
-    found = ct.related_std_tests(_spec(), _index(), min_score=0.4, client_name="apparel")
+    found = ct.related_std_tests(_spec(), _index(), min_score=0.4, client_name="clientx")
     assert found and found[0]["path"].endswith("TOW-90.feature")
     # Nom anglais collé du client : repackcontent -> repack (synonyme de reconditionnement) + content
-    found = ct.related_std_tests(_spec(mots_cles=["repackcontent"]), _index(), min_score=0.4, client_name="apparel")
+    found = ct.related_std_tests(_spec(mots_cles=["repackcontent"]), _index(), min_score=0.4, client_name="clientx")
     assert found and found[0]["path"].endswith("TOW-90.feature")
 
 
@@ -93,7 +93,7 @@ def _commit_lot(worktree, number, title):
     path = os.path.join(worktree, *FEATURE_REL.split("/"))
     with open(path, "a", encoding="utf-8", newline="\n") as f:
         f.write(f"\n  Scenario: {title}\n    Then le champ \"statut\" vaut \"VALIDE\"\n")
-    assert ct.commit_lot(worktree, "apparel", number)
+    assert ct.commit_lot(worktree, "clientx", number)
 
 
 def test_complete_keeps_previous_lots(repo, tmp_path, monkeypatch):
@@ -102,7 +102,7 @@ def test_complete_keeps_previous_lots(repo, tmp_path, monkeypatch):
     write(os.path.join(repo, *FEATURE_REL.split("/")), "Feature: Commandes\n")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "base")
-    worktree = ct.prepare_worktree(repo, "apparel", "integration", reset=True)
+    worktree = ct.prepare_worktree(repo, "clientx", "integration", reset=True)
     _commit_lot(worktree, 1, "Lot un")
     _commit_lot(worktree, 2, "Lot deux")
     state = {"base": "integration", "lots": [
@@ -128,15 +128,15 @@ def test_complete_keeps_previous_lots(repo, tmp_path, monkeypatch):
 
     # Complément : worktree et commits conservés, même si le dossier du worktree a disparu
     ct._git(repo, "worktree", "remove", "--force", worktree)
-    worktree = ct.prepare_worktree(repo, "apparel", "integration", reset=False)
+    worktree = ct.prepare_worktree(repo, "clientx", "integration", reset=False)
     assert "lot 2" in git(worktree, "log", "-1", "--format=%s")
     _commit_lot(worktree, 3, "Lot trois")
-    patch = str(tmp_path / "apparel-cucumber.patch")
-    assert ct.write_patch(worktree, "integration", patch, "apparel")
+    patch = str(tmp_path / "clientx-cucumber.patch")
+    assert ct.write_patch(worktree, "integration", patch, "clientx")
     text = open(patch, encoding="utf-8").read()
     assert text.count("Subject: [PATCH") == 3 and all(t in text for t in ("Lot un", "Lot deux", "Lot trois"))
     # Nouvelle génération : repart de la base
-    worktree = ct.prepare_worktree(repo, "apparel", "integration", reset=True)
+    worktree = ct.prepare_worktree(repo, "clientx", "integration", reset=True)
     assert git(worktree, "log", "-1", "--format=%s") == "base"
 
 

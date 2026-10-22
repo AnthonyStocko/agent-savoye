@@ -11,9 +11,9 @@ pipeline {
     agent { label 'maven' }
     parameters {
         stashedFile(name: 'PATCH', description: 'Patch git du lot (git diff depuis la base du dépôt Cucumber client)')
-        string(name: 'TAGS', defaultValue: '', description: "Expression de tags Cucumber, ex. @agent_apparel_3_1 or @agent_apparel_3_2")
+        string(name: 'TAGS', defaultValue: '', description: "Expression de tags Cucumber, ex. @agent_client_3_1 or @agent_client_3_2")
         string(name: 'ENV', defaultValue: '', description: 'Environnement cible déjà démarré (recette client ou Standard)')
-        string(name: 'CUCUMBER_SPEC_REPOSITORY', defaultValue: '', description: 'Dépôt Cucumber client, ex. apparel-cucumber (obligatoire)')
+        string(name: 'CUCUMBER_SPEC_REPOSITORY', defaultValue: '', description: 'Dépôt Cucumber client, ex. client-cucumber (obligatoire)')
         string(name: 'CUCUMBER_SPEC_BRANCH', defaultValue: 'integration', description: 'Branche de base du dépôt client')
         string(name: 'CUCUMBER_SPEC_COMMIT', defaultValue: '', description: 'Commit de base du dépôt client (vide = dernier commit de la branche)')
         string(name: 'CUCUMBER_STANDARD_BRANCH', defaultValue: 'development', description: 'Branche du Cucumber Standard')

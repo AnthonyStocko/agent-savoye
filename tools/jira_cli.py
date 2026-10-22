@@ -4,7 +4,7 @@ et y attache des fichiers, de façon idempotente (relançable sans créer de dou
 
   python tools/jira_cli.py create --project SPEC --summary "..." --description-file desc.md \
       --component oda_Prenom_N --label WAIT_TEAM_SPEC
-  python tools/jira_cli.py attach --issue SPEC-2045 --file SPEC-2045-client-novalia-cucumber-2.patch
+  python tools/jira_cli.py attach --issue PROJ-123 --file PROJ-123-client-cucumber-2.patch
 
 La dernière ligne de sortie est toujours lisible par machine : JIRA_KEY=<clé> ou JIRA_ERROR=<message>.
 """

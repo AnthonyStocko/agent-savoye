@@ -5,7 +5,7 @@ from tools import cucumber_verify as cv
 
 FEATURE = """Feature: Commandes
 
-  @agent_apparel_1 @agent_apparel_1_1
+  @agent_clientx_1 @agent_clientx_1_1
   Scenario: Statut de la commande
     Given une commande "CMD-1"
     When je valide la commande "CMD-1"
@@ -19,15 +19,15 @@ FEATURE = """Feature: Commandes
 
 
 def test_mutation_only_last_quoted_value_of_then():
-    mutated, counts = cv.mutate_feature(FEATURE, {"@agent_apparel_1_1"})
+    mutated, counts = cv.mutate_feature(FEATURE, {"@agent_clientx_1_1"})
     assert 'Then le champ "statut" vaut "VALIDE_MUT"' in mutated
     assert '"statut_MUT"' not in mutated
     assert 'Given une commande "CMD-1"' in mutated and 'When je valide la commande "CMD-1"' in mutated
-    assert counts["@agent_apparel_1_1"] >= 1
+    assert counts["@agent_clientx_1_1"] >= 1
 
 
 def test_mutation_keeps_key_column_of_then_tables():
-    mutated, _ = cv.mutate_feature(FEATURE, {"@agent_apparel_1_1"})
+    mutated, _ = cv.mutate_feature(FEATURE, {"@agent_clientx_1_1"})
     rows = [line.strip() for line in mutated.splitlines() if line.strip().startswith("|")]
     assert rows[0] == "| champ   | valeur |"
     # Une ligne de données sur deux (1re, 3e) faussée, dans la colonne valeur seulement
@@ -38,7 +38,7 @@ def test_mutation_keeps_key_column_of_then_tables():
 def test_mutation_of_table_without_key_header_mutates_all_columns():
     text = FEATURE.replace("| champ   | valeur |", "| statut  | montant |").replace(
         "      | statut  | VALIDE |\n", "      | VALIDE  | 12      |\n")
-    mutated, _ = cv.mutate_feature(text, {"@agent_apparel_1_1"})
+    mutated, _ = cv.mutate_feature(text, {"@agent_clientx_1_1"})
     rows = [line.strip() for line in mutated.splitlines() if line.strip().startswith("|")]
     assert [c.strip() for c in rows[1].split("|")[1:-1]] == ["VALIDE_MUT", "13"]
 
@@ -134,9 +134,9 @@ def test_run_tags_sends_sources_and_detects_unapplicable_patch(monkeypatch, repo
         write(target, "PATCH_NON_APPLICABLE\n")
         return True
     monkeypatch.setattr(cv.jenkins_tools, "fetch_artifact", fetch)
-    sources = cv.job_sources("apparel-cucumber", "integration", "abc123", "def456")
+    sources = cv.job_sources("clientx-cucumber", "integration", "abc123", "def456")
     result = cv.run_tags("jenkins", repo, "HEAD", None, "@t", "recette", {}, "lot1-client", sources)
-    assert sent["CUCUMBER_SPEC_REPOSITORY"] == "apparel-cucumber" and sent["CUCUMBER_SPEC_COMMIT"] == "abc123"
+    assert sent["CUCUMBER_SPEC_REPOSITORY"] == "clientx-cucumber" and sent["CUCUMBER_SPEC_COMMIT"] == "abc123"
     assert sent["CUCUMBER_STANDARD_COMMIT"] == "def456" and sent["CUCUMBER_SPEC_BRANCH"] == "integration"
     assert not result["ok"] and result["message"] == cv.PATCH_NOT_APPLICABLE
     level = ("nv", result["message"])
@@ -144,40 +144,61 @@ def test_run_tags_sends_sources_and_detects_unapplicable_patch(monkeypatch, repo
 
 
 def _feature_report(*elements):
-    return [{"uri": "src/test/resources/cucumber/features/apparel/b.feature", "elements": [
+    return [{"uri": "src/test/resources/cucumber/features/clientx/b.feature", "elements": [
         {"type": "scenario", "name": name, "tags": [{"name": t} for t in tags],
          "steps": [{"keyword": "Given ", "name": "un step",
                     "result": {"status": "passed"} if not error else {"status": "failed", "error_message": error}}]}
         for name, tags, error in elements]}]
 
 
-def test_failure_kind_environment():
-    assert cv.failure_kind("java.lang.AssertionError: 404 - Site non trouvé(e) avec code VDA")[0] == "environnement"
-    assert cv.failure_kind("Donneur d'ordres non trouvé(e) avec code SO-1")[0] == "environnement"
+def test_failure_kind_categories():
+    # Donnée de référence absente de l'environnement
+    assert cv.failure_kind("java.lang.AssertionError: 404 - Site non trouvé(e) avec code SITEA")[0] == "donnee_reference"
+    assert cv.failure_kind("Donneur d'ordres non trouvé(e) avec code DO-1")[0] == "donnee_reference"
+    # Écart de version bibliothèque / serveur : route absente, champ exigé, champ inconnu du POJO
     assert cv.failure_kind("No route found for \"GET /api/v1/x\"")[0] == "environnement"
+    assert cv.failure_kind("400 Bad Request : field 'priority' must not be null")[0] == "environnement"
+    assert cv.failure_kind("com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException: x")[0] == "environnement"
+    # Erreurs du test : colonne, chemin de filtre, fichier de données
+    assert cv.failure_kind("No such path 'value' in status")[0] == "technique"
+    assert cv.failure_kind("Invalid path: 'wmsContent.wmsHandlingUnit.code'")[0] == "technique"
+    assert cv.failure_kind("java.io.FileNotFoundException: ./a.xml")[0] == "technique"
+    # Erreur serveur
+    assert cv.failure_kind("Request failed : 500 Internal Server Error")[0] == "bug_applicatif"
     # Un statut HTTP attendu dans une assertion reste une assertion
     assert cv.failure_kind("AssertionError: expected status <200> but was <404>")[0] == "assertion"
+    assert [cv.failure_category(n) for n in ("assertion", "technique", "environnement", "donnee_reference",
+                                              "bug_applicatif", "cascade")] == [
+        "test", "test", "environnement", "donnee_reference", "bug_applicatif", "cascade"]
 
 
-def test_environment_failure_is_not_invalid():
-    result = _result("Given", "", "java.lang.RuntimeException: 404 - Site non trouvé(e) avec code VDA")
-    level = cv._level(result, expect_failure=False)
-    assert level[0] == "env"
-    status, reason = cv.final_status({"client": level})
-    assert status == "environnement" and reason.startswith(cv.ENV_NOT_VERIFIED) and "VDA" in reason
-    # Contre-épreuve : un échec d'environnement n'est pas concluant
-    assert cv._level(result, expect_failure=True)[0] == "nv"
+def test_not_test_failures_are_not_invalid():
+    expected = {"java.lang.RuntimeException: 404 - Site non trouvé(e) avec code SITEA":
+                ("ref", "donnee_reference", cv.REFERENCE_NOT_VERIFIED),
+                "No route found for GET /x": ("env", "environnement", cv.ENV_NOT_VERIFIED),
+                "HTTP 503 Service Unavailable": ("bug", "bug_applicatif", cv.APPLICATION_BUG)}
+    for message, (code, status, prefix) in expected.items():
+        result = _result("Given", "", message)
+        level = cv._level(result, expect_failure=False)
+        assert level[0] == code
+        final, reason = cv.final_status({"client": level})
+        assert final == status and reason.startswith(prefix) and final in cv.UNJUDGED
+        # Contre-épreuve : un échec hors test n'est pas concluant
+        assert cv._level(result, expect_failure=True)[0] == "nv"
+    # Échec du test (colonne refusée) : invalide, donc corrigé puis retiré s'il le reste
+    level = cv._level(_result("Then", "", "No such path 'value'"), expect_failure=False)
+    assert cv.final_status({"client": level})[0] == "invalide"
 
 
 def test_failed_setup_puts_following_scenarios_in_cascade():
     parsed = cv.parse_cucumber_report(_feature_report(
-        ("Contexte", [], "404 - Site non trouvé(e) avec code VDA"),
-        ("Test A", ["@agent_apparel_1_1"], "java.lang.AssertionError: expected X"),
-        ("Test B", ["@agent_apparel_1_2"], "")))
-    rel = "src/test/resources/cucumber/features/apparel/b.feature"
+        ("Contexte", [], "404 - Site non trouvé(e) avec code SITEA"),
+        ("Test A", ["@agent_clientx_1_1"], "java.lang.AssertionError: expected X"),
+        ("Test B", ["@agent_clientx_1_2"], "")))
+    rel = "src/test/resources/cucumber/features/clientx/b.feature"
     assert parsed[(rel, "Contexte")]["statut"] == "echoue"
     cascade = parsed[(rel, "Test A")]
-    assert cascade["statut"] == "cascade" and cascade["cause"] == "environnement"
+    assert cascade["statut"] == "cascade" and cascade["cause"] == "donnee_reference"
     assert "Contexte" in cascade["message"]
     assert parsed[(rel, "Test B")]["statut"] == "passe"
     level = cv._level(cascade, expect_failure=False)
@@ -187,9 +208,9 @@ def test_failed_setup_puts_following_scenarios_in_cascade():
 
 def test_setup_detected_by_agent_tag_and_test_cause():
     parsed = cv.parse_cucumber_report(_feature_report(
-        ("Préparer les données", ["@agent_apparel_1_0"], "java.lang.NullPointerException"),
-        ("Test A", ["@agent_apparel_1_1"], "java.lang.AssertionError: expected X")))
-    cascade = parsed[("src/test/resources/cucumber/features/apparel/b.feature", "Test A")]
+        ("Préparer les données", ["@agent_clientx_1_0"], "java.lang.NullPointerException"),
+        ("Test A", ["@agent_clientx_1_1"], "java.lang.AssertionError: expected X")))
+    cascade = parsed[("src/test/resources/cucumber/features/clientx/b.feature", "Test A")]
     assert cascade["statut"] == "cascade" and cascade["cause"] == "technique"
 
 
@@ -200,21 +221,21 @@ def test_failure_without_setup_failure_is_not_cascade():
 
 
 def test_tag_scenarios_tags_preceding_setup(tmp_path):
-    rel = "src/test/resources/cucumber/features/apparel/c.feature"
+    rel = "src/test/resources/cucumber/features/clientx/c.feature"
     path = tmp_path / rel
     path.parent.mkdir(parents=True)
     path.write_text("Feature: F\n\n  Scenario: Contexte\n    Given INIT- Purge\n\n"
                     "  Scenario: Test A\n    Then le champ vaut \"X\"\n", encoding="utf-8")
-    tagged = cv.tag_scenarios(str(tmp_path), [{"fichier": rel, "titre": "Test A"}], "apparel", 3)
-    assert tagged == {"@agent_apparel_3_1": f"{rel}::Test A"}
+    tagged = cv.tag_scenarios(str(tmp_path), [{"fichier": rel, "titre": "Test A"}], "clientx", 3)
+    assert tagged == {"@agent_clientx_3_1": f"{rel}::Test A"}
     text = path.read_text(encoding="utf-8")
-    assert "  @agent_apparel_3_0\n  Scenario: Contexte" in text
-    assert cv.setup_tags(str(tmp_path), [rel], tagged) == {"@agent_apparel_3_0"}
+    assert "  @agent_clientx_3_0\n  Scenario: Contexte" in text
+    assert cv.setup_tags(str(tmp_path), [rel], tagged) == {"@agent_clientx_3_0"}
     # Un second lot ne retague pas la mise en place ; le tag de mise en place est retiré du patch
-    cv.tag_scenarios(str(tmp_path), [{"fichier": rel, "titre": "Test A"}], "apparel", 4)
+    cv.tag_scenarios(str(tmp_path), [{"fichier": rel, "titre": "Test A"}], "clientx", 4)
     assert path.read_text(encoding="utf-8").count("_0") == 1
     from tools.cucumber_tools import strip_agent_tags
-    assert "@agent_" not in strip_agent_tags(path.read_text(encoding="utf-8"), "apparel")
+    assert "@agent_" not in strip_agent_tags(path.read_text(encoding="utf-8"), "clientx")
 
 
 def test_unjudged_statuses_counted_apart():
@@ -236,8 +257,50 @@ def test_run_init_stops_on_failed_initialisation(monkeypatch):
     def fake(mode, worktree, base, build_fn, tags, env, overrides, label, sources=None):
         return {"ok": True, "message": "build SUCCESS", "build": "http://jenkins/1", "resultats": {
             ("f", "Intégration des données"): {"statut": "echoue", "step": "Given INIT-",
-                                               "message": "Donneur d'ordres non trouvé(e) avec code SO-1"}}}
+                                               "message": "Donneur d'ordres non trouvé(e) avec code DO-1"}}}
     monkeypatch.setattr(cv, "run_tags", fake)
-    init = cv.run_init("jenkins", "", "", None, "@INIT_APPAREL_WMS")
-    assert not init["ok"] and init["message"].startswith("environnement non initialisé (@INIT_APPAREL_WMS)")
-    assert "SO-1" in init["message"]
+    init = cv.run_init("jenkins", "", "", None, "@INIT_CLIENTX_WMS")
+    assert not init["ok"] and init["message"].startswith("environnement non initialisé (@INIT_CLIENTX_WMS)")
+    assert "DO-1" in init["message"]
+
+
+STD_FEATURE = """Feature: Standard
+  Background:
+    Given CONTENT- Création des contenus
+      | wmsHandlingUnit.code | status.id | quantity |
+      | UM-1                 | FREE      | 2        |
+
+  Scenario: Statut
+    Then CONTENT- Contrôle contenu de stock
+      | wmsHandlingUnit.code | status.id |
+      | UM-1                 | FREE      |
+"""
+
+
+def test_table_columns_indexed_by_step():
+    expressions = ["CONTENT- Création des contenus", "CONTENT- Contrôle contenu de stock"]
+    columns = cv.table_columns_by_step(expressions, [STD_FEATURE])
+    assert columns["CONTENT- Création des contenus"] == ["quantity", "status.id", "wmsHandlingUnit.code"]
+    assert columns["CONTENT- Contrôle contenu de stock"] == ["status.id", "wmsHandlingUnit.code"]
+
+
+def test_unknown_table_column_reported_with_closest(repo):
+    from tests.conftest import git, write
+    rel = "src/test/resources/cucumber/features/clientx/WMS/A.feature"
+    write(os.path.join(repo, *rel.split("/")), "Feature: A\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    write(os.path.join(repo, *rel.split("/")),
+          "Feature: A\n  Scenario: S\n    Then CONTENT- Contrôle contenu de stock\n"
+          "      | wmsContent.wmsHandlingUnit.code | status.value.id |\n      | UM-1 | FREE |\n"
+          "    Then un step client\n      | colonne libre |\n      | x |\n")
+    reference = {"colonnes_par_step": cv.table_columns_by_step(
+        ["CONTENT- Contrôle contenu de stock"], [STD_FEATURE])}
+    errors = cv.check_table_columns(repo, "HEAD", [rel], reference)
+    assert len(errors) == 2 and all(e.startswith(f"{rel}:3 ") for e in errors)
+    assert any("« status.value.id »" in e and "plus proche « status.id »" in e for e in errors)
+    assert any("« wmsContent.wmsHandlingUnit.code »" in e and "« wmsHandlingUnit.code »" in e for e in errors)
+    # Table identique déjà présente à la base : non contrôlée
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lot")
+    assert cv.check_table_columns(repo, "HEAD", [rel], reference) == []

@@ -9,11 +9,12 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import cucumber_checks, cucumber_init, cucumber_tools, cucumber_verify, integration_tools
+from tools import (cucumber_checks, cucumber_init, cucumber_init_data, cucumber_profile, cucumber_tools,
+                   cucumber_verify, integration_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
-    set_jira_description_markdown,
+    set_jira_description_markdown, std_only_projects,
 )
 from tools.db_tools import DB_TYPES, test_connection
 from tools.jenkins_tools import trigger_cucumber_job
@@ -159,13 +160,13 @@ def search_criteria_form(key_prefix: str) -> dict:
             "Projet Jira cible :",
             value=os.getenv("JIRA_PROJECT_KEY", ""),
             key=f"{key_prefix}search_project",
-            help="Ex: SPEC, OXY, PHE..."
+            help="Clé du projet Jira (ex. PROJ)."
         )
         jira_team_input = st.text_input(
             "Équipe / Composant (Optionnel) :",
             value=os.getenv("JIRA_SEARCH_TEAM", ""),
             key=f"{key_prefix}search_team",
-            help="Composant Jira ou équipe Atlassian. Ex: TEAM_SPEC, WMS, Socle...",
+            help="Composant Jira ou équipe Atlassian (ex. WMS, Socle...)",
             disabled=open_epics_only
         )
 
@@ -181,7 +182,7 @@ def search_criteria_form(key_prefix: str) -> dict:
             "Labels (Séparés par une virgule) :",
             value=os.getenv("JIRA_SEARCH_LABELS", ""),
             key=f"{key_prefix}search_labels",
-            help="Ex: WAIT_TEAM_SPEC, BUG (laissez vide si aucun label requis)",
+            help="Ex. le label d'attente de l'équipe (laissez vide si aucun label requis)",
             disabled=open_epics_only
         )
 
@@ -286,9 +287,10 @@ with tab_execution:
         st.markdown("---")
         st.markdown("### 2. Sélection du Ticket & Mode d'Exécution")
         
-        is_oxy = (current_project == "OXY")
-        if is_oxy:
-            st.info("ℹ️ Projet OXY détecté : Analyse basée uniquement sur le socle Standard (branche dev).")
+        std_only = (current_project or "").upper() in std_only_projects()
+        if std_only:
+            st.info(f"ℹ️ Projet {current_project} (STD_ONLY_PROJECTS) : analyse basée uniquement sur le socle "
+                    f"Standard (branche dev).")
             client_repo_path = "STD_ONLY"
         else:
             client_repo_path = st.text_input(
@@ -401,7 +403,7 @@ with tab_execution:
 
         # Épopée : analyse avec création des tâches enfants, relecture, ou patchs de toutes les tâches
         if is_epic and (run_cadrage_btn or run_direct_patch_btn):
-            if not is_oxy and not client_repo_path.strip():
+            if not std_only and not client_repo_path.strip():
                 st.error("Veuillez renseigner le chemin local ou l'URL Bitbucket du dépôt client.")
             elif run_direct_patch_btn:
                 if run_epic_patches(selected_ticket, current_project, client_repo_path.strip(), db_schema_input):
@@ -434,7 +436,7 @@ with tab_execution:
 
         # Option A : Lancer ou revoir l'analyse
         if run_cadrage_btn:
-            if not is_oxy and not client_repo_path.strip():
+            if not std_only and not client_repo_path.strip():
                 st.error("Veuillez renseigner le chemin local ou l'URL Bitbucket du dépôt client.")
             else:
                 st.info(f"Analyse/Cadrage en cours pour {selected_ticket}...")
@@ -474,7 +476,7 @@ with tab_execution:
 
         # Option B : Génération directe du Patch (sans passer par la relecture)
         if run_direct_patch_btn:
-            if not is_oxy and not client_repo_path.strip():
+            if not std_only and not client_repo_path.strip():
                 st.error("Veuillez renseigner le chemin local ou l'URL Bitbucket du dépôt client.")
             else:
                 st.info(f"Génération directe du patch et envoi sur Jira pour {selected_ticket}...")
@@ -795,7 +797,7 @@ with tab_integration:
             placeholder="Vide = valeur du champ Projet / Application du ticket",
             disabled=not application_field,
             help="L'agent consulte tous les tickets Jira (tous projets) de ce Projet / Application pour rédiger le "
-                 "besoin. Ex: CANSON. Plusieurs valeurs séparées par des virgules. "
+                 "besoin. Ex: APPLI. Plusieurs valeurs séparées par des virgules. "
                  + ("" if application_field else "Renseignez JIRA_APPLICATION_FIELD dans l'onglet Configuration."),
         ).strip()
 
@@ -908,7 +910,7 @@ with tab_cucumber:
 
     cucumber_repo_input = st.text_input(
         "Dépôt Bitbucket du projet client :", key="cucumber_repo",
-        help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/NOVALIA) ou chemin d'un clone local.",
+        help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/CLIENT) ou chemin d'un clone local.",
     ).strip()
     # Nom du client recalculé quand le dépôt change, sauf s'il a été modifié à la main depuis
     derived_client = cucumber_tools.client_name_from_repo(cucumber_repo_input)
@@ -931,7 +933,7 @@ with tab_cucumber:
         cucumber_application = st.text_input(
             "Projet / Application Jira (optionnel) :", key="cucumber_application",
             disabled=not os.getenv("JIRA_APPLICATION_FIELD", "").strip(),
-            help="Ex: CANSON. Les tickets Jira ayant cette valeur (champ JIRA_APPLICATION_FIELD) servent de "
+            help="Ex: APPLI. Les tickets Jira ayant cette valeur (champ JIRA_APPLICATION_FIELD) servent de "
                  "référence fonctionnelle sur les spécifiques.",
         ).strip()
     if cucumber_client:
@@ -1000,14 +1002,80 @@ with tab_cucumber:
     if health_file and os.path.exists(health_file):
         with open(health_file, "r", encoding="utf-8", errors="replace") as f:
             health = f.read()
-        drifted = "décalé du Standard" in health
-        with st.expander(("⚠️ Le projet client est décalé du Standard — " if drifted else "") + "Bilan de santé du "
+        drifted = "décalé de sa bibliothèque" in health or "⚠️ le client utilise la bibliothèque" in health
+        with st.expander(("⚠️ Projet client décalé de sa bibliothèque — " if drifted else "") + "Bilan de santé du "
                          "dépôt client " + time.strftime("(%d/%m/%Y %H:%M)",
                                                          time.localtime(os.path.getmtime(health_file))),
                          expanded=drifted):
             st.markdown(health)
 
     inventory = cucumber_tools.load_inventory(cucumber_client) if cucumber_client else {}
+
+    # 1 quater. Profil client : conventions détectées dans le dépôt <client>-cucumber, corrigeables (aucun token)
+    profile_doc = cucumber_profile.load_profile(cucumber_client) if cucumber_client else {}
+    profile = cucumber_profile.effective_profile(profile_doc)
+    empty_fields = [cucumber_profile.LABELS[k] for k in cucumber_profile.FIELDS if cucumber_profile.is_empty(profile[k])]
+    with st.expander(("⚠️ " if empty_fields or not profile_doc else "") + "Profil client"
+                     + (f" — {len(empty_fields)} champ(s) vide(s)" if profile_doc and empty_fields else ""),
+                     expanded=bool(profile_doc) and bool(empty_fields)):
+        if st.button("Détecter le profil", icon=":material/manage_search:", disabled=not ready,
+                     help="Relit le dépôt <client>-cucumber à sa base : racine et tag des features, init, clear, "
+                          "fichiers du module spécifique, runner, codes de référence, version de la bibliothèque. "
+                          "La saisie enregistrée est conservée. Aucun appel à Claude."):
+            if run_main_step(cucumber_cmd + ["--profile-only"], on_line=capture_std_ref) == 0:
+                st.rerun()
+            st.error("Détection du profil impossible : voir le journal ci-dessus.")
+        if not profile_doc:
+            st.caption("Aucun profil : lancez l'inventaire ou « Détecter le profil ».")
+        else:
+            st.caption(f"Détecté le {profile_doc.get('date', '?').replace('T', ' ')[:16]} · priorité : "
+                       f"{cucumber_profile.REPO_PROFILE} du dépôt > saisie > détection.")
+            for warning in profile["avertissements"]:
+                st.markdown(f":orange[⚠️ {warning}]")
+            sources = profile["sources"]
+
+            def origin(key: str) -> str:
+                return {"depot": "fixé par le dépôt", "saisi": "saisi", "detecte": "détecté"}.get(sources.get(key),
+                                                                                                  "vide")
+            with st.form(f"cucumber_profile_{cucumber_client}"):
+                values = {}
+                with st.container(horizontal=True):
+                    for key in ("features_root", "tag_client", "init_tags", "clear_name", "library_version"):
+                        values[key] = st.text_input(f"{cucumber_profile.LABELS[key]} ({origin(key)})",
+                                                    value=profile[key], disabled=sources.get(key) == "depot")
+                values["init_features"] = [line.strip() for line in st.text_area(
+                    f"{cucumber_profile.LABELS['init_features']} ({origin('init_features')}), une par ligne",
+                    value="\n".join(profile["init_features"]), disabled=sources.get("init_features") == "depot",
+                    height=80).splitlines() if line.strip()]
+                options = list(dict.fromkeys(profile["spec_files"]
+                                             + (profile_doc.get("suggestions") or {}).get("spec_files", [])))
+                values["spec_files"] = st.multiselect(
+                    f"{cucumber_profile.LABELS['spec_files']} ({origin('spec_files')}), dans l'ordre d'intégration",
+                    options, default=profile["spec_files"], disabled=sources.get("spec_files") == "depot",
+                    help="Intégrés par l'init après l'initialisation globale, dans l'ordre de sélection. Suggestions : "
+                         "fichiers de données du dépôt client hors initialisation Standard.")
+                codes = {}
+                with st.container(horizontal=True):
+                    for category in cucumber_profile.REFERENCE_CATEGORIES:
+                        codes[category] = [c.strip() for c in st.text_input(
+                            cucumber_init_data.LABELS.get(category, category),
+                            value=", ".join((profile["reference_codes"] or {}).get(category) or []),
+                            disabled=sources.get("reference_codes") == "depot").split(",") if c.strip()]
+                values["reference_codes"] = codes
+                runner_text = st.text_area(f"{cucumber_profile.LABELS['runner']} ({origin('runner')}, JSON)",
+                                           value=json.dumps(profile["runner"], ensure_ascii=False, indent=1),
+                                           disabled=sources.get("runner") == "depot", height=150)
+                if st.form_submit_button("Enregistrer le profil", icon=":material/save:"):
+                    try:
+                        values["runner"] = json.loads(runner_text)
+                    except ValueError:
+                        st.error("Runner : JSON invalide, profil non enregistré.")
+                    else:
+                        depot = profile_doc.get("depot") or {}
+                        cucumber_profile.save_user_fields(
+                            cucumber_client, {k: v for k, v in values.items() if k not in depot})
+                        st.success("Profil enregistré.")
+                        st.rerun()
 
     # 1 bis. Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token)
     detected_modules = cucumber_init.client_modules(inventory.get("depot_client", ""), inventory) if inventory else set()
@@ -1182,18 +1250,20 @@ with tab_cucumber:
     if verified_rows:
         indicators = cucumber_verify.verification_indicators(cucumber_state)
         st.markdown("#### :material/fact_check: Vérification des scénarios")
-        if indicators["environnement"] or indicators["cascade"]:
-            st.warning(f"**{indicators['environnement']} scénario(s) non vérifié(s) — environnement** (donnée de "
-                       f"référence ou route absente, initialisation en échec) et **{indicators['cascade']} en "
-                       f"cascade** d'une mise en place en échec : ils ne sont ni corrigés ni retirés pour cela. "
-                       f"Corrigez l'environnement (initialisation du client, bilan de santé) puis relancez.",
+        if indicators["hors_test"]:
+            st.warning(f"**{indicators['hors_test']} échec(s) hors test**, ni corrigés ni retirés : "
+                       f"🌐 {indicators['environnement']} environnement (route, champ exigé, version, init en échec) · "
+                       f"📭 {indicators['donnee_reference']} donnée de référence absente · "
+                       f"🐞 {indicators['bug_applicatif']} bug applicatif probable · "
+                       f"⛓️ {indicators['cascade']} en cascade d'une mise en place en échec. Corrigez l'environnement "
+                       f"(profil et initialisation du client, bilan de santé) ou signalez le bug, puis relancez.",
                        icon=":material/public:")
-            with st.expander("Scénarios non jugés : environnement et cascade"):
+            with st.expander("Scénarios non jugés : environnement, donnée de référence, bug applicatif, cascade"):
                 st.dataframe([{k: row[k] for k in ("Lot", "Scénario", "Statut", "Motif", "Build")}
-                              for row in verified_rows if row["Statut"] in ("environnement", "cascade")],
+                              for row in verified_rows if row["Statut"] in cucumber_verify.NOT_TEST_STATUSES],
                              hide_index=True, width="stretch",
                              column_config={"Build": st.column_config.LinkColumn("Build", display_text="Jenkins")})
-        if not indicators["verifies"] and not (indicators["environnement"] or indicators["cascade"]):
+        if not indicators["verifies"] and not indicators["hors_test"]:
             message = next((lot["execution"]["message"] for lot in cucumber_state["lots"] if lot.get("execution")), "")
             st.warning(f"**Pertinence non vérifiée par exécution** : {message or 'aucun moyen d’exécution configuré'}. "
                        "Configurez CUCUMBER_VERIFY_JOB ou CUCUMBER_VERIFY_LOCAL_CMD (onglet Configuration).",
@@ -1212,9 +1282,11 @@ with tab_cucumber:
                              "Statut", help="pertinent : passe sur le client, échoue sur le Standard (override) et "
                                             "mutation détectée ; faible : mutation non détectée ou passe sur le "
                                             "Standard ; invalide : échoue sur le client ; non_verifie : pas "
-                                            "d'exécution (jamais compté pertinent) ; environnement : donnée de "
-                                            "référence ou route absente sur l'environnement ; cascade : une mise "
-                                            "en place de la feature a échoué avant lui"),
+                                            "d'exécution (jamais compté pertinent) ; environnement : route absente, "
+                                            "champ exigé ou version ; donnee_reference : code absent de "
+                                            "l'environnement ; bug_applicatif : erreur serveur ; cascade : une mise "
+                                            "en place de la feature a échoué avant lui. Seuls invalide et faible "
+                                            "sont corrigés puis retirés vers le patch « à revoir »."),
                          "Client": st.column_config.TextColumn("Client", width="small"),
                          "Standard": st.column_config.TextColumn("Standard", width="small"),
                          "Mutation": st.column_config.TextColumn("Mutation", width="small"),
@@ -1349,7 +1421,7 @@ with tab_merges:
             "Projets Bitbucket à écouter",
             value=os.getenv("POLL_REPOSITORIES", ""),
             help="Clé de projet (tous ses dépôts) ou PROJET/dépôt, séparés par des virgules. "
-                 "Ex : NOVALIA, OSCARO/odatio-oscaro. Les dépôts *cucumber* sont toujours ignorés."
+                 "Ex : CLIENT, AUTRE/odatio-autre. Les dépôts *cucumber* sont toujours ignorés."
         )
         listen_interval = st.number_input(
             "Fréquence de vérification (minutes)", min_value=1, max_value=60,
@@ -1412,7 +1484,7 @@ with tab_config:
                 help="Statuts pré-remplis, séparés par une virgule. Ex: Analysée, Analysé")
             env_values["JIRA_SEARCH_LABELS"] = st.text_input(
                 "JIRA_SEARCH_LABELS", value=os.getenv("JIRA_SEARCH_LABELS", ""),
-                help="Labels pré-remplis, séparés par une virgule. Ex: WAIT_TEAM_SPEC")
+                help="Labels pré-remplis, séparés par une virgule")
         with st.container(horizontal=True):
             env_values["JIRA_OPEN_EPICS_TEAM"] = st.text_input(
                 "JIRA_OPEN_EPICS_TEAM", value=os.getenv("JIRA_OPEN_EPICS_TEAM", ""),
@@ -1424,7 +1496,7 @@ with tab_config:
             env_values["JIRA_APPLICATION_FIELD"] = st.text_input(
                 "JIRA_APPLICATION_FIELD", value=os.getenv("JIRA_APPLICATION_FIELD", ""),
                 help="Champ Jira « Projet / Application » (ex. customfield_10268). Onglet Intégration : l'agent "
-                     "consulte tous les tickets ayant la même valeur que le ticket (ex. CANSON). Vide = désactivé.")
+                     "consulte tous les tickets ayant la même valeur que le ticket (ex. APPLI). Vide = désactivé.")
             application_max = st.number_input(
                 "JIRA_APPLICATION_MAX_TICKETS", min_value=0, step=50,
                 value=env_int("JIRA_APPLICATION_MAX_TICKETS", 300),
@@ -1495,7 +1567,7 @@ with tab_config:
             "BITBUCKET_CLIENT_REPO_PATH (Dépôt client par défaut)",
             value=os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""),
             help="Pré-remplit le dépôt client de l'onglet Lancement. "
-                 "Ex: https://git.kiscloud.io/projects/NOVALIA ou C:\\development\\NOVALIA"
+                 "Ex: https://git.kiscloud.io/projects/CLIENT ou C:\\development\\CLIENT"
         )
         env_values["BITBUCKET_CUCUMBER_STD_REPO"] = st.text_input(
             "BITBUCKET_CUCUMBER_STD_REPO",
@@ -1605,7 +1677,7 @@ with tab_config:
         env_values["CUCUMBER_FIX_ATTEMPTS"] = str(int(fix_attempts))
         env_values["CUCUMBER_FIX_MAX_TURNS"] = str(int(fix_turns))
         dry_run = st.checkbox(
-            "CUCUMBER_DRY_RUN", value=os.getenv("CUCUMBER_DRY_RUN", "").strip() == "1",
+            "CUCUMBER_DRY_RUN", value=os.getenv("CUCUMBER_DRY_RUN", "1").strip() != "0",
             help="Après une compilation réussie, dry-run Cucumber des features du lot : vérifie que chaque step a "
                  "une définition (mvn test -Dcucumber.execution.dry-run=true), sans rien exécuter.")
         env_values["CUCUMBER_DRY_RUN"] = "1" if dry_run else "0"
@@ -1626,15 +1698,15 @@ with tab_config:
                 help="Environnement Standard de même version, pour la contre-épreuve des overrides (vide = pas de "
                      "contre-épreuve Standard).")
         env_values["CUCUMBER_INIT_TAGS"] = st.text_input(
-            "CUCUMBER_INIT_TAGS", value=os.getenv("CUCUMBER_INIT_TAGS", ""), placeholder="Ex. @INIT_APPAREL_WMS",
+            "CUCUMBER_INIT_TAGS", value=os.getenv("CUCUMBER_INIT_TAGS", ""), placeholder="Ex. @INIT_CLIENT_WMS",
             help="Initialisation du client, exécutée une fois par génération avant de juger les lots. En échec : "
                  "la vérification s'arrête, les scénarios sont « non vérifiés — environnement non initialisé ». "
                  "Désigne aussi les features d'init dont les codes créés sont imposés aux lots (défaut : tag "
                  "@INIT_*, dossier 0x-Contexte). Vide = pas d'initialisation préalable.")
         env_values["CUCUMBER_CLEAR_NAME"] = st.text_input(
-            "CUCUMBER_CLEAR_NAME", value=os.getenv("CUCUMBER_CLEAR_NAME", "") or "init-data-rest-clear-main-wms",
-            help="Seul clear autorisé pour purger l'environnement : utilisé par « Générer l'initialisation client » "
-                 "(step client « INIT- Purge de l'environnement par le clear ») et cité dans le prompt des lots.")
+            "CUCUMBER_CLEAR_NAME", value=os.getenv("CUCUMBER_CLEAR_NAME", ""),
+            help="Repli si le profil client n'a pas de clear : seul clear autorisé pour purger l'environnement, "
+                 "propre à chaque environnement (aucune valeur par défaut). Le profil client (onglet Cucumber) prime.")
         env_values["CUCUMBER_VERIFY_LOCAL_CMD"] = st.text_input(
             "CUCUMBER_VERIFY_LOCAL_CMD", value=os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", ""),
             placeholder='mvn -q test "-Dcucumber.filter.tags={tags}" -Denv={env}',
@@ -1673,7 +1745,7 @@ with tab_config:
         with st.container(horizontal=True):
             env_values["POSTMERGE_CUCUMBER_REPOS"] = st.text_input(
                 "POSTMERGE_CUCUMBER_REPOS", value=os.getenv("POSTMERGE_CUCUMBER_REPOS", ""),
-                help="Dépôt Cucumber de chaque projet client. Ex: NOVALIA=novalia-cucumber-2,OSCARO=oscaro-cucumber. "
+                help="Dépôt Cucumber de chaque projet client. Ex: CLIENT=client-cucumber-2,AUTRE=autre-cucumber. "
                      "Vide = détection du dépôt *cucumber* du projet.")
             env_values["POSTMERGE_CUCUMBER_BASE_BRANCH"] = st.text_input(
                 "POSTMERGE_CUCUMBER_BASE_BRANCH", value=os.getenv("POSTMERGE_CUCUMBER_BASE_BRANCH", "integration"),
