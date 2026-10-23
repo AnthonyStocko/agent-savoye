@@ -27,6 +27,9 @@ from tools.cucumber_tools import (_HTTP_CALL, _expression_regex, _first_argument
 # ---------------------------------------------------------------------------
 
 DEFAULT_DUP_THRESHOLD = 0.85
+# Doublon que la revue peut retirer (RÈGLE 3a) : similarité au moins égale
+EXACT_DUPLICATE = 0.95
+_DUPLICATE_MOTIF = re.compile(r"^doublon de .*\(similarité ([\d.]+)\)$")
 _PHASES = {"given": "given", "soit": "given", "sachant que": "given", "etant donné": "given", "étant donné": "given",
            "etant donnée": "given", "étant donnée": "given", "etant donnés": "given", "étant donnés": "given",
            "when": "when", "quand": "when", "lorsque": "when", "then": "then", "alors": "then"}
@@ -276,6 +279,12 @@ def _client_step_endpoints(worktree: str, java_files: list, reference: dict) -> 
             for expr in method["steps"]:
                 found[expr.replace('\\"', '"')] = list(dict.fromkeys(endpoints))
     return found
+
+
+def exact_duplicate(motif: str) -> bool:
+    """Motif de doublon quasi exact (similarité >= EXACT_DUPLICATE) : seul retrait permis à la revue."""
+    match = _DUPLICATE_MOTIF.match(motif)
+    return bool(match) and float(match.group(1)) >= EXACT_DUPLICATE
 
 
 def analyse_lot(worktree: str, files: list, results: list, reference: dict, threshold: float = None,
@@ -1016,65 +1025,6 @@ def not_verified(scenarios: dict, kinds: dict, message: str, status: str = "non_
 
 
 # ---------------------------------------------------------------------------
-# Retrait des scénarios invalides ou faibles (patch « à revoir »)
-# ---------------------------------------------------------------------------
-
-def a_revoir_path(client_name: str) -> str:
-    return os.path.join(WORKSPACE_DIR, f"{client_name}-cucumber-a-revoir.patch")
-
-
-def remove_scenarios(worktree: str, files: list, items: dict, client_name: str) -> list:
-    """
-    Retire des .feature les scénarios {tag: motif} (de leurs tags jusqu'au scénario suivant) et les ajoute, avec leur
-    motif, à <client>-cucumber-a-revoir.patch (diff qui les réintroduit). Renvoie [{fichier, titre, motif}].
-    """
-    found = tagged_scenarios(worktree, files, items)
-    removed, chunks = [], []
-    for rel in sorted({rel for rel, _ in found.values()}):
-        path = os.path.join(worktree, *rel.split("/"))
-        original = _read_text_file(path).splitlines()
-        starts = [s["ligne"] - 1 for s in parse_scenarios("\n".join(original))]
-        drop = set()
-        for tag, (file_rel, scenario) in found.items():
-            if file_rel != rel:
-                continue
-            start = scenario["ligne"] - 1
-            while start > 0 and original[start - 1].strip().startswith(("@", "#")):
-                start -= 1
-            following = [s for s in starts if s > scenario["ligne"] - 1]
-            end = following[0] if following else len(original)
-            while end > start and following and original[end - 1].strip().startswith(("@", "#")):
-                end -= 1
-            drop |= set(range(start, end))
-            removed.append({"fichier": rel, "titre": scenario["titre"], "tag": tag, "motif": items[tag]})
-        cleaned = [line for i, line in enumerate(original) if i not in drop]
-        _write_text(path, "\n".join(cleaned) + "\n")
-        motifs = "; ".join(f"{r['titre']} : {r['motif']}" for r in removed if r["fichier"] == rel)
-        chunks.append(f"# À revoir — {rel} — {motifs}\n" + "".join(difflib.unified_diff(
-            [line + "\n" for line in cleaned], [line + "\n" for line in original], f"a/{rel}", f"b/{rel}")))
-    if chunks:
-        with open(a_revoir_path(client_name), "a", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(chunks) + "\n")
-    return removed
-
-
-def drop_results(results: list, removed: list, reason_prefix: str) -> None:
-    """Retire du JSON du lot les scénarios retirés ; un spécifique sans scénario restant devient non couvert."""
-    for r in results or []:
-        kept = []
-        for declared in r.get("scenarios") or []:
-            obj = declared if isinstance(declared, dict) else {"nom": str(declared)}
-            name = _title_key(obj.get("nom", "").rsplit(" / ", 1)[-1])
-            if any(name == _title_key(d["titre"]) for d in removed):
-                continue
-            kept.append(declared)
-        if r.get("statut") == "couvert" and r.get("scenarios") and not kept:
-            r["statut"] = "non_couvert"
-            r["raison"] = f"{reason_prefix} : " + " ; ".join(sorted({d["motif"] for d in removed}))
-        r["scenarios"] = kept
-
-
-# ---------------------------------------------------------------------------
 # Revue humaine : échantillon, verdicts et consignes projet
 # ---------------------------------------------------------------------------
 
@@ -1231,12 +1181,11 @@ def verification_indicators(state: dict) -> dict:
     verified = [s for s in items if s["statut"] not in UNJUDGED]
     mutations = [s for s in items if (s["niveaux"].get("mutation") or ["nv"])[0] in ("ok", "ko")]
     standards = [s for s in items if (s["niveaux"].get("standard") or ["nv"])[0] in ("ok", "ko")]
-    removed = [r for lot in state.get("lots", []) for r in (lot.get("execution") or {}).get("retires", [])]
+    disabled = [e for lot in state.get("lots", []) for e in lot.get("a_revoir") or []]
     verdicts = list((state.get("verdicts") or {}).values())
-    reasons = {}
-    for r in removed:
-        key = re.sub(r" : .*$", "", r["motif"])
-        reasons[key] = reasons.get(key, 0) + 1
+    causes = {}
+    for e in disabled:
+        causes[e["cause"]] = causes.get(e["cause"], 0) + 1
 
     def rate(part, whole):
         return round(100 * part / whole) if whole else None
@@ -1251,6 +1200,7 @@ def verification_indicators(state: dict) -> dict:
             "taux_mutation": rate(sum(1 for s in mutations if s["niveaux"]["mutation"][0] == "ok"), len(mutations)),
             "taux_echec_standard": rate(sum(1 for s in standards if s["niveaux"]["standard"][0] == "ok"),
                                         len(standards)),
-            "retires": len(removed), "motifs_retrait": reasons,
+            "desactives": len(disabled), "causes_desactivation": causes,
+            "faibles": sum(len(lot.get("faibles") or []) for lot in state.get("lots", [])),
             "taux_validation_humaine": rate(sum(1 for v in verdicts if v["verdict"] == "pertinent"), len(verdicts)),
             "verdicts": len(verdicts)}

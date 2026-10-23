@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_checks, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
+from tools import cucumber_a_revoir, cucumber_checks, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1279,9 +1279,10 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
                         reference: dict, values: dict, model: str, work_key: str, run_dir: str, on_usage) -> None:
     """
     Contrôles Python d'un lot (doublons, assertions, réutilisation des steps, champs du JSON) ; s'il y a des
-    scénarios signalés, un seul appel de revue (--max-turns CUCUMBER_REVIEW_MAX_TURNS) les corrige ou les supprime,
-    sauf si leurs seuls motifs sont des champs du JSON vides (EMPTY_FIELD_MOTIFS : notés dans revue["sans_appel"]).
-    Met à jour lot["indicateurs"], lot["revue"] et le JSON du lot (scénarios supprimés retirés).
+    scénarios signalés, un seul appel de revue (--max-turns CUCUMBER_REVIEW_MAX_TURNS) les corrige, sauf si leurs
+    seuls motifs sont des champs du JSON vides (EMPTY_FIELD_MOTIFS : notés dans revue["sans_appel"]). La revue ne
+    supprime qu'un doublon quasi exact signalé (RÈGLE 3a) : toute autre suppression ou affaiblissement est annulé
+    (feature remise en l'état). Met à jour lot["indicateurs"], lot["revue"] et le JSON du lot (doublons retirés).
     """
     analysis = cucumber_verify.analyse_lot(worktree, files, results, reference)
     flagged = [s for s in analysis["scenarios"] if s["motifs"]]
@@ -1298,15 +1299,21 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
         prompt = render_prompt("cucumber_client_review", **values, lot_label=label,
                                scenarios_signales=cucumber_verify.review_block(lot_specs, analysis, results))
         effort = cucumber_fix_effort()
+        before = cucumber_a_revoir.snapshot(worktree, files)
+        duplicates = {cucumber_verify._title_key(s["titre"]) for s in flagged
+                      if any(cucumber_verify.exact_duplicate(m) for m in s["motifs"])}
         returncode, output, usage, _ = run_cucumber_claude(
             prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8)), run_dir, effort)
         report_token_usage(work_key, "cucumber-review", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         review["decisions"] = cucumber_verify.parse_review(output)
+        review["annulations"] = cucumber_a_revoir.check_corrections(worktree, before, duplicates)
+        for error in review["annulations"]:
+            print(f"[LOT {label}] ⛔ Revue : {error}")
         files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         after = cucumber_verify.analyse_lot(worktree, files, results, reference)
         review["supprimes"] = cucumber_verify.apply_review(results, analysis, after, review["decisions"])
-        print(f"[LOT {label}] Revue : {len(review['supprimes'])} scénario(s) supprimé(s), "
+        print(f"[LOT {label}] Revue : {len(review['supprimes'])} doublon(s) retiré(s), "
               f"{sum(1 for d in review['decisions'] if d.get('decision') == 'corrige')} corrigé(s).")
         analysis = after
     lot["indicateurs"] = analysis
@@ -1321,11 +1328,13 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     """
     Niveaux 2 et 3 (cucumber_verify) pour les scénarios tagués du lot, sans token ; `sources` : dépôt et commits de
     base transmis au job Jenkins (cucumber_verify.job_sources) ; sans `mode`, tous les scénarios prennent le statut
-    `unverified_status` (environnement si l'initialisation a échoué). Scénarios invalides, faibles, ou en cascade
-    d'une mise en place en échec hors environnement :
-    au plus CUCUMBER_VERIFY_FIX_ATTEMPTS appels de correction (cucumber_client_fix.md), recompilation, revérification
-    de ces seuls scénarios ; ceux qui le restent sont retirés vers <client>-cucumber-a-revoir.patch.
-    Résultat dans lot["execution"].
+    `unverified_status` (environnement si l'initialisation a échoué). Scénarios invalides, faibles, en cascade
+    d'une mise en place en échec côté test, ou sur une donnée de référence absente : au plus
+    CUCUMBER_VERIFY_FIX_ATTEMPTS (2) appels de correction (cucumber_client_fix.md), contrôlés (RÈGLE 3c : une
+    correction interdite est annulée), recompilation, revérification de ces seuls scénarios. Puis RÈGLE 3 : rien
+    n'est supprimé ; les scénarios bloqués par une cause hors test prouvée sont désactivés (cucumber_a_revoir), sauf
+    seuil dépassé ou échec côté test persistant : lot["arret"] (décision humaine), rien n'est désactivé.
+    Résultat dans lot["execution"], lot["a_revoir"], lot["faibles"].
     """
     scenarios, kinds = dict(lot["tags"]), lot.get("types") or {}
     number = lot["numero"]
@@ -1343,9 +1352,12 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     tests = {s["id"]: s.get("tests_std") or [] for s in lot_specs}
     spec_of = {cucumber_verify.scenario_id(s["fichier"], s["titre"]): s["spec"]
                for s in (lot.get("indicateurs") or {}).get("scenarios", [])}
-    for attempt in range(_env_int("CUCUMBER_VERIFY_FIX_ATTEMPTS", 1) if mode else 0):
-        # Cascade d'une mise en place en échec pour une raison de test (catégorie « test ») : à corriger aussi
-        bad = {t: v for t, v in result["scenarios"].items() if v["statut"] in ("invalide", "faible")
+    violations = []
+    for attempt in range(_env_int("CUCUMBER_VERIFY_FIX_ATTEMPTS", 2) if mode else 0):
+        # Cascade d'une mise en place en échec pour une raison de test (catégorie « test ») : à corriger aussi ;
+        # donnée de référence absente : à créer dans le Background avant toute désactivation
+        bad = {t: v for t, v in result["scenarios"].items()
+               if v["statut"] in ("invalide", "faible", "donnee_reference")
                or (v["statut"] == "cascade"
                    and cucumber_verify.failure_category(v.get("cause", "")) == "test")}
         if not bad:
@@ -1357,8 +1369,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             linked = tests.get(spec_of.get(item["id"], ""), [])
             lines.append(f"- {item['id']} [tag {tag}] : {item['motif']}" + (
                 f" ; test Standard lié : '{linked[0].get('extrait', linked[0]['path'])}'" if linked else ""))
+        lines += [f"- {e}" for e in violations]
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
+        before = cucumber_a_revoir.snapshot(worktree, files)
         effort = cucumber_fix_effort()
         returncode, _, usage, limit_hit = run_cucumber_claude(
             prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort)
@@ -1366,6 +1380,9 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         on_usage(usage)
         if limit_hit:
             break
+        violations = cucumber_a_revoir.check_corrections(worktree, before)
+        for error in violations:
+            print(f"[LOT {label}] ⛔ {error}")
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         check = verify_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
                                     values, model, work_key, run_dir, on_usage, inspired_of(results), context)
@@ -1380,11 +1397,28 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
                                                f"lot{number}-r{attempt + 1}", sources)
             builds += again["builds"]
             result["scenarios"].update(again["scenarios"])
-    still_bad = {t: v["motif"] for t, v in result["scenarios"].items() if v["statut"] in ("invalide", "faible")}
-    removed = cucumber_verify.remove_scenarios(worktree, files, still_bad, client) if still_bad else []
-    if removed:
-        cucumber_verify.drop_results(results, removed, "Scénario(s) retiré(s) après vérification par exécution")
-        print(f"[LOT {label}] {len(removed)} scénario(s) retiré(s) vers {cucumber_verify.a_revoir_path(client)}.")
+    # RÈGLE 3 : désactivation des seuls blocages hors test prouvés, ou arrêt pour décision humaine
+    decision = cucumber_a_revoir.decide(result["scenarios"], spec_of) if mode else {
+        "desactiver": {}, "faibles": [], "bloquants": [], "arret": False, "motifs": []}
+    located = cucumber_verify.tagged_scenarios(worktree, files, result["scenarios"])
+    conventions = (context or {}).get("conventions") or {}
+    disabled = cucumber_a_revoir.apply_decision(worktree, files, result["scenarios"], decision,
+                                                conventions.get("client_tag", ""), located)
+    for entry in disabled:
+        print(f"[LOT {label}] 🔕 Désactivé ({cucumber_a_revoir.CAUSES[entry['cause']][0]}) : {entry['fichier']} / "
+              f"{entry['titre']}")
+    if disabled and not cucumber_a_revoir.runner_selects_client_tag(conventions.get("runner"),
+                                                                     conventions.get("client_tag", "")):
+        print(f"[LOT {label}] ⚠️ Le runner ne filtre pas sur le tag client : les scénarios désactivés restent "
+              f"exécutés tant que le job n'exclut pas {cucumber_a_revoir.a_revoir_tag()}.")
+    lot["a_revoir"] = disabled
+    lot["faibles"] = [{"fichier": located[t][0], "titre": located[t][1]["titre"],
+                       "motif": result["scenarios"][t]["motif"]} for t in decision["faibles"] if t in located]
+    if decision["arret"]:
+        lot["arret"] = decision["motifs"]
+        print(f"[LOT {label}] ✋ Décision humaine requise, rien n'est désactivé : " + " ; ".join(decision["motifs"]))
+    else:
+        lot.pop("arret", None)
     counts = {}
     for item in result["scenarios"].values():
         counts[item["statut"]] = counts.get(item["statut"], 0) + 1
@@ -1399,7 +1433,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             item["motif"] += f" — {hint}"
             print(f"[LOT {label}] ⚠️ {item['id']} : {hint}")
     lot["execution"] = {"mode": mode or "aucun", "message": mode_message, "builds": builds,
-                        "scenarios": result["scenarios"], "retires": removed}
+                        "scenarios": result["scenarios"], "desactives": disabled}
     if result.get("classes_executees") is not None:
         # CUCUMBER_JACOCO=1 : part des classes de chaque spécifique du lot exécutées pendant le build client
         lot["execution"]["couverture_code"] = cucumber_verify.specific_coverage(
@@ -1423,7 +1457,7 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
         print(f"[LOT {label}] Fichier de données copié du Standard : {target} (depuis {source})")
     for rel in files_check["restaures"]:
         print(f"[LOT {label}] ⛔ Fichier de l'init globale modifié, restauré depuis la base : {rel}")
-    errors = list(files_check["erreurs"])
+    errors = list(files_check["erreurs"]) + cucumber_a_revoir.check_deletions(worktree, base)
     if context:
         new = cucumber_checks.new_features(worktree, base, [f for f in files if f.endswith(".feature")])
         errors += cucumber_init_data.check_lot_init(worktree, files, new, context.get("init"))
@@ -1467,7 +1501,7 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
     cucumber_tools.verify_build, avec "quota" si la limite de session a été atteinte.
     """
     plan = cucumber_fix_plan(model, _env_int("CUCUMBER_FIX_ATTEMPTS", 2))
-    attempts = len(plan)
+    attempts, violations = len(plan), []
     fix_turns = str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))
     for attempt in range(attempts + 1):
         check = check_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
@@ -1477,14 +1511,18 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
         fix_model, effort = plan[attempt]
         print(f"[LOT {label}] Correction {attempt + 1}/{attempts} ({fix_model}, effort {effort or 'défaut'})...")
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape=check["etape"].upper(),
-                               erreurs="\n".join(f"- {e}" for e in check["erreurs"]),
+                               erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
+        before = cucumber_a_revoir.snapshot(worktree, files)
         returncode, _, usage, limit_hit = run_cucumber_claude(prompt, fix_model, CUCUMBER_TOOLS, fix_turns, run_dir,
                                                               effort)
         report_token_usage(work_key, "cucumber-fix", fix_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
             return {**check, "quota": True}
+        violations = cucumber_a_revoir.check_corrections(worktree, before)
+        for error in violations:
+            print(f"[LOT {label}] ⛔ {error}")
         files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
     return check
 
@@ -1733,9 +1771,6 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                  "lots": lots}
         if cucumber_tools.load_state(client).get("lots"):
             print("⚠️ Nouvelle génération : les lots précédents (worktree, commits, etat.json) sont écrasés.")
-        # Nouvelle génération : le patch des scénarios à revoir repart de zéro
-        if os.path.exists(cucumber_verify.a_revoir_path(client)):
-            os.remove(cucumber_verify.a_revoir_path(client))
     try:
         worktree = cucumber_tools.prepare_worktree(cucumber_repo_dir, client, state["base"], reset=not (resume_state or complete_state))
     except RuntimeError as e:
@@ -1837,10 +1872,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"\n[LOT {label}] " + " ; ".join(s["libelle"] for s in lot_specs))
         java = cucumber_tools.client_java_context(client, worktree, std_java, conventions)
         context = {"init": client_init, "java": java, "conventions": conventions, "reference": reference}
-        if lot.get("statut") == "erreur_compilation" and lot.get("resultats") is not None:
-            # Reprise d'un lot écrit mais qui ne compilait pas : seule la correction est relancée
+        if lot.get("statut") in ("erreur_compilation", "decision_humaine") and lot.get("resultats") is not None:
+            # Reprise d'un lot écrit mais qui ne compilait pas, ou arrêté pour décision humaine : correction et
+            # vérification seules
             results, files = lot["resultats"], lot.get("fichiers") or []
-            print(f"[LOT {label}] Reprise de la correction ({len(files)} fichier(s)).")
+            print(f"[LOT {label}] Reprise de la correction et de la vérification ({len(files)} fichier(s)).")
         else:
             has_parameters = any(s["type"] == "parametrage" for s in lot_specs)
             db_block = build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
@@ -1916,6 +1952,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                  {**fixed_values, **java}, model, work_key, run_dir,
                                  lambda usage: add_usage(lot, usage), verify_sources, unverified_status, context)
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
+        # A_REVOIR.md du dépôt client (défauts détectés, scénarios désactivés ou faibles, arrêts), livré avec le lot
+        if lot.get("arret"):
+            lot["statut"] = "decision_humaine"
+        if cucumber_a_revoir.write_a_revoir(worktree, state, specifics):
+            print(f"[LOT {label}] {cucumber_a_revoir.A_REVOIR_FILE} mis à jour.")
         # Commit même en erreur de compilation, pour ne rien perdre ; fichiers de test ignorés par le .gitignore du
         # client ajoutés de force, puis aucun fichier ne doit rester hors du commit
         forced = cucumber_checks.ignored_test_files(worktree)
@@ -1939,6 +1980,13 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             if check.get("quota"):
                 break
             continue
+        if lot.get("arret"):
+            cucumber_tools.save_state(client, state)
+            print(f"[LOT {label}] ✋ Génération arrêtée pour décision humaine (voir "
+                  f"{cucumber_a_revoir.A_REVOIR_FILE}) : « Reprendre » relancera la correction et la vérification "
+                  f"de ce lot.")
+            exit_code = 1
+            break
         if check["ok"] and compile_cmd and files:
             # Tout le worktree compile : les lots précédents restés en erreur de compilation sont corrigés
             for other in lots:

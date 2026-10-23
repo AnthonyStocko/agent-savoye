@@ -252,8 +252,11 @@ def merge_statuses(detected: list, chosen: list) -> list:
 
 
 def usable(item: dict, survive_clear: str) -> bool:
-    """Donnée présente après un clear : recréée, conservée, ou statut inconnu avec initializers déclarés survivants."""
-    return item.get("statut") in ("recreee", "survit") or (item.get("statut") == "inconnu" and survive_clear == "oui")
+    """
+    Donnée présente après un clear : recréée, conservée, ou statut inconnu avec données des initializers déclarées
+    conservées par le clear (`survive_clear` : vrai / faux / '' inconnu).
+    """
+    return item.get("statut") in ("recreee", "survit") or (item.get("statut") == "inconnu" and survive_clear == "vrai")
 
 
 _REFERENCE_CODE = re.compile(r"avec\s+(?:le\s+)?code\s*:?\s*[\"'«]?\s*([\w.-]+)", re.I)

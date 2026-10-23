@@ -141,7 +141,7 @@ def test_views_for_checks(client_repo, std_dir, cache):
     assert {k: v for k, v in cp.conventions(effective).items() if k not in ("runner", "protected_files")} == {
         "features_root": f"{RES}/features/{CLIENT}/", "client_tag": CLIENT_TAG, "init": [INIT_REL],
         "library_version": "26.21", "server_version": "26.30", "server_initialized_data": [],
-        "initializers_survive_clear": ""}
+        "initializers_survive_clear": "", "workarounds": []}
     assert INIT_REL in cp.conventions(effective)["protected_files"]
 
 
@@ -207,6 +207,17 @@ def test_initializer_statuses_and_profile_block():
         ("DOC1", "recreee"), ("DOC2", "inconnu"), ("M1", "survit")]
     block = cp.initializers_block(effective["server_initialized_data"], "")
     assert "utilisables : DOC1 (RefReportDoc), M1 (?)" in block and "incertaine : DOC2 (RefReportDoc)" in block
-    assert "effacées par le clear : DOC2" in cp.initializers_block(effective["server_initialized_data"], "non")
-    assert "incertaine" not in cp.initializers_block(effective["server_initialized_data"], "oui")
+    assert "effacées par le clear : DOC2" in cp.initializers_block(effective["server_initialized_data"], "faux")
+    assert "incertaine" not in cp.initializers_block(effective["server_initialized_data"], "vrai")
     assert cp.initializers_block([], "") == "" and "initializers serveur" in cp.profile_block(effective)
+
+
+def test_workarounds_detected_and_optional(client_repo, std_dir, cache):
+    rel = f"{RES}/features/{CLIENT}/Contournement.feature"
+    write(os.path.join(client_repo, rel), "Feature: X\n  # TODO-VERSION: step réécrit, bibliothèque ancienne\n")
+    git(client_repo, "add", "-A")
+    git(client_repo, "commit", "-qm", "contournement")
+    profile = cp.client_profile(CLIENT, client_repo, "HEAD", std_dir)
+    assert profile["workarounds"] == [{"fichier": rel, "ligne": 2, "texte": "step réécrit, bibliothèque ancienne"}]
+    assert not any("contournements" in w or "initializers serveur vide" in w for w in profile["avertissements"])
+    assert profile["initializers_survive_clear"] == "" and cp.SURVIVE_CLEAR[""] == "inconnu"

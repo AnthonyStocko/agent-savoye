@@ -9,8 +9,8 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import (cucumber_checks, cucumber_init, cucumber_init_data, cucumber_profile, cucumber_tools,
-                   cucumber_verify, integration_tools)
+from tools import (cucumber_checks, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_profile,
+                   cucumber_tools, cucumber_verify, integration_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -1070,6 +1070,33 @@ with tab_cucumber:
                             value=", ".join((profile["reference_codes"] or {}).get(category) or []),
                             disabled=sources.get("reference_codes") == "depot").split(",") if c.strip()]
                 values["reference_codes"] = codes
+                # Données créées au démarrage par les initializers serveur : statut après un clear, saisi à la main
+                values["initializers_survive_clear"] = st.segmented_control(
+                    f"{cucumber_profile.LABELS['initializers_survive_clear']} "
+                    f"({origin('initializers_survive_clear')})", list(cucumber_profile.SURVIVE_CLEAR),
+                    format_func=cucumber_profile.SURVIVE_CLEAR.get,
+                    default=profile["initializers_survive_clear"] or "",
+                    disabled=sources.get("initializers_survive_clear") == "depot",
+                    help="Réponse globale, appliquée aux données dont le statut est « inconnu ».") or ""
+                initialized = profile["server_initialized_data"]
+                if initialized:
+                    import pandas as pd
+                    edited = st.data_editor(
+                        pd.DataFrame(initialized), hide_index=True, num_rows="fixed",
+                        column_order=("statut", "code", "entite", "classe", "depot", "mode", "certitude"),
+                        disabled=sources.get("server_initialized_data") == "depot" or [
+                            c for c in pd.DataFrame(initialized).columns if c != "statut"],
+                        column_config={"statut": st.column_config.SelectboxColumn(
+                            "Statut après un clear", options=list(cucumber_initializers.STATUSES),
+                            format_func=cucumber_initializers.STATUSES.get, required=True)},
+                        key=f"cucumber_initialized_{cucumber_client}")
+                    values["server_initialized_data"] = edited.to_dict("records")
+                    st.caption(f"{cucumber_profile.LABELS['server_initialized_data']} ({origin('server_initialized_data')}"
+                               f", {len(initialized)}) : codes « partiel » non résolus, jamais devinés.")
+                if profile["workarounds"]:
+                    st.caption(f"{cucumber_profile.LABELS['workarounds']} ({len(profile['workarounds'])}, lecture "
+                               f"seule) : " + " ; ".join(f"{w['fichier']}:{w['ligne']} {w['texte']}"
+                                                         for w in profile["workarounds"][:10]))
                 runner_text = st.text_area(f"{cucumber_profile.LABELS['runner']} ({origin('runner')}, JSON)",
                                            value=json.dumps(profile["runner"], ensure_ascii=False, indent=1),
                                            disabled=sources.get("runner") == "depot", height=150)
@@ -1281,8 +1308,8 @@ with tab_cucumber:
                 return "—" if value is None else f"{value} %"
             st.caption(f"Pertinents : {pct(indicators['taux_pertinent'])} des {indicators['verifies']} vérifié(s) · "
                        f"mutations détectées : {pct(indicators['taux_mutation'])} · overrides en échec sur le "
-                       f"Standard : {pct(indicators['taux_echec_standard'])} · {indicators['retires']} retiré(s) vers "
-                       f"le patch à revoir · validation humaine : {pct(indicators['taux_validation_humaine'])}")
+                       f"Standard : {pct(indicators['taux_echec_standard'])} · {indicators['desactives']} désactivé(s) "
+                       f"(A_REVOIR.md) · {indicators['faibles']} faible(s) · validation humaine : {pct(indicators['taux_validation_humaine'])}")
         st.dataframe([{k: v for k, v in row.items() if k != "tag"} for row in verified_rows], hide_index=True,
                      width="stretch", column_config={
                          "Build": st.column_config.LinkColumn("Build", display_text="Jenkins"),
@@ -1357,12 +1384,11 @@ with tab_cucumber:
             with open(patch_file, "rb") as f:
                 st.download_button("Télécharger le patch", f.read(), file_name=os.path.basename(patch_file),
                                    mime="text/x-diff", icon=":material/download:")
-            review_patch = cucumber_verify.a_revoir_path(cucumber_client)
-            if os.path.exists(review_patch):
-                with open(review_patch, "rb") as f:
-                    st.download_button("Scénarios retirés à revoir (patch séparé, avec leur motif)", f.read(),
-                                       file_name=os.path.basename(review_patch), mime="text/x-diff",
-                                       icon=":material/rule:")
+            review_file = os.path.join(cucumber_tools.worktree_dir(cucumber_client), "A_REVOIR.md")
+            if os.path.exists(review_file):
+                with st.expander("À revoir : défauts détectés, scénarios désactivés (livré dans le patch)"):
+                    with open(review_file, "r", encoding="utf-8", errors="replace") as f:
+                        st.markdown(f.read())
             if os.path.exists(coverage_file):
                 with st.expander("Récapitulatif de couverture"):
                     with open(coverage_file, "r", encoding="utf-8", errors="replace") as f:

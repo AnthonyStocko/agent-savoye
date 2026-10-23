@@ -5,7 +5,7 @@ Le profil réunit ce que la génération et les contrôles doivent savoir du cli
 features et tags de son initialisation, clear de son environnement, fichiers d'intégration de son module
 spécifique, fichiers protégés de l'init globale, runner, codes de référence créés par l'init, version de la
 bibliothèque de steps et version du serveur (celle du Standard applicatif), données créées par les initializers
-serveur et leur sort après un clear. Rien n'est propre à un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
+serveur et leur sort après un clear, contournements TODO-VERSION du dépôt. Rien n'est propre à un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
 dans le dépôt client. Priorité : dépôt (.agent-savoye.json) > saisie (cache) > détection ; un champ non détecté
 reste vide, avec un avertissement.
 
@@ -26,7 +26,10 @@ REPO_PROFILE = ".agent-savoye.json"
 REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
 FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
-          "initializers_survive_clear")
+          "initializers_survive_clear", "workarounds")
+# Champs dont l'absence est normale : vides sans avertissement
+OPTIONAL_FIELDS = ("server_initialized_data", "workarounds")
+SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
 LABELS = {"features_root": "racine des features", "tag_client": "tag client", "init_features": "features d'init",
           "init_tags": "tags d'init", "clear_name": "clear de l'environnement",
           "spec_files": "fichiers du module spécifique", "protected_files": "fichiers protégés de l'init globale",
@@ -34,7 +37,8 @@ LABELS = {"features_root": "racine des features", "tag_client": "tag client", "i
           "reference_codes": "codes de référence", "library_version": "version de la bibliothèque de steps",
           "server_version": "version du serveur",
           "server_initialized_data": "données créées par les initializers serveur",
-          "initializers_survive_clear": "données des initializers après un clear (oui / non)"}
+          "initializers_survive_clear": "données des initializers conservées après un clear (vrai / faux / inconnu)",
+          "workarounds": "contournements TODO-VERSION"}
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _GLOBAL_INIT = "Initialisation globale par fichiers"
@@ -54,7 +58,7 @@ def empty_profile() -> dict:
             "runner": {k: ([] if k in ("features", "glue", "tags") else False if k == "surcouche" else "")
                        for k in RUNNER_KEYS},
             "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
-            "server_initialized_data": [], "initializers_survive_clear": ""}
+            "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": []}
 
 
 def is_empty(value) -> bool:
@@ -144,6 +148,7 @@ def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
                    reference_codes={k: list((init.get("codes") or {}).get(k) or []) for k in REFERENCE_CATEGORIES},
                    library_version=cucumber_checks.library_version(worktree),
                    server_version=server_version if re.match(r"\d", server_version or "") else "")
+    profile["workarounds"] = cucumber_versions.todo_markers(worktree, ref)
     inventory = load_inventory(client_name)
     if "initialiseurs" in inventory:
         profile["server_initialized_data"] = cucumber_initializers.initialized_data(inventory["initialiseurs"])
@@ -201,7 +206,8 @@ def effective_profile(document: dict) -> dict:
                     value = cucumber_initializers.merge_statuses(profile[key], value)
                 profile[key], sources[key] = value, source
     warnings = list((document or {}).get("avertissements_detection") or [])
-    warnings += [f"{LABELS[k]} vide : à renseigner dans le profil client" for k in FIELDS if is_empty(profile[k])]
+    warnings += [f"{LABELS[k]} vide : à renseigner dans le profil client" for k in FIELDS
+                 if is_empty(profile[k]) and k not in OPTIONAL_FIELDS]
     return {**profile, "sources": sources, "avertissements": warnings}
 
 
@@ -290,7 +296,7 @@ def initializers_block(data: list, survive_clear: str, max_codes: int = 20) -> s
     if present:
         parts.append(f"présentes après le clear, utilisables : {codes(present)}")
     if missing:
-        parts.append(("effacées par le clear" if survive_clear == "non" else "présence après le clear incertaine")
+        parts.append(("effacées par le clear" if survive_clear == "faux" else "présence après le clear incertaine")
                      + f" : {codes(missing)} — ne t'y fie pas, crée la donnée dans le Background ou signale un "
                        f"constat « donnee_introuvable »")
     return " ; ".join(parts) + "."
@@ -316,4 +322,5 @@ def conventions(profile: dict) -> dict:
             "protected_files": list(profile.get("protected_files") or []),
             "library_version": profile.get("library_version", ""), "server_version": profile.get("server_version", ""),
             "server_initialized_data": list(profile.get("server_initialized_data") or []),
-            "initializers_survive_clear": profile.get("initializers_survive_clear", "")}
+            "initializers_survive_clear": profile.get("initializers_survive_clear", ""),
+            "workarounds": list(profile.get("workarounds") or [])}

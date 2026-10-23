@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import unicodedata
+from collections import Counter
 from datetime import datetime
 
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3045,17 +3046,26 @@ def _compilation_status(lot: dict) -> str:
 def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> str:
     """
     Récapitulatif <client>-cucumber-couverture.md : indicateurs globaux (réutilisation des steps Standard,
-    scénarios supprimés à la revue), puis par spécifique ses scénarios, leur différence avec le Standard, leur
-    source, le test Standard d'inspiration, les steps réutilisés / créés, les endpoints et la compilation.
+    doublons retirés à la revue, scénarios générés / actifs / désactivés par cause), puis par spécifique ses
+    scénarios actifs, leur différence avec le Standard, leur source, le test Standard d'inspiration, les steps
+    réutilisés / créés, les endpoints et la compilation. Un spécifique sans scénario actif est non couvert.
     """
     specs = {s["id"]: s for s in inventory.get("specifiques", [])}
     lots = state.get("lots", [])
     lot_of = {i: lot for lot in lots for i in lot["ids"]}
     results = {r["id"]: r for lot in lots for r in lot.get("resultats", []) or []}
     selected = [i for lot in lots for i in lot["ids"]]
-    covered = [i for i in selected if results.get(i, {}).get("statut") == "couvert"]
-    indirect = [i for i in selected if results.get(i, {}).get("statut") == "couvert_indirectement"]
     analysed = [s for lot in lots for s in (lot.get("indicateurs") or {}).get("scenarios", [])]
+    disabled = {(e["fichier"], e["titre"]): e for lot in lots for e in lot.get("a_revoir") or []}
+    active = {}
+    for s in analysed:
+        if (s["fichier"], s["titre"]) not in disabled:
+            active[s.get("spec", "")] = active.get(s.get("spec", ""), 0) + 1
+    # RÈGLE 3e : un spécifique dont tous les scénarios sont désactivés n'est pas couvert
+    emptied = [i for i in selected if results.get(i, {}).get("statut") == "couvert" and not active.get(i)
+               and any(s.get("spec") == i for s in analysed)]
+    covered = [i for i in selected if results.get(i, {}).get("statut") == "couvert" and i not in emptied]
+    indirect = [i for i in selected if results.get(i, {}).get("statut") == "couvert_indirectement"]
     deleted = [d for lot in lots for d in (lot.get("revue") or {}).get("supprimes", [])]
     std_steps = sum(s["steps_std"] for s in analysed)
     all_steps = sum(s["steps_std"] + s["steps_client"] + s["steps_non_definis"] for s in analysed)
@@ -3071,7 +3081,11 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
              f"- Scénarios contrôlés : {len(analysed)} ; réutilisation des steps Standard : "
              + (f"{round(100 * std_steps / all_steps)} % ({std_steps}/{all_steps} steps)" if all_steps else "—")
              + f" ; steps non définis : {sum(s['steps_non_definis'] for s in analysed)}",
-             f"- Scénarios supprimés à la revue : {len(deleted)}"
+             f"- Scénarios générés : {len(analysed)} ; actifs livrés : {len(analysed) - len(disabled)} ; "
+             f"désactivés (tag à revoir, jamais supprimés) : {len(disabled)}"
+             + (" — " + " ; ".join(f"{k} : {n}" for k, n in sorted(Counter(
+                 e["cause"] for e in disabled.values()).items())) if disabled else ""),
+             f"- Doublons retirés à la revue : {len(deleted)}"
              + (" — " + " ; ".join(f"{k} : {n}" for k, n in sorted(reasons.items(), key=lambda kv: -kv[1]))
                 if reasons else "")]
     unreviewed = [s for lot in lots for s in (lot.get("revue") or {}).get("sans_appel", [])]
@@ -3092,7 +3106,7 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
     def pct(value):
         return "—" if value is None else f"{value} %"
     if verif["hors_test"]:
-        lines.append(f"- Échecs hors test, ni corrigés ni retirés : 🌐 environnement {verif['environnement']} (route, "
+        lines.append(f"- Échecs hors test, jamais corrigés pour cela : 🌐 environnement {verif['environnement']} (route, "
                      f"champ exigé, version) ; 📭 donnée de référence absente {verif['donnee_reference']} ; 🐞 bug "
                      f"applicatif probable {verif['bug_applicatif']} ; ⛓️ cascade d'une mise en place en échec "
                      f"{verif['cascade']}")
@@ -3105,9 +3119,8 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
                   f"{verif['verifies']} vérifiés ; {verif['non_verifies']} non vérifié(s))",
                   f"- Mutations des attendus détectées : {pct(verif['taux_mutation'])} ; overrides en échec sur le "
                   f"Standard : {pct(verif['taux_echec_standard'])}",
-                  f"- Scénarios retirés vers {client_name}-cucumber-a-revoir.patch : {verif['retires']}"
-                  + (" — " + " ; ".join(f"{k} : {n}" for k, n in verif["motifs_retrait"].items())
-                     if verif["motifs_retrait"] else "")]
+                  f"- Scénarios désactivés (A_REVOIR.md) : {verif['desactives']} ; faibles restés actifs : "
+                  f"{verif['faibles']}"]
     lines.append(f"- Validation humaine : {pct(verif['taux_validation_humaine'])} ({verif['verdicts']} verdict(s))")
     coverage = {k: v for lot in lots for k, v in ((lot.get("execution") or {}).get("couverture_code") or {}).items()}
     lines += ["", "## Spécifiques couverts", ""]
@@ -3115,6 +3128,9 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
         spec, result, lot = specs.get(i, {"libelle": i, "fichiers": []}), results[i], lot_of.get(i, {})
         mine = [s for s in (lot.get("indicateurs") or {}).get("scenarios", []) if s.get("spec") == i]
         lines += [f"### {spec['libelle']} ({spec.get('type', '?')})",
+                  f"- Scénarios actifs livrés : {active.get(i, 0)}"
+                  + (f" ; désactivés : {sum(1 for s in mine if (s['fichier'], s['titre']) in disabled)}"
+                     if any((s["fichier"], s["titre"]) in disabled for s in mine) else ""),
                   f"- Sources : {', '.join(f['path'].rsplit('/', 1)[-1] for f in spec['fichiers'][:4])}"
                   + (" …" if len(spec["fichiers"]) > 4 else ""),
                   f"- Inspiré du Standard : {' ; '.join(str(x) for x in result.get('inspire_de') or []) or '—'}",
@@ -3153,6 +3169,8 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
     for i in not_covered:
         result = results.get(i)
         reason = result.get("raison", "") if result else "lot non terminé"
+        if i in emptied:
+            reason = "aucun scénario actif : tous désactivés (voir A_REVOIR.md)"
         if result and result.get("requalification"):
             reason = f"{reason} (requalifié : {result['requalification']})"
         lines.append(f"- {specs.get(i, {}).get('libelle', i)} : {reason or 'raison non précisée'}")

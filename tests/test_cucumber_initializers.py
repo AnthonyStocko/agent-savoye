@@ -109,5 +109,5 @@ def test_reference_hint_on_initializer_code():
     hint = ci.reference_hint("404 - Document non trouvé(e) avec code SPEC_INVOICE", data)
     assert "DocDatabaseInitializer" in hint and "ne survit sans doute pas au clear" in hint
     assert ci.reference_hint("404 - Document non trouvé(e) avec code AUTRE", data) == ""
-    assert ci.usable({"statut": "inconnu"}, "oui") and not ci.usable({"statut": "inconnu"}, "")
-    assert ci.usable({"statut": "recreee"}, "non")
+    assert ci.usable({"statut": "inconnu"}, "vrai") and not ci.usable({"statut": "inconnu"}, "")
+    assert ci.usable({"statut": "recreee"}, "faux")
