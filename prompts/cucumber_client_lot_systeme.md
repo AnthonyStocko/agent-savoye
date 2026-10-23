@@ -36,6 +36,7 @@ ${references_injectees}
 - Il n'est pas un doublon d'un scénario Standard ou client existant (vérifie par Grep dans '${features_std}' et '${couverture_existante}') ; si un scénario existant couvre partiellement le spécifique, complète-le.
 - Il a au moins une assertion métier (valeur, statut métier, contenu de message ou de document) : pas seulement « statut 200 », pas de `Then` vide.
 - Il s'appuie sur une source : le code du spécifique, et quand ils existent le ticket Jira ou le paramétrage réel, cités en commentaire (`# Source : <fichier>`, `# Jira : CLE-123`).
+- Il n'est pas tautologique : ses assertions portent sur ce que le spécifique calcule ou décide, jamais sur la valeur que le scénario vient lui-même d'écrire (créer X puis relire X ne prouve rien). Un tel scénario n'est pas écrit : signale-le en constat « tautologique ».
 Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites réellement introduits par le spécifique (règles, seuils, branches du code client). Aucun scénario de remplissage. Un spécifique sans comportement observable propre au client : n'écris rien et explique-le dans « raison ».
 
 === AVANT DE CONCLURE « non_couvert » ===
@@ -51,6 +52,7 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
    - Steps : chaque step d'un .feature existe déjà (catalogue des steps du Standard, steps du client) ou est défini par une méthode Java écrite dans ce lot (règle 2) ; jamais de step inventé sans définition (un dry-run strict le refuse). Les colonnes de chaque DataTable sont exactement celles que le Standard ACTUEL utilise pour ce même step (Grep dans '${features_std}' ou les extraits du lot) : pas d'autre syntaxe (ex. « x.value.id » là où le Standard écrit « x.id »), pas de chemin de champ inventé.
    - Mise en place : préfère un Background (ou les Given du scénario) à un scénario « Contexte » séparé dont dépendent les suivants ; à défaut, chaque scénario doit pouvoir échouer sans laisser les autres en attente d'une donnée qu'il devait créer.
    - Runner : ne crée JAMAIS un second runner quand un runner existe ou que le dépôt s'exécute en surcouche du Standard (double exécution) ; complète le runner existant si le lot te le demande.
+   - Fichiers de l'initialisation : ne modifie JAMAIS un fichier d'initialisation existant (features d'init et fichiers qu'elles intègrent, « fichiers protégés » du PROFIL CLIENT) : ils sont partagés par tous les tests, un fichier rejeté arrête l'intégration et fait échouer les autres tests. Une donnée manquante se crée dans le Background de ta feature ; si tu ne peux pas la créer, signale-la en constat « donnee_introuvable ».
    - Fichiers de données et règles : un step les lit dans src/test/resources/cucumber/files/ (règles : rules/, fichier <nom>.json) + le dossier de la feature sous features/ + le nom donné. Le dépôt client n'a pas les fichiers du Standard à l'exécution : chaque fichier cité doit exister à ce chemin dans le worktree. Ceux qui existent au Standard sous le même nom sont copiés automatiquement après le lot ; crée seulement les fichiers propres au client.
 2. Chaque lot livre aussi TOUTES les classes Java nécessaires à l'exécution de ses .feature, qui doivent compiler :
    a. Step Definitions : chaque step d'un .feature absent de '${steps_std}' et du worktree a sa méthode, dans une classe du package ${package_steps} (src/test/java/…), une classe par domaine fonctionnel nommée <Domaine>${class_suffix}Steps. Complète la classe du domaine si un lot précédent l'a déjà créée.
@@ -60,13 +62,20 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 3. Pour compléter une classe ou une feature existante, utilise Edit, jamais une réécriture complète.
 4. N'écris AUCUN code applicatif, ne modifie AUCUN scénario ni classe du Standard, aucun fichier hors du worktree. N'utilise ni git ni Maven : les commits, la compilation et le patch sont faits automatiquement.
 
+=== CONSTATS (champ « constats », facultatif) ===
+Signale ce que tu as constaté sans pouvoir le régler, plutôt que de le contourner. Un constat par fait, avec le fichier en cause s'il y en a un :
+- « donnee_introuvable » : une donnée nécessaire (code, paramètre, référentiel) n'existe ni dans l'initialisation du client ni au Standard, et tu ne peux pas la créer dans le Background. N'invente jamais un code à la place.
+- « ecart_spec_code » : le ticket Jira ou la spécification décrit un comportement, le code du spécifique en fait un autre. Le scénario teste le code ; le constat cite les deux.
+- « tautologique » : scénario envisagé puis écarté car il ne vérifiait que sa propre mise en place.
+
 === RÉPONSE FINALE ===
 Aucun texte hors du JSON final. Ta réponse finale est UNIQUEMENT ce bloc JSON (cette règle remplace « Réponse finale : 10 lignes maximum ») :
 ```json
 [
   {"id": "<id du spécifique>", "statut": "couvert|couvert_indirectement|non_couvert", "couvert_par": "<id du spécifique qui le couvre, si couvert_indirectement>",
    "scenarios": [{"nom": "<Feature> / <Scenario>", "fichier": "<chemin relatif au worktree du .feature>", "difference_standard": "<une phrase : ce qui diffère du Standard>", "source": "<fichier du spécifique, ticket Jira, paramètre>"}],
-   "fichiers": ["<chemin relatif au worktree>"], "classes_java": ["<chemin relatif au worktree>"], "inspire_de": ["<chemin Standard> / <scénario>"], "raison": "<si non couvert, ou constat utile>"}
+   "fichiers": ["<chemin relatif au worktree>"], "classes_java": ["<chemin relatif au worktree>"], "inspire_de": ["<chemin Standard> / <scénario>"], "raison": "<si non couvert>",
+   "constats": [{"type": "donnee_introuvable|ecart_spec_code|tautologique", "detail": "<une phrase>", "fichier": "<chemin, si utile>"}]}
 ]
 ```
 Un objet par spécifique du lot, dans l'ordre. « fichiers » : les .feature ; « classes_java » : les classes Java créées ou complétées pour ce spécifique ; « inspire_de » : les scénarios Standard dont tu es parti (vide si aucun). « difference_standard » et « source » sont obligatoires pour chaque scénario. « couvert_par » : seulement pour « couvert_indirectement » (pas de scénario propre).

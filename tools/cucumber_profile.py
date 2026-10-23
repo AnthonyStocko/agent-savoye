@@ -3,8 +3,9 @@ Profil client Cucumber (0 token) : conventions d'un dépôt <client>-cucumber, d
 
 Le profil réunit ce que la génération et les contrôles doivent savoir du client : racine et tag de ses features,
 features et tags de son initialisation, clear de son environnement, fichiers d'intégration de son module
-spécifique, runner, codes de référence créés par l'init, version de la bibliothèque de steps. Rien n'est propre à
-un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
+spécifique, fichiers protégés de l'init globale, runner, codes de référence créés par l'init, version de la
+bibliothèque de steps et version du serveur (celle du Standard applicatif), données créées par les initializers
+serveur et leur sort après un clear. Rien n'est propre à un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
 dans le dépôt client. Priorité : dépôt (.agent-savoye.json) > saisie (cache) > détection ; un champ non détecté
 reste vide, avec un avertissement.
 
@@ -16,19 +17,24 @@ import os
 import re
 from datetime import datetime
 
-from tools import cucumber_checks, cucumber_init_data
+from tools import cucumber_checks, cucumber_init_data, cucumber_initializers, cucumber_versions
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _runners, _test_java_files, _write_json,
                                   add_worktree, cache_dir, depends_on_std_test_jar, java_classes,
-                                  java_package_segment)
+                                  java_package_segment, load_inventory)
 
 REPO_PROFILE = ".agent-savoye.json"
 REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
-FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "runner",
-          "reference_codes", "library_version")
+FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
+          "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
+          "initializers_survive_clear")
 LABELS = {"features_root": "racine des features", "tag_client": "tag client", "init_features": "features d'init",
           "init_tags": "tags d'init", "clear_name": "clear de l'environnement",
-          "spec_files": "fichiers du module spécifique", "runner": "runner",
-          "reference_codes": "codes de référence", "library_version": "version de la bibliothèque de steps"}
+          "spec_files": "fichiers du module spécifique", "protected_files": "fichiers protégés de l'init globale",
+          "runner": "runner",
+          "reference_codes": "codes de référence", "library_version": "version de la bibliothèque de steps",
+          "server_version": "version du serveur",
+          "server_initialized_data": "données créées par les initializers serveur",
+          "initializers_survive_clear": "données des initializers après un clear (oui / non)"}
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _GLOBAL_INIT = "Initialisation globale par fichiers"
@@ -44,9 +50,11 @@ def base_worktree_dir(client_name: str) -> str:
 
 def empty_profile() -> dict:
     return {"features_root": "", "tag_client": "", "init_features": [], "init_tags": "", "clear_name": "",
-            "spec_files": [], "runner": {k: ([] if k in ("features", "glue", "tags") else False if k == "surcouche"
-                                             else "") for k in RUNNER_KEYS},
-            "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": ""}
+            "spec_files": [], "protected_files": [],
+            "runner": {k: ([] if k in ("features", "glue", "tags") else False if k == "surcouche" else "")
+                       for k in RUNNER_KEYS},
+            "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
+            "server_initialized_data": [], "initializers_survive_clear": ""}
 
 
 def is_empty(value) -> bool:
@@ -105,10 +113,13 @@ def spec_file_suggestions(worktree: str, cucumber_std_dir: str, chosen: list) ->
                   and data.search(p) and p.rsplit("/", 1)[-1] not in std_names and p not in chosen)[:300]
 
 
-def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = ()) -> tuple:
+def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = (),
+                   server_version: str = "") -> tuple:
     """
     Profil détecté dans le worktree du dépôt client (à `ref`) : (profil, suggestions, avertissements). Un champ non
     détecté reste vide ; seules exceptions, racine et tag déduits du nom du client, signalés comme tels.
+    `server_version` : version lue dans le pom du Standard applicatif, retenue si elle est numérique. Données des
+    initializers serveur : celles de l'inventaire (statut inconnu), non analysées sans inventaire.
     """
     profile, warnings = empty_profile(), []
     root = cucumber_checks.client_features_root(worktree, ref, client_name, cucumber_std_dir, fallback=False)
@@ -128,9 +139,16 @@ def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
     profile.update(features_root=root, tag_client=tag, init_features=paths, init_tags=" or ".join(init_tags),
                    clear_name=init_clear_name(list(texts.values())),
                    spec_files=[s for p in paths for s in init_spec_files(p, texts[p])],
+                   protected_files=cucumber_init_data.protected_files(init),
                    runner=runner_profile(worktree, ref, list(std_runners)),
                    reference_codes={k: list((init.get("codes") or {}).get(k) or []) for k in REFERENCE_CATEGORIES},
-                   library_version=cucumber_checks.library_version(worktree))
+                   library_version=cucumber_checks.library_version(worktree),
+                   server_version=server_version if re.match(r"\d", server_version or "") else "")
+    inventory = load_inventory(client_name)
+    if "initialiseurs" in inventory:
+        profile["server_initialized_data"] = cucumber_initializers.initialized_data(inventory["initialiseurs"])
+    else:
+        warnings.append("initializers serveur non analysés (inventaire absent ou antérieur) : lancez l'inventaire")
     suggestions = {"spec_files": spec_file_suggestions(worktree, cucumber_std_dir, profile["spec_files"])}
     return profile, suggestions, warnings
 
@@ -153,9 +171,11 @@ def load_profile(client_name: str) -> dict:
     return _read_json(profile_path(client_name), {}) or {}
 
 
-def refresh_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = ()) -> dict:
+def refresh_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = (),
+                    server_version: str = "") -> dict:
     """Détection et surcharge du dépôt recalculées, saisie conservée ; profil.json réécrit. Renvoie le document."""
-    detected, suggestions, warnings = detect_profile(client_name, worktree, ref, cucumber_std_dir, std_runners)
+    detected, suggestions, warnings = detect_profile(client_name, worktree, ref, cucumber_std_dir, std_runners,
+                                                     server_version)
     document = load_profile(client_name)
     depot = repo_profile(worktree, ref)
     if depot.pop("_erreur", ""):
@@ -176,6 +196,9 @@ def effective_profile(document: dict) -> dict:
     for source in ("detecte", "saisi", "depot"):
         for key, value in ((document or {}).get(source) or {}).items():
             if key in FIELDS and not is_empty(value):
+                if key == "server_initialized_data" and source != "detecte":
+                    # Statuts choisis appliqués aux données détectées, sans les remplacer
+                    value = cucumber_initializers.merge_statuses(profile[key], value)
                 profile[key], sources[key] = value, source
     warnings = list((document or {}).get("avertissements_detection") or [])
     warnings += [f"{LABELS[k]} vide : à renseigner dans le profil client" for k in FIELDS if is_empty(profile[k])]
@@ -191,17 +214,19 @@ def save_user_fields(client_name: str, fields: dict) -> dict:
     return document
 
 
-def client_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = ()) -> dict:
+def client_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = (),
+                   server_version: str = "") -> dict:
     """Profil appliqué, après détection dans `worktree` à `ref` (profil.json mis à jour)."""
-    return effective_profile(refresh_profile(client_name, worktree, ref, cucumber_std_dir, std_runners))
+    return effective_profile(refresh_profile(client_name, worktree, ref, cucumber_std_dir, std_runners,
+                                             server_version))
 
 
 def detect_in_base(client_name: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str,
-                   std_runners: list = ()) -> dict:
+                   std_runners: list = (), server_version: str = "") -> dict:
     """Profil détecté dans un worktree du dépôt client à `base` (avant génération). Lève RuntimeError."""
     worktree = add_worktree(cucumber_repo_dir, base_worktree_dir(client_name), f"cucumber_{client_name}_profil", base,
                             reset=True)
-    return client_profile(client_name, worktree, base, cucumber_std_dir, std_runners)
+    return client_profile(client_name, worktree, base, cucumber_std_dir, std_runners, server_version)
 
 
 def init_view(profile: dict) -> dict:
@@ -213,7 +238,8 @@ def init_view(profile: dict) -> dict:
 def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_CODES) -> str:
     """
     Bloc « PROFIL CLIENT » de la partie variable du prompt de lot : seuls emplacement, tag et données autorisés,
-    interdiction d'écrire purge, clear ou init. Tout vient du profil ; un champ vide est signalé comme tel.
+    interdiction d'écrire purge, clear ou init et de modifier les fichiers de l'init globale, marquage TODO-VERSION
+    quand la bibliothèque du client diffère du serveur. Tout vient du profil ; un champ vide est signalé comme tel.
     """
     root = profile.get("features_root") or "(non renseignée : signale-le dans « raison »)"
     tag = profile.get("tag_client") or "(non renseigné : n'ajoute aucun tag client)"
@@ -223,11 +249,71 @@ def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_
         f"- Racine des features (seul emplacement autorisé) : '{root}'",
         f"- Tag du client (casse exacte) : {tag}",
         cucumber_init_data.init_block(init_view(profile), clear, max_codes),
+        protected_block(profile.get("protected_files") or []),
+        *filter(None, [version_block(profile.get("library_version", ""), profile.get("server_version", "")),
+                       initializers_block(profile.get("server_initialized_data") or [],
+                                          profile.get("initializers_survive_clear", ""))]),
         "- N'utilise QUE des steps existants (catalogue du Standard, steps du client) ou définis par ce lot, avec la "
         "syntaxe de colonnes du Standard actuel ; préfère un Background à un scénario « Contexte » séparé."])
 
 
+def version_block(library: str, server: str) -> str:
+    """
+    Ligne du bloc profil quand la bibliothèque de steps du client diffère du serveur (Standard aligné) : marquer
+    d'un TODO-VERSION chaque step, colonne ou champ pris au Standard aligné sans certitude qu'il existe dans la
+    bibliothèque du client. '' si les versions sont inconnues ou identiques.
+    """
+    if not library or not server or not cucumber_checks.compare_versions(library, server):
+        return ""
+    return (f"- Versions : le client exécute la bibliothèque de steps {library}, le catalogue du Standard est aligné "
+            f"sur le serveur {server}. Un step, une colonne ou un champ récent peut manquer à l'exécution : garde-le "
+            f"s'il est nécessaire, mais précède sa ligne du commentaire Gherkin "
+            f"`# {cucumber_versions.TODO_MARKER} <step, colonne ou champ> — à vérifier en {library}` (inventorié "
+            f"automatiquement) ; n'invente aucun contournement.")
+
+
+def initializers_block(data: list, survive_clear: str, max_codes: int = 20) -> str:
+    """
+    Ligne du bloc profil : codes créés par les initializers serveur, utilisables (présents après un clear) ou à
+    créer dans le Background. '' sans donnée codée.
+    """
+    coded = [d for d in data if d.get("code")]
+    if not coded:
+        return ""
+
+    def codes(items):
+        shown = [f"{d['code']} ({d.get('entite') or '?'})" for d in items[:max_codes]]
+        return ", ".join(shown) + (f", … (+{len(items) - max_codes})" if len(items) > max_codes else "")
+    present = [d for d in coded if cucumber_initializers.usable(d, survive_clear)]
+    missing = [d for d in coded if d not in present]
+    parts = [f"- Données créées au démarrage par les initializers serveur ({len(coded)}, hors features d'init)"]
+    if present:
+        parts.append(f"présentes après le clear, utilisables : {codes(present)}")
+    if missing:
+        parts.append(("effacées par le clear" if survive_clear == "non" else "présence après le clear incertaine")
+                     + f" : {codes(missing)} — ne t'y fie pas, crée la donnée dans le Background ou signale un "
+                       f"constat « donnee_introuvable »")
+    return " ; ".join(parts) + "."
+
+
+def protected_block(protected: list, max_folders: int = 6) -> str:
+    """Ligne du bloc profil : fichiers de l'init globale à ne jamais modifier, résumés par dossier (borné)."""
+    if not protected:
+        return "- Fichiers de l'init globale : aucun détecté ; ne modifie de toute façon aucun fichier d'initialisation."
+    folders = sorted({p.rsplit("/", 1)[0] + "/" for p in protected})
+    shown = ", ".join(folders[:max_folders]) + (f", … ({len(folders) - max_folders} autres)"
+                                                if len(folders) > max_folders else "")
+    return (f"- Fichiers protégés de l'init globale ({len(protected)} : features d'init et fichiers qu'elles intègrent, "
+            f"dossiers {shown}) : partagés par tous les tests, ne les modifie JAMAIS (un fichier rejeté arrête "
+            f"l'intégration et fait échouer les autres tests) ; une donnée manquante se crée dans le Background de ta "
+            f"feature.")
+
+
 def conventions(profile: dict) -> dict:
-    """Conventions des contrôles et du runner : racine, tag, init et runner du client."""
+    """Conventions des contrôles et du runner : racine, tag, init, fichiers protégés, runner et versions du client."""
     return {"features_root": profile.get("features_root", ""), "client_tag": profile.get("tag_client", ""),
-            "init": list(profile.get("init_features") or []), "runner": profile.get("runner") or {}}
+            "init": list(profile.get("init_features") or []), "runner": profile.get("runner") or {},
+            "protected_files": list(profile.get("protected_files") or []),
+            "library_version": profile.get("library_version", ""), "server_version": profile.get("server_version", ""),
+            "server_initialized_data": list(profile.get("server_initialized_data") or []),
+            "initializers_survive_clear": profile.get("initializers_survive_clear", "")}

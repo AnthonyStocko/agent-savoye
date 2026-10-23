@@ -1040,7 +1040,8 @@ with tab_cucumber:
             with st.form(f"cucumber_profile_{cucumber_client}"):
                 values = {}
                 with st.container(horizontal=True):
-                    for key in ("features_root", "tag_client", "init_tags", "clear_name", "library_version"):
+                    for key in ("features_root", "tag_client", "init_tags", "clear_name", "library_version",
+                                "server_version"):
                         values[key] = st.text_input(f"{cucumber_profile.LABELS[key]} ({origin(key)})",
                                                     value=profile[key], disabled=sources.get(key) == "depot")
                 values["init_features"] = [line.strip() for line in st.text_area(
@@ -1054,6 +1055,13 @@ with tab_cucumber:
                     options, default=profile["spec_files"], disabled=sources.get("spec_files") == "depot",
                     help="Intégrés par l'init après l'initialisation globale, dans l'ordre de sélection. Suggestions : "
                          "fichiers de données du dépôt client hors initialisation Standard.")
+                values["protected_files"] = [line.strip() for line in st.text_area(
+                    f"{cucumber_profile.LABELS['protected_files']} ({origin('protected_files')}, "
+                    f"{len(profile['protected_files'])}), un par ligne",
+                    value="\n".join(profile["protected_files"]), disabled=sources.get("protected_files") == "depot",
+                    height=100, help="Features d'init et fichiers qu'elles intègrent, partagés par tous les tests : "
+                                     "toute modification par la génération est une erreur bloquante (fichier "
+                                     "restauré après le lot, patch refusé).").splitlines() if line.strip()]
                 codes = {}
                 with st.container(horizontal=True):
                     for category in cucumber_profile.REFERENCE_CATEGORIES:

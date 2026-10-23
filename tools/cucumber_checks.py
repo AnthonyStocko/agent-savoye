@@ -17,6 +17,7 @@ import re
 import shutil
 from collections import Counter
 
+from tools import cucumber_versions
 from tools.cucumber_tools import (WORKSPACE_DIR, _git, _read_text_file, _write_text, add_worktree, blob_texts,
                                   build_dir, cache_dir, java_package_segment, ls_tree, verify_build)
 
@@ -262,12 +263,13 @@ def new_features(worktree: str, base: str, features: list) -> set:
 def check_lot_files(worktree: str, base: str, files: list, client_name: str, cucumber_std_dir: str,
                     inspired: list = (), conventions: dict = None) -> dict:
     """
-    Contrôles déterministes des features d'un lot : emplacement, casse du tag client, fichiers de données (copiés du
-    Standard quand c'est possible). Les fichiers d'une feature mal placée ne sont pas contrôlés : ils dépendent de
-    son futur dossier. `conventions` (profil client) : racine et tag du client, à défaut détectés. Renvoie
-    {"copies", "erreurs"}.
+    Contrôles déterministes des features d'un lot : fichiers protégés de l'init globale (restaurés), emplacement,
+    casse du tag client, fichiers de données (copiés du Standard quand c'est possible). Les fichiers d'une feature
+    mal placée ne sont pas contrôlés : ils dépendent de son futur dossier. `conventions` (profil client) : racine,
+    tag et fichiers protégés du client, racine et tag à défaut détectés. Renvoie {"copies", "restaures", "erreurs"}.
     """
     conventions = conventions or {}
+    protected = check_protected_files(worktree, base, conventions.get("protected_files"))
     features = [f for f in files if f.endswith(".feature")
                 and os.path.exists(os.path.join(worktree, *f.split("/")))]
     root = conventions.get("features_root") or client_features_root(worktree, base, client_name, cucumber_std_dir)
@@ -275,7 +277,91 @@ def check_lot_files(worktree: str, base: str, files: list, client_name: str, cuc
     placed = [f for f in features if not any(e.startswith(f + " :") for e in misplaced)]
     data = check_data_files(worktree, placed, cucumber_std_dir, inspired=inspired)
     tags = check_tags(worktree, features, conventions.get("client_tag") or client_tag(worktree, base, client_name))
-    return {"copies": data["copies"], "erreurs": misplaced + tags + data["erreurs"]}
+    return {"copies": data["copies"], "restaures": protected["restaures"],
+            "erreurs": protected["erreurs"] + misplaced + tags + data["erreurs"]}
+
+
+# ---------------------------------------------------------------------------
+# Fichiers protégés de l'initialisation globale et cohérence git du livrable
+# ---------------------------------------------------------------------------
+
+PROTECTED_REASON = ("fichier de l'init globale, partagé par tous les tests : créer la donnée dans la feature "
+                    "(Background) ou dans une étape d'init dédiée")
+# Fichiers d'un lot qui doivent être livrés : features, classes Java, données et règles
+_DELIVERED_FILE = re.compile(rf"\.(feature|java|{'|'.join(DATA_EXTENSIONS)})$", re.I)
+_BUILD_OUTPUT = re.compile(r"(^|/)target/")
+
+
+def changed_since(worktree: str, base: str) -> set:
+    """Fichiers suivis ajoutés, modifiés ou supprimés depuis `base` : commits du worktree et modifications en cours."""
+    out = _git(worktree, "diff", "--name-only", "--no-renames", "-z", base, "--").stdout
+    return {p for p in out.split("\0") if p}
+
+
+def check_protected_files(worktree: str, base: str, protected: list, restore: bool = True) -> dict:
+    """
+    Fichiers protégés (features d'init et fichiers qu'elles intègrent) modifiés depuis `base` : une erreur bloquante
+    par fichier. `restore` : fichier remis à son contenu de `base` (un binaire ne se corrige pas par Edit), la
+    donnée manquante restant à créer dans la feature. Renvoie {"restaures", "erreurs"}.
+    """
+    touched = sorted(changed_since(worktree, base) & set(protected or ()))
+    in_base = ls_tree(worktree, base) if restore and touched else {}
+    restored = [p for p in touched if p in in_base]
+    if restored:
+        _git(worktree, "checkout", base, "--", *restored)
+    return {"restaures": restored,
+            "erreurs": [f"{p} : modifié alors que c'est un {PROTECTED_REASON}"
+                        + (" ; modification annulée (fichier restauré depuis la base)" if p in restored else "")
+                        for p in touched]}
+
+
+def ignored_test_files(worktree: str) -> list:
+    """
+    Fichiers de test nouveaux (features, Java, données) ignorés par le .gitignore du dépôt client : sans ajout
+    forcé, ils manqueraient au commit et au patch.
+    """
+    out = _git(worktree, "ls-files", "-o", "-i", "--exclude-standard", "-z", "--", "src/test").stdout
+    return sorted(p for p in out.split("\0") if p and _DELIVERED_FILE.search(p) and not _BUILD_OUTPUT.search(p))
+
+
+def uncommitted_files(worktree: str) -> list:
+    """Fichiers modifiés ou nouveaux restés hors du dernier commit du worktree (hors sorties Maven target/)."""
+    out = _git(worktree, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames").stdout
+    return sorted(p[3:] for p in out.split("\0") if len(p) > 3 and not _BUILD_OUTPUT.search(p[3:]))
+
+
+def patch_paths(worktree: str, patch: str) -> set:
+    """Fichiers d'un patch format-patch, binaires compris (git apply --numstat, chemins non échappés)."""
+    out = _git(worktree, "apply", "--numstat", "-z", patch).stdout.split("\0")
+    paths, index = set(), 0
+    while index < len(out):
+        fields = out[index].split("\t")
+        if len(fields) == 3 and fields[2]:
+            paths.add(fields[2])
+        elif len(fields) == 3 and index + 2 < len(out):
+            # Renommage : chemins d'origine et de destination dans les deux entrées suivantes
+            paths |= {out[index + 1], out[index + 2]}
+            index += 2
+        index += 1
+    return paths
+
+
+def check_patch_files(worktree: str, base: str, patch: str, client_name: str = "") -> list:
+    """
+    Fichiers ajoutés ou modifiés depuis `base` (commits du worktree) absents du patch : une erreur par fichier. Une
+    feature identique à la base une fois les tags @agent_ retirés n'a rien à livrer.
+    """
+    from tools.cucumber_tools import strip_agent_tags
+    expected = set(_git(worktree, "diff", "--name-only", "--no-renames", "-z", base, "HEAD", "--").stdout
+                   .split("\0")) - {""}
+    missing = expected - patch_paths(worktree, patch)
+    errors = []
+    for rel in sorted(missing):
+        head, original = (_git(worktree, "show", f"{ref}:{rel}").stdout for ref in ("HEAD", base))
+        if rel.endswith(".feature") and client_name and strip_agent_tags(head, client_name) == original:
+            continue
+        errors.append(f"{rel} : modifié dans les commits du worktree mais absent du patch {os.path.basename(patch)}")
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -312,36 +398,69 @@ def std_library_version(cucumber_std_dir: str) -> str:
     return version.group(1) if version else ""
 
 
-def version_gap(client_version: str, std_version: str) -> str:
-    """Écart entre la bibliothèque de steps du client et le Standard (SNAPSHOT ignoré) : message, '' si aucun."""
-    def norm(v):
-        return v.replace("-SNAPSHOT", "").strip()
-    if not client_version or not std_version:
-        return (f"version de bibliothèque inconnue (client : {client_version or '?'}, Standard : "
-                f"{std_version or '?'}) : écart non vérifiable")
-    if norm(client_version) == norm(std_version):
-        return ""
-    return (f"le client utilise la bibliothèque de steps {client_version}, le Cucumber Standard de la branche est en "
-            f"{std_version} : steps, colonnes et POJO peuvent différer entre la génération et l'exécution")
+def version_key(version: str) -> tuple:
+    """Clé de tri d'une version (SNAPSHOT ignoré) : segments numériques comparés comme des nombres."""
+    parts = re.split(r"[.\-_]", version.replace("-SNAPSHOT", "").strip())
+    return tuple((0, int(p), "") if p.isdigit() else (1, 0, p.lower()) for p in parts if p)
+
+
+def compare_versions(a: str, b: str) -> int:
+    """-1, 0 ou 1 selon que la version `a` est antérieure, égale ou postérieure à `b` (SNAPSHOT ignoré)."""
+    key_a, key_b = version_key(a), version_key(b)
+    return (key_a > key_b) - (key_a < key_b)
+
+
+def version_gap(client_version: str, std_version: str, server_version: str = "") -> str:
+    """
+    Écart entre la bibliothèque de steps du client et la version attendue, celle du serveur (à défaut celle du
+    Standard de la branche), SNAPSHOT ignoré : message orienté (bibliothèque en retard ou en avance), '' si aucun.
+    Signale aussi un Standard de la branche différent du serveur (catalogue de génération non aligné).
+    """
+    expected = server_version or std_version
+    if not client_version or not expected:
+        return (f"version de bibliothèque inconnue (client : {client_version or '?'}, attendue : "
+                f"{expected or '?'}) : écart non vérifiable")
+    notes = []
+    order = compare_versions(client_version, expected)
+    if order < 0:
+        notes.append(f"le client utilise la bibliothèque de steps {client_version}, ANTÉRIEURE à la version attendue "
+                     f"{expected} : des steps, colonnes, routes ou champs POJO du Standard aligné peuvent manquer ou "
+                     f"différer à l'exécution")
+    elif order > 0:
+        notes.append(f"le client utilise la bibliothèque de steps {client_version}, POSTÉRIEURE à la version attendue "
+                     f"{expected} : des routes ou champs peuvent être inconnus du serveur")
+    if server_version and std_version and compare_versions(std_version, server_version):
+        notes.append(f"le Cucumber Standard de la branche est en {std_version}, différent du serveur "
+                     f"{server_version} : catalogue de génération non aligné")
+    return " ; ".join(notes)
 
 
 def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str, compile_cmd: str,
                   dry_run_cmd: str, conventions: dict = None) -> dict:
     """
     Bilan du dépôt client à `base`, avant génération : emplacement et tags de ses features, fichiers de données
-    manquants, écart de version de la bibliothèque de steps avec le Standard, puis (si `compile_cmd`) compilation et
-    dry-run strict de toutes ses features (steps non définis ou ambigus : projet client décalé de sa bibliothèque).
-    `conventions` (profil client) : racine et tag, à défaut détectés. Écrit health_path(client). Renvoie {"ok",
-    "decale", "ecart_version", "sections", "fichier"}. Lève RuntimeError.
+    manquants, écart de version de la bibliothèque de steps avec la version attendue (serveur), écarts des steps
+    utilisés entre cette bibliothèque et le Standard aligné, marqueurs TODO-VERSION, puis (si `compile_cmd`)
+    compilation et dry-run strict de toutes ses features (steps non définis ou ambigus : projet client décalé de sa
+    bibliothèque). `conventions` (profil client) : racine, tag et versions, à défaut détectés. Écrit
+    health_path(client). Renvoie {"ok", "decale", "ecart_version", "ecarts_steps", "todo_version", "sections",
+    "fichier"} ; les écarts de steps et les marqueurs informent sans rendre le dépôt malsain. Lève RuntimeError.
     """
     conventions = conventions or {}
     worktree = add_worktree(cucumber_repo_dir, health_worktree_dir(client_name), f"cucumber_{client_name}_sante",
                             base, reset=True)
-    features = sorted(_base_features(worktree, base))
+    blobs = _base_features(worktree, base)
+    features = sorted(blobs)
     root = conventions.get("features_root") or client_features_root(worktree, base, client_name, cucumber_std_dir)
     convention = conventions.get("client_tag") or client_tag(worktree, base, client_name)
-    versions = (library_version(worktree), std_library_version(cucumber_std_dir))
-    gap = version_gap(*versions)
+    versions = (conventions.get("library_version") or library_version(worktree), std_library_version(cucumber_std_dir))
+    server = conventions.get("server_version", "")
+    gap = version_gap(*versions, server)
+    steps_report = {"ref_bibliotheque": "", "ecarts": [], "avertissement": ""}
+    if versions[0] and versions[1] and compare_versions(*versions):
+        steps_report = cucumber_versions.version_report(cucumber_std_dir, versions[0],
+                                                        blob_texts(worktree, blobs.values()).values())
+    markers = cucumber_versions.todo_markers(worktree, base)
     sections = {
         "Emplacement": check_locations(features, root, client_name, set(features)),
         "Tags": check_tags(worktree, features, convention),
@@ -358,8 +477,8 @@ def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_
     lines = [f"# Bilan de santé de {client_name}-cucumber", "",
              f"- Base : `{base}` ; {len(features)} feature(s) ; racine des features : `{root}` ; tag client : "
              f"`{convention}`",
-             f"- Bibliothèque de steps : client {versions[0] or '?'} ; Cucumber Standard {versions[1] or '?'}"
-             + (f" — ⚠️ {gap}" if gap else " — identiques"),
+             f"- Bibliothèque de steps : client {versions[0] or '?'} ; Cucumber Standard {versions[1] or '?'} ; "
+             f"serveur {server or '?'}" + (f" — ⚠️ {gap}" if gap else " — alignés"),
              "- Compilation et dry-run : " + ("non lancés (CUCUMBER_COMPILE_CMD vide)" if not compile_cmd else
                                               "OK" if build["ok"] else f"{build['etape']} en échec")]
     if drifted:
@@ -369,6 +488,15 @@ def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_
                      "la version de sa bibliothèque) avant de générer.")
     for title, errors in sections.items():
         lines += ["", f"## {title} : {len(errors)}", ""] + [f"- {e}" for e in errors]
+    if steps_report["ref_bibliotheque"] or steps_report["avertissement"]:
+        lines += ["", f"## Écarts des steps utilisés entre la bibliothèque et le Standard aligné : "
+                      f"{len(steps_report['ecarts'])}", ""]
+        lines += ([f"- ⚠️ {steps_report['avertissement']}"] if steps_report["avertissement"] else
+                  [f"- Référence de la bibliothèque : `{steps_report['ref_bibliotheque']}`"])
+        lines += [f"- {cucumber_versions.difference_line(d)}" for d in steps_report["ecarts"]]
+    if markers:
+        lines += ["", f"## Marqueurs {cucumber_versions.TODO_MARKER.rstrip(':')} : {len(markers)}", ""]
+        lines += [f"- {m['fichier']}:{m['ligne']} — {m['texte']}" for m in markers]
     _write_text(health_path(client_name), "\n".join(lines) + "\n")
-    return {"ok": ok, "decale": drifted, "ecart_version": gap, "sections": sections,
-            "fichier": health_path(client_name)}
+    return {"ok": ok, "decale": drifted, "ecart_version": gap, "ecarts_steps": steps_report, "todo_version": markers,
+            "sections": sections, "fichier": health_path(client_name)}

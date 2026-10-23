@@ -299,3 +299,39 @@ def test_claude_env_config_dir(main_module, monkeypatch):
     assert main_module.claude_env()["CLAUDE_CONFIG_DIR"] == os.path.expanduser("~/.claude-pro")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", " ")
     assert "CLAUDE_CONFIG_DIR" not in main_module.claude_env()
+
+
+def test_lot_result_constats_are_normalized():
+    text = ('```json\n[{"id": "sp-1", "statut": "couvert", "constats": ['
+            '{"type": "donnee_introuvable", "detail": "  code   transporteur absent ", "fichier": "a.feature"},'
+            '{"type": "ECART_SPEC_CODE", "detail": "Jira : seuil 10 ; code : 12"}, {"type": "tautologique"},'
+            '"texte libre", {"type": "inconnu", "detail": "x"}]}, {"id": "sp-2", "statut": "non_couvert"}]\n```')
+    results = ct.parse_lot_result(text)
+    assert results[0]["constats"] == [
+        {"type": "donnee_introuvable", "detail": "code transporteur absent", "fichier": "a.feature"},
+        {"type": "ecart_spec_code", "detail": "Jira : seuil 10 ; code : 12", "fichier": ""},
+        {"type": "autre", "detail": "texte libre", "fichier": ""},
+        {"type": "autre", "detail": "x", "fichier": ""}]
+    assert results[1]["constats"] == []
+    assert ct.constat_line(results[0]["constats"][0]) == "donnée introuvable : code transporteur absent (a.feature)"
+    assert len(ct.normalize_constats({"constats": ["c"] * 20})) == ct.MAX_CONSTATS
+
+
+def test_summary_lists_constats(tmp_path, monkeypatch):
+    monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path))
+    result = {"id": "sp-1", "statut": "non_couvert", "raison": "r",
+              "constats": [{"type": "tautologique", "detail": "relecture de la valeur créée", "fichier": ""}]}
+    state = {"lots": [{"numero": 1, "ids": ["sp-1"], "statut": "termine", "resultats": [result]}]}
+    inventory = {"specifiques": [{"id": "sp-1", "libelle": "un", "fichiers": []}]}
+    text = open(ct.write_coverage_summary("clientx", inventory, state), encoding="utf-8").read()
+    assert "## Constats des lots" in text and "- un — scénario tautologique écarté : relecture de la valeur créée" in text
+
+
+def test_system_prompt_describes_constats(main_module):
+    names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
+             "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
+             "class_suffix features_root client_tag clear_name").split()
+    text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
+                                     tour_alerte=30)
+    assert "=== CONSTATS" in text and '"constats": [{"type": "donnee_introuvable|ecart_spec_code|tautologique"' in text
+    assert all(kind in text for kind in ct.CONSTAT_TYPES) and "Il n'est pas tautologique" in text

@@ -66,17 +66,27 @@ def client_repo(repo):
 
 
 def test_profile_detected_from_repository(client_repo, std_dir, cache):
-    profile, suggestions, warnings = cp.detect_profile(CLIENT, client_repo, "HEAD", std_dir, [STD_RUNNER])
+    creation = {"entite": "RefReportDoc", "code": "DOC1", "expression": "DOC_CODE", "mode": "initByNaturalId",
+                "certitude": "certain"}
+    ct.save_inventory(CLIENT, {"specifiques": [], "initialiseurs": [
+        {"depot": "app", "chemin": "A.java", "classe": "DocInitializer", "creations": [creation]}]})
+    profile, suggestions, warnings = cp.detect_profile(CLIENT, client_repo, "HEAD", std_dir, [STD_RUNNER], "26.21")
     assert profile["features_root"] == f"{RES}/features/{CLIENT}/" and profile["tag_client"] == CLIENT_TAG
     assert profile["init_features"] == [INIT_REL] and profile["init_tags"] == f"@INIT_{CLIENT.upper()}_WMS"
     assert profile["clear_name"] == CLEAR
     # Fichiers intégrés après l'initialisation globale, dans l'ordre de la feature
     folder = f"{RES}/files/{CLIENT}/01-Contexte/WMS/"
     assert profile["spec_files"] == [folder + "20-SpecDocument.xlsm", folder + "10-SpecStatus.csv"]
+    # Fichiers protégés : la feature d'init et tout ce qu'elle intègre (dossier de l'init globale compris)
+    assert set(profile["protected_files"]) == {INIT_REL, *(folder + n for n in (
+        "01-RefSiteDraft.csv", "03-RefStockOwnerDraft.csv", "04-ExcPartnerDraft.csv", "20-SpecDocument.xlsm",
+        "10-SpecStatus.csv"))}
     assert profile["reference_codes"]["sites"] == list(SITES)
     assert profile["reference_codes"]["donneurs_ordres"] == list(OWNERS)
     assert profile["reference_codes"]["partenaires"] == ["PART-X"]
-    assert profile["library_version"] == "26.21"
+    assert profile["library_version"] == "26.21" and profile["server_version"] == "26.21"
+    assert profile["server_initialized_data"] == [{"depot": "app", "classe": "DocInitializer", **creation,
+                                                   "statut": "inconnu"}]
     # Pas de runner propre, test-jar du Standard : runner du Standard en surcouche
     assert profile["runner"]["classe"] == "cucumber.RunCucumberTest" and profile["runner"]["surcouche"]
     assert profile["runner"]["plugin_json"].startswith("json:")
@@ -89,8 +99,8 @@ def test_profile_detected_from_repository(client_repo, std_dir, cache):
 
 def test_undetected_fields_stay_empty_with_warnings(repo, std_dir, cache):
     git(repo, "commit", "-q", "--allow-empty", "-m", "vide")
-    profile, _, warnings = cp.detect_profile(CLIENT, repo, "HEAD", std_dir)
-    assert profile["clear_name"] == "" and profile["init_features"] == [] and profile["spec_files"] == []
+    profile, _, warnings = cp.detect_profile(CLIENT, repo, "HEAD", std_dir, server_version="dev")
+    assert profile["server_version"] == "" and profile["clear_name"] == "" and profile["init_features"] == [] and profile["spec_files"] == []
     assert profile["library_version"] == "" and not profile["runner"]["classe"]
     effective = cp.effective_profile({"detecte": profile, "avertissements_detection": warnings})
     assert any("clear de l'environnement vide" in w for w in effective["avertissements"])
@@ -125,11 +135,14 @@ def test_invalid_repo_profile_is_ignored_with_warning(client_repo, std_dir, cach
 
 
 def test_views_for_checks(client_repo, std_dir, cache):
-    effective = cp.client_profile(CLIENT, client_repo, "HEAD", std_dir)
+    effective = cp.client_profile(CLIENT, client_repo, "HEAD", std_dir, server_version="26.30")
     assert cp.init_view(effective)["features"] == [{"chemin": INIT_REL}]
     assert cp.init_view(effective)["codes"]["sites"] == list(SITES)
-    assert {k: v for k, v in cp.conventions(effective).items() if k != "runner"} == {
-        "features_root": f"{RES}/features/{CLIENT}/", "client_tag": CLIENT_TAG, "init": [INIT_REL]}
+    assert {k: v for k, v in cp.conventions(effective).items() if k not in ("runner", "protected_files")} == {
+        "features_root": f"{RES}/features/{CLIENT}/", "client_tag": CLIENT_TAG, "init": [INIT_REL],
+        "library_version": "26.21", "server_version": "26.30", "server_initialized_data": [],
+        "initializers_survive_clear": ""}
+    assert INIT_REL in cp.conventions(effective)["protected_files"]
 
 
 def guarded_files() -> list:
@@ -154,8 +167,15 @@ def test_profile_block_in_lot_prompt(client_repo, std_dir, cache):
     assert f"sites [{', '.join(SITES)}]" in block and "Utilise UNIQUEMENT ces codes" in block
     assert "Ne réécris jamais de purge ni d'init" in block and CLEAR in block
     assert "N'utilise QUE des steps existants" in block and "Background" in block
+    assert "Fichiers protégés de l'init globale (6" in block and f"{RES}/files/{CLIENT}/01-Contexte/WMS/" in block
+    assert "ne les modifie JAMAIS" in block
+    assert "TODO-VERSION" not in block
+    gap = cp.profile_block({**cp.empty_profile(), "library_version": "26.16", "server_version": "26.21-SNAPSHOT"})
+    assert "bibliothèque de steps 26.16" in gap and "`# TODO-VERSION: <step, colonne ou champ> — à vérifier en 26.16`" in gap
+    assert cp.version_block("26.21", "26.21-SNAPSHOT") == "" and cp.version_block("", "26.21") == ""
     empty = cp.profile_block(cp.effective_profile({}))
     assert "(non renseignée" in empty and "aucune feature d'initialisation détectée" in empty
+    assert "aucun détecté" in empty
 
 
 def test_lot_prompts_take_profile_from_variables(monkeypatch):
@@ -174,3 +194,19 @@ def test_generated_init_spec_files_detected_back(client_repo, std_dir, cache):
     text = ci.adapt_feature(INIT.replace(f"    And INIT- Intégration des fichiers", "    # ", 1), "WMS", CLIENT, CLEAR,
                             CLIENT_TAG, [spec], INIT_REL)
     assert cp.init_spec_files(INIT_REL, text)[0] == spec
+
+
+def test_initializer_statuses_and_profile_block():
+    data = [{"depot": "app", "classe": "C", "entite": "RefReportDoc", "code": code, "expression": code,
+             "mode": "initByNaturalId", "certitude": "certain", "statut": "inconnu"} for code in ("DOC1", "DOC2")]
+    document = {"detecte": {**cp.empty_profile(), "server_initialized_data": data},
+                "saisi": {"server_initialized_data": [{**data[0], "statut": "recreee"},
+                                                      {"classe": "Manuel", "code": "M1", "statut": "survit"}]}}
+    effective = cp.effective_profile(document)
+    assert [(d["code"], d["statut"]) for d in effective["server_initialized_data"]] == [
+        ("DOC1", "recreee"), ("DOC2", "inconnu"), ("M1", "survit")]
+    block = cp.initializers_block(effective["server_initialized_data"], "")
+    assert "utilisables : DOC1 (RefReportDoc), M1 (?)" in block and "incertaine : DOC2 (RefReportDoc)" in block
+    assert "effacées par le clear : DOC2" in cp.initializers_block(effective["server_initialized_data"], "non")
+    assert "incertaine" not in cp.initializers_block(effective["server_initialized_data"], "oui")
+    assert cp.initializers_block([], "") == "" and "initializers serveur" in cp.profile_block(effective)

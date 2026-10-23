@@ -2200,6 +2200,8 @@ def prepare(client_name: str, client_root: str, std_root: str, cucumber_std_dir:
     inventory["couverture_existante"] = coverage["fichier"]
     match_coverage(inventory, coverage)
     jira_extracts(inventory, tickets)
+    from tools.cucumber_initializers import find_initializers
+    inventory["initialiseurs"] = find_initializers(inventory)
     _write_json(inventory_path(client_name), inventory)
     return inventory
 
@@ -2258,9 +2260,14 @@ def add_worktree(cucumber_repo_dir: str, path: str, branch: str, base: str, rese
     return path
 
 
-def commit_lot(worktree: str, client_name: str, lot_number: int) -> bool:
-    """Commite les fichiers écrits par le lot (hors sorties Maven). Renvoie True si un commit a été créé."""
+def commit_lot(worktree: str, client_name: str, lot_number: int, forced: list = ()) -> bool:
+    """
+    Commite les fichiers écrits par le lot (hors sorties Maven), plus `forced` : fichiers de test ignorés par le
+    .gitignore du client, ajoutés de force pour être livrés. Renvoie True si un commit a été créé.
+    """
     _git(worktree, "add", "-A", "--", ".", ":(exclude)target", ":(exclude)**/target/**")
+    if forced:
+        _git(worktree, "add", "-f", "--", *forced)
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return False
     return _git(worktree, "commit", "-m", f"Cucumber coverage of {client_name} specifics - lot {lot_number}"
@@ -2928,8 +2935,42 @@ def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) 
     return "\n".join(lines).rstrip()
 
 
+CONSTAT_TYPES = {"donnee_introuvable": "donnée introuvable",
+                 "ecart_spec_code": "écart entre spécification et code",
+                 "tautologique": "scénario tautologique écarté"}
+MAX_CONSTATS = 10
+
+
+def normalize_constats(result: dict) -> list:
+    """
+    « constats » d'un résultat de lot (champ facultatif) ramenés à [{type, detail, fichier}] : entrée sans détail
+    ignorée, type hors CONSTAT_TYPES rangé en « autre », au plus MAX_CONSTATS. Le résultat est mis à jour.
+    """
+    constats = []
+    raw = result.get("constats")
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, str):
+            item = {"detail": item}
+        if not isinstance(item, dict) or not str(item.get("detail") or "").strip():
+            continue
+        kind = str(item.get("type") or "").strip().lower()
+        constats.append({"type": kind if kind in CONSTAT_TYPES else "autre",
+                         "detail": " ".join(str(item["detail"]).split())[:500],
+                         "fichier": str(item.get("fichier") or "").strip()})
+    result["constats"] = constats[:MAX_CONSTATS]
+    return result["constats"]
+
+
+def constat_line(constat: dict) -> str:
+    return (f"{CONSTAT_TYPES.get(constat['type'], 'constat')} : {constat['detail']}"
+            + (f" ({constat['fichier']})" if constat.get("fichier") else ""))
+
+
 def parse_lot_result(text: str):
-    """Bloc JSON final de l'agent (liste d'objets par spécifique), ou None s'il est absent ou invalide."""
+    """
+    Bloc JSON final de l'agent (liste d'objets par spécifique, « constats » normalisés), ou None s'il est absent
+    ou invalide.
+    """
     text = (text or "").strip()
     fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.S)
     candidates = fenced[::-1] + [text]
@@ -2944,6 +2985,8 @@ def parse_lot_result(text: str):
         if isinstance(data, dict):
             data = data.get("specifiques") or data.get("resultats") or [data]
         if isinstance(data, list) and all(isinstance(d, dict) and "id" in d for d in data):
+            for result in data:
+                normalize_constats(result)
             return data
     return None
 
@@ -3119,6 +3162,13 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
         lines += ["", "## Scénarios supprimés à la revue", ""]
         lines += [f"- {d['fichier']} / {d['titre']} : {' ; '.join(d['motifs'])}"
                   + (f" — {d['justification']}" if d.get("justification") else "") for d in deleted]
+    noted = [(i, c) for i in selected for c in (results.get(i) or {}).get("constats") or []]
+    if noted:
+        lines += ["", "## Constats des lots", "",
+                  "Signalés par l'agent : donnée absente qu'il n'a pas pu créer, comportement du code différent de la "
+                  "spécification (le test suit le code), scénario écarté car il ne vérifiait que sa propre mise en "
+                  "place.", ""]
+        lines += [f"- {specs.get(i, {}).get('libelle', i)} — {constat_line(c)}" for i, c in noted]
     classes = list(dict.fromkeys(c for i in covered for c in results[i].get("classes_java") or []))
     if classes:
         lines += ["", "## Classes Java écrites", ""] + [f"- {c}" for c in classes]

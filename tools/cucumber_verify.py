@@ -567,33 +567,41 @@ _EXCEPTION_NAME = re.compile(r"\b((?:[a-z_]\w*\.)*[A-Z]\w*(?:Exception|Error|Fai
 
 # Donnée de référence absente de l'environnement (« Site non trouvé(e) avec code XXX »)
 _REFERENCE_FAILURE = re.compile(r"non\s+trouv[ée]+(?:\(e\))?s?\s+avec\s+(?:le\s+)?code", re.I)
-# Écart de version entre la bibliothèque de steps et le serveur : route absente, champ exigé ou inconnu du POJO
-_ENVIRONMENT_FAILURE = re.compile(r"No route found|\b404\s*-\s*\w|UnrecognizedPropertyException|Unrecognized field|"
-                                  r"must not be (?:null|blank|empty)|ne doit pas être (?:nul|vide)|is required|"
-                                  r"est obligatoire|required (?:field|property)|champ obligatoire", re.I)
-# Erreur du test lui-même : colonne ou chemin de champ refusé, fichier de données absent
-_TEST_FAILURE = re.compile(r"No such path|Invalid path|FileNotFoundException|NoSuchFileException", re.I)
+# Écart de version entre la bibliothèque de steps et le serveur : route absente, chemin ou champ inconnu du POJO,
+# paramètre exigé par le serveur et absent de la bibliothèque (un chemin de champ inventé n'est alors plus corrigé)
+_VERSION_FAILURE = re.compile(r"No route found|Invalid path|has no field|UnrecognizedPropertyException|"
+                              r"Unrecognized field|parameter\b[^\n]{0,80}?\bis required", re.I)
+# Environnement : ressource introuvable, champ exigé par le serveur
+_ENVIRONMENT_FAILURE = re.compile(r"\b404\s*-\s*\w|must not be (?:null|blank|empty)|ne doit pas être (?:nul|vide)|"
+                                  r"is required|est obligatoire|required (?:field|property)|champ obligatoire", re.I)
+# Erreur du test lui-même : colonne refusée, fichier de données absent
+_TEST_FAILURE = re.compile(r"No such path|FileNotFoundException|NoSuchFileException", re.I)
 # Erreur serveur : bug applicatif probable
 _APPLICATION_FAILURE = re.compile(r"Internal Server Error|\bHTTP[/ ]?\d?\.?\d?\s*5\d\d\b|status(?: code)?\D{0,12}5\d\d\b",
                                   re.I)
 ENV_NOT_VERIFIED = "non vérifié — environnement"
+VERSION_GAP = "écart de version bibliothèque / serveur"
 REFERENCE_NOT_VERIFIED = "non vérifié — donnée de référence absente"
 APPLICATION_BUG = "bug applicatif probable"
 # Natures d'échec qui ne viennent pas du test : le scénario n'est ni corrigé pour cela ni retiré
-NOT_TEST_NATURES = ("environnement", "donnee_reference", "bug_applicatif")
+NOT_TEST_NATURES = ("environnement", "version", "donnee_reference", "bug_applicatif")
+# Niveau d'exécution de chaque nature hors test : un écart de version relève de l'environnement
+_NOT_TEST_LEVELS = {"environnement": "env", "version": "env", "donnee_reference": "ref", "bug_applicatif": "bug"}
 
 
 def failure_kind(error_message: str) -> tuple:
     """
-    (nature, nom de l'exception) d'un message d'échec Cucumber : donnee_reference, environnement (version, route,
-    champ exigé), bug_applicatif (erreur serveur), sinon échec du test : technique (colonne, chemin, fichier, code
-    du step) ou assertion.
+    (nature, nom de l'exception) d'un message d'échec Cucumber : donnee_reference, version (route, chemin ou champ
+    inconnu, paramètre exigé : écart bibliothèque / serveur), environnement (champ exigé), bug_applicatif (erreur
+    serveur), sinon échec du test : technique (colonne, fichier, code du step) ou assertion.
     """
     message = str(error_message or "")
     exception = _EXCEPTION_NAME.search(message)
     name = exception.group(1).rsplit(".", 1)[-1] if exception else ""
     if _REFERENCE_FAILURE.search(message):
         return "donnee_reference", name
+    if _VERSION_FAILURE.search(message):
+        return "version", name
     if _ENVIRONMENT_FAILURE.search(message):
         return "environnement", name
     if _TEST_FAILURE.search(message):
@@ -604,7 +612,12 @@ def failure_kind(error_message: str) -> tuple:
 
 
 def failure_category(nature: str) -> str:
-    """Catégorie d'un échec : environnement, donnee_reference, bug_applicatif, cascade ou test (assertion, technique)."""
+    """
+    Catégorie d'un échec : environnement (version comprise), donnee_reference, bug_applicatif, cascade ou test
+    (assertion, technique).
+    """
+    if nature == "version":
+        return "environnement"
     return nature if nature in NOT_TEST_NATURES or nature == "cascade" else "test"
 
 
@@ -852,8 +865,9 @@ def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple
         return ("nv" if expect_failure else "cascade"), result["message"]
     if not expect_failure:
         if status == "echoue" and result.get("nature") in NOT_TEST_NATURES:
-            code = {"environnement": "env", "donnee_reference": "ref", "bug_applicatif": "bug"}[result["nature"]]
-            return code, f"{result['step']} — {result['message']}".strip(" —")
+            detail = f"{result['step']} — {result['message']}".strip(" —")
+            return _NOT_TEST_LEVELS[result["nature"]], (f"{VERSION_GAP} : {detail}" if result["nature"] == "version"
+                                                        else detail)
         return ("ok", "passe") if status == "passe" else (
             "ko", f"{status} : {result['step']} — {result['message']}".strip(" —:"))
     if status == "echoue":

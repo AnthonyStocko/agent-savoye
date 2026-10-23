@@ -13,7 +13,7 @@ import re
 import xml.etree.ElementTree as ET
 import zipfile
 
-from tools.cucumber_checks import FEATURES_ROOT, FILES_ROOT, data_references, repo_files, resolved_path
+from tools.cucumber_checks import FEATURES_ROOT, FILES_ROOT, RULES_ROOT, data_references, repo_files, resolved_path
 from tools.cucumber_tools import _read_text_file, _write_json, cache_dir
 
 # Catégorie d'un fichier de données d'après son nom (premier motif trouvé), colonne « code » de ses lignes
@@ -78,12 +78,21 @@ def step_lines(text: str) -> list:
 
 
 def init_data_files(rel: str, text: str, present: set) -> list:
-    """Fichiers de données intégrés par une feature d'init : références des steps, et dossier entier si chargé."""
+    """Fichiers intégrés par une feature d'init : références des steps (règles comprises), et dossier entier si chargé."""
     files = [resolved_path(rel, ref) for ref in data_references(text)]
     if _GLOBAL_INIT_STEP in text:
         folder = resolved_path(rel, {"nom": "", "regle": False})
         files += sorted(p for p in present if p.startswith(folder))
-    return [p for p in dict.fromkeys(files) if p in present and p.startswith(FILES_ROOT)]
+    return [p for p in dict.fromkeys(files) if p in present and p.startswith((FILES_ROOT, RULES_ROOT))]
+
+
+def protected_files(init: dict) -> list:
+    """
+    Fichiers de l'initialisation globale, partagés par tous les tests : features d'init et fichiers qu'elles intègrent.
+    Une modification les casse tous (fichier rejeté : intégration arrêtée, échecs en cascade).
+    """
+    return list(dict.fromkeys(p for f in (init or {}).get("features", [])
+                              for p in [f["chemin"], *(f.get("fichiers") or [])]))
 
 
 # ---------------------------------------------------------------------------

@@ -155,27 +155,31 @@ def test_failure_kind_categories():
     # Donnée de référence absente de l'environnement
     assert cv.failure_kind("java.lang.AssertionError: 404 - Site non trouvé(e) avec code SITEA")[0] == "donnee_reference"
     assert cv.failure_kind("Donneur d'ordres non trouvé(e) avec code DO-1")[0] == "donnee_reference"
-    # Écart de version bibliothèque / serveur : route absente, champ exigé, champ inconnu du POJO
-    assert cv.failure_kind("No route found for \"GET /api/v1/x\"")[0] == "environnement"
+    # Écart de version bibliothèque / serveur : route absente, chemin ou champ inconnu du POJO, paramètre exigé
+    assert cv.failure_kind("No route found for \"GET /api/v1/x\"")[0] == "version"
+    assert cv.failure_kind("com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException: x")[0] == "version"
+    assert cv.failure_kind("Invalid path: 'wmsContent.wmsHandlingUnit.code'")[0] == "version"
+    assert cv.failure_kind("class HandlingUnitPojo has no field additionalProperties")[0] == "version"
+    assert cv.failure_kind("400 : parameter 'warehouseCode' is required")[0] == "version"
+    # Environnement : champ exigé par le serveur
     assert cv.failure_kind("400 Bad Request : field 'priority' must not be null")[0] == "environnement"
-    assert cv.failure_kind("com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException: x")[0] == "environnement"
-    # Erreurs du test : colonne, chemin de filtre, fichier de données
+    # Erreurs du test : colonne, fichier de données
     assert cv.failure_kind("No such path 'value' in status")[0] == "technique"
-    assert cv.failure_kind("Invalid path: 'wmsContent.wmsHandlingUnit.code'")[0] == "technique"
     assert cv.failure_kind("java.io.FileNotFoundException: ./a.xml")[0] == "technique"
     # Erreur serveur
     assert cv.failure_kind("Request failed : 500 Internal Server Error")[0] == "bug_applicatif"
     # Un statut HTTP attendu dans une assertion reste une assertion
     assert cv.failure_kind("AssertionError: expected status <200> but was <404>")[0] == "assertion"
-    assert [cv.failure_category(n) for n in ("assertion", "technique", "environnement", "donnee_reference",
-                                              "bug_applicatif", "cascade")] == [
-        "test", "test", "environnement", "donnee_reference", "bug_applicatif", "cascade"]
+    assert [cv.failure_category(n) for n in ("assertion", "technique", "environnement", "version",
+                                              "donnee_reference", "bug_applicatif", "cascade")] == [
+        "test", "test", "environnement", "environnement", "donnee_reference", "bug_applicatif", "cascade"]
 
 
 def test_not_test_failures_are_not_invalid():
     expected = {"java.lang.RuntimeException: 404 - Site non trouvé(e) avec code SITEA":
                 ("ref", "donnee_reference", cv.REFERENCE_NOT_VERIFIED),
                 "No route found for GET /x": ("env", "environnement", cv.ENV_NOT_VERIFIED),
+                "field 'priority' must not be null": ("env", "environnement", cv.ENV_NOT_VERIFIED),
                 "HTTP 503 Service Unavailable": ("bug", "bug_applicatif", cv.APPLICATION_BUG)}
     for message, (code, status, prefix) in expected.items():
         result = _result("Given", "", message)
@@ -185,6 +189,9 @@ def test_not_test_failures_are_not_invalid():
         assert final == status and reason.startswith(prefix) and final in cv.UNJUDGED
         # Contre-épreuve : un échec hors test n'est pas concluant
         assert cv._level(result, expect_failure=True)[0] == "nv"
+    # Écart de version : motif explicite, jamais corrigé
+    level = cv._level(_result("Then", "", "Invalid path: 'a.b'"), expect_failure=False)
+    assert level[0] == "env" and cv.VERSION_GAP in cv.final_status({"client": level})[1]
     # Échec du test (colonne refusée) : invalide, donc corrigé puis retiré s'il le reste
     level = cv._level(_result("Then", "", "No such path 'value'"), expect_failure=False)
     assert cv.final_status({"client": level})[0] == "invalide"

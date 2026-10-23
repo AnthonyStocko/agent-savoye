@@ -211,3 +211,89 @@ def test_health_report_uses_profile_and_reports_version(client_repo, std_dir, tm
     assert len(report["sections"]["Emplacement"]) == 1
     with open(report["fichier"], encoding="utf-8") as f:
         assert "Bibliothèque de steps : client ? ; Cucumber Standard 26.16" in f.read()
+
+
+# ---------------------------------------------------------------------------
+# Fichiers protégés de l'init globale et cohérence git du livrable
+# ---------------------------------------------------------------------------
+
+INIT_FILE = f"{RES}/files/clientx/01-Contexte/WMS/20-SpecDocument.xlsm"
+
+
+@pytest.fixture
+def init_repo(client_repo):
+    """Dépôt client avec un fichier binaire de l'init globale (protégé)."""
+    path = os.path.join(client_repo, *INIT_FILE.split("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b"PK\x03\x04 init d'origine")
+    git(client_repo, "add", "-A")
+    git(client_repo, "commit", "-qm", "init")
+    return client_repo
+
+
+def test_modified_protected_file_is_restored_and_blocking(init_repo):
+    path = os.path.join(init_repo, *INIT_FILE.split("/"))
+    with open(path, "wb") as f:
+        f.write(b"PK\x03\x04 donnee ajoutee par un lot")
+    result = cc.check_protected_files(init_repo, "HEAD", [INIT_FILE])
+    assert result["restaures"] == [INIT_FILE] and len(result["erreurs"]) == 1
+    assert "fichier de l'init globale, partagé par tous les tests" in result["erreurs"][0]
+    assert "créer la donnée dans la feature" in result["erreurs"][0]
+    with open(path, "rb") as f:
+        assert f.read() == b"PK\x03\x04 init d'origine"
+    # Sans restauration (génération du patch) : erreur seulement
+    os.remove(path)
+    blocked = cc.check_protected_files(init_repo, "HEAD", [INIT_FILE], restore=False)
+    assert blocked["restaures"] == [] and len(blocked["erreurs"]) == 1 and not os.path.exists(path)
+    assert cc.check_protected_files(init_repo, "HEAD", []) == {"restaures": [], "erreurs": []}
+
+
+def test_lot_check_reports_protected_file_committed_by_previous_lot(init_repo, std_dir):
+    base = git(init_repo, "rev-parse", "HEAD")
+    with open(os.path.join(init_repo, *INIT_FILE.split("/")), "ab") as f:
+        f.write(b" modifie")
+    git(init_repo, "commit", "-qam", "lot 1")
+    result = cc.check_lot_files(init_repo, base, [], "clientx", std_dir,
+                                conventions={"protected_files": [INIT_FILE], "features_root": f"{RES}/features/clientx/",
+                                             "client_tag": "@CLIENTX"})
+    assert result["restaures"] == [INIT_FILE] and "init globale" in result["erreurs"][0]
+    assert git(init_repo, "diff", "--name-only", base) == ""
+
+
+def test_ignored_test_files_are_forced_into_the_commit(init_repo):
+    from tools import cucumber_tools as ct
+    write(os.path.join(init_repo, ".gitignore"), "*.xlsx\n*.log\n")
+    git(init_repo, "add", "-A")
+    git(init_repo, "commit", "-qm", "gitignore")
+    data = f"{RES}/files/clientx/WMS/Content/NOUVEAU.xlsx"
+    write(os.path.join(init_repo, *data.split("/")), "classeur")
+    write(os.path.join(init_repo, RES, "files", "clientx", "trace.log"), "journal")
+    forced = cc.ignored_test_files(init_repo)
+    assert forced == [data]
+    assert ct.commit_lot(init_repo, "clientx", 1, forced)
+    assert data in git(init_repo, "show", "--name-only", "--format=", "HEAD").splitlines()
+    assert cc.uncommitted_files(init_repo) == []
+    write(os.path.join(init_repo, RES, "features", "clientx", "Oublie.feature"), "Feature: x\n")
+    assert cc.uncommitted_files(init_repo) == [f"{RES}/features/clientx/Oublie.feature"]
+
+
+def test_patch_contains_every_committed_file_binaries_included(init_repo, tmp_path):
+    from tools import cucumber_tools as ct
+    base = git(init_repo, "rev-parse", "HEAD")
+    binary = f"{RES}/files/clientx/WMS/Content/Données é.xlsm"
+    with open(os.path.join(init_repo, *binary.split("/")), "wb") as f:
+        f.write(bytes(range(256)))
+    write(os.path.join(init_repo, RES, "features", "clientx", "WMS", "Content", "Lot1.feature"), "Feature: 1\n")
+    assert ct.commit_lot(init_repo, "clientx", 1)
+    write(os.path.join(init_repo, RES, "files", "clientx", "WMS", "Content", "lot2.csv"), "code\nX\n")
+    assert ct.commit_lot(init_repo, "clientx", 2)
+    patch = str(tmp_path / "complet.patch")
+    assert ct.write_patch(init_repo, base, patch, "clientx")
+    assert binary in cc.patch_paths(init_repo, patch)
+    assert cc.check_patch_files(init_repo, base, patch, "clientx") == []
+    # Patch amputé du dernier commit : le fichier du lot 2 manque
+    partial = str(tmp_path / "partiel.patch")
+    assert ct.format_patch(init_repo, f"{base}..HEAD~1", partial)
+    errors = cc.check_patch_files(init_repo, base, partial, "clientx")
+    assert len(errors) == 1 and "lot2.csv" in errors[0] and "absent du patch" in errors[0]
