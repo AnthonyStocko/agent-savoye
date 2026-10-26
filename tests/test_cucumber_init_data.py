@@ -176,7 +176,7 @@ STD_RUNNER = {"path": "src/test/java/cucumber/RunCucumberTest.java", "fqcn": "cu
               "plugins": ["pretty", "json:target/cucumber-reports/Cucumber.json"]}
 
 
-def runner(features=f"{RES}/features/", tags="@CLIENTX", plugins='"pretty", "json:target/cucumber.json"'):
+def runner(features=f"{RES}/features/", tags="not @A_REVOIR", plugins='"pretty", "json:target/cucumber.json"'):
     text = RUNNER.format(features=features, tags=tags, plugins=plugins)
     files = {"src/test/java/cucumber/RunnerTest.java": text}
     return ct.runner_entries(ct.java_classes(files), files)[0]
@@ -185,7 +185,7 @@ def runner(features=f"{RES}/features/", tags="@CLIENTX", plugins='"pretty", "jso
 def test_runner_options_are_read():
     entry = runner()
     assert entry["fqcn"] == "cucumber.RunnerTest" and entry["glue"] == ["cucumber"]
-    assert entry["features"] == [f"{RES}/features/"] and entry["tags"] == ["@CLIENTX"]
+    assert entry["features"] == [f"{RES}/features/"] and entry["tags"] == ["not @A_REVOIR"]
     assert "json:target/cucumber.json" in entry["plugins"]
 
 
@@ -195,6 +195,19 @@ def test_tags_match():
     assert ct.tags_match("(@A or @B) and not @C", {"@B"}) and ct.tags_match("", {"@X"})
 
 
+def test_runner_never_filters_on_client_tag_and_excludes_disabled():
+    # Filtre sur le tag client : retiré (l'init et les features anciennes ne le portent pas toujours)
+    gaps = ct.runner_gaps(runner(tags="@CLIENTX"), "cucumber.features.clientx", CONVENTIONS)
+    assert len(gaps) == 2 and "retire le filtre sur le tag client @CLIENTX" in gaps[0]
+    assert 'tags = "not @A_REVOIR"' in gaps[1]
+    # Filtre d'exclusion existant : combiné avec l'exclusion des scénarios désactivés
+    gaps = ct.runner_gaps(runner(tags="not @wip"), "cucumber.features.clientx", CONVENTIONS)
+    assert gaps == ['exclus les scénarios désactivés dans le runner : tags = "(not @wip) and not @A_REVOIR"']
+    assert ct.runner_gaps(runner(tags="not @wip and not @A_REVOIR"), "cucumber.features.clientx", CONVENTIONS) == []
+    assert ct.filters_on_tag(["@CLIENTX or @INIT"], "@CLIENTX") and not ct.filters_on_tag(["not @X"], "@CLIENTX")
+    assert ct.excludes_tag(["not @A_REVOIR"], "@A_REVOIR") and not ct.excludes_tag([], "@A_REVOIR")
+
+
 def test_runner_without_gap():
     assert ct.runner_gaps(runner(), "cucumber.features.clientx", CONVENTIONS) == []
 
@@ -202,10 +215,11 @@ def test_runner_without_gap():
 def test_runner_gaps_path_tags_json():
     gaps = ct.runner_gaps(runner(features=f"{RES}/features/WMS", tags="@WMS", plugins='"pretty"'),
                           "cucumber.features.clientx", CONVENTIONS)
-    assert len(gaps) == 3
+    assert len(gaps) == 4
     assert "chemin de features" in gaps[0] and f"{RES}/features/clientx/" in gaps[0]
-    assert "« @WMS » ne sélectionne pas @CLIENTX" in gaps[1]
-    assert "json:target/cucumber-reports/Cucumber.json" in gaps[2]
+    assert "retire le filtre « @WMS »" in gaps[1]
+    assert 'tags = "not @A_REVOIR"' in gaps[2]
+    assert "json:target/cucumber-reports/Cucumber.json" in gaps[3]
     # classpath: rapporté à src/test/resources/
     assert ct.runner_gaps(runner(features="classpath:cucumber/features"), "cucumber.features.clientx",
                           CONVENTIONS) == []
@@ -232,7 +246,7 @@ def test_overlay_uses_standard_runner():
 def test_no_runner_creation_includes_init_and_tags():
     status, target = ct.runner_status_for("cucumber.features.clientx", [], [], "Clientx", CONVENTIONS)
     assert target is None and ct.needs_runner(status)
-    assert INIT_REL in status and "@CLIENTX" in status and "json:" in status
+    assert INIT_REL in status and "@CLIENTX" in status and "json:" in status and 'not @A_REVOIR' in status
 
 
 def test_client_with_std_test_jar_and_no_runner_runs_in_overlay(client_repo, tmp_path, monkeypatch):
@@ -245,7 +259,7 @@ def test_client_with_std_test_jar_and_no_runner_runs_in_overlay(client_repo, tmp
 def test_second_runner_written_by_lot_is_rejected(client_repo):
     rel = "src/test/java/cucumber/features/clientx/RunClientxCucumberTest.java"
     write(os.path.join(client_repo, *rel.split("/")),
-          RUNNER.format(features=f"{RES}/features/", tags="@CLIENTX", plugins='"json:a.json"')
+          RUNNER.format(features=f"{RES}/features/", tags="not @A_REVOIR", plugins='"json:a.json"')
           .replace("package cucumber;", "package cucumber.features.clientx;")
           .replace("RunnerTest", "RunClientxCucumberTest"))
     java = {"overlay_run": True, "runner": STD_RUNNER, "package_steps": "cucumber.features.clientx"}

@@ -1,6 +1,7 @@
 """Vérification des tests Cucumber générés : mutation, niveaux, statut final, job Jenkins."""
 import os
 
+from tests.conftest import write
 from tools import cucumber_verify as cv
 
 FEATURE = """Feature: Commandes
@@ -311,3 +312,27 @@ def test_unknown_table_column_reported_with_closest(repo):
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "lot")
     assert cv.check_table_columns(repo, "HEAD", [rel], reference) == []
+
+
+def test_scenario_dependencies(tmp_path):
+    rel = "src/test/resources/cucumber/features/clientx/Dep.feature"
+    write(os.path.join(str(tmp_path), rel),
+          "Feature: Dépendances\n\n"
+          "  Scenario: Contexte\n    Given INIT- Intégration des fichiers via l'écran\n      | fileName |\n"
+          "      | CIN-1.xml |\n\n"
+          "  Scenario: Création\n    When STOCK- je crée le contenant \"CONT-1\"\n"
+          "    Then STOCK- le contenant \"CONT-1\" est \"LIBRE\"\n\n"
+          "  Scenario: Blocage\n    When STOCK- je bloque le contenant \"CONT-1\"\n"
+          "    Then STOCK- le contenant \"CONT-1\" est \"BLOQUE\"\n\n"
+          "  Scenario: Autonome\n    When STOCK- je crée le contenant \"CONT-2\"\n"
+          "    Then STOCK- le statut est \"LIBRE\"\n")
+    errors = cv.check_scenario_dependencies(str(tmp_path), [rel])
+    assert len(errors) == 2
+    assert "mise en place « Contexte » séparé" in errors[0]
+    assert "« Blocage » utilise CONT-1 créé(s) par « Création »" in errors[1]
+    # Donnée créée dans le Background : disponible pour tous les scénarios
+    write(os.path.join(str(tmp_path), rel),
+          "Feature: Dépendances\n\n  Background:\n    Given STOCK- je crée le contenant \"CONT-1\"\n\n"
+          "  Scenario: Création\n    When STOCK- je crée le contenant \"CONT-1\"\n    Then STOCK- ok\n\n"
+          "  Scenario: Blocage\n    When STOCK- je bloque le contenant \"CONT-1\"\n    Then STOCK- ok\n")
+    assert cv.check_scenario_dependencies(str(tmp_path), [rel]) == []

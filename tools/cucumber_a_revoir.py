@@ -10,7 +10,9 @@ Scénarios à revoir (RÈGLE 3, 0 token) : un scénario n'est jamais supprimé.
 - Seuil CUCUMBER_MAX_RETRACT_PCT : au-delà (ou si un spécifique perdrait tous ses scénarios actifs, ou si un échec
   côté test persiste), rien n'est désactivé et la génération s'arrête pour une décision humaine.
 - A_REVOIR.md à la racine du dépôt client (section générée entre deux marqueurs, le reste conservé) : défauts
-  détectés en tête, puis scénarios désactivés (cause, preuve, condition de réactivation) et scénarios faibles.
+  détectés en tête, puis scénarios désactivés (cause, preuve, condition de réactivation) et scénarios faibles. Une
+  cause déduite (défaut produit derrière une erreur serveur, cascade d'une mise en place, déploiement) est notée NON
+  PROUVÉE, avec la vérification à faire (export de logs serveur sur une fenêtre étroite autour du step).
 - Aucun nettoyage ne supprime un step, un fichier de données ou une règle encore utilisé (check_deletions).
 """
 import os
@@ -18,16 +20,16 @@ import re
 
 from tools import cucumber_checks
 from tools.cucumber_tools import (_GHERKIN_STEP, _expression_regex, _git, _read_text_file, _write_text,
-                                  constat_line, step_expressions)
-from tools.cucumber_verify import VERSION_GAP, _title_key, parse_scenarios
+                                  a_revoir_tag, constat_line, excludes_tag, step_expressions)
+from tools.cucumber_verify import VERSION_GAP, _title_key, failure_kind, log_request, parse_scenarios
 
-DEFAULT_TAG = "@A_REVOIR"
 DEFAULT_MAX_RETRACT_PCT = 30
 A_REVOIR_FILE = "A_REVOIR.md"
 BEGIN = "<!-- agent-savoye : début de la section générée -->"
 END = "<!-- agent-savoye : fin de la section générée -->"
 REALIGNED = "# Réaligné sur le code :"
 DISABLED_COMMENT = "# À revoir :"
+UNPROVEN = "NON PROUVÉE"
 FORBIDDEN_TAGS = ("@ignore", "@Ignore", "@wip", "@skip")
 # Cause hors test : libellé et condition de réactivation
 CAUSES = {
@@ -44,11 +46,6 @@ CAUSES = {
 }
 _STATUS_CAUSE = {"environnement": "environnement", "donnee_reference": "donnee_reference",
                  "bug_applicatif": "bug_applicatif", "deploiement": "deploiement"}
-
-
-def a_revoir_tag() -> str:
-    tag = os.getenv("CUCUMBER_TAG_A_REVOIR", "").strip() or DEFAULT_TAG
-    return tag if tag.startswith("@") else "@" + tag
 
 
 def max_retract_pct() -> float:
@@ -159,11 +156,14 @@ def _feature_texts(worktree: str) -> dict:
 def check_deletions(worktree: str, base: str) -> list:
     """
     Fichiers supprimés depuis `base` encore utilisés par une feature (scénario actif ou désactivé) : fichier de
-    données ou règle référencé, classe Java dont un step est employé. Une erreur bloquante par fichier.
+    données ou règle référencé, classe Java dont un step est employé ; step retiré d'une classe conservée alors
+    qu'une feature l'emploie. Une erreur bloquante par fichier ou par step.
     """
     deleted = [p for p in _git(worktree, "diff", "--name-only", "--diff-filter=D", "--no-renames", base, "--")
                .stdout.splitlines() if p]
-    if not deleted:
+    modified = [p for p in _git(worktree, "diff", "--name-only", "--diff-filter=M", "--no-renames", base, "--",
+                                "*.java").stdout.splitlines() if p]
+    if not deleted and not modified:
         return []
     features = _feature_texts(worktree)
     referenced = {cucumber_checks.resolved_path(rel, ref) for rel, text in features.items()
@@ -182,6 +182,15 @@ def check_deletions(worktree: str, base: str) -> list:
         elif rel in referenced or any(r == rel.rsplit(".", 1)[0] for r in referenced):
             errors.append(f"{rel} : fichier supprimé alors qu'une feature le référence — interdit, restaure-le "
                           f"(RÈGLE 3g)")
+    for rel in modified:
+        before, _ = step_expressions(_git(worktree, "show", f"{base}:{rel}").stdout)
+        now, _ = step_expressions(_read_text_file(os.path.join(worktree, *rel.split("/"))))
+        for expression in sorted(set(before) - set(now)):
+            regex = _expression_regex(expression)
+            used = next((line for line in step_lines if regex and regex.match(line)), "")
+            if used:
+                errors.append(f"{rel} : step « {expression} » retiré alors que « {used} » l'utilise — interdit, "
+                              f"restaure-le (RÈGLE 3g)")
     return errors
 
 
@@ -234,6 +243,27 @@ def decide(scenarios: dict, spec_of: dict, max_pct: float = None) -> dict:
 # Désactivation par tag, jamais de suppression (RÈGLE 3f)
 # ---------------------------------------------------------------------------
 
+def proof_status(cause: str, item: dict) -> tuple:
+    """
+    (prouvée, vérification à faire) d'une cause hors test. Prouvée : le message d'échec du serveur la montre
+    directement (route ou champ inconnu, donnée « non trouvée avec code », champ exigé). Déduite, donc NON PROUVÉE :
+    défaut produit derrière une erreur serveur, scénario en cascade d'une mise en place, déploiement en retard,
+    cause que le message ne montre pas ; la vérification à faire indique la fenêtre d'export des logs serveur.
+    """
+    logs = log_request(item)
+    if item.get("statut") == "cascade":
+        return False, ("le scénario n'a pas été jugé sur ses propres steps (mise en place en échec) : le rejouer seul "
+                       "une fois la mise en place corrigée ; " + logs)
+    if cause == "bug_applicatif":
+        return False, f"erreur serveur constatée, défaut produit déduit : le confirmer par la trace serveur ; {logs}"
+    if cause == "deploiement":
+        return False, f"comparer la version déployée au dépôt (écran reçu, valeur lue) ; {logs}"
+    nature = failure_kind(item.get("motif", ""))[0]
+    if nature == cause or (cause == "environnement" and nature == "version"):
+        return True, ""
+    return False, f"cause déduite, absente du message d'échec : la confirmer par une preuve directe ; {logs}"
+
+
 def _proof(item: dict, max_chars: int = 200) -> str:
     return " ".join(str(item.get("motif", "")).split())[:max_chars]
 
@@ -276,7 +306,8 @@ def deactivate(worktree: str, rel: str, items: dict, client_tag: str) -> list:
                 lines.insert(line, indent + tag)
                 top = line
             if not (top > 0 and lines[top - 1].strip().startswith(DISABLED_COMMENT)):
-                lines.insert(top, f"{indent}{DISABLED_COMMENT} {label} — {_proof(item)}")
+                unproven = "" if proof_status(cause, item)[0] else f" ({UNPROVEN})"
+                lines.insert(top, f"{indent}{DISABLED_COMMENT} {label}{unproven} — {_proof(item)}")
             done.append(scenario["titre"])
         elif move_client and tag not in scenario["tags"]:
             if has_tags:
@@ -297,7 +328,7 @@ def apply_decision(worktree: str, files: list, scenarios: dict, decision: dict, 
                    located: dict) -> list:
     """
     Désactive les scénarios de decision["desactiver"] ; `located` : {tag: (feature, scénario)} (tagged_scenarios).
-    Renvoie [{fichier, titre, tag, cause, preuve, reactivation, id}] pour A_REVOIR.md.
+    Renvoie [{fichier, titre, id, cause, preuve, reactivation, prouvee, verification, heure}] pour A_REVOIR.md.
     """
     by_file = {}
     for tag, cause in decision["desactiver"].items():
@@ -308,8 +339,10 @@ def apply_decision(worktree: str, files: list, scenarios: dict, decision: dict, 
     for rel, items in by_file.items():
         deactivate(worktree, rel, items, client_tag)
         for title, (cause, item) in items.items():
+            proven, check = proof_status(cause, item)
             entries.append({"fichier": rel, "titre": title, "id": item.get("id", ""), "cause": cause,
-                            "preuve": _proof(item, 400), "reactivation": CAUSES[cause][1]})
+                            "preuve": _proof(item, 400), "reactivation": CAUSES[cause][1], "prouvee": proven,
+                            "verification": check, "heure": item.get("heure", "")})
     return entries
 
 
@@ -323,7 +356,9 @@ def generated_section(state: dict, specifics: dict) -> str:
     label = lambda i: specifics.get(i, {}).get("libelle", i)  # noqa: E731
     disabled = [e for lot in lots for e in lot.get("a_revoir") or []]
     weak = [e for lot in lots for e in lot.get("faibles") or []]
-    defects = [e for e in disabled if e["cause"] == "bug_applicatif"]
+    # Défauts avérés (preuve directe) en tête
+    defects = sorted((e for e in disabled if e["cause"] == "bug_applicatif"),
+                     key=lambda e: not e.get("prouvee", True))
     defects += [{"constat": c, "spec": r["id"]} for lot in lots for r in lot.get("resultats") or []
                 for c in r.get("constats") or [] if c.get("type") == "ecart_spec_code"]
     stops = [lot for lot in lots if lot.get("statut") == "decision_humaine"]
@@ -333,13 +368,19 @@ def generated_section(state: dict, specifics: dict) -> str:
              "réactivation.", "", f"## Défauts détectés : {len(defects)}", ""]
     for d in defects:
         if "constat" in d:
-            lines.append(f"- {label(d['spec'])} — {constat_line(d['constat'])}")
+            lines.append(f"- {label(d['spec'])} — {constat_line(d['constat'])} ({UNPROVEN} : constat de l'agent, à "
+                         f"confirmer par une trace serveur, un écran reçu ou une valeur lue)")
         else:
-            lines.append(f"- {d['fichier']} / {d['titre']} — {d['preuve']}")
+            lines.append(f"- {d['fichier']} / {d['titre']} — {d['preuve']}" + (
+                "" if d.get("prouvee", True) else f" ({UNPROVEN} : {d.get('verification', '')})"))
     lines += ["", f"## Scénarios désactivés : {len(disabled)}", ""]
     for e in disabled:
         lines += [f"### {e['fichier']} / {e['titre']}", "",
-                  f"- Cause : {CAUSES[e['cause']][0]}", f"- Preuve : `{e['preuve']}`",
+                  f"- Cause : {CAUSES[e['cause']][0]}" + ("" if e.get("prouvee", True) else f" — **{UNPROVEN}**"),
+                  f"- Preuve : `{e['preuve']}`"]
+        if not e.get("prouvee", True):
+            lines.append(f"- Vérification à faire : {e.get('verification', '')}")
+        lines += [
                   f"- Condition de réactivation : {e['reactivation']} ; retirer alors le tag `{a_revoir_tag()}` et "
                   f"le commentaire, et remettre le tag client.", ""]
     if weak:
@@ -374,7 +415,7 @@ def write_a_revoir(worktree: str, state: dict, specifics: dict) -> str:
     return A_REVOIR_FILE
 
 
-def runner_selects_client_tag(runner: dict, client_tag: str) -> bool:
-    """Le runner filtre sur le tag client : un scénario qui ne le porte plus n'est pas exécuté."""
-    return bool(client_tag) and any(client_tag in str(t) for t in (runner or {}).get("tags") or [])
-
+def runner_excludes_a_revoir(runner: dict) -> bool:
+    """Le runner exclut les scénarios désactivés : sinon ils restent exécutés (le filtre du job peut ne pas
+    atteindre Cucumber)."""
+    return excludes_tag((runner or {}).get("tags") or [], a_revoir_tag())

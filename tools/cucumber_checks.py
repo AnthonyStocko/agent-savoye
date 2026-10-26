@@ -8,7 +8,11 @@ santé du dépôt avant génération.
   présent seulement dans le Cucumber Standard manque. Il est copié automatiquement depuis le Standard quand on l'y
   trouve ; sinon c'est une erreur de lot.
 - Emplacement : toute nouvelle feature est sous la racine des features du client (ex. features/<client>/).
-- Tags : le tag du client garde la casse de ses features existantes (ex. @CLIENT, jamais @client).
+- Tags : le tag du client garde la casse de ses features existantes (ex. @CLIENT, jamais @client) ; chaque scénario
+  actif le porte (directement ou par sa ligne Feature), aucun scénario désactivé n'en hérite ; deux dry-runs, sans
+  filtre et avec le tag client, sélectionnent le même nombre de scénarios (« nombre attendu » de la livraison).
+- Exécution : le job de vérification lit la branche verify_branch du profil ; le worktree y est commité et poussé
+  avant chaque vérification (jamais de push forcé).
 - Bilan de santé : ces contrôles sur les features existantes du client, plus compilation et dry-run de tout le projet.
 """
 import os
@@ -18,8 +22,10 @@ import shutil
 from collections import Counter
 
 from tools import cucumber_versions
-from tools.cucumber_tools import (WORKSPACE_DIR, _git, _read_text_file, _write_text, add_worktree, blob_texts,
-                                  build_dir, cache_dir, java_package_segment, ls_tree, verify_build)
+from tools.cucumber_tools import (WORKSPACE_DIR, _git, _read_text_file, _write_text, a_revoir_tag, add_worktree,
+                                  blob_texts, build_dir, cache_dir, dry_run_errors, java_package_segment, ls_tree,
+                                  run_maven, verify_build)
+from tools.cucumber_verify import _read_report, _report_files, expected_count, report_test_count, scenario_units
 
 RESOURCES = "src/test/resources/cucumber/"
 FEATURES_ROOT = RESOURCES + "features/"
@@ -254,6 +260,81 @@ def check_tags(worktree: str, features: list, convention: str) -> list:
     return errors
 
 
+def check_client_tags(texts: dict, client: str, disabled: str = "") -> list:
+    """
+    Tag client des scénarios ({feature: texte}) : chaque scénario actif le porte, directement ou par sa ligne
+    Feature (init comprise) ; aucun scénario désactivé (tag `disabled`, a_revoir_tag par défaut) ne le porte ni n'en
+    hérite. Un tag de Feature s'applique à tous ses scénarios : pour désactiver une partie d'une feature, le tag
+    client descend sur les scénarios actifs. Une erreur par scénario.
+    """
+    disabled, errors = disabled or a_revoir_tag(), []
+    for rel, text in texts.items():
+        for unit in scenario_units(text):
+            where = f"{rel}:{unit['ligne']} « {unit['titre']} »"
+            if disabled not in unit["tags"] and client not in unit["tags"]:
+                errors.append(f"{where} : scénario actif sans le tag client {client} (ni sur la ligne Feature) : il "
+                              f"ne serait pas exécuté par un job filtré sur {client} ; ajoute-le au-dessus du scénario")
+            elif disabled in unit["tags"] and client in unit["feature"]:
+                errors.append(f"{where} : scénario désactivé ({disabled}) qui hérite du tag client {client} par sa "
+                              f"ligne Feature : retire {client} de la ligne Feature et mets-le sur les seuls "
+                              f"scénarios actifs")
+            elif disabled in unit["tags"] and client in unit["propres"]:
+                errors.append(f"{where} : scénario désactivé ({disabled}) qui porte le tag client {client} : "
+                              f"retire-le")
+    return errors
+
+
+def _dry_run_count(build: str, dry_run_cmd: str, paths: list, tags: str = "") -> dict:
+    """Dry-run strict des features `paths` (filtre `tags` s'il est donné) : {ok, nombre, erreurs, environnement}."""
+    for old in _report_files(build):
+        os.remove(old)
+    command = f'{dry_run_cmd} "-Dcucumber.features={",".join(paths)}" -Dcucumber.execution.dry-run=true'
+    code, output = run_maven(command + (f' "-Dcucumber.filter.tags={tags}"' if tags else ""), build)
+    errors = dry_run_errors(output)
+    report = [r for path in _report_files(build) for r in _read_report(path)]
+    summary = re.findall(r"^\s*(\d+) Scenarios?\b", output, re.M)
+    count = report_test_count(report) if report else int(summary[-1]) if summary else -1
+    if code != 0 or errors or count < 0:
+        return {"ok": False, "nombre": count, "environnement": not errors,
+                "erreurs": errors or [line.strip() for line in output.strip().splitlines()[-3:]]
+                or ["aucun rapport de dry-run"]}
+    return {"ok": True, "nombre": count, "erreurs": [], "environnement": False}
+
+
+def selection_check(build: str, dry_run_cmd: str, texts: dict, client: str) -> dict:
+    """
+    Deux dry-runs stricts des features du client ({chemin: texte}) : sans filtre (le runner exclut les scénarios
+    désactivés) et avec le tag client. Même nombre de scénarios, égal au nombre attendu à la lecture des features
+    (scénarios actifs) : ce nombre est le « nombre attendu » de la livraison. Renvoie {ok, sans_filtre, tag_client,
+    attendu, nombre_attendu, erreurs, environnement}.
+    """
+    paths = []
+    for directory in feature_dirs(sorted(texts)):
+        # Dossier partagé avec d'autres features (init hors de la racine du client) : fichiers un par un
+        on_disk = {os.path.relpath(os.path.join(d, n), build).replace("\\", "/")
+                   for d, _, names in os.walk(os.path.join(build, *directory.split("/"))) for n in names
+                   if n.endswith(".feature")}
+        mine = sorted(f for f in texts if f.startswith(directory + "/"))
+        paths += [directory] if on_disk <= set(mine) else mine
+    expected = expected_count(texts.values(), "", a_revoir_tag())
+    unfiltered = _dry_run_count(build, dry_run_cmd, paths)
+    tagged = _dry_run_count(build, dry_run_cmd, paths, client) if unfiltered["ok"] else unfiltered
+    out = {"ok": False, "sans_filtre": unfiltered["nombre"], "tag_client": tagged["nombre"], "attendu": expected,
+           "nombre_attendu": 0, "erreurs": [], "environnement": False}
+    if not (unfiltered["ok"] and tagged["ok"]):
+        return {**out, "erreurs": [f"dry-run en échec : {e}" for e in (unfiltered["erreurs"] or tagged["erreurs"])],
+                "environnement": unfiltered["environnement"] or tagged["environnement"]}
+    if unfiltered["nombre"] != tagged["nombre"]:
+        out["erreurs"].append(f"les deux dry-runs ne sélectionnent pas le même nombre de scénarios (sans filtre : "
+                              f"{unfiltered['nombre']}, avec {client} : {tagged['nombre']}) : des scénarios actifs ne "
+                              f"portent pas le tag client, ou le runner n'exclut pas {a_revoir_tag()}")
+    elif unfiltered["nombre"] != expected:
+        out["erreurs"].append(f"les dry-runs sélectionnent {unfiltered['nombre']} scénario(s) pour {expected} "
+                              f"scénario(s) actif(s) dans les features : filtre de tags inopérant (propriété non "
+                              f"transmise à Cucumber) ou runner qui n'exclut pas {a_revoir_tag()}")
+    return {**out, "ok": not out["erreurs"], "nombre_attendu": 0 if out["erreurs"] else tagged["nombre"]}
+
+
 def new_features(worktree: str, base: str, features: list) -> set:
     """Features absentes de `base` (créées par la génération)."""
     existing = set(_base_features(worktree, base))
@@ -328,6 +409,47 @@ def uncommitted_files(worktree: str) -> list:
     """Fichiers modifiés ou nouveaux restés hors du dernier commit du worktree (hors sorties Maven target/)."""
     out = _git(worktree, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames").stdout
     return sorted(p[3:] for p in out.split("\0") if len(p) > 3 and not _BUILD_OUTPUT.search(p[3:]))
+
+
+def verify_branch_error(worktree: str, branch: str) -> str:
+    """
+    Le job de vérification lit `branch` : le worktree doit y être commité et poussé, sinon le job exécuterait une
+    ancienne version. Renvoie '' si c'est le cas, sinon le message d'arrêt.
+    """
+    pending = uncommitted_files(worktree)
+    if pending:
+        return (f"{len(pending)} fichier(s) non commité(s) ({', '.join(pending[:3])}) : le job exécuterait une "
+                f"ancienne version — commite et pousse sur {branch} avant la vérification")
+    head = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    remote = _git(worktree, "ls-remote", "origin", f"refs/heads/{branch}")
+    pushed = remote.stdout.split()[0] if remote.stdout.split() else ""
+    if remote.returncode != 0 or not pushed:
+        return (f"branche {branch} introuvable sur origin : le job exécuterait une ancienne version (ou rien) — "
+                f"pousse le worktree sur {branch} avant la vérification")
+    if pushed != head:
+        return (f"{branch} est à {pushed[:10]} sur origin, le worktree à {head[:10]} : le job exécuterait une "
+                f"ancienne version — pousse sur {branch} avant la vérification")
+    return ""
+
+
+def push_for_verification(worktree: str, branch: str, message: str) -> tuple:
+    """
+    Commite le worktree (hors sorties Maven, fichiers de test ignorés par le .gitignore ajoutés de force) puis le
+    pousse sur `branch` (origin), sans forcer. Renvoie (erreur d'arrêt ou '', commit créé) ; un push refusé (branche
+    distante divergente, droits) arrête la vérification.
+    """
+    _git(worktree, "add", "-A", "--", ".", ":(exclude)target", ":(exclude)**/target/**")
+    forced = ignored_test_files(worktree)
+    if forced:
+        _git(worktree, "add", "-f", "--", *forced)
+    committed = (_git(worktree, "diff", "--cached", "--quiet").returncode != 0
+                 and _git(worktree, "commit", "-m", message).returncode == 0)
+    push = _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
+    if push.returncode != 0:
+        detail = " ".join((push.stderr.strip().splitlines() or ["?"])[-1].split())[:200]
+        return (f"push sur {branch} refusé ({detail}) : le job exécuterait une ancienne version — intègre la branche "
+                f"distante ou corrige les droits, puis relance"), committed
+    return verify_branch_error(worktree, branch), committed
 
 
 def patch_paths(worktree: str, patch: str) -> set:
@@ -435,16 +557,34 @@ def version_gap(client_version: str, std_version: str, server_version: str = "")
     return " ; ".join(notes)
 
 
+def runner_health(conventions: dict) -> list:
+    """
+    Cohérence du runner du profil avec la racine des features, l'init et le tag client, et rapport JSON
+    (cucumber_tools.runner_gaps) ; un runner absent est signalé. Glue non contrôlée (package des steps inconnu ici).
+    """
+    from tools.cucumber_tools import runner_gaps
+    runner = conventions.get("runner") or {}
+    if not runner.get("classe"):
+        return ["aucun runner détecté (ni runner du client, ni runner du Standard en surcouche) : à créer sur le "
+                "modèle du Standard, en incluant les features d'init"]
+    entry = {"glue": runner.get("glue") or [], "features": runner.get("features") or [],
+             "tags": runner.get("tags") or [], "plugins": [runner["plugin_json"]] if runner.get("plugin_json") else []}
+    label = runner["classe"] + (" (Standard, en surcouche)" if runner.get("surcouche") else "")
+    return [f"{label} : {gap}" for gap in runner_gaps(entry, "", conventions)]
+
+
 def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str, compile_cmd: str,
                   dry_run_cmd: str, conventions: dict = None) -> dict:
     """
     Bilan du dépôt client à `base`, avant génération : emplacement et tags de ses features, fichiers de données
-    manquants, écart de version de la bibliothèque de steps avec la version attendue (serveur), écarts des steps
+    manquants, cohérence du runner (profil fourni), écart de version de la bibliothèque de steps avec la version
+    attendue (serveur), écarts des steps
     utilisés entre cette bibliothèque et le Standard aligné, marqueurs TODO-VERSION, puis (si `compile_cmd`)
     compilation et dry-run strict de toutes ses features (steps non définis ou ambigus : projet client décalé de sa
     bibliothèque). `conventions` (profil client) : racine, tag et versions, à défaut détectés. Écrit
-    health_path(client). Renvoie {"ok", "decale", "ecart_version", "ecarts_steps", "todo_version", "sections",
-    "fichier"} ; les écarts de steps et les marqueurs informent sans rendre le dépôt malsain. Lève RuntimeError.
+    health_path(client). Tag client de chaque scénario actif, et deux dry-runs (sans filtre, avec le tag client) qui
+    donnent le nombre attendu. Renvoie {"ok", "decale", "ecart_version", "ecarts_steps", "todo_version", "sections",
+    "fichier", "nombre_attendu"} ; les écarts de steps et les marqueurs informent sans rendre le dépôt malsain. Lève RuntimeError.
     """
     conventions = conventions or {}
     worktree = add_worktree(cucumber_repo_dir, health_worktree_dir(client_name), f"cucumber_{client_name}_sante",
@@ -461,17 +601,26 @@ def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_
         steps_report = cucumber_versions.version_report(cucumber_std_dir, versions[0],
                                                         blob_texts(worktree, blobs.values()).values())
     markers = cucumber_versions.todo_markers(worktree, base)
+    contents = blob_texts(worktree, blobs.values())
+    texts = {rel: contents.get(blob, "") for rel, blob in blobs.items()}
     sections = {
         "Emplacement": check_locations(features, root, client_name, set(features)),
-        "Tags": check_tags(worktree, features, convention),
+        "Tags": check_tags(worktree, features, convention) + check_client_tags(texts, convention),
         "Fichiers de données": check_data_files(worktree, features, cucumber_std_dir, copy=False)["erreurs"],
     }
+    if conventions:
+        sections["Runner"] = runner_health(conventions)
     build = {"ok": True, "etape": "", "erreurs": [], "environnement": False}
+    selection = {"nombre_attendu": 0, "attendu": expected_count(texts.values(), "", a_revoir_tag())}
     if compile_cmd and features:
-        build = verify_build(build_dir(client_name, worktree, cucumber_std_dir), compile_cmd,
-                             feature_dirs(features), dry_run_cmd)
+        directory = build_dir(client_name, worktree, cucumber_std_dir)
+        build = verify_build(directory, compile_cmd, feature_dirs(features), dry_run_cmd)
         label = "Compilation" if build["etape"] == "compilation" else "Dry-run (steps non définis ou ambigus)"
         sections[label + (" — hors code (environnement Maven)" if build["environnement"] else "")] = build["erreurs"]
+        if build["ok"] and dry_run_cmd:
+            selection = selection_check(directory, dry_run_cmd, texts, convention)
+            sections["Sélection des scénarios (dry-runs sans filtre et avec le tag client)" + (
+                " — hors code (environnement Maven)" if selection["environnement"] else "")] = selection["erreurs"]
     drifted = not build["ok"] and not build["environnement"]
     ok = not any(sections.values())
     lines = [f"# Bilan de santé de {client_name}-cucumber", "",
@@ -480,7 +629,10 @@ def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_
              f"- Bibliothèque de steps : client {versions[0] or '?'} ; Cucumber Standard {versions[1] or '?'} ; "
              f"serveur {server or '?'}" + (f" — ⚠️ {gap}" if gap else " — alignés"),
              "- Compilation et dry-run : " + ("non lancés (CUCUMBER_COMPILE_CMD vide)" if not compile_cmd else
-                                              "OK" if build["ok"] else f"{build['etape']} en échec")]
+                                              "OK" if build["ok"] else f"{build['etape']} en échec"),
+             f"- Scénarios actifs : {selection['attendu']} à la lecture des features" + (
+                 f" ; nombre attendu (dry-runs) : {selection['nombre_attendu']}" if selection["nombre_attendu"]
+                 else "")]
     if drifted:
         lines.append("- ⚠️ **Le projet client est décalé de sa bibliothèque de steps** : ses features EXISTANTES ne "
                      "compilent pas ou ont des steps non définis ou ambigus. Ce n'est pas un problème de génération : "
@@ -499,4 +651,4 @@ def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_
         lines += [f"- {m['fichier']}:{m['ligne']} — {m['texte']}" for m in markers]
     _write_text(health_path(client_name), "\n".join(lines) + "\n")
     return {"ok": ok, "decale": drifted, "ecart_version": gap, "ecarts_steps": steps_report, "todo_version": markers,
-            "sections": sections, "fichier": health_path(client_name)}
+            "sections": sections, "fichier": health_path(client_name), "nombre_attendu": selection["nombre_attendu"]}

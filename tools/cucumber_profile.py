@@ -5,7 +5,8 @@ Le profil réunit ce que la génération et les contrôles doivent savoir du cli
 features et tags de son initialisation, clear de son environnement, fichiers d'intégration de son module
 spécifique, fichiers protégés de l'init globale, runner, codes de référence créés par l'init, version de la
 bibliothèque de steps et version du serveur (celle du Standard applicatif), données créées par les initializers
-serveur et leur sort après un clear, contournements TODO-VERSION du dépôt. Rien n'est propre à un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
+serveur et leur sort après un clear, contournements TODO-VERSION du dépôt, branche lue par le job de vérification
+(verify_branch) et paramètre du job qui la porte. Rien n'est propre à un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
 dans le dépôt client. Priorité : dépôt (.agent-savoye.json) > saisie (cache) > détection ; un champ non détecté
 reste vide, avec un avertissement.
 
@@ -26,9 +27,11 @@ REPO_PROFILE = ".agent-savoye.json"
 REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
 FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
-          "initializers_survive_clear", "workarounds")
+          "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param")
 # Champs dont l'absence est normale : vides sans avertissement
-OPTIONAL_FIELDS = ("server_initialized_data", "workarounds")
+OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param")
+# Paramètre du job de vérification qui porte la branche, à défaut de saisie
+DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
 LABELS = {"features_root": "racine des features", "tag_client": "tag client", "init_features": "features d'init",
           "init_tags": "tags d'init", "clear_name": "clear de l'environnement",
@@ -38,7 +41,9 @@ LABELS = {"features_root": "racine des features", "tag_client": "tag client", "i
           "server_version": "version du serveur",
           "server_initialized_data": "données créées par les initializers serveur",
           "initializers_survive_clear": "données des initializers conservées après un clear (vrai / faux / inconnu)",
-          "workarounds": "contournements TODO-VERSION"}
+          "workarounds": "contournements TODO-VERSION",
+          "verify_branch": "branche lue par le job de vérification (l'agent y commite et pousse avant chaque vérification)",
+          "verify_branch_param": "paramètre du job de vérification qui porte la branche"}
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _GLOBAL_INIT = "Initialisation globale par fichiers"
@@ -58,7 +63,8 @@ def empty_profile() -> dict:
             "runner": {k: ([] if k in ("features", "glue", "tags") else False if k == "surcouche" else "")
                        for k in RUNNER_KEYS},
             "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
-            "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": []}
+            "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
+            "verify_branch_param": ""}
 
 
 def is_empty(value) -> bool:
@@ -241,11 +247,13 @@ def init_view(profile: dict) -> dict:
             "codes": {k: v for k, v in (profile.get("reference_codes") or {}).items() if v}}
 
 
-def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_CODES) -> str:
+def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_CODES, gap_file: str = "") -> str:
     """
     Bloc « PROFIL CLIENT » de la partie variable du prompt de lot : seuls emplacement, tag et données autorisés,
-    interdiction d'écrire purge, clear ou init et de modifier les fichiers de l'init globale, marquage TODO-VERSION
-    quand la bibliothèque du client diffère du serveur. Tout vient du profil ; un champ vide est signalé comme tel.
+    interdiction d'écrire purge, clear ou init et de modifier les fichiers de l'init globale, steps du projet
+    marqués TODO-VERSION quand la bibliothèque du client est plus ancienne que le serveur (`gap_file` : écarts du
+    catalogue, cucumber_versions.library_gap_file), données des initializers serveur. Tout vient du profil ; un champ
+    vide est signalé comme tel.
     """
     root = profile.get("features_root") or "(non renseignée : signale-le dans « raison »)"
     tag = profile.get("tag_client") or "(non renseigné : n'ajoute aucun tag client)"
@@ -256,26 +264,32 @@ def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_
         f"- Tag du client (casse exacte) : {tag}",
         cucumber_init_data.init_block(init_view(profile), clear, max_codes),
         protected_block(profile.get("protected_files") or []),
-        *filter(None, [version_block(profile.get("library_version", ""), profile.get("server_version", "")),
+        *filter(None, [version_block(profile.get("library_version", ""), profile.get("server_version", ""),
+                                     gap_file),
                        initializers_block(profile.get("server_initialized_data") or [],
                                           profile.get("initializers_survive_clear", ""))]),
         "- N'utilise QUE des steps existants (catalogue du Standard, steps du client) ou définis par ce lot, avec la "
         "syntaxe de colonnes du Standard actuel ; préfère un Background à un scénario « Contexte » séparé."])
 
 
-def version_block(library: str, server: str) -> str:
+def version_block(library: str, server: str, gap_file: str = "") -> str:
     """
-    Ligne du bloc profil quand la bibliothèque de steps du client diffère du serveur (Standard aligné) : marquer
-    d'un TODO-VERSION chaque step, colonne ou champ pris au Standard aligné sans certitude qu'il existe dans la
-    bibliothèque du client. '' si les versions sont inconnues ou identiques.
+    Ligne du bloc profil quand la bibliothèque de steps du client diffère du serveur (Standard aligné) : step dont
+    l'implémentation de la bibliothèque est plus ancienne (`gap_file`, à interroger par Grep) remplacé par un step du
+    projet de nom unique sur le modèle récent, marqué TODO-VERSION ; bibliothèque partagée jamais modifiée. '' si les
+    versions sont inconnues ou identiques.
     """
     if not library or not server or not cucumber_checks.compare_versions(library, server):
         return ""
+    marker = f"`# {cucumber_versions.TODO_MARKER} <step, colonne ou champ> — à vérifier en {library}`"
     return (f"- Versions : le client exécute la bibliothèque de steps {library}, le catalogue du Standard est aligné "
-            f"sur le serveur {server}. Un step, une colonne ou un champ récent peut manquer à l'exécution : garde-le "
-            f"s'il est nécessaire, mais précède sa ligne du commentaire Gherkin "
-            f"`# {cucumber_versions.TODO_MARKER} <step, colonne ou champ> — à vérifier en {library}` (inventorié "
-            f"automatiquement) ; n'invente aucun contournement.")
+            f"sur le serveur {server}. "
+            + (f"Avant d'utiliser un step du Standard, cherche-le par Grep dans '{gap_file}' (steps absents de la "
+               f"bibliothèque, signature, endpoint ou champs POJO modifiés). " if gap_file else "")
+            + f"Un step absent ou dont l'implémentation de la bibliothèque est plus ancienne : écris un step du projet "
+              f"de nom unique (préfixe du client) sur le modèle du Standard aligné, et précède son usage du "
+              f"commentaire Gherkin {marker} ; une colonne ou un champ récent : même commentaire. Ne modifie JAMAIS "
+              f"la bibliothèque partagée ; n'invente aucun autre contournement.")
 
 
 def initializers_block(data: list, survive_clear: str, max_codes: int = 20) -> str:
@@ -288,7 +302,7 @@ def initializers_block(data: list, survive_clear: str, max_codes: int = 20) -> s
         return ""
 
     def codes(items):
-        shown = [f"{d['code']} ({d.get('entite') or '?'})" for d in items[:max_codes]]
+        shown = [f"{d['code']} ({d.get('entite') or '?'}, {d.get('classe') or '?'})" for d in items[:max_codes]]
         return ", ".join(shown) + (f", … (+{len(items) - max_codes})" if len(items) > max_codes else "")
     present = [d for d in coded if cucumber_initializers.usable(d, survive_clear)]
     missing = [d for d in coded if d not in present]
@@ -299,6 +313,9 @@ def initializers_block(data: list, survive_clear: str, max_codes: int = 20) -> s
         parts.append(("effacées par le clear" if survive_clear == "faux" else "présence après le clear incertaine")
                      + f" : {codes(missing)} — ne t'y fie pas, crée la donnée dans le Background ou signale un "
                        f"constat « donnee_introuvable »")
+    parts.append("aucun test de leur seule existence (tautologique) ; toute assertion sur leur état initial reprend "
+                 "les valeurs écrites par l'initializer cité (lis sa classe), un écart avec la spécification est un "
+                 "constat « ecart_spec_code », pas un test")
     return " ; ".join(parts) + "."
 
 
@@ -323,4 +340,6 @@ def conventions(profile: dict) -> dict:
             "library_version": profile.get("library_version", ""), "server_version": profile.get("server_version", ""),
             "server_initialized_data": list(profile.get("server_initialized_data") or []),
             "initializers_survive_clear": profile.get("initializers_survive_clear", ""),
-            "workarounds": list(profile.get("workarounds") or [])}
+            "workarounds": list(profile.get("workarounds") or []),
+            "verify_branch": profile.get("verify_branch", ""),
+            "verify_branch_param": profile.get("verify_branch_param", "") or DEFAULT_VERIFY_BRANCH_PARAM}

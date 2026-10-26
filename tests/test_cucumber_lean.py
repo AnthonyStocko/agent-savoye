@@ -287,7 +287,7 @@ def test_system_prompt_asks_to_write_early(main_module):
     assert main_module.warning_turn(40) == 30 and main_module.warning_turn(25) == 19
     names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
              "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
-             "class_suffix features_root client_tag clear_name").split()
+             "class_suffix features_root client_tag clear_name tag_a_revoir").split()
     text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
                                      tour_alerte=main_module.warning_turn(40))
     assert "=== ÉCRIRE TÔT ===" in text and "au plus 40 tours" in text and "au tour 30 (75 %)" in text
@@ -330,8 +330,9 @@ def test_summary_lists_constats(tmp_path, monkeypatch):
 def test_system_prompt_describes_constats(main_module):
     names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
              "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
-             "class_suffix features_root client_tag clear_name").split()
+             "class_suffix features_root client_tag clear_name tag_a_revoir").split()
     text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
                                      tour_alerte=30)
     assert "=== CONSTATS" in text and '"constats": [{"type": "donnee_introuvable|ecart_spec_code|tautologique"' in text
     assert all(kind in text for kind in ct.CONSTAT_TYPES) and "Il n'est pas tautologique" in text
+    assert "=== CONTRÔLES (Then) ===" in text and "jamais un comptage ou une recherche globale" in text

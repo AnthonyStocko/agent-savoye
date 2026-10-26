@@ -15,12 +15,14 @@ import random
 import re
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 
 from tools import jenkins_tools, memory_tools
 from tools.cucumber_tools import (_HTTP_CALL, _expression_regex, _first_argument, _git, _http_path, _java_methods,
                                   _read_text_file, _resolve, _step_prefix, _string_constants, _write_text,
-                                  WORKSPACE_DIR, blob_texts, disk_class_constants, extract_cucumber,
-                                  java_package_segment, ls_tree, report_unresolved_steps, step_expressions)
+                                  WORKSPACE_DIR, a_revoir_tag, blob_texts, disk_class_constants, extract_cucumber,
+                                  java_package_segment, ls_tree, report_unresolved_steps, step_expressions,
+                                  tags_match)
 
 # ---------------------------------------------------------------------------
 # Niveau 1 : contrôle statique (doublons, assertions, réutilisation, champs du JSON)
@@ -84,6 +86,93 @@ def parse_scenarios(text: str) -> list:
         elif line.strip().startswith("|") and current is not None and current["steps"]:
             current["steps"][-1]["table"].append(" ".join(line.split()))
     return scenarios
+
+
+_FEATURE_LINE = re.compile(r"^\s*(Feature|Fonctionnalité)\s*:")
+_RULE_LINE = re.compile(r"^\s*(Rule|Règle)\s*:")
+_EXAMPLES_LINE = re.compile(r"^\s*(Examples|Exemples|Scenarios)\s*:")
+
+
+def scenario_units(text: str) -> list:
+    """
+    Scénarios d'une feature tels que Cucumber les sélectionne : [{titre, ligne, propres (tags du scénario),
+    feature (tags de la ligne Feature et de la Rule, hérités), tags (tags effectifs), exemples [(tags du bloc
+    Examples, lignes)], nombre (tests exécutés : 1, ou une ligne d'Examples par test)}].
+    """
+    units, pending, feature, rule, current, examples = [], [], [], [], None, None
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("@"):
+            pending = pending + [t for t in stripped.split() if t.startswith("@")]
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        if _FEATURE_LINE.match(line):
+            feature, pending, current, examples = pending, [], None, None
+        elif _RULE_LINE.match(line):
+            rule, pending, current, examples = pending, [], None, None
+        elif _BACKGROUND_LINE.match(line):
+            pending, current, examples = [], None, None
+        elif _SCENARIO_LINE.match(line):
+            current = {"titre": _SCENARIO_LINE.match(line).group(2).strip(), "ligne": number, "propres": pending,
+                       "feature": feature + rule, "tags": feature + rule + pending, "exemples": []}
+            units.append(current)
+            pending, examples = [], None
+        elif _EXAMPLES_LINE.match(line) and current is not None:
+            examples = [pending, -1]
+            current["exemples"].append(examples)
+            pending = []
+        elif stripped.startswith("|") and examples is not None:
+            examples[1] += 1
+        elif _STEP_LINE.match(line):
+            examples = None
+    for unit in units:
+        unit["exemples"] = [(tags, max(rows, 0)) for tags, rows in unit["exemples"]]
+        unit["nombre"] = sum(rows for _, rows in unit["exemples"]) if unit["exemples"] else 1
+    return units
+
+
+def expected_count(texts, expression: str = "", exclude: str = "") -> int:
+    """
+    Nombre de tests que Cucumber exécuterait sur ces features avec le filtre `expression` ('' : aucun), sans les
+    scénarios portant `exclude` : un par scénario, un par ligne d'Examples d'un plan de scénario.
+    """
+    total = 0
+    for text in texts:
+        for unit in scenario_units(text):
+            for tags, rows in unit["exemples"] or [((), 1)]:
+                effective = set(unit["tags"]) | set(tags)
+                if tags_match(expression, effective) and not (exclude and exclude in effective):
+                    total += rows
+    return total
+
+
+def feature_texts(worktree: str) -> list:
+    """Textes des .feature suivis ou nouveaux du worktree."""
+    paths = _git(worktree, "ls-files", "-co", "--exclude-standard", "--", "*.feature").stdout.splitlines()
+    return [_read_text_file(os.path.join(worktree, *p.split("/"))) for p in paths
+            if os.path.exists(os.path.join(worktree, *p.split("/")))]
+
+
+def report_test_count(report: list) -> int:
+    """Tests exécutés d'un rapport Cucumber JSON : éléments hors Background (une ligne d'Examples = un test)."""
+    return sum(1 for feature in report if isinstance(feature, dict) for element in feature.get("elements") or []
+               if element.get("type") != "background")
+
+
+def selection_gap(report: list, texts, tags: str) -> str:
+    """
+    Écart entre le nombre de tests d'un rapport et le nombre attendu pour `tags` sur ces features (scénarios
+    désactivés exclus ou non : les deux sont admis) ; '' si conforme. Un écart signale un run sur une autre version
+    du code ou une sélection de tags inopérante : le rapport n'est jamais analysé comme un résultat de test.
+    """
+    executed = report_test_count(report)
+    texts = list(texts)
+    expected, active = expected_count(texts, tags), expected_count(texts, tags, a_revoir_tag())
+    if executed in (expected, active):
+        return ""
+    return (f"{executed} test(s) exécuté(s) pour {active} attendu(s) avec les tags « {tags or 'aucun'} » : run sur "
+            f"une autre version du code ou sélection de tags inopérante — résultats non analysés")
 
 
 def step_matcher(expressions) -> callable:
@@ -193,6 +282,75 @@ def check_table_columns(worktree: str, base: str, features: list, reference: dic
                 errors.append(f"{rel}:{number} colonne « {column} » jamais utilisée au Standard pour le step "
                               f"« {expr} »" + (f" : colonne la plus proche « {closest[0]} »" if closest else "")
                               + " (syntaxe du Standard actuel)")
+    return errors
+
+
+# Step qui crée une donnée (création, ajout, intégration, import, génération) et colonnes qui l'identifient
+_CREATION_STEP = re.compile(r"cr[ée]{1,2}|cr[ée]ation|creat|ajout|\badd|int[ée]gr|import|g[ée]n[èée]r|enregistr|"
+                            r"^INIT-", re.I)
+_KEY_COLUMN = re.compile(r"(^|[._])(code|id|num[ée]?ro|number|r[ée]f[ée]rence|reference|name|nom)$", re.I)
+_QUOTED = re.compile(r'"([^"]+)"')
+
+
+def _identifier(value: str) -> bool:
+    """Valeur pouvant identifier une donnée : au moins une lettre et un chiffre ou un séparateur, sans espace."""
+    return bool(re.fullmatch(r"[\w.-]{2,}", value)) and bool(re.search(r"[A-Za-z]", value)) \
+        and bool(re.search(r"[\d_.-]", value)) and not re.search(r"[<$]", value)
+
+
+def _step_values(step: dict, keys_only: bool = False) -> set:
+    """Valeurs d'un step : arguments entre guillemets et cellules de sa table (colonnes d'identifiant seulement)."""
+    values = {v for v in _QUOTED.findall(step["texte"]) if _identifier(v)}
+    rows = [[c.strip() for c in row.strip().strip("|").split("|")] for row in step["table"]]
+    for row in rows[1:]:
+        values |= {v for h, v in zip(rows[0], row) if _identifier(v) and (not keys_only or _KEY_COLUMN.search(h))}
+    return values
+
+
+def _background_values(text: str) -> set:
+    """Valeurs citées par le Background d'une feature : disponibles pour tous ses scénarios."""
+    lines, values, inside = text.splitlines(), set(), False
+    for line in lines:
+        if _BACKGROUND_LINE.match(line):
+            inside = True
+        elif inside and _SCENARIO_LINE.match(line):
+            break
+        elif inside:
+            values |= {v for v in _QUOTED.findall(line) if _identifier(v)}
+            values |= {c.strip() for c in line.strip().strip("|").split("|") if line.strip().startswith("|")
+                       and _identifier(c.strip())}
+    return values
+
+
+def check_scenario_dependencies(worktree: str, features: list) -> list:
+    """
+    Scénarios qui dépendent de l'état laissé par un autre (RÈGLE 3, point 3h) : scénario de mise en place séparé
+    suivi d'autres scénarios (Background attendu), ou donnée créée par un scénario précédent puis utilisée sans être
+    créée ni dans le scénario ni dans le Background. Une erreur par scénario, à corriger.
+    """
+    errors = []
+    for rel in features:
+        text = _read_text_file(os.path.join(worktree, *rel.split("/")))
+        scenarios = parse_scenarios(text)
+        if len(scenarios) < 2:
+            continue
+        background, created = _background_values(text), {}
+        for index, scenario in enumerate(scenarios):
+            if is_setup_scenario(scenario["titre"]) and any(not is_setup_scenario(o["titre"])
+                                                            for o in scenarios[index + 1:]):
+                errors.append(f"{rel}:{scenario['ligne']} scénario de mise en place « {scenario['titre']} » séparé : "
+                              f"les scénarios suivants dépendent de son état ; déplace ses steps dans un Background "
+                              f"ou rends chaque scénario autonome")
+            own = set().union(*(_step_values(s, keys_only=True) for s in scenario["steps"]
+                                if _CREATION_STEP.search(s["texte"]))) if scenario["steps"] else set()
+            used = set().union(*(_step_values(s) for s in scenario["steps"])) if scenario["steps"] else set()
+            borrowed = sorted(v for v in used - own - background if v in created)
+            if borrowed and not is_setup_scenario(scenario["titre"]):
+                errors.append(f"{rel}:{scenario['ligne']} « {scenario['titre']} » utilise "
+                              f"{', '.join(borrowed[:5])} créé(s) par « {created[borrowed[0]]} » : il dépend de l'état "
+                              f"laissé par un autre scénario ; crée la donnée dans ce scénario ou dans le Background")
+            for value in own:
+                created.setdefault(value, scenario["titre"])
     return errors
 
 
@@ -588,6 +746,10 @@ _TEST_FAILURE = re.compile(r"No such path|FileNotFoundException|NoSuchFileExcept
 # Erreur serveur : bug applicatif probable
 _APPLICATION_FAILURE = re.compile(r"Internal Server Error|\bHTTP[/ ]?\d?\.?\d?\s*5\d\d\b|status(?: code)?\D{0,12}5\d\d\b",
                                   re.I)
+# Champ contrôlé non renvoyé par l'endpoint ou non mappé par le POJO de réponse : cause « test », à corriger
+_NULL_FIELD_FAILURE = re.compile(r"expected:?\s*<[^>]*>\s*but was:?\s*<null>", re.I)
+NULL_FIELD_HINT = ("champ contrôlé renvoyé null : l'endpoint ne le renvoie pas ou le POJO de réponse du step ne le "
+                   "mappe pas — corrige la colonne ou le step (cause « test », ni retrait ni désactivation)")
 ENV_NOT_VERIFIED = "non vérifié — environnement"
 VERSION_GAP = "écart de version bibliothèque / serveur"
 REFERENCE_NOT_VERIFIED = "non vérifié — donnée de référence absente"
@@ -600,13 +762,16 @@ _NOT_TEST_LEVELS = {"environnement": "env", "version": "env", "donnee_reference"
 
 def failure_kind(error_message: str) -> tuple:
     """
-    (nature, nom de l'exception) d'un message d'échec Cucumber : donnee_reference, version (route, chemin ou champ
+    (nature, nom de l'exception) d'un message d'échec Cucumber : champ_absent (« expected:<X> but was:<null> » :
+    champ contrôlé non renvoyé ou non mappé, cause « test »), donnee_reference, version (route, chemin ou champ
     inconnu, paramètre exigé : écart bibliothèque / serveur), environnement (champ exigé), bug_applicatif (erreur
     serveur), sinon échec du test : technique (colonne, fichier, code du step) ou assertion.
     """
     message = str(error_message or "")
     exception = _EXCEPTION_NAME.search(message)
     name = exception.group(1).rsplit(".", 1)[-1] if exception else ""
+    if _NULL_FIELD_FAILURE.search(message):
+        return "champ_absent", name
     if _REFERENCE_FAILURE.search(message):
         return "donnee_reference", name
     if _VERSION_FAILURE.search(message):
@@ -649,6 +814,8 @@ def parse_cucumber_report(report: list) -> dict:
                 background = element.get("steps") or []
                 continue
             steps, phase, outcome = background + (element.get("steps") or []), "given", None
+            # Heure du step en échec : début du cas de test (Background compris), plus la durée des steps précédents
+            started, elapsed = _timestamp(element.get("start_timestamp")), 0.0
             background = []
             statuses = []
             for step in steps:
@@ -660,7 +827,10 @@ def parse_cucumber_report(report: list) -> dict:
                     nature, exception = failure_kind(error)
                     outcome = {"statut": "echoue", "step": f"{step.get('keyword', '').strip()} {step.get('name', '')}",
                                "phase": phase, "message": " ".join(error.split())[:300], "nature": nature,
-                               "exception": exception}
+                               "exception": exception,
+                               "heure": (started + timedelta(seconds=elapsed)).isoformat(timespec="seconds")
+                               if started else ""}
+                elapsed += _duration(step)
             if not outcome:
                 if any(s in ("undefined", "pending", "ambiguous") for s in statuses) or not statuses:
                     outcome = {"statut": "indefini", "step": "", "phase": "", "message": "step non défini ou ignoré"}
@@ -679,6 +849,23 @@ def parse_cucumber_report(report: list) -> dict:
             if key not in results or rank[outcome["statut"]] > rank[results[key]["statut"]]:
                 results[key] = outcome
     return results
+
+
+def _timestamp(value) -> datetime:
+    """Horodatage ISO d'un rapport Cucumber (start_timestamp), en UTC ; None s'il est absent ou illisible."""
+    try:
+        stamp = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp.astimezone(timezone.utc) if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def _duration(step: dict) -> float:
+    """Durée d'un step du rapport, en secondes (Cucumber l'écrit en nanosecondes)."""
+    try:
+        return float((step.get("result") or {}).get("duration") or 0) / 1e9
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _report_files(build: str) -> list:
@@ -704,7 +891,8 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
     """
     Exécute les scénarios filtrés par `tags` sur l'environnement `env` ; `overrides` {chemin relatif: texte}
     remplace des .feature le temps de l'exécution (mutation) ; `sources` (job_sources) : paramètres du job Jenkins
-    désignant le dépôt et les commits de base. Renvoie {ok, message, build, resultats}.
+    désignant le dépôt et les commits de base. Rapport dont le nombre de tests diffère du nombre attendu pour
+    `tags` (selection_gap) : non analysé (ok faux, ecart_selection). Renvoie {ok, message, build, resultats}.
     """
     started = time.time()
     if mode == "local":
@@ -730,6 +918,9 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
             tail = " | ".join(line.strip() for line in output.strip().splitlines()[-3:])
             return {"ok": False, "message": f"aucun rapport Cucumber JSON produit ({tail[:300]})", "build": "",
                     "resultats": {}}
+        gap = selection_gap(report, feature_texts(worktree), tags)
+        if gap:
+            return {"ok": False, "message": gap, "build": "", "resultats": {}, "ecart_selection": True}
         return {"ok": True, "message": f"exécution locale en {time.time() - started:.0f} s", "build": "",
                 "resultats": parse_cucumber_report(report)}
     # Jenkins : patch du worktree depuis la base (fichiers mutés écrits le temps de produire le patch)
@@ -761,6 +952,9 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
     if not report:
         return {"ok": False, "message": f"build {build['result']} sans rapport Cucumber JSON", "build": build["url"],
                 "resultats": {}}
+    gap = selection_gap(report, feature_texts(worktree), tags)
+    if gap:
+        return {"ok": False, "message": gap, "build": build["url"], "resultats": {}, "ecart_selection": True}
     return {"ok": True, "message": f"build {build['result']}", "build": build["url"],
             "resultats": parse_cucumber_report(report), "artefacts": build["artifacts"]}
 
@@ -877,8 +1071,9 @@ def _level(result: dict, expect_failure: bool, then_only: bool = False) -> tuple
             detail = f"{result['step']} — {result['message']}".strip(" —")
             return _NOT_TEST_LEVELS[result["nature"]], (f"{VERSION_GAP} : {detail}" if result["nature"] == "version"
                                                         else detail)
+        hint = f" — {NULL_FIELD_HINT}" if result.get("nature") == "champ_absent" else ""
         return ("ok", "passe") if status == "passe" else (
-            "ko", f"{status} : {result['step']} — {result['message']}".strip(" —:"))
+            "ko", f"{status} : {result['step']} — {result['message']}".strip(" —:") + hint)
     if status == "echoue":
         if result.get("nature", "assertion") != "assertion":
             return "nv", f"non concluant : {result.get('exception') or 'exception technique'} ({result['step']})"
@@ -989,8 +1184,79 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
                     "niveaux": {k: list(v) for k, v in levels[tag].items()},
                     "build": next((b["build"] for b in builds if b["execution"] == "client"), ""),
                     "cause": (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get("cause", "")
-                    if status == "cascade" else ""}
+                    if status == "cascade" else "",
+                    # Step en échec et son heure (UTC) : fenêtre d'export des logs serveur
+                    **{k: (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get(k, "")
+                       for k in ("step", "heure")}}
     return {"scenarios": out, "builds": builds, "classes_executees": executed}
+
+
+# ---------------------------------------------------------------------------
+# Exports de logs serveur : fenêtre étroite autour du step en échec, couverture vérifiée à l'import
+# ---------------------------------------------------------------------------
+
+LOG_WINDOW_MINUTES = 1
+_LOG_STAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})")
+
+
+def log_filter(item: dict) -> str:
+    """Texte de filtre d'un export de logs : valeur citée du step en échec, sinon nom de l'exception, sinon step."""
+    step = str(item.get("step", ""))
+    quoted = re.findall(r'"([^"]{3,})"', step)
+    if quoted:
+        return max(quoted, key=len)
+    exception = _EXCEPTION_NAME.search(str(item.get("motif", "")))
+    return exception.group(1).rsplit(".", 1)[-1] if exception else re.sub(r"^\w+\s+", "", step)[:60]
+
+
+def log_window(when: str, minutes: int = LOG_WINDOW_MINUTES) -> dict:
+    """
+    Fenêtre d'export des logs serveur autour de `when` (heure UTC du step en échec) : deux minutes, en UTC et en
+    heure locale ; {} sans heure. L'outil d'export peut plafonner le nombre de lignes en gardant les plus récentes :
+    une fenêtre étroite évite de perdre le step.
+    """
+    stamp = _timestamp(when)
+    if not stamp:
+        return {}
+    start, end = stamp - timedelta(minutes=minutes), stamp + timedelta(minutes=minutes)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return {"heure": stamp.strftime(fmt), "debut_utc": start.strftime(fmt), "fin_utc": end.strftime(fmt),
+            "debut_local": start.astimezone().strftime(fmt), "fin_local": end.astimezone().strftime(fmt)}
+
+
+def log_request(item: dict) -> str:
+    """Consigne d'export des logs serveur d'un scénario en échec : fenêtre UTC et locale, texte de filtre."""
+    window = log_window(item.get("heure", ""))
+    if not window:
+        return "exporter les logs serveur du step en échec (heure inconnue : rapport sans start_timestamp)"
+    return (f"exporter les logs serveur du {window['debut_utc']} au {window['fin_utc']} UTC (heure locale : "
+            f"{window['debut_local']} → {window['fin_local']}), filtre « {log_filter(item)} », puis vérifier à "
+            f"l'import que l'export couvre {window['heure']} UTC")
+
+
+def log_coverage(text: str, when: str) -> tuple:
+    """
+    (couvre, message) : l'export de logs `text` couvre-t-il l'heure `when` (UTC) du step ? Horodatages lus comme
+    UTC ou comme heure locale (l'un des deux suffit). Un export qui commence après le step a été tronqué par l'outil
+    (il garde les lignes les plus récentes) ; un export qui finit avant ne contient pas le step.
+    """
+    stamp = _timestamp(when)
+    if not stamp:
+        return False, "heure du step inconnue : couverture non vérifiable"
+    found = [datetime.fromisoformat(f"{d}T{t}") for d, t in _LOG_STAMP.findall(text or "")]
+    if not found:
+        return False, "aucun horodatage lisible dans l'export"
+    first, last = min(found), max(found)
+    readings = {"UTC": (first.replace(tzinfo=timezone.utc), last.replace(tzinfo=timezone.utc)),
+                "heure locale": (first.astimezone(), last.astimezone())}
+    for zone, (start, end) in readings.items():
+        if start <= stamp <= end:
+            return True, f"l'export ({zone}) couvre le step ({stamp:%Y-%m-%d %H:%M:%S} UTC)"
+    if all(start > stamp for start, _ in readings.values()):
+        return False, (f"l'export commence le {first:%Y-%m-%d %H:%M:%S}, après le step ({stamp:%Y-%m-%d %H:%M:%S} "
+                       f"UTC) : l'outil a gardé les lignes les plus récentes — resserre la fenêtre ou le filtre")
+    return False, (f"l'export finit le {last:%Y-%m-%d %H:%M:%S}, avant le step ({stamp:%Y-%m-%d %H:%M:%S} UTC) : "
+                   f"il ne contient pas le step")
 
 
 def init_tags() -> str:

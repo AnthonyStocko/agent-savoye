@@ -297,3 +297,16 @@ def test_patch_contains_every_committed_file_binaries_included(init_repo, tmp_pa
     assert ct.format_patch(init_repo, f"{base}..HEAD~1", partial)
     errors = cc.check_patch_files(init_repo, base, partial, "clientx")
     assert len(errors) == 1 and "lot2.csv" in errors[0] and "absent du patch" in errors[0]
+
+
+def test_runner_health_against_profile():
+    conventions = {"features_root": f"{RES}/features/clientx/", "client_tag": "@CLIENTX",
+                   "init": [f"{RES}/features/clientx/01-Contexte/Init.feature"]}
+    assert "aucun runner détecté" in cc.runner_health(conventions)[0]
+    runner = {"classe": "client.RunTest", "features": ["classpath:cucumber/features/autre"], "glue": ["client"],
+              "tags": ["@AUTRE"], "plugin_json": "", "surcouche": False}
+    gaps = cc.runner_health({**conventions, "runner": runner})
+    assert any("chemin de features" in g for g in gaps) and any("retire le filtre « @AUTRE »" in g for g in gaps)
+    assert any("json:" in g for g in gaps) and not any("glue" in g for g in gaps)
+    good = {**runner, "features": [f"{RES}/features"], "tags": ["not @A_REVOIR"], "plugin_json": "json:target/c.json"}
+    assert cc.runner_health({**conventions, "runner": good}) == []

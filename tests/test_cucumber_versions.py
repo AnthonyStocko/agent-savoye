@@ -147,3 +147,13 @@ def test_health_report_lists_step_differences(std_repo, tmp_path, monkeypatch):
     with open(report["fichier"], encoding="utf-8") as f:
         text = f.read()
     assert "serveur 26.21" in text and "Écarts des steps utilisés" in text and "Marqueurs TODO-VERSION : 1" in text
+
+
+def test_library_gap_file_lists_catalogue_differences(std_repo):
+    path = cvs.library_gap_file(std_repo, "26.16")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    assert "- STOCK- nouveau contrôle {string} — step absent de la bibliothèque du client" in text
+    assert "- STOCK- je crée le contenant {string} — signature du step modifiée" in text
+    assert "STOCK- ancien contrôle" not in text  # absent du Standard aligné : pas utilisable en génération
+    assert cvs.library_gap_file(std_repo, "26.99") == ""

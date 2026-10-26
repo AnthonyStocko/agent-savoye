@@ -141,7 +141,8 @@ def test_views_for_checks(client_repo, std_dir, cache):
     assert {k: v for k, v in cp.conventions(effective).items() if k not in ("runner", "protected_files")} == {
         "features_root": f"{RES}/features/{CLIENT}/", "client_tag": CLIENT_TAG, "init": [INIT_REL],
         "library_version": "26.21", "server_version": "26.30", "server_initialized_data": [],
-        "initializers_survive_clear": "", "workarounds": []}
+        "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
+        "verify_branch_param": "CUCUMBER_SPEC_BRANCH"}
     assert INIT_REL in cp.conventions(effective)["protected_files"]
 
 
@@ -173,6 +174,10 @@ def test_profile_block_in_lot_prompt(client_repo, std_dir, cache):
     gap = cp.profile_block({**cp.empty_profile(), "library_version": "26.16", "server_version": "26.21-SNAPSHOT"})
     assert "bibliothèque de steps 26.16" in gap and "`# TODO-VERSION: <step, colonne ou champ> — à vérifier en 26.16`" in gap
     assert cp.version_block("26.21", "26.21-SNAPSHOT") == "" and cp.version_block("", "26.21") == ""
+    assert "step du projet de nom unique" in gap and "Ne modifie JAMAIS la bibliothèque partagée" in gap
+    with_file = cp.profile_block({**cp.empty_profile(), "library_version": "26.16", "server_version": "26.21"},
+                                 gap_file="/cache/ecarts.md")
+    assert "cherche-le par Grep dans '/cache/ecarts.md'" in with_file
     empty = cp.profile_block(cp.effective_profile({}))
     assert "(non renseignée" in empty and "aucune feature d'initialisation détectée" in empty
     assert "aucun détecté" in empty
@@ -206,10 +211,11 @@ def test_initializer_statuses_and_profile_block():
     assert [(d["code"], d["statut"]) for d in effective["server_initialized_data"]] == [
         ("DOC1", "recreee"), ("DOC2", "inconnu"), ("M1", "survit")]
     block = cp.initializers_block(effective["server_initialized_data"], "")
-    assert "utilisables : DOC1 (RefReportDoc), M1 (?)" in block and "incertaine : DOC2 (RefReportDoc)" in block
+    assert "utilisables : DOC1 (RefReportDoc, C), M1 (?, Manuel)" in block and "incertaine : DOC2 (RefReportDoc, C)" in block
     assert "effacées par le clear : DOC2" in cp.initializers_block(effective["server_initialized_data"], "faux")
     assert "incertaine" not in cp.initializers_block(effective["server_initialized_data"], "vrai")
     assert cp.initializers_block([], "") == "" and "initializers serveur" in cp.profile_block(effective)
+    assert "aucun test de leur seule existence" in block and "DOC1 (RefReportDoc, C)" in block
 
 
 def test_workarounds_detected_and_optional(client_repo, std_dir, cache):

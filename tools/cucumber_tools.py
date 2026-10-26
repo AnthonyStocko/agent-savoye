@@ -1622,6 +1622,33 @@ def _runners(repo_dir: str, ref: str, classes: list, files: dict) -> list:
     return runner_entries(classes, files, "\n".join(blob_texts(repo_dir, props).values()))
 
 
+# Tag générique des scénarios désactivés (RÈGLE 3f), exclu par le runner du client
+DEFAULT_A_REVOIR_TAG = "@A_REVOIR"
+
+
+def a_revoir_tag() -> str:
+    tag = os.getenv("CUCUMBER_TAG_A_REVOIR", "").strip() or DEFAULT_A_REVOIR_TAG
+    return tag if tag.startswith("@") else "@" + tag
+
+
+def runner_tag_expression(expressions) -> str:
+    """Expression de tags effective d'un runner (filtres combinés par « and »), '' sans filtre."""
+    expressions = [e for e in expressions or [] if e.strip()]
+    return expressions[0] if len(expressions) == 1 else " and ".join(f"({e})" for e in expressions)
+
+
+def filters_on_tag(expressions, tag: str) -> bool:
+    """Le filtre exige `tag` : un scénario sans ce tag n'est pas sélectionné (alors qu'il l'est sans filtre)."""
+    expression = runner_tag_expression(expressions)
+    return bool(tag and expression) and not tags_match(expression, set()) and tags_match(expression, {tag})
+
+
+def excludes_tag(expressions, tag: str) -> bool:
+    """Le filtre exclut les scénarios portant `tag` et garde les scénarios sans tag."""
+    expression = runner_tag_expression(expressions)
+    return bool(expression) and tags_match(expression, set()) and not tags_match(expression, {tag})
+
+
 def tags_match(expression: str, tags) -> bool:
     """Une expression de tags Cucumber (and, or, not, parenthèses) sélectionne-t-elle un scénario portant `tags` ?"""
     tokens = re.findall(r"\(|\)|@[^\s()]+|\band\b|\bor\b|\bnot\b", expression or "")
@@ -1671,11 +1698,13 @@ def _feature_dir(path: str) -> str:
 def runner_gaps(runner: dict, package_steps: str, conventions: dict) -> list:
     """
     Écarts d'un runner pour les tests du client : glue sans le package des steps, chemin de features qui n'inclut
-    pas la racine du client ou son init, filtre de tags qui ne sélectionne pas le tag client, pas de rapport JSON.
-    `conventions` : {"features_root", "client_tag", "init": [chemins], "init_tags": [tags]}.
+    pas la racine du client ou son init, filtre sur le tag client, scénarios désactivés (a_revoir_tag) non exclus,
+    pas de rapport JSON.
+    `conventions` : {"features_root", "client_tag", "init": [chemins], "init_tags": [tags]} ; glue non contrôlée
+    sans `package_steps`.
     """
     gaps = []
-    if not any(package_steps == g or package_steps.startswith(g + ".") for g in runner["glue"]):
+    if package_steps and not any(package_steps == g or package_steps.startswith(g + ".") for g in runner["glue"]):
         gaps.append(f"ajoute la glue '{package_steps}' (glue actuelle : {', '.join(runner['glue'])})")
     root = conventions.get("features_root", "")
     dirs = [_feature_dir(p) for p in runner.get("features") or []]
@@ -1684,11 +1713,20 @@ def runner_gaps(runner: dict, package_steps: str, conventions: dict) -> list:
             gaps.append(f"ajoute le chemin de features '{root}' (actuel : {', '.join(runner['features'])}) pour "
                         f"inclure {needed}")
             break
-    client_tag = conventions.get("client_tag", "")
-    for expression in runner.get("tags") or []:
-        if client_tag and not tags_match(expression, {client_tag}):
-            gaps.append(f"le filtre de tags « {expression} » ne sélectionne pas {client_tag} : ajoute « or "
-                        f"{client_tag} »")
+    # Tags : jamais de filtre sur le tag client (des scénarios actifs ne le portent pas) ; exclusion des scénarios
+    # désactivés dans le runner, le filtre passé au job pouvant ne pas atteindre Cucumber
+    client_tag, disabled = conventions.get("client_tag", ""), a_revoir_tag()
+    expressions = [e for e in runner.get("tags") or [] if e.strip()]
+    kept = [e for e in expressions if tags_match(e, set())]
+    for expression in (e for e in expressions if e not in kept):
+        gaps.append((f"retire le filtre sur le tag client {client_tag} (« {expression} ») : des scénarios actifs "
+                     f"(init, features plus anciennes) peuvent ne pas le porter"
+                     if client_tag and filters_on_tag([expression], client_tag) else
+                     f"retire le filtre « {expression} » : il écarte les scénarios du client qui ne portent pas ce "
+                     f"tag"))
+    if not excludes_tag(kept, disabled):
+        wanted = f"({runner_tag_expression(kept)}) and not {disabled}" if kept else f"not {disabled}"
+        gaps.append(f"exclus les scénarios désactivés dans le runner : tags = \"{wanted}\"")
     if not any(p.startswith("json:") for p in runner.get("plugins") or []):
         gaps.append("ajoute le plugin \"json:target/cucumber-reports/Cucumber.json\" (rapport JSON lu par la "
                     "vérification par exécution)")
@@ -1805,7 +1843,7 @@ def runner_status_for(package_steps: str, client_runners: list, std_runners: lis
     tag = conventions.get("client_tag") or "le tag du client"
     return (f"aucun runner ne couvre '{package_steps}' : crée {package_steps}.Run{suffix}CucumberTest sur le modèle du "
             f"runner exemple (glue '{package_steps}' et celle du Standard, features {root} — qui contient "
-            f"l'initialisation du client : {init} —, tags sans filtre ou sélectionnant {tag}, plugin "
+            f"l'initialisation du client : {init} —, tags = \"not {a_revoir_tag()}\" sans filtre sur {tag}, plugin "
             f"\"json:target/cucumber-reports/Cucumber.json\"), un seul pour toute l'exécution."), None
 
 
@@ -3043,6 +3081,21 @@ def _compilation_status(lot: dict) -> str:
     return f"{check.get('etape', 'compilation')} OK" if check.get("ok") else f"en erreur ({check.get('etape')})"
 
 
+def _selection_line(selection: dict) -> str:
+    """Ligne du récapitulatif : nombre attendu de la livraison (deux dry-runs) ou erreurs de sélection."""
+    if not selection:
+        return "- Nombre attendu de la livraison : non contrôlé"
+    if selection.get("erreurs"):
+        return (f"- Nombre attendu de la livraison : ❌ {len(selection['erreurs'])} erreur(s) de sélection — "
+                f"{selection['erreurs'][0]}")
+    if selection.get("nombre_attendu"):
+        return (f"- Nombre attendu de la livraison : {selection['nombre_attendu']} scénario(s) (dry-runs sans filtre "
+                f"et avec le tag client identiques) ; un run du job qui en exécute un autre nombre ne porte pas sur "
+                f"cette version ou ignore la sélection de tags")
+    return (f"- Nombre attendu de la livraison : {selection.get('attendu', 0)} scénario(s) actif(s) à la lecture des "
+            f"features (dry-runs non lancés)")
+
+
 def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> str:
     """
     Récapitulatif <client>-cucumber-couverture.md : indicateurs globaux (réutilisation des steps Standard,
@@ -3085,6 +3138,7 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
              f"désactivés (tag à revoir, jamais supprimés) : {len(disabled)}"
              + (" — " + " ; ".join(f"{k} : {n}" for k, n in sorted(Counter(
                  e["cause"] for e in disabled.values()).items())) if disabled else ""),
+             _selection_line(state.get("selection")),
              f"- Doublons retirés à la revue : {len(deleted)}"
              + (" — " + " ; ".join(f"{k} : {n}" for k, n in sorted(reasons.items(), key=lambda kv: -kv[1]))
                 if reasons else "")]

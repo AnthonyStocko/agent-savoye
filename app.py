@@ -1070,6 +1070,16 @@ with tab_cucumber:
                             value=", ".join((profile["reference_codes"] or {}).get(category) or []),
                             disabled=sources.get("reference_codes") == "depot").split(",") if c.strip()]
                 values["reference_codes"] = codes
+                # Branche lue par le job de vérification : commitée et poussée avant chaque vérification
+                with st.container(horizontal=True):
+                    for key in ("verify_branch", "verify_branch_param"):
+                        values[key] = st.text_input(
+                            f"{cucumber_profile.LABELS[key]} ({origin(key)})", value=profile[key],
+                            disabled=sources.get(key) == "depot",
+                            placeholder="" if key == "verify_branch" else cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
+                            help="Le worktree y est commité et poussé avant chaque vérification (jamais de push "
+                                 "forcé). Vide : le job reçoit le commit de base et le patch du worktree." if key ==
+                            "verify_branch" else None)
                 # Données créées au démarrage par les initializers serveur : statut après un clear, saisi à la main
                 values["initializers_survive_clear"] = st.segmented_control(
                     f"{cucumber_profile.LABELS['initializers_survive_clear']} "

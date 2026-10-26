@@ -39,6 +39,13 @@ ${references_injectees}
 - Il n'est pas tautologique : ses assertions portent sur ce que le spécifique calcule ou décide, jamais sur la valeur que le scénario vient lui-même d'écrire (créer X puis relire X ne prouve rien). Un tel scénario n'est pas écrit : signale-le en constat « tautologique ».
 Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites réellement introduits par le spécifique (règles, seuils, branches du code client). Aucun scénario de remplissage. Un spécifique sans comportement observable propre au client : n'écris rien et explique-le dans « raison ».
 
+=== CONTRÔLES (Then) ===
+- Filtre toujours sur l'objet en contexte (son code, son identifiant) : jamais un comptage ou une recherche globale, que d'autres features faussent par leurs données.
+- Un effet asynchrone (notification, message, statut calculé, document) s'attend avec le step d'attente du Standard avant d'être lu : jamais une lecture immédiate.
+- Préfère un step de contrôle générique du Standard avec les colonnes exactes de l'entité contrôlée (Grep dans '${features_std}') à un step métier inventé.
+- Avant de contrôler un champ, vérifie que l'endpoint du step le renvoie : POJO de la réponse dans '${java_std}', endpoint dans '${endpoints_std}'. Un champ absent de la réponse ne se contrôle pas par ce step. Chaque colonne d'un Then est contrôlée après le lot contre le POJO de réponse du step (chemin pointé compris) : une colonne non mappée est une erreur, le contrôle lirait null (« expected:<X> but was:<null> »).
+- Source d'une donnée introuvable : dis-le (constat « donnee_introuvable ») ; ne fabrique jamais une donnée en modifiant un fichier existant.
+
 === AVANT DE CONCLURE « non_couvert » ===
 - Lis d'abord ce que le spécifique change (parties modifiées injectées, puis les fichiers du spécifique si nécessaire) : une conclusion sans avoir examiné le comportement modifié n'est pas acceptée.
 - Applique les recettes du lot (en particulier : un champ ou une entité modifiés se vérifient en relisant l'objet par un endpoint REST Standard, avec un nouveau step si besoin), examine ses « Steps candidats », puis fais AU MOINS 3 recherches dans '${steps_std}' / '${endpoints_std}' avec des formulations différentes : synonymes, anglais / français (repack / reconditionnement, slot / emplacement, screen / écran / interaction…), nom de l'objet métier, chemin REST.
@@ -47,11 +54,11 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 
 === FICHIERS ET CODE ===
 1. Écris les .feature dans le worktree uniquement, TOUJOURS sous la racine des features du client donnée par le « PROFIL CLIENT » du lot (sinon elles s'exécutent hors de son initialisation) : jamais dans l'arborescence du Standard, sans aucun repli. Pour reprendre un dossier du Standard, reproduis-le SOUS cette racine (features/WMS/07-Stock/ → <racine du client>WMS/07-Stock/).
-   - Tag du client : celui du « PROFIL CLIENT », exactement avec cette casse (jamais une autre graphie) ; les autres tags comme le Standard.
+   - Tag du client : celui du « PROFIL CLIENT », exactement avec cette casse (jamais une autre graphie), porté par CHAQUE scénario (sur la ligne Feature ou au-dessus du scénario) ; les autres tags comme le Standard.
    - Initialisation du client : elle s'exécute AVANT tes features (Cucumber trie les features par chemin) et crée les données de référence listées dans le « PROFIL CLIENT ». N'utilise que ces codes (site, donneur d'ordres, secteur, partenaire), ou crée la donnée dans le Background de ta feature. N'écris jamais de purge, de clear ni d'initialisation (« INIT- Purge… », « INIT- Initialisation globale… ») : c'est le rôle des features d'initialisation du client.
    - Steps : chaque step d'un .feature existe déjà (catalogue des steps du Standard, steps du client) ou est défini par une méthode Java écrite dans ce lot (règle 2) ; jamais de step inventé sans définition (un dry-run strict le refuse). Les colonnes de chaque DataTable sont exactement celles que le Standard ACTUEL utilise pour ce même step (Grep dans '${features_std}' ou les extraits du lot) : pas d'autre syntaxe (ex. « x.value.id » là où le Standard écrit « x.id »), pas de chemin de champ inventé.
    - Mise en place : préfère un Background (ou les Given du scénario) à un scénario « Contexte » séparé dont dépendent les suivants ; à défaut, chaque scénario doit pouvoir échouer sans laisser les autres en attente d'une donnée qu'il devait créer.
-   - Runner : ne crée JAMAIS un second runner quand un runner existe ou que le dépôt s'exécute en surcouche du Standard (double exécution) ; complète le runner existant si le lot te le demande.
+   - Runner : ne crée JAMAIS un second runner quand un runner existe ou que le dépôt s'exécute en surcouche du Standard (double exécution) ; complète le runner existant si le lot te le demande. Ses tags ne filtrent jamais sur le tag client et excluent les scénarios désactivés (« not ${tag_a_revoir} »).
    - Fichiers de l'initialisation : ne modifie JAMAIS un fichier d'initialisation existant (features d'init et fichiers qu'elles intègrent, « fichiers protégés » du PROFIL CLIENT) : ils sont partagés par tous les tests, un fichier rejeté arrête l'intégration et fait échouer les autres tests. Une donnée manquante se crée dans le Background de ta feature ; si tu ne peux pas la créer, signale-la en constat « donnee_introuvable ».
    - Fichiers de données et règles : un step les lit dans src/test/resources/cucumber/files/ (règles : rules/, fichier <nom>.json) + le dossier de la feature sous features/ + le nom donné. Le dépôt client n'a pas les fichiers du Standard à l'exécution : chaque fichier cité doit exister à ce chemin dans le worktree. Ceux qui existent au Standard sous le même nom sont copiés automatiquement après le lot ; crée seulement les fichiers propres au client.
 2. Chaque lot livre aussi TOUTES les classes Java nécessaires à l'exécution de ses .feature, qui doivent compiler :
@@ -66,6 +73,7 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 Signale ce que tu as constaté sans pouvoir le régler, plutôt que de le contourner. Un constat par fait, avec le fichier en cause s'il y en a un :
 - « donnee_introuvable » : une donnée nécessaire (code, paramètre, référentiel) n'existe ni dans l'initialisation du client ni au Standard, et tu ne peux pas la créer dans le Background. N'invente jamais un code à la place.
 - « ecart_spec_code » : le ticket Jira ou la spécification décrit un comportement, le code du spécifique en fait un autre. Le scénario teste le code ; le constat cite les deux.
+Une cause que tu DÉDUIS (« traitement sauté », « personnalisation absente ») sans preuve directe (trace serveur, écran reçu, valeur lue) s'écrit « NON PROUVÉE : <cause> — à vérifier par <preuve attendue> » dans le détail du constat.
 - « tautologique » : scénario envisagé puis écarté car il ne vérifiait que sa propre mise en place.
 
 === RÉPONSE FINALE ===
