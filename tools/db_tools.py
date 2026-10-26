@@ -19,6 +19,7 @@ Garde-fous cumulés (aucun ne suffit seul ; utilisez aussi un compte base en lec
 La dernière ligne de sortie est DB_OK ou DB_ERROR=<message>.
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -443,6 +444,45 @@ def test_connection(schema: str = "") -> tuple:
         return False, _scrub(e)
 
 
+# ---------------------------------------------------------------------------
+# Journal des commandes de l'agent (AGENT_DB_LOG), pour rendre vérifiable l'usage de la base
+# ---------------------------------------------------------------------------
+_FROM_JOIN = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_$#]*(?:\.[A-Za-z_][A-Za-z0-9_$#]*)?)", re.I)
+
+
+def query_tables(sql: str, db_type: str = "") -> list:
+    """Tables lues par une requête (après FROM et JOIN, littéraux et commentaires écartés), sans doublon."""
+    try:
+        code = _strip_literals_and_comments(sql or "", db_type)
+    except DbError:
+        return []
+    return list(dict.fromkeys(m.group(1) for m in _FROM_JOIN.finditer(code)))
+
+
+def log_command(args, schema: str, error: str) -> None:
+    """
+    Ajoute la commande au journal AGENT_DB_LOG (une ligne JSON) s'il est défini : nature, schéma, tables lues,
+    erreur. Ni le texte de la requête ni ses valeurs littérales ne sont journalisés (données éventuellement
+    nominatives). Un journal illisible n'empêche jamais la commande.
+    """
+    path = os.getenv("AGENT_DB_LOG", "").strip()
+    if not path:
+        return
+    if args.command == "query":
+        tables = query_tables(args.sql, get_db_config().get("type", ""))
+    elif args.command == "describe":
+        tables = [args.table]
+    else:
+        tables = []
+    entry = {"date": datetime.now().isoformat(timespec="seconds"), "commande": args.command, "schema": schema,
+             "tables": tables, "motif": getattr(args, "like", "") or "", "ok": not error, "erreur": error[:300]}
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
 def main() -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--schema", default=argparse.SUPPRESS, help="Schéma cible (défaut : DB_SCHEMA du .env)")
@@ -474,12 +514,15 @@ def main() -> int:
         else:
             print(run_query(args.sql, schema, args.limit))
         print("DB_OK")
+        log_command(args, schema, "")
         return 0
     except DbError as e:
         print(f"DB_ERROR={e}")
+        log_command(args, schema, str(e))
         return 1
     except Exception as e:
         print(f"DB_ERROR={_scrub(e)}")
+        log_command(args, schema, _scrub(e))
         return 1
 
 

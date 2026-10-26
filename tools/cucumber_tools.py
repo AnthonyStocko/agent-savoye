@@ -3123,6 +3123,31 @@ def _selection_line(selection: dict) -> str:
             f"features (dry-runs non lancés)")
 
 
+def db_usage_lines(state: dict) -> list:
+    """
+    Section « Base de données consultée » du récapitulatif : par lot, les commandes base réellement lancées par
+    l'agent (journal de db_tools, lot["base"]) par étape, avec les tables lues et les erreurs ; rien si aucun lot
+    n'a interrogé la base.
+    """
+    lots = [lot for lot in state.get("lots", []) if lot.get("base")]
+    if not lots:
+        return []
+    lines = ["", "## Base de données consultée", "",
+             "Commandes réellement lancées par l'agent (journal de tools/db_tools.py : nature et tables, jamais les "
+             "valeurs).", ""]
+    for lot in lots:
+        by_step = {}
+        for entry in lot["base"]:
+            by_step.setdefault(entry.get("etape") or "?", []).append(entry)
+        for step, entries in by_step.items():
+            tables = list(dict.fromkeys(t for e in entries for t in e.get("tables") or []))
+            errors = [e.get("erreur") for e in entries if not e.get("ok")]
+            lines.append(f"- Lot {lot['numero']}, {step} : {len(entries)} commande(s)"
+                         + (f" — tables : {', '.join(tables)}" if tables else "")
+                         + (f" — {len(errors)} en erreur ({errors[0]})" if errors else ""))
+    return lines
+
+
 def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> str:
     """
     Récapitulatif <client>-cucumber-couverture.md : indicateurs globaux (réutilisation des steps Standard,
@@ -3282,6 +3307,7 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
                           f"la correction")
             lines.append(f"- Lot {lot['numero']} : {label}")
             lines += [f"  - `{e}`" for e in (check.get("erreurs") or [])[:10]]
+    lines += db_usage_lines(state)
     already = [s for s in specs.values() if s.get("couverture") == "deja_couvert" and s["id"] not in selected]
     if already:
         lines += ["", "## Déjà couverts (non traités)", ""]

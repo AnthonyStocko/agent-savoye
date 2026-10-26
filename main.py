@@ -474,9 +474,11 @@ DB_BLOCK_WORDING = {
     },
     "generate-cucumber-client": {
         "db_usage": "le paramétrage qui active ou conditionne les spécifiques du lot, ainsi que les valeurs de "
-                    "référence utiles aux jeux de données des scénarios",
-        "db_findings_target": "le champ « raison » du JSON final (paramétrage constaté), et appuie les jeux de "
-                              "données des scénarios sur ces valeurs réelles",
+                    "référence utiles aux jeux de données des scénarios (articles, emplacements, statuts, codes "
+                    "existants). Une donnée de référence introuvable ou un échec « donnée de référence absente » se "
+                    "vérifie en base avant d'être créé dans le Background ou signalé",
+        "db_findings_target": "ta réponse finale (champ « raison » d'un lot, « restantes » d'une correction), et "
+                              "appuie les jeux de données des scénarios sur ces valeurs réelles",
         "db_private_targets": "dans les scénarios,\n  les Step Definitions ni le JSON final",
         "db_max_commands": "3",
     },
@@ -1362,15 +1364,57 @@ EMPTY_FIELD_MOTIFS = {"« source » vide dans le JSON", "« difference_standard 
 
 
 def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
-                        effort: str, system_file: str = "") -> tuple:
+                        effort: str, system_file: str = "", db_log: list = None, db_step: str = "") -> tuple:
     """
     Appel Claude d'un lot Cucumber : session allégée (CLAUDE_LEAN_SESSION) et budget CUCUMBER_MAX_BUDGET_USD.
     `system_file` : partie fixe ajoutée au prompt système (--append-system-prompt-file), identique d'un lot à
     l'autre et donc lue depuis le cache ; un texte en tête du message ne l'est pas (un seul bloc par message).
+    `db_log` : liste (lot["base"]) complétée par les commandes base réellement lancées pendant l'appel (journal
+    AGENT_DB_LOG de db_tools), chacune marquée de l'étape `db_step`.
     """
     extra = ("--max-turns", max_turns) + (("--append-system-prompt-file", system_file) if system_file else ())
-    return run_claude(prompt, model, [cucumber_tools.STD_CACHE_DIR], allowed_tools, extra_args=extra, cwd=run_dir,
-                      effort=effort, lean=lean_session(), budget_usd=cucumber_budget())
+    journal = os.path.join(run_dir, f"base_journal_{os.getpid()}.jsonl") if db_log is not None else ""
+    if journal:
+        if os.path.exists(journal):
+            os.remove(journal)
+        os.environ["AGENT_DB_LOG"] = journal
+    try:
+        return run_claude(prompt, model, [cucumber_tools.STD_CACHE_DIR], allowed_tools, extra_args=extra,
+                          cwd=run_dir, effort=effort, lean=lean_session(), budget_usd=cucumber_budget())
+    finally:
+        if journal:
+            os.environ.pop("AGENT_DB_LOG", None)
+            db_log.extend({**entry, "etape": db_step} for entry in read_db_journal(journal))
+            if os.path.exists(journal):
+                os.remove(journal)
+
+
+def read_db_journal(path: str) -> list:
+    """Commandes base journalisées par db_tools (une ligne JSON chacune) ; lignes illisibles ignorées."""
+    entries = []
+    for line in _read_text(path).splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def lot_tools(values: dict) -> list:
+    """Outils d'un appel Cucumber : CUCUMBER_TOOLS, plus le python de l'agent si l'accès base est accordé."""
+    return CUCUMBER_TOOLS + ([f"Bash({sys.executable}:*)"] if values.get("db_block") else [])
+
+
+def db_summary(entries: list) -> str:
+    """Résumé des commandes base d'un lot : nombre, tables lues, erreurs."""
+    if not entries:
+        return "aucune commande"
+    tables = list(dict.fromkeys(t for e in entries for t in e.get("tables") or []))
+    errors = sum(1 for e in entries if not e.get("ok"))
+    return (f"{len(entries)} commande(s)" + (f", tables : {', '.join(tables)}" if tables else "")
+            + (f", {errors} en erreur" if errors else ""))
 
 
 def cucumber_fix_effort() -> str:
@@ -1516,7 +1560,8 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         before = cucumber_a_revoir.snapshot(worktree, files)
         effort = cucumber_fix_effort()
         returncode, output, usage, limit_hit = run_cucumber_claude(
-            prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort)
+            prompt, model, lot_tools(values), str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort,
+            db_log=lot.setdefault("base", []), db_step="correction après exécution")
         report_token_usage(work_key, "cucumber-verify-fix", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
@@ -1534,7 +1579,8 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             print(f"[LOT {label}] ⛔ {error}")
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         check = verify_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
-                                    values, model, work_key, run_dir, on_usage, inspired_of(results), context)
+                                    values, model, work_key, run_dir, on_usage, inspired_of(results), context,
+                                    lot.setdefault("base", []))
         if not check["ok"] and not check.get("environnement"):
             break
         bad = {t: v for t, v in bad.items() if t not in deployed}
@@ -1706,13 +1752,14 @@ def inspired_of(results: list) -> list:
 
 def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumber_std_dir: str, files: list,
                         compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
-                        on_usage, inspired: list = (), context: dict = None) -> dict:
+                        on_usage, inspired: list = (), context: dict = None, db_log: list = None) -> dict:
     """
     Contrôles des fichiers (check_cucumber_lot, avec `context` : init du client et runner, fichiers de données du Standard copiés), puis compilation (et
     dry-run) si `compile_cmd`, en Python ; en cas d'erreurs dans les fichiers ou le code, au plus
     CUCUMBER_FIX_ATTEMPTS appels de correction limités (erreurs, fichiers du lot, catalogue Java) avec le modèle de
     correction, puis une dernière avec le modèle du lot (cucumber_fix_plan). Renvoie le dernier résultat de
-    cucumber_tools.verify_build, avec "quota" si la limite de session a été atteinte.
+    cucumber_tools.verify_build, avec "quota" si la limite de session a été atteinte. `db_log` : commandes base
+    des corrections (lot["base"]).
     """
     plan = cucumber_fix_plan(model, _env_int("CUCUMBER_FIX_ATTEMPTS", 2))
     attempts, violations = len(plan), []
@@ -1728,8 +1775,9 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
-        returncode, _, usage, limit_hit = run_cucumber_claude(prompt, fix_model, CUCUMBER_TOOLS, fix_turns, run_dir,
-                                                              effort)
+        returncode, _, usage, limit_hit = run_cucumber_claude(prompt, fix_model, lot_tools(values), fix_turns,
+                                                              run_dir, effort, db_log=db_log,
+                                                              db_step=f"correction ({check['etape']})")
         report_token_usage(work_key, "cucumber-fix", fix_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
@@ -1973,8 +2021,10 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
                            erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
     effort = cucumber_fix_effort()
-    returncode, _, usage, _ = run_cucumber_claude(prompt, model, CUCUMBER_TOOLS,
-                                                  str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort)
+    returncode, _, usage, _ = run_cucumber_claude(prompt, model, lot_tools(values),
+                                                  str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort,
+                                                  db_log=lot.setdefault("base", []),
+                                                  db_step="correction d'un run importé")
     report_token_usage(work_key, "cucumber-import-fix", model, usage, len(prompt), returncode, effort)
     on_usage(usage)
     for error in cucumber_a_revoir.check_corrections(worktree, before):
@@ -2256,6 +2306,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     fixed_values = {
         "client_name": client, "token_saving_rules": token_saving_rules,
         "knowledge_block": f"\n{shared['bloc']}\n" if shared["bloc"] else "",
+        # Accès base en lecture seule de tous les lots et de leurs corrections (--db-schema), journalisé par lot
+        "db_block": build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
+                                   step="generate-cucumber-client"),
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
         "features_std": catalogue["features_std"],
         "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",
@@ -2335,9 +2388,6 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             results, files = lot["resultats"], lot.get("fichiers") or []
             print(f"[LOT {label}] Reprise de la correction et de la vérification ({len(files)} fichier(s)).")
         else:
-            has_parameters = any(s["type"] == "parametrage" for s in lot_specs)
-            db_block = build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
-                                      step="generate-cucumber-client") if has_parameters else ""
             # Exemple du lot : la feature Standard la mieux classée, à défaut les exemples globaux
             example = cucumber_tools.lot_example(lot_specs)
             values = {**fixed_values, "examples": f"'{example}'"} if example else fixed_values
@@ -2356,11 +2406,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                                                             java["runner_status"], inline_max),
                                    lot_block=cucumber_tools.lot_block(lot_specs, inline_max, inlined),
                                    profil_block=cucumber_profile.profile_block(profile, gap_file=gap_file),
-                                   lot_label=label, db_block=db_block)
-            tools_allowed = CUCUMBER_TOOLS + ([f"Bash({python_exe}:*)"] if db_block else [])
+                                   lot_label=label)
             # Accès limité au dossier de travail du client (worktree, sources, extraits Jira) et aux catalogues
-            returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, tools_allowed, max_turns,
-                                                                       run_dir, effort, system_file)
+            returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, lot_tools(fixed_values),
+                                                                       max_turns, run_dir, effort, system_file,
+                                                                       lot.setdefault("base", []), "écriture")
             report_token_usage(work_key, "cucumber-lot", model, usage, len(system_prompt) + len(prompt), returncode,
                                effort)
             lot["tokens"] = {}
@@ -2400,7 +2450,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             # Fichiers des features (0 token, données du Standard copiées), puis compilation si configurée
             check = verify_cucumber_lot(client, label, worktree, state["base"], local_cucumber_std_repo, files,
                                         compile_cmd, dry_run_cmd, {**fixed_values, **java}, model, work_key, run_dir,
-                                        lambda usage: add_usage(lot, usage), inspired_of(results), context)
+                                        lambda usage: add_usage(lot, usage), inspired_of(results), context,
+                                        lot.setdefault("base", []))
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         # Niveaux 2 et 3 : exécution sur le client, contre-épreuves, correction bornée, retrait des scénarios faibles
         if lot.get("tags") and (check["ok"] or check.get("environnement")):
@@ -2461,6 +2512,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"[LOT {label}] ✅ {done}/{len(lot_specs)} spécifique(s) couvert(s)"
               + (f", {indirect} indirectement" if indirect else "")
               + f"{' — commit créé' if committed else ' — aucun fichier écrit'}{verified}.")
+        if fixed_values["db_block"]:
+            print(f"[LOT {label}] Base consultée : {db_summary(lot.get('base') or [])}.")
 
     # 4. Patch et récapitulatif, produits en Python ; « couvert_indirectement » vérifié sur l'ensemble des lots
     requalified = cucumber_tools.requalify_indirect(state, inventory)

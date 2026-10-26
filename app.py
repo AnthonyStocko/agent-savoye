@@ -1337,6 +1337,9 @@ with tab_cucumber:
                 "Steps Standard (%)": indicators.get("reutilisation"),
                 "Steps créés": indicators.get("steps_crees"),
                 "Signalés": indicators.get("signales"), "Supprimés": indicators.get("supprimes"),
+                # Commandes base réellement lancées (journal de db_tools) et tables lues
+                "Base": (f"{len(lot['base'])} cmd : " + ", ".join(dict.fromkeys(
+                    t for e in lot["base"] for t in e.get("tables") or [])) if lot.get("base") else None),
                 "Tokens": total_tokens or None,
                 "Coût ($)": round(tokens["cout_usd"], 3) if isinstance(tokens.get("cout_usd"), (int, float)) else None,
                 "Erreur": lot.get("erreur", "") or ("tri Python, sans appel Claude" if lot.get("tri") else ""),

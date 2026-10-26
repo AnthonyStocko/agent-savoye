@@ -119,7 +119,7 @@ def test_fix_loop_runs_diagnostic_once_and_accepts_verified_deployment(repo, mai
             runs.append("TEMPORAIRE-" in f.read())
         return {"scenarios": {tag: dict(diagnosed if runs[-1] else failing)}, "builds": []}
 
-    def claude(prompt, *args):
+    def claude(prompt, *args, **kwargs):
         prompts.append(prompt)
         if len(prompts) == 1:  # 1re correction : diagnostic temporaire
             write(os.path.join(repo, REL), DIAGNOSED)
