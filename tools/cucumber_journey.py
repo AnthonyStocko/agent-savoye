@@ -5,7 +5,8 @@ Bilan), 0 token : état de chaque étape, résumé en une ligne et action suivan
 import os
 import re
 
-from tools import cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_import
+from tools import (cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_import,
+                   cucumber_profile, cucumber_run)
 from tools.cucumber_tools import (_read_json, completable_specifics, init_patch_path, patch_path, pending_lots,
                                   worktree_dir)
 
@@ -114,12 +115,20 @@ def run_counts(analysis: dict) -> tuple:
     return green, len(results) - green
 
 
-def execution_step(client_name: str, analysis: dict) -> dict:
-    """Dernier run importé ; action : importer les logs du run suivant le dernier patch."""
+def execution_step(client_name: str, analysis: dict, profile_doc: dict = None, state: dict = None) -> dict:
+    """Dernier run importé ; action : lancer le run Jenkins (profil complet) ou importer ses logs."""
     patch = patch_path(client_name)
+    profile = cucumber_profile.effective_profile(profile_doc or {})
+    automatic = bool(cucumber_run.run_job(profile) and profile["verify_branch"])
+    last = cucumber_run.last_run(state or {})
+    if last and not last.get("ok"):
+        return _step("execution", "attention", f"dernier lancement Jenkins non abouti : {last['message'][:140]}",
+                     "Corriger la cause puis relancer le run")
     if not analysis:
+        action = ("Pousser et lancer le run Jenkins" if automatic else
+                  "Lancer le job Jenkins puis importer sa console et son rapport")
         return _step("execution", "a_faire" if os.path.exists(patch) else "vide", "aucun run importé",
-                     "Lancer le job Jenkins puis importer sa console et son rapport" if os.path.exists(patch) else "")
+                     action if os.path.exists(patch) else "")
     if analysis.get("non_analyse"):
         return _step("execution", "attention", f"dernier import (n° {analysis['numero']}) non analysé : "
                                                f"{analysis['non_analyse']}", "Importer le bon run")
@@ -201,7 +210,7 @@ def journey(client_name: str, inventory: dict, profile_doc: dict, state: dict, r
     analysis = last_analysis(client_name) if client_name else {}
     return [project_step(client_name, inventory, profile_doc, state), coverage_step(rows),
             selection_step(selected, lots), generation_step(client_name, state),
-            execution_step(client_name, analysis), correction_step(client_name, rows, analysis, state),
+            execution_step(client_name, analysis, profile_doc, state), correction_step(client_name, rows, analysis, state),
             review_step(client_name, state)]
 
 

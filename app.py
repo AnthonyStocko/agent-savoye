@@ -12,8 +12,8 @@ from dotenv import dotenv_values, load_dotenv, set_key
 
 from tools import (cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions,
                    cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_journey,
-                   cucumber_profile, cucumber_studio, cucumber_tools, cucumber_verify, integration_tools,
-                   knowledge_tools)
+                   cucumber_profile, cucumber_run, cucumber_studio, cucumber_tools, cucumber_verify,
+                   integration_tools, jenkins_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -759,6 +759,44 @@ def integration_option_label(ticket: dict) -> str:
     return label
 
 
+def render_cucumber_run(ctx: dict, state: dict) -> None:
+    """
+    Étape 5, run Jenkins automatique (cucumber_run) : push du worktree sur la branche lue par le job, contrôle du
+    commit, lancement avec la branche et les tags, suivi, puis import de la console et des rapports (bilan).
+    """
+    client = ctx["client"]
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    job, branch = cucumber_run.run_job(profile), profile["verify_branch"]
+    with st.container(border=True):
+        st.markdown("##### :material/rocket_launch: Lancer un run Jenkins")
+        missing = [label for label, ok in (("JENKINS_URL (onglet Configuration)", jenkins_tools.jenkins_configured()),
+                                           ("job Jenkins du client (profil)", job),
+                                           ("branche lue par le job (profil)", branch)) if not ok]
+        if missing:
+            st.caption("Lancement automatique indisponible, à renseigner : " + ", ".join(missing) + ". Sinon, "
+                       "importez la console et le rapport ci-dessous.")
+            return
+        st.caption(f"Job **{job}** sur la branche **{branch}** : le worktree y est commité et poussé (jamais de push "
+                   f"forcé), le commit est contrôlé sur origin avant le lancement, puis le build est suivi et sa "
+                   f"console et ses rapports Cucumber JSON sont importés.")
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            tags = st.text_input("Tags (paramètre TAGS du job, vide : tous les scénarios actifs)",
+                                 key=f"cucumber_run_tags_{client}", placeholder="Ex. @agent_<client>_3")
+            launch = st.button("Pousser et lancer le run", icon=":material/play_arrow:", type="primary",
+                               disabled=not ctx["ready"])
+        if launch:
+            st.info("Run Jenkins en cours : push, lancement, suivi du build puis import…")
+            code = run_main_step(ctx["cmd"] + ["--run-jenkins", "--run-tags", tags.strip()])
+            (st.success if code in (0, 1) else st.error)(
+                "Run importé : voir le résultat ci-dessous et le bilan." if code in (0, 1) else
+                "Run non lancé ou non abouti : voir le journal ci-dessus.")
+            state.update(cucumber_tools.load_state(client))
+        last = cucumber_run.last_run(state)
+        if last:
+            st.caption(f"Dernier lancement : {last['date'].replace('T', ' ')[:16]} · commit {last['commit'][:10]} · "
+                       f"{last['message']}" + (f" · [build]({last['build']})" if last.get("build") else ""))
+
+
 def render_cucumber_import(client: str, state: dict) -> None:
     """
     Étape 5, import d'un rapport d'exécution (0 token) : fichiers déposés ou build Jenkins, secrets masqués en
@@ -1236,14 +1274,18 @@ def render_cucumber_profile(ctx: dict, profile_doc: dict) -> None:
             values["reference_codes"] = codes
             # Branche lue par le job de vérification : commitée et poussée avant chaque vérification
             with st.container(horizontal=True):
-                for key in ("verify_branch", "verify_branch_param"):
+                for key in ("verify_branch", "verify_branch_param", "run_job"):
                     values[key] = st.text_input(
                         f"{cucumber_profile.LABELS[key]} ({origin(key)})", value=profile[key],
                         disabled=sources.get(key) == "depot",
-                        placeholder="" if key == "verify_branch" else cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
-                        help="Le worktree y est commité et poussé avant chaque vérification (jamais de push "
-                             "forcé). Vide : le job reçoit le commit de base et le patch du worktree." if key ==
-                        "verify_branch" else None)
+                        placeholder={"verify_branch_param": cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
+                                     "run_job": "DOSSIER/JOB"}.get(key, ""),
+                        help={"verify_branch": "Le worktree y est commité et poussé avant chaque vérification (jamais "
+                                               "de push forcé). Vide : le job reçoit le commit de base et le patch "
+                                               "du worktree.",
+                              "run_job": "Job qui exécute <client>-cucumber sur la branche ci-contre : lancé par "
+                                         "« Pousser et lancer le run » (étape Exécution). Repli : CUCUMBER_RUN_JOB."
+                              }.get(key))
             # Données créées au démarrage par les initializers serveur : statut après un clear, saisi à la main
             values["initializers_survive_clear"] = st.segmented_control(
                 f"{cucumber_profile.LABELS['initializers_survive_clear']} "
@@ -1868,6 +1910,7 @@ with tab_cucumber:
         render_cucumber_generation(cucumber_ctx, cucumber_state)
     elif cucumber_step == "execution":
         if cucumber_client:
+            render_cucumber_run(cucumber_ctx, cucumber_state)
             render_cucumber_import(cucumber_client, cucumber_state)
     elif cucumber_step == "correction":
         if cucumber_client:
@@ -2406,6 +2449,10 @@ with tab_config:
             "CUCUMBER_CLEAR_NAME", value=os.getenv("CUCUMBER_CLEAR_NAME", ""),
             help="Repli si le profil client n'a pas de clear : seul clear autorisé pour purger l'environnement, "
                  "propre à chaque environnement (aucune valeur par défaut). Le profil client (onglet Cucumber) prime.")
+        env_values["CUCUMBER_RUN_JOB"] = st.text_input(
+            "CUCUMBER_RUN_JOB", value=os.getenv("CUCUMBER_RUN_JOB", ""), placeholder="DOSSIER/JOB",
+            help="Run Jenkins automatique (onglet Cucumber, étape Exécution) : job qui exécute <client>-cucumber, si "
+                 "le profil client n'en donne pas. Il doit lire la branche du profil et accepter TAGS.")
         env_values["CUCUMBER_VERIFY_LOCAL_CMD"] = st.text_input(
             "CUCUMBER_VERIFY_LOCAL_CMD", value=os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", ""),
             placeholder='mvn -q test "-Dcucumber.filter.tags={tags}" -Denv={env}',

@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_diagnostic, cucumber_run, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -895,6 +895,8 @@ def main():
     parser.add_argument("--import-run", nargs="*", default=None, help="generate-cucumber-client : import d'un rapport d'exécution (console Jenkins, rapport Cucumber JSON, exports de logs serveur CSV), secrets masqués avant stockage, analysé sans appel à Claude")
     parser.add_argument("--import-url", default="", help="generate-cucumber-client : import d'un build Jenkins (console et rapports Cucumber JSON lus en mémoire), analysé sans appel à Claude")
     parser.add_argument("--from-import", type=int, default=0, help="generate-cucumber-client --complete : lots « correction » des échecs « test » des scénarios de l'agent de l'import n° N")
+    parser.add_argument("--run-jenkins", action="store_true", help="generate-cucumber-client : pousse le worktree sur la branche lue par le job (profil), contrôle le commit, lance le job Jenkins du client, suit le build puis importe sa console et ses rapports (bilan)")
+    parser.add_argument("--run-tags", default="", help="generate-cucumber-client --run-jenkins : expression de tags passée au paramètre TAGS du job (vide : tous les scénarios actifs)")
     parser.add_argument("--server-log", default="", help="generate-cucumber-client : export de logs serveur à contrôler (avec --log-scenario) : couvre-t-il l'heure du step en échec ? (l'outil d'export peut garder les seules lignes les plus récentes), sans appel à Claude")
     parser.add_argument("--log-scenario", default="", help="generate-cucumber-client --server-log : identifiant ou tag @agent_… du scénario en échec (dernière génération)")
     parser.add_argument("--init-modules", default="", help="generate-cucumber-client --init-only : modules retenus parmi WMS, TMS, OMS, séparés par des virgules (défaut : détectés dans les dépôts et l'inventaire du client)")
@@ -2045,6 +2047,20 @@ def run_cucumber_import(client: str, paths: list, build_url: str = "", project: 
     return 1 if analysis["non_analyse"] else 0
 
 
+def run_cucumber_jenkins(client: str, tags: str, project: str = "") -> int:
+    """
+    Run Jenkins automatique (cucumber_run) : push du worktree sur la branche lue par le job, contrôle du commit,
+    lancement, suivi, puis import de la console et des rapports du build (analyse, bilan). Renvoie le code de
+    run_cucumber_import, 2 si rien n'a été lancé ou si le build n'a pas abouti.
+    """
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    run = cucumber_run.launch(client, cucumber_tools.worktree_dir(client), profile, tags)
+    print(f"[RUN JENKINS] {'✅' if run['ok'] else '⛔'} {run['message']}" + (f" — {run['build']}" if run["build"] else ""))
+    if not run["ok"]:
+        return 2
+    return run_cucumber_import(client, [], run["build"], project)
+
+
 def print_import(analysis: dict) -> None:
     """Résumé console d'une analyse d'import."""
     label = f"[CUCUMBER IMPORT] Import n° {analysis['numero']}"
@@ -2197,6 +2213,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         return check_server_log(client, args.server_log, args.log_scenario)
     if args.import_run is not None or args.import_url:
         return run_cucumber_import(client, args.import_run or [], args.import_url, project)
+    if args.run_jenkins:
+        return run_cucumber_jenkins(client, args.run_tags, project)
     base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
     if not base:
         print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")

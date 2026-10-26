@@ -60,6 +60,31 @@ def job_parameters(job_name: str) -> dict:
         return {}
 
 
+def trigger_job(job_name: str, parameters: dict) -> str:
+    """
+    Déclenche un job avec des paramètres texte. Renvoie l'URL de l'élément de file d'attente Jenkins ('' en cas
+    d'échec), à passer à wait_build_result pour suivre CE build (et non le dernier du job).
+    """
+    jenkins_url, auth = _jenkins()
+    if not jenkins_url or not job_name.strip():
+        print("[JENKINS] JENKINS_URL ou nom du job non renseigné (onglet Configuration).")
+        return ""
+    try:
+        response = requests.post(f"{jenkins_url}/{_job_path(job_name)}/buildWithParameters", auth=auth,
+                                 data=parameters, timeout=60)
+        if response.status_code in (200, 201) and response.headers.get("Location"):
+            print(f"[JENKINS] Job {job_name} lancé.")
+            return response.headers["Location"].rstrip("/")
+        print(f"[JENKINS] Erreur lancement job ({response.status_code}) : {response.text[:300]}")
+    except requests.RequestException as e:
+        print(f"[JENKINS] Impossible de lancer le job {job_name} : {e}")
+    return ""
+
+
+def jenkins_configured() -> bool:
+    return bool(_jenkins()[0])
+
+
 def trigger_cucumber_job_with_file(job_name: str, parameters: dict, file_parameter: str, file_path: str) -> str:
     """
     Déclenche un job avec un paramètre fichier (ex. PATCH = le .patch du lot) en plus des paramètres texte.
