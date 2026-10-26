@@ -10,7 +10,7 @@ import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
 from tools import (cucumber_checks, cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers,
-                   cucumber_profile, cucumber_tools, cucumber_verify, integration_tools)
+                   cucumber_profile, cucumber_tools, cucumber_verify, integration_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -1992,6 +1992,25 @@ with tab_config:
                    "et n'est jamais transmis à l'agent.")
 
         st.markdown("---")
+        st.markdown("#### :material/folder_shared: Connaissances partagées")
+        env_values["AGENT_KNOWLEDGE_DIR"] = st.text_input(
+            "AGENT_KNOWLEDGE_DIR", value=os.getenv("AGENT_KNOWLEDGE_DIR", ""),
+            placeholder=r"\\serveur\partage\agent-savoye, X:\agent-savoye ou /mnt/partage/agent-savoye",
+            help="Répertoire commun où chaque analyse est déposée en Markdown et consultée avant les suivantes. "
+                 "Chemin UNC, lecteur mappé ou chemin POSIX. Vide = fonction désactivée. Tout utilisateur du partage "
+                 "lit tous les documents.")
+        with st.container(horizontal=True):
+            env_values["AGENT_KNOWLEDGE_AUTHOR"] = st.text_input(
+                "AGENT_KNOWLEDGE_AUTHOR", value=os.getenv("AGENT_KNOWLEDGE_AUTHOR", ""),
+                placeholder=f"Vide = {knowledge_tools.author()}",
+                help="Auteur inscrit dans les documents déposés. Vide = utilisateur système.")
+            knowledge_max = st.number_input(
+                "AGENT_KNOWLEDGE_MAX_CONTEXT", min_value=0, max_value=100000, step=1000,
+                value=env_int("AGENT_KNOWLEDGE_MAX_CONTEXT", knowledge_tools.DEFAULT_MAX_CONTEXT),
+                help="Taille maximale (caractères) des connaissances partagées injectées dans un prompt. 0 = aucune.")
+        env_values["AGENT_KNOWLEDGE_MAX_CONTEXT"] = str(int(knowledge_max))
+
+        st.markdown("---")
         submit_save = st.form_submit_button("💾 Enregistrer la configuration complète", type="primary", use_container_width=True)
 
         if submit_save:
@@ -2014,6 +2033,20 @@ with tab_config:
             st.success(db_message, icon=":material/check_circle:")
         else:
             st.error(db_message, icon=":material/error:")
+
+    # Hors formulaire : teste le répertoire partagé enregistré (existence, écriture, temps d'accès)
+    with st.container(horizontal=True, vertical_alignment="center"):
+        test_knowledge_clicked = st.button("Tester le répertoire partagé", icon=":material/folder_shared:",
+                                           disabled=not knowledge_tools.enabled())
+        st.caption(f"Teste AGENT_KNOWLEDGE_DIR enregistré : {knowledge_tools.knowledge_dir()}"
+                   if knowledge_tools.enabled() else "AGENT_KNOWLEDGE_DIR vide : connaissances partagées désactivées.")
+    if test_knowledge_clicked:
+        with st.spinner("Test du répertoire partagé…"):
+            knowledge_test = knowledge_tools.test_dir()
+        (st.success if knowledge_test["ok"] else st.error)(
+            knowledge_test["message"], icon=":material/check_circle:" if knowledge_test["ok"] else ":material/error:")
+        for step, step_ok, detail in knowledge_test["etapes"]:
+            st.caption(f"{'✅' if step_ok else '❌'} {step} : {detail}")
 
     st.divider()
     st.subheader("Mémoire de l'agent")
