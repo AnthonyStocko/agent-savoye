@@ -268,6 +268,7 @@ def test_review_skipped_for_empty_fields_only(main_module, monkeypatch):
 
 def test_summary_notes_unreviewed_and_presorted(tmp_path, monkeypatch):
     monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(ct, "WORKSPACE_DIR", str(tmp_path))
     results = [{"id": "sp-t", "statut": "non_couvert", "raison": ct.TECHNICAL_REASON, "tri": True}]
     state = {"lots": [{"numero": 1, "ids": ["sp-1"], "statut": "termine", "resultats": [{"id": "sp-1",
                                                                                          "statut": "couvert"}],
@@ -319,6 +320,7 @@ def test_lot_result_constats_are_normalized():
 
 def test_summary_lists_constats(tmp_path, monkeypatch):
     monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path))
+    monkeypatch.setattr(ct, "WORKSPACE_DIR", str(tmp_path))
     result = {"id": "sp-1", "statut": "non_couvert", "raison": "r",
               "constats": [{"type": "tautologique", "detail": "relecture de la valeur créée", "fichier": ""}]}
     state = {"lots": [{"numero": 1, "ids": ["sp-1"], "statut": "termine", "resultats": [result]}]}
