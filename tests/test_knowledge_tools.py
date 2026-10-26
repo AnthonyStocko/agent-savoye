@@ -159,3 +159,161 @@ def test_update_header_changes_status_only(tmp_path):
     assert reread == meta and reread["statut"] == "remplacé" and body == "corps\nintact\n"
     with pytest.raises(ValueError):
         kt.update_header(path, statut="supprimé")
+
+
+# ---------------------------------------------------------------------------
+# Étape 3 : dépôt (masquage et refus, file locale, remplacement, import)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def share(tmp_path, monkeypatch):
+    """Répertoire partagé et file locale fictifs ; aucune variable secrète héritée du .env du poste."""
+    base = tmp_path / "partage"
+    base.mkdir()
+    monkeypatch.setenv("AGENT_KNOWLEDGE_DIR", str(base))
+    monkeypatch.setenv("AGENT_KNOWLEDGE_AUTHOR", "auteur.fictif")
+    monkeypatch.setattr(kt, "OUTBOX_DIR", str(tmp_path / "outbox"))
+    for name in list(os.environ):
+        if kt.secret_tools._SECRET_ENV_NAME.search(name):
+            monkeypatch.delenv(name)
+    return base
+
+
+def _publish(**overrides):
+    values = dict(body="# Analyse\n\nConstat principal.\n", projet="PROJX", doc_type="cadrage",
+                  sujet="Écart de stock", client="ClientFictif", tickets=["PROJX-1"])
+    values.update(overrides)
+    return kt.publish_knowledge(values.pop("body"), values.pop("projet"), values.pop("doc_type"),
+                                values.pop("sujet"), **values)
+
+
+def _docs(base):
+    return sorted(str(p) for p in base.rglob("*.md"))
+
+
+def test_disabled_without_directory(monkeypatch):
+    monkeypatch.setenv("AGENT_KNOWLEDGE_DIR", "")
+    assert _publish()["statut"] == kt.DISABLED
+
+
+def test_publish_masks_secrets_and_derives_summary(share):
+    result = _publish(body="Lancement : mvn test -Dpassword.db=s3cretValue -DuserName=compte\n"
+                           "Authorization: Basic dXNlcjpwYXNz\n")
+    assert result["statut"] == kt.PUBLISHED, result["message"]
+    meta, body = kt.read_document(result["chemin"])
+    assert "s3cretValue" not in body and "compte" not in body and "dXNlcjpwYXNz" not in body
+    assert "-Dpassword.db=****" in body and meta["resume"].startswith("Lancement")
+    assert meta["client"] == "ClientFictif" and meta["auteur"] == "auteur.fictif"
+
+
+def test_publish_refuses_when_a_secret_remains(share, monkeypatch):
+    refused = _publish(body="clé :\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\n")
+    assert refused["statut"] == kt.REFUSED and "clé privée" in refused["message"]
+    # Valeur secrète de la configuration : masquée, donc acceptée
+    monkeypatch.setenv("FICTIF_API_TOKEN", "valeur-du-jeton-fictif")
+    accepted = _publish(body="appel avec valeur-du-jeton-fictif")
+    assert accepted["statut"] == kt.PUBLISHED
+    assert "valeur-du-jeton-fictif" not in kt.read_document(accepted["chemin"])[1]
+    # Rien d'écrit pour le document refusé, ni sur le partage ni en file locale
+    assert len(_docs(share)) == 1 and kt.outbox_count() == 0
+
+
+def test_remaining_secrets_detects_unmasked_patterns():
+    from tools import secret_tools
+    assert secret_tools.remaining_secrets("-Dpassword=****  Authorization: Bearer ****", environ={}) == []
+    found = secret_tools.remaining_secrets("-DuserPassword=abc eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJSMeKKF2",
+                                           environ={})
+    assert {kind for kind, _ in found} == {"mot de passe", "utilisateur", "jeton JWT"}
+    assert all("abc" not in excerpt for _, excerpt in found)
+
+
+def test_unreachable_share_queues_then_flushes(share, monkeypatch):
+    monkeypatch.setattr(kt, "_reachable", lambda base: False)
+    queued = _publish(body="analyse -Dpassword=secretValue")
+    assert queued["statut"] == kt.QUEUED and kt.outbox_count() == 1 and _docs(share) == []
+    # La file ne contient que du texte masqué
+    with open(kt.outbox_files()[0], encoding="utf-8") as f:
+        assert "secretValue" not in f.read()
+    monkeypatch.setattr(kt, "_reachable", lambda base: True)
+    flushed = kt.flush_outbox()
+    assert flushed["deposes"] == 1 and flushed["restants"] == 0 and len(_docs(share)) == 1
+
+
+def test_write_failure_queues_instead_of_blocking(share, monkeypatch):
+    def broken(*args):
+        raise PermissionError("accès refusé")
+    monkeypatch.setattr(kt, "write_document", broken)
+    result = _publish()
+    assert result["statut"] == kt.QUEUED and "accès refusé" in result["message"]
+
+
+def test_new_version_replaces_previous_one_of_same_ticket(share):
+    first = _publish(body="v1")
+    other_author = kt.update_header(first["chemin"], auteur="autre.auteur")  # déposé par un autre utilisateur
+    assert other_author["auteur"] == "autre.auteur"
+    other_ticket = _publish(body="autre ticket", tickets=["PROJX-2"])
+    second = _publish(body="v2")
+    assert second["statut"] == kt.PUBLISHED and len(second["remplacements"]) == 1
+    meta_first, body_first = kt.read_document(first["chemin"])
+    assert meta_first["statut"] == kt.STATUS_REPLACED and body_first == "v1"
+    assert meta_first["remplace_par"] == kt.relative_path(str(share), second["chemin"])
+    assert kt.read_document(other_ticket["chemin"])[0]["statut"] == kt.STATUS_ACTIVE
+    assert kt.read_document(second["chemin"])[0]["statut"] == kt.STATUS_ACTIVE
+
+
+def test_late_deposit_does_not_replace_a_newer_version(share):
+    newer = kt.write_document(str(share), kt.make_meta("PROJX", "cadrage", "s", client="ClientFictif",
+                                                       tickets=["PROJX-1"], date="2030-01-01T00:00:00"), "récent")
+    older = kt.write_document(str(share), kt.make_meta("PROJX", "cadrage", "s", client="ClientFictif",
+                                                       tickets=["PROJX-1"], date="2026-01-01T00:00:00"), "ancien")
+    messages = kt.supersede(str(share), older, kt.read_document(older)[0])
+    assert kt.read_document(newer)[0]["statut"] == kt.STATUS_ACTIVE
+    assert kt.read_document(older)[0]["statut"] == kt.STATUS_REPLACED and "plus récente" in messages[0]
+
+
+def test_documents_without_ticket_are_replaced_by_subject(share):
+    first = _publish(doc_type="cucumber-couverture", tickets=[], sujet="Couverture ClientFictif")
+    _publish(doc_type="cucumber-couverture", tickets=[], sujet="Autre sujet")
+    _publish(doc_type="cucumber-couverture", tickets=[], sujet="couverture clientfictif")
+    statuses = sorted(kt.read_document(p)[0]["statut"] for p in _docs(share))
+    assert statuses == [kt.STATUS_ACTIVE, kt.STATUS_ACTIVE, kt.STATUS_REPLACED]
+    assert kt.read_document(first["chemin"])[0]["statut"] == kt.STATUS_REPLACED
+
+
+def test_import_existing_markdown(share, tmp_path):
+    source = tmp_path / "A_REVOIR.md"
+    source.write_text("# À revoir\n\n- scénario désactivé : donnée absente\n", encoding="utf-8")
+    result = kt.import_markdown(str(source), "PROJX", "cucumber-a-revoir", tickets=["PROJX-9"],
+                                client="ClientFictif")
+    meta, body = kt.read_document(result["chemin"])
+    assert result["statut"] == kt.PUBLISHED and meta["sujet"] == "A_REVOIR" and meta["tickets"] == ["PROJX-9"]
+    assert meta["resume"] == "scénario désactivé : donnée absente" and body.startswith("# À revoir")
+    assert os.path.relpath(result["chemin"], share).split(os.sep)[:2] == ["ClientFictif", "cucumber-a-revoir"]
+    assert kt.import_markdown(str(tmp_path / "absent.md"), "PROJX", "audit")["statut"] == kt.FAILED
+
+
+def test_publish_never_raises(share, monkeypatch):
+    def crash(*args, **kwargs):
+        raise RuntimeError("imprévu")
+    monkeypatch.setattr(kt, "make_meta", crash)
+    assert _publish()["statut"] == kt.FAILED
+
+
+def test_main_production_points_helpers(share, monkeypatch):
+    import importlib
+    import io
+    import sys
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        main = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    specifics = {"S1": {"id": "S1", "libelle": "depot | dossier", "type": "java", "couverture": "partiel"}}
+    table = main.inventory_markdown("clientfictif", specifics)
+    assert "| S1 | depot / dossier | java | partiel |" in table
+    assert "PROJX-1-a.patch" in main.patch_recap("PROJX-1", ["x/PROJX-1-a.patch"], "récapitulatif")
+    result = main.share_knowledge(table, "CLIENTFICTIF", "cucumber-inventaire", "Inventaire", client="clientfictif")
+    assert result["statut"] == kt.PUBLISHED and main.share_knowledge("  ", "P", "autre", "vide") == {}
+    monkeypatch.setenv("AGENT_KNOWLEDGE_DIR", "")
+    assert main.share_knowledge(table, "CLIENTFICTIF", "cucumber-inventaire", "Inventaire") == {}

@@ -8,6 +8,10 @@ Configuration (.env, onglet ⚙️ Configuration, section « Connaissances parta
 - AGENT_KNOWLEDGE_AUTHOR : auteur des documents déposés (défaut : utilisateur système) ;
 - AGENT_KNOWLEDGE_MAX_CONTEXT : taille maximale (caractères) du bloc injecté dans un prompt.
 
+Dépôt : publish_knowledge, appelée à chaque point de production (main.py), masque les secrets (secret_tools) et
+refuse de déposer si un motif subsiste ; partage indisponible = file locale .tmp/knowledge_outbox, réessayée au
+démarrage et avant chaque dépôt. Import ponctuel de .md existants : python -m tools.knowledge_tools import ...
+
 Aucun nom de client, de projet ni de chemin d'entreprise dans le code : tout vient de la configuration et du
 contexte de l'analyse.
 """
@@ -21,6 +25,8 @@ import re
 import subprocess
 import time
 import uuid
+
+from tools import secret_tools
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -275,6 +281,19 @@ def bound_summary(text: str) -> str:
                      for line in lines[:SUMMARY_MAX_LINES])
 
 
+def summarize(text: str) -> str:
+    """Résumé tiré d'un texte Markdown : ses premières lignes de contenu (titres, séparateurs et tableaux exclus)."""
+    lines = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "|", "```", "---", "===")):
+            continue
+        lines.append(re.sub(r"^(?:[-*+]|\d+\.)\s+", "", stripped).replace("**", ""))
+        if len(lines) == SUMMARY_MAX_LINES:
+            break
+    return bound_summary("\n".join(lines))
+
+
 def make_meta(projet: str, doc_type: str, sujet: str, client: str = "", tickets=(), composants=(), tags=(),
               resume: str = "", depots=(), sources=(), auteur: str = None, date: str = None) -> dict:
     """
@@ -411,3 +430,264 @@ def update_header(path: str, **changes) -> dict:
     meta.update(changes)
     write_atomic(path, render_document(meta, body), overwrite=True)
     return meta
+
+
+# ---------------------------------------------------------------------------
+# Dépôt : masquage, file locale hors ligne, remplacement des versions précédentes, import
+# ---------------------------------------------------------------------------
+
+OUTBOX_DIR = os.path.join(AGENT_DIR, ".tmp", "knowledge_outbox")
+# Délai maximal pour constater que le partage répond, avant de déposer (sinon : file locale)
+REACH_TIMEOUT_S = 10
+PUBLISHED, QUEUED, REFUSED, DISABLED, FAILED = "depose", "en_attente", "refuse", "desactive", "erreur"
+
+
+def mask_document(meta: dict, body: str, environ=None) -> tuple:
+    """
+    (en-tête, corps, secrets restants) : secrets masqués dans le corps et dans les champs texte de l'en-tête
+    (mêmes règles que le reste de l'agent, voir secret_tools), puis contrôle de ce qui subsiste.
+    """
+    body, _ = secret_tools.mask_all(body, environ)
+    masked, texts = dict(meta), [body]
+    for key, value in meta.items():
+        if isinstance(value, str):
+            masked[key] = secret_tools.mask_all(value, environ)[0]
+            texts.append(masked[key])
+        elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+            masked[key] = [secret_tools.mask_all(v, environ)[0] for v in value]
+            texts.extend(masked[key])
+    # Contrôle texte par texte : dans l'en-tête rendu en JSON, un saut de ligne devient « \n » et se collerait
+    # à une valeur masquée
+    remaining = [found for text in texts for found in secret_tools.remaining_secrets(text, environ)]
+    return masked, body, remaining
+
+
+def _same_subject(meta: dict, other: dict) -> bool:
+    """Même analyse : un ticket en commun ; sans ticket des deux côtés, même projet et même sujet."""
+    tickets, other_tickets = set(meta.get("tickets") or []), set(other.get("tickets") or [])
+    if tickets or other_tickets:
+        return bool(tickets & other_tickets)
+    return (str(meta.get("projet", "")).casefold() == str(other.get("projet", "")).casefold()
+            and str(meta.get("sujet", "")).strip().casefold() == str(other.get("sujet", "")).strip().casefold())
+
+
+def relative_path(base: str, path: str) -> str:
+    """Chemin d'un document relatif au répertoire partagé, avec des « / » (identique sur tous les postes)."""
+    return os.path.relpath(path, base).replace(os.sep, "/")
+
+
+def supersede(base: str, path: str, meta: dict) -> list:
+    """
+    Nouvelle version d'une analyse (même dossier projet et type, même ticket ou même sujet) : les versions actives
+    plus anciennes sont marquées « remplacé » par `path`, quel qu'en soit l'auteur. Si une version plus récente
+    existe déjà (dépôt différé depuis la file locale), c'est le nouveau document qui est marqué remplacé par elle.
+    Renvoie les messages des changements.
+    """
+    folder, messages, newer = os.path.dirname(path), [], []
+    when = _parse_date(meta.get("date"))
+    for name in sorted(os.listdir(folder)):
+        other = os.path.join(folder, name)
+        if not name.endswith(".md") or name.startswith(".") or os.path.normcase(other) == os.path.normcase(path):
+            continue
+        try:
+            other_meta, _ = read_document(other)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if other_meta.get("statut", STATUS_ACTIVE) != STATUS_ACTIVE or not _same_subject(meta, other_meta):
+            continue
+        if _parse_date(other_meta.get("date")) > when:
+            newer.append((str(other_meta.get("date")), other))
+            continue
+        try:
+            update_header(other, statut=STATUS_REPLACED, remplace_par=relative_path(base, path))
+            messages.append(f"{relative_path(base, other)} marqué remplacé")
+        except OSError as e:
+            messages.append(f"{relative_path(base, other)} non marqué remplacé ({e})")
+    if newer:
+        latest = max(newer)[1]
+        update_header(path, statut=STATUS_REPLACED, remplace_par=relative_path(base, latest))
+        messages.append(f"version plus récente déjà déposée : {relative_path(base, latest)}")
+    return messages
+
+
+def _reachable(base: str) -> bool:
+    """Le partage répond-il (dossier existant ou créable) dans le délai REACH_TIMEOUT_S ?"""
+    def probe():
+        os.makedirs(base, exist_ok=True)
+        return os.path.isdir(base)
+    try:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            return executor.submit(probe).result(timeout=REACH_TIMEOUT_S)
+        finally:
+            executor.shutdown(wait=False)
+    except (concurrent.futures.TimeoutError, OSError):
+        return False
+
+
+def _deposit(base: str, meta: dict, body: str) -> dict:
+    """Écrit le document (déjà masqué) puis marque les versions précédentes remplacées."""
+    path = write_document(base, meta, body)
+    try:
+        messages = supersede(base, path, meta)
+    except OSError as e:
+        messages = [f"versions précédentes non examinées ({e})"]
+    return {"statut": PUBLISHED, "chemin": path, "message": f"déposé : {relative_path(base, path)}",
+            "remplacements": messages}
+
+
+def _enqueue(meta: dict, body: str, reason: str) -> dict:
+    """Met le document (déjà masqué) en file locale, déposé au prochain démarrage ou au prochain dépôt."""
+    os.makedirs(OUTBOX_DIR, exist_ok=True)
+    stamp = _parse_date(meta.get("date")).strftime("%Y%m%d%H%M%S")
+    path = os.path.join(OUTBOX_DIR, f"{stamp}-{uuid.uuid4().hex[:8]}.json")
+    write_atomic(path, json.dumps({"meta": meta, "body": body, "raison": reason}, ensure_ascii=False))
+    return {"statut": QUEUED, "chemin": path, "remplacements": [],
+            "message": f"partage indisponible ({reason}) : document en file locale, déposé dès que possible"}
+
+
+def outbox_files() -> list:
+    """Documents en attente de dépôt, du plus ancien au plus récent."""
+    try:
+        return sorted(os.path.join(OUTBOX_DIR, n) for n in os.listdir(OUTBOX_DIR) if n.endswith(".json"))
+    except OSError:
+        return []
+
+
+def outbox_count() -> int:
+    return len(outbox_files())
+
+
+def flush_outbox() -> dict:
+    """
+    Dépose les documents en attente (au démarrage et avant chaque dépôt). S'arrête au premier échec : le partage
+    est alors indisponible, les suivants attendent. Renvoie {"deposes", "restants", "messages"}.
+    """
+    files, base, done, messages = outbox_files(), knowledge_dir(), 0, []
+    if not files or not base or not _reachable(base):
+        return {"deposes": 0, "restants": len(files), "messages": messages}
+    for path in files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                entry = json.load(f)
+            # Contrôle refait : la configuration (secrets du .env) a pu changer depuis la mise en file
+            meta, body, remaining = mask_document(entry["meta"], entry["body"])
+            if remaining:
+                messages.append(f"{os.path.basename(path)} : secret détecté, document écarté de la file")
+                os.replace(path, path + ".refuse")
+                continue
+            result = _deposit(base, meta, body)
+        except (OSError, ValueError, KeyError) as e:
+            messages.append(f"{os.path.basename(path)} : dépôt impossible ({e})")
+            break
+        os.remove(path)
+        done += 1
+        messages.append(result["message"])
+    return {"deposes": done, "restants": outbox_count(), "messages": messages}
+
+
+def publish_knowledge(body: str, projet: str, doc_type: str, sujet: str, client: str = "", tickets=(),
+                      composants=(), tags=(), resume: str = "", depots=(), sources=()) -> dict:
+    """
+    Point unique de dépôt d'une analyse dans le répertoire partagé. Ne lève jamais d'exception : l'analyse n'est
+    jamais bloquée. Renvoie {"statut", "chemin", "message", "remplacements"}, statut parmi :
+    - « desactive » : AGENT_KNOWLEDGE_DIR vide ;
+    - « refuse » : un motif de secret subsiste après masquage, rien n'est écrit (ni partage ni file locale) ;
+    - « en_attente » : partage indisponible, document en file locale (.tmp/knowledge_outbox) ;
+    - « depose » : document écrit, versions précédentes marquées remplacées ;
+    - « erreur » : autre échec, détaillé dans le message.
+    Sans `resume`, le résumé est tiré des premières lignes de contenu de `body`.
+    """
+    base = knowledge_dir()
+    if not base:
+        return {"statut": DISABLED, "chemin": "", "message": "connaissances partagées désactivées",
+                "remplacements": []}
+    try:
+        meta = make_meta(projet, doc_type, sujet, client=client, tickets=tickets, composants=composants, tags=tags,
+                         resume=resume or summarize(body), depots=depots, sources=sources)
+        meta, body, remaining = mask_document(meta, body or "")
+        if remaining:
+            kinds = ", ".join(sorted({kind for kind, _ in remaining}))
+            return {"statut": REFUSED, "chemin": "", "remplacements": [],
+                    "message": f"dépôt refusé : motif de secret subsistant après masquage ({kinds})"}
+        flush_outbox()
+        if not _reachable(base):
+            return _enqueue(meta, body, f"{base} injoignable")
+        try:
+            return _deposit(base, meta, body)
+        except OSError as e:
+            return _enqueue(meta, body, str(e))
+    except Exception as e:  # noqa: BLE001 — le dépôt ne doit jamais interrompre l'analyse
+        return {"statut": FAILED, "chemin": "", "message": f"dépôt impossible ({e})", "remplacements": []}
+
+
+def publish_line(result: dict) -> str:
+    """Ligne de console décrivant le résultat d'un dépôt."""
+    icon = {PUBLISHED: "✅", QUEUED: "⏳", REFUSED: "⛔", FAILED: "⚠️"}.get(result["statut"], "ℹ️")
+    extra = "".join(f"\n    {m}" for m in result.get("remplacements") or [])
+    return f"[CONNAISSANCES] {icon} {result['message']}{extra}"
+
+
+def repo_commits(*repos: str) -> list:
+    """[{"nom", "commit"}] des dépôts git analysés (nom du dossier, commit courant) ; dépôts illisibles ignorés."""
+    out = []
+    for repo in repos:
+        if not repo or not os.path.isdir(repo):
+            continue
+        try:
+            result = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                    timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            out.append({"nom": os.path.basename(os.path.normpath(repo)), "commit": result.stdout.strip()})
+    return out
+
+
+def import_markdown(path: str, projet: str, doc_type: str, tickets=(), client: str = "", sujet: str = "",
+                    composants=(), tags=()) -> dict:
+    """
+    Import ponctuel d'un .md existant (A_REVOIR.md, AUDIT.md, COUVERTURE.md...) : même chemin que tout dépôt
+    (masquage, refus, file locale). Un éventuel en-tête du fichier est retiré ; le sujet par défaut est le nom du
+    fichier et le résumé, les premières lignes de contenu du texte.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            _, body = parse_document(f.read())
+    except (OSError, UnicodeDecodeError) as e:
+        return {"statut": FAILED, "chemin": "", "message": f"{path} illisible ({e})", "remplacements": []}
+    return publish_knowledge(body, projet, doc_type, sujet or os.path.splitext(os.path.basename(path))[0],
+                             client=client, tickets=tickets, composants=composants, tags=tags,
+                             sources=())
+
+
+def _cli(argv=None) -> int:
+    """python -m tools.knowledge_tools import FICHIER.md --projet P --type T [--tickets A,B] [--client C]..."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Connaissances partagées : import de documents Markdown existants")
+    sub = parser.add_subparsers(dest="commande", required=True)
+    imp = sub.add_parser("import", help="dépose des .md existants dans le répertoire partagé")
+    imp.add_argument("fichiers", nargs="+")
+    imp.add_argument("--projet", required=True, help="projet Jira")
+    imp.add_argument("--type", required=True, choices=KNOWLEDGE_TYPES)
+    imp.add_argument("--client", default="")
+    imp.add_argument("--tickets", default="", help="clés séparées par des virgules")
+    imp.add_argument("--sujet", default="", help="défaut : nom du fichier")
+    sub.add_parser("flush", help="dépose les documents en file locale")
+    args = parser.parse_args(argv)
+    if args.commande == "flush":
+        result = flush_outbox()
+        print("\n".join(result["messages"]) or "Rien à déposer.")
+        print(f"{result['deposes']} déposé(s), {result['restants']} en attente.")
+        return 0 if not result["restants"] else 1
+    codes = []
+    for path in args.fichiers:
+        result = import_markdown(path, args.projet, args.type, tickets=[t for t in args.tickets.split(",")],
+                                 client=args.client, sujet=args.sujet)
+        print(f"{path} : " + publish_line(result))
+        codes.append(result["statut"] in (PUBLISHED, QUEUED))
+    return 0 if all(codes) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

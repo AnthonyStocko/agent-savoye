@@ -1485,6 +1485,30 @@ with tab_cucumber:
                         st.markdown(f.read())
 
 
+def render_knowledge_outbox() -> None:
+    """
+    Documents en file locale (partage indisponible lors du dépôt) : nombre affiché, nouvel essai au premier
+    affichage de la session puis à la demande.
+    """
+    if not knowledge_tools.enabled():
+        return
+    retry = not st.session_state.get("knowledge_outbox_tried") and knowledge_tools.outbox_count()
+    with st.container(horizontal=True, vertical_alignment="center"):
+        retry = st.button("Déposer les documents en attente", icon=":material/cloud_upload:",
+                          disabled=not knowledge_tools.outbox_count()) or retry
+        pending_caption = st.empty()
+    if retry:
+        st.session_state["knowledge_outbox_tried"] = True
+        with st.spinner("Dépôt des documents en attente…"):
+            flushed = knowledge_tools.flush_outbox()
+        for message in flushed["messages"]:
+            st.caption(message)
+    pending = knowledge_tools.outbox_count()
+    pending_caption.caption(f":orange[{pending} document(s) en attente de dépôt] (partage indisponible lors de "
+                            f"l'analyse, file locale .tmp/knowledge_outbox)" if pending else
+                            "Aucun document en attente de dépôt.")
+
+
 # ---------------------------------------------------------
 # ONGLET 3 : ÉCOUTE DES MERGES BITBUCKET (post-merge Cucumber)
 # ---------------------------------------------------------
@@ -2047,6 +2071,7 @@ with tab_config:
             knowledge_test["message"], icon=":material/check_circle:" if knowledge_test["ok"] else ":material/error:")
         for step, step_ok, detail in knowledge_test["etapes"]:
             st.caption(f"{'✅' if step_ok else '❌'} {step} : {detail}")
+    render_knowledge_outbox()
 
     st.divider()
     st.subheader("Mémoire de l'agent")

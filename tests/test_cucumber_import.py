@@ -136,12 +136,12 @@ def test_correction_lot_sends_the_real_messages(setup, monkeypatch):
     import importlib
     import io
     import sys
-    saved = sys.stdout
-    sys.stdout = io.StringIO()
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
     try:
         main = importlib.import_module("main")
     finally:
-        sys.stdout = saved
+        sys.stdout, sys.stderr = saved
     repo, state = setup
     imported = cimp.import_files(CLIENT, {"cucumber.json": _report({
         "S0": "expected:<A> but was:<B>", "S1": "", "S2": "", "S3": ""}).encode()})

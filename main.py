@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
+from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -23,6 +23,7 @@ from tools.jira_tools import (
     get_issue_field_values, std_only_projects, update_jira_cadrage, update_jira_release_note,
 )
 from tools.memory_tools import (
+    _extract_recap,
     get_capitalized_experience,
     save_cadrage_memory,
     save_refine_feedback,
@@ -381,6 +382,74 @@ def publish_release_note(issue_key: str, note_path: str, run_started_at: float) 
     except Exception as e:
         print(f"[RELEASE NOTE] ⚠️ Mise à jour de la description Jira impossible ({e}). Fichier local conservé : {note_path}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Connaissances partagées : dépôt des analyses produites (knowledge_tools), jamais bloquant
+# ---------------------------------------------------------------------------
+
+def share_knowledge(body: str, projet: str, doc_type: str, sujet: str, **fields) -> dict:
+    """
+    Dépose une analyse dans le répertoire partagé et affiche le résultat ({} si la fonction est désactivée ou le
+    texte vide). Ni un partage injoignable ni un refus (secret détecté) n'interrompent l'étape.
+    """
+    if not knowledge_tools.enabled() or not (body or "").strip():
+        return {}
+    result = knowledge_tools.publish_knowledge(body, projet, doc_type, sujet, **fields)
+    print(knowledge_tools.publish_line(result))
+    return result
+
+
+def share_file(path: str, projet: str, doc_type: str, sujet: str, **fields) -> dict:
+    """share_knowledge du contenu d'un fichier produit ({} s'il est absent)."""
+    return share_knowledge(_read_text(path), projet, doc_type, sujet, **fields) if path else {}
+
+
+def produced(path: str, since: float) -> bool:
+    """Le fichier a-t-il été écrit pendant cette exécution ?"""
+    return bool(path) and os.path.exists(path) and os.path.getmtime(path) >= since
+
+
+def flush_knowledge_outbox() -> None:
+    """Au démarrage : dépose les documents restés en file locale (partage indisponible lors d'un dépôt)."""
+    if not (knowledge_tools.enabled() and knowledge_tools.outbox_count()):
+        return
+    result = knowledge_tools.flush_outbox()
+    for message in result["messages"]:
+        print(f"[CONNAISSANCES] {message}")
+    print(f"[CONNAISSANCES] File locale : {result['deposes']} document(s) déposé(s), {result['restants']} en attente.")
+
+
+def ticket_client(args, project: str) -> str:
+    """Client d'une analyse de ticket, déduit du dépôt client ('' pour un projet du socle seul)."""
+    if project.upper() in std_only_projects() or args.client_repo == "STD_ONLY":
+        return ""
+    return cucumber_tools.client_name_from_repo(args.client_repo or os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""))
+
+
+def epic_markdown(epic_key: str) -> str:
+    """Découpage d'une épopée en un document : une section par tâche (clé, titre) suivie de son analyse."""
+    tasks = load_epic_manifest(epic_key).get("tasks", [])
+    parts = [f"# Découpage de l'épopée {epic_key}", ""]
+    for number, task in enumerate(tasks, 1):
+        parts += [f"## {number}. {task.get('key') or 'tâche non créée'} — {task.get('summary', '')}", "",
+                  _read_text(task.get("file") or "").strip(), ""]
+    return "\n".join(parts) if tasks else ""
+
+
+def patch_recap(issue_key: str, patch_paths: list, agent_output: str) -> str:
+    """Récapitulatif d'un patch : fichiers produits et fin de la sortie de l'agent (son récapitulatif)."""
+    names = "\n".join(f"- {os.path.basename(p)}" for p in patch_paths)
+    return f"# Récapitulatif du patch {issue_key}\n\nPatchs produits :\n{names}\n\n{_extract_recap(agent_output, 6000)}\n"
+
+
+def inventory_markdown(client: str, specifics: dict) -> str:
+    """Inventaire des spécifiques d'un client : un tableau id, libellé, type, couverture."""
+    lines = [f"# Inventaire des spécifiques {client}", "", "| Spécifique | Libellé | Type | Couverture |",
+             "|---|---|---|---|"]
+    lines += [f"| {s['id']} | {str(s.get('libelle', '')).replace('|', '/')} | {s.get('type', '')} | {s.get('couverture', '')} |"
+              for s in specifics.values()]
+    return "\n".join(lines) + "\n"
 
 
 # Formulations du bloc base propres à l'étape (défaut : cadrage, révision et patch d'un ticket)
@@ -863,6 +932,7 @@ def main():
 
     target_issue = args.issue.strip().upper()
     target_project = args.project.strip().upper()
+    flush_knowledge_outbox()
 
     # Création des tâches d'un découpage déjà rédigé (ex. création Jira échouée) : sans relancer l'agent
     if args.step == "epic-sync":
@@ -1115,6 +1185,13 @@ def main():
         
         # Enregistrement en mémoire / capitalisation d'expérience
         cadrage_content = _read_text(cadrage_file)
+        # Connaissances partagées : champs communs des analyses du ticket
+        knowledge = {"client": ticket_client(args, target_project), "tickets": [target_issue],
+                     "composants": jira_context.get("components", []),
+                     "depots": knowledge_tools.repo_commits(local_std_repo, local_client_repo)}
+        knowledge_subject = jira_context.get("summary") or target_issue
+        if args.step in ("cadrage", "refine", "cadrage-reponses") and produced(cadrage_file, run_started_at):
+            share_knowledge(cadrage_content, target_project, "cadrage", knowledge_subject, **knowledge)
         if args.step == "cadrage":
             if _safe_memory(save_cadrage_memory, target_issue, target_project,
                             cadrage_text=cadrage_content, jira_context=jira_context):
@@ -1134,6 +1211,9 @@ def main():
                                    component=args.jira_component, issue_type=args.epic_task_type,
                                    epic_components=jira_context.get("components", [])):
                 sys.exit(1)
+            task_keys = [t["key"] for t in load_epic_manifest(target_issue).get("tasks", []) if t.get("key")]
+            share_knowledge(epic_markdown(target_issue), target_project, "decoupage-epopee", knowledge_subject,
+                            **{**knowledge, "tickets": [target_issue] + task_keys})
         elif args.step == "refine":
             if _safe_memory(save_refine_feedback, target_issue, args.feedback,
                             previous_cadrage=cadrage_before_run, updated_cadrage=cadrage_content):
@@ -1154,12 +1234,18 @@ def main():
                                 final_cadrage=cadrage_content, jira_context=jira_context):
                     print(f"[MÉMOIRE] Livrable validé indexé : {', '.join(patch_paths)}.")
                 publish_release_note(target_issue, release_note_file, run_started_at)
+                share_knowledge(patch_recap(target_issue, patch_paths, stdout_output), target_project, "recap-patch",
+                                knowledge_subject, **knowledge)
+                if produced(release_note_file, run_started_at):
+                    share_file(release_note_file, target_project, "release-note", knowledge_subject, **knowledge)
         elif is_besoin:
             if not finalize_besoin(target_issue, target_project, besoin_output, previous_besoin, run_started_at):
                 sys.exit(1)
+            share_knowledge(integration_tools.render_section_markdown(integration_tools.load_state(target_issue)),
+                            target_project, "besoin", knowledge_subject, **knowledge)
         elif is_postmerge:
             if not finalize_postmerge(args, target_issue, postmerge_summary, description_file,
-                                      workspace_dir, run_started_at, stdout_output):
+                                      workspace_dir, run_started_at, stdout_output, knowledge):
                 sys.exit(1)
     else:
         print(f"\n=== Étape {args.step.upper()} interrompue pour {target_issue} (Code: {returncode}) ===")
@@ -1790,11 +1876,11 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     return 0
 
 
-def run_cucumber_import(client: str, paths: list, build_url: str = "") -> int:
+def run_cucumber_import(client: str, paths: list, build_url: str = "", project: str = "") -> int:
     """
     Import d'un rapport d'exécution (0 token, cucumber_import) : fichiers lus et masqués en mémoire, ou build
-    Jenkins ; analyse affichée et écrite dans imports/<n>/analyse.md. Renvoie 0 si l'import est analysé, 1 sinon,
-    2 si rien n'a été importé.
+    Jenkins ; analyse affichée, écrite dans imports/<n>/analyse.md et déposée dans les connaissances partagées.
+    Renvoie 0 si l'import est analysé, 1 sinon, 2 si rien n'a été importé.
     """
     files = {}
     for path in paths:
@@ -1816,6 +1902,9 @@ def run_cucumber_import(client: str, paths: list, build_url: str = "") -> int:
     analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client),
                                        cucumber_tools.worktree_dir(client))
     print_import(analysis)
+    share_file(os.path.join(cucumber_import.imports_dir(client), str(analysis["numero"]), "analyse.md"),
+               project or client.upper(), "cucumber-diagnostic-run", f"Run importé n° {analysis['numero']}",
+               client=client, tags=["cucumber"])
     return 1 if analysis["non_analyse"] else 0
 
 
@@ -1890,7 +1979,8 @@ def check_server_log(client: str, path: str, scenario: str) -> int:
     return 0 if covered else 1
 
 
-def run_cucumber_health(client: str, local_cucumber_std_repo: str, cucumber_repo_dir: str, base: str) -> int:
+def run_cucumber_health(client: str, local_cucumber_std_repo: str, cucumber_repo_dir: str, base: str,
+                        project: str = "") -> int:
     """
     Bilan de santé du dépôt client (0 token, cucumber_checks.health_report) : compilation et dry-run avec les
     commandes de la génération (CUCUMBER_COMPILE_CMD, dry-run toujours lancé). Renvoie 0 si le dépôt est sain, 1 sinon.
@@ -1926,6 +2016,8 @@ def run_cucumber_health(client: str, local_cucumber_std_repo: str, cucumber_repo
         print("[CUCUMBER SANTÉ] ⚠️ Projet client décalé de sa bibliothèque de steps : ses features existantes ne "
               "compilent pas ou ont des steps non définis ou ambigus (pas un problème de génération).")
     print(f"[CUCUMBER SANTÉ] Rapport : {report['fichier']}")
+    share_file(report["fichier"], project or client.upper(), "cucumber-sante", f"Santé du dépôt {client}-cucumber",
+               client=client, tags=["cucumber"], depots=knowledge_tools.repo_commits(cucumber_repo_dir))
     return 0 if report["ok"] else 1
 
 
@@ -1939,10 +2031,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     la génération existante, sans repartir de la base. Renvoie le code de sortie.
     """
     client = args.client_name
+    project = args.project.strip().upper()
     if args.server_log:
         return check_server_log(client, args.server_log, args.log_scenario)
     if args.import_run is not None or args.import_url:
-        return run_cucumber_import(client, args.import_run or [], args.import_url)
+        return run_cucumber_import(client, args.import_run or [], args.import_url, project)
     base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
     if not base:
         print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")
@@ -1950,7 +2043,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     if args.init_only:
         return run_cucumber_init(args, local_client_repo, local_cucumber_std_repo, cucumber_repo_dir, base)
     if args.health_only:
-        return run_cucumber_health(client, local_cucumber_std_repo, cucumber_repo_dir, base)
+        return run_cucumber_health(client, local_cucumber_std_repo, cucumber_repo_dir, base, project)
     if args.profile_only:
         subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
         return 0 if detect_cucumber_profile(client, cucumber_repo_dir, base, local_cucumber_std_repo,
@@ -2009,6 +2102,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
           f"de processus Studio : {with_studio} fichier(s)")
     if args.inventory_only:
         detect_cucumber_profile(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version)
+        share_knowledge(inventory_markdown(client, specifics), project, "cucumber-inventaire",
+                        f"Inventaire des spécifiques {client}", client=client, tags=["cucumber"],
+                        depots=knowledge_tools.repo_commits(cucumber_repo_dir))
         return 0
 
     # 2. Lots : complément, reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
@@ -2377,7 +2473,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             exit_code = 1
     else:
         print("\n[CUCUMBER] Aucun test écrit : pas de patch.")
-    print(f"[CUCUMBER] Récapitulatif : {cucumber_tools.write_coverage_summary(client, inventory, state)}")
+    coverage_file = cucumber_tools.write_coverage_summary(client, inventory, state)
+    print(f"[CUCUMBER] Récapitulatif : {coverage_file}")
+    # Connaissances partagées : un document de couverture par génération (pas par lot) et l'A_REVOIR.md livré
+    cucumber_knowledge = {"client": client, "tags": ["cucumber"],
+                          "depots": knowledge_tools.repo_commits(worktree, local_cucumber_std_repo)}
+    share_file(coverage_file, project, "cucumber-couverture", f"Couverture Cucumber {client}", **cucumber_knowledge)
+    share_file(os.path.join(worktree, cucumber_a_revoir.A_REVOIR_FILE), project, "cucumber-a-revoir",
+               f"À revoir Cucumber {client}", **cucumber_knowledge)
     not_compiling = [str(lot["numero"]) for lot in lots if lot.get("statut") == "erreur_compilation"]
     if not_compiling:
         print(f"[CUCUMBER] ⚠️ Lot(s) en erreur de compilation, commités tels quels : {', '.join(not_compiling)} "
@@ -2443,10 +2546,11 @@ def finalize_besoin(issue_key: str, project_key: str, output_file: str, previous
 
 
 def finalize_postmerge(args, source_issue: str, summary: str, description_file: str,
-                       workspace_dir: str, run_started_at: float, agent_output: str) -> bool:
+                       workspace_dir: str, run_started_at: float, agent_output: str, knowledge: dict = None) -> bool:
     """
     Contrôle le résultat de l'agent : ticket SPEC créé, patch attaché. Rattrape ce que l'agent
-    n'a pas fait (création depuis la description, pièce jointe manquante) puis capitalise.
+    n'a pas fait (création depuis la description, pièce jointe manquante) puis capitalise et dépose la description
+    dans les connaissances partagées (`knowledge` : champs communs de l'analyse).
     """
     keys = re.findall(rf"JIRA_KEY=({re.escape(args.jira_target_project)}-\d+)", agent_output or "")
     new_key = keys[-1] if keys else find_jira_issue_by_summary(args.jira_target_project, summary)
@@ -2480,6 +2584,9 @@ def finalize_postmerge(args, source_issue: str, summary: str, description_file: 
     _safe_memory(save_cadrage_memory, new_key, args.jira_target_project, cadrage_text=description, jira_context=ticket_context)
     if patch_paths:
         _safe_memory(save_patch_memory, new_key, patch_paths, agent_output=agent_output, final_cadrage=description)
+    if knowledge is not None:
+        share_knowledge(description, args.jira_target_project, "postmerge-cucumber", summary,
+                        **{**knowledge, "tickets": [source_issue, new_key]})
 
     print(f"\n[POST-MERGE] ✅ Ticket {new_key} prêt pour {source_issue} : {summary}")
     print(f"POSTMERGE_RESULT source={source_issue} jira={new_key} patches={len(patch_paths)}")

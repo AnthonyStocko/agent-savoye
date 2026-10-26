@@ -16,8 +16,6 @@ Import d'un rapport d'exécution (point 8, onglet Cucumber, main.py --import-run
 
 Stockage : .tmp/cucumber/<client>/imports/index.json et imports/<n>/ (fichiers masqués, analyse.json, analyse.md).
 """
-import base64
-import binascii
 import hashlib
 import json
 import os
@@ -25,61 +23,19 @@ import re
 from datetime import datetime, timezone
 
 from tools import jenkins_tools
+# Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
+from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
 from tools.cucumber_tools import _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag, cache_dir
 from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _timestamp, expected_count, failure_category,
                                    feature_texts, log_coverage, log_request, parse_cucumber_report, report_test_count,
                                    scenario_id, selection_gap)
 
-MASK = "****"
-_VALUE = r"(\"[^\"]*\"|'[^']*'|[^\s\"',;&}]+)"
-SECRET_PATTERNS = (
-    ("mot de passe", re.compile(r"(-D[\w.-]*pass(?:word|wd)?[\w.-]*=)" + _VALUE, re.I)),
-    ("utilisateur", re.compile(r"(-D[\w.-]*user(?:name)?[\w.-]*=)" + _VALUE, re.I)),
-    ("jeton", re.compile(r"(-D[\w.-]*(?:token|secret|api[_-]?key)[\w.-]*=)" + _VALUE, re.I)),
-    ("jeton", re.compile(r"(Authorization\s*:\s*(?:Bearer|Basic)\s+)(\S+)", re.I)),
-    ("mot de passe", re.compile(r"([?&;](?:password|passwd|pwd|token)=)([^&\s\"']+)", re.I)),
-    ("mot de passe", re.compile(r"(\"(?:password|passwd|pwd|token)\"\s*:\s*\")([^\"]+)", re.I)),
-)
 _TESTS_RUN = re.compile(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)")
 # Valeur entre guillemets, sinon jusqu'à un guillemet, une option suivante (« -X ») ou la fin de la ligne
 _FILTER_TAGS = re.compile(r"cucumber\.filter\.tags=(?:\"([^\"]+)\"|'([^']+)'|([^\"'\n]+?)(?=[\"']|\s+-|\s*$))", re.M)
 _BUILD_NUMBER = re.compile(r"(?:Build|build)\s*#\s*(\d+)|/job/[^\s]+?/(\d+)/")
 _LOG_LEVEL = re.compile(r"\b(ERROR|WARN(?:ING)?|SEVERE|FATAL)\b")
 EVIDENCE_LINES = 5
-
-
-# ---------------------------------------------------------------------------
-# Masquage des secrets (avant tout stockage ou affichage)
-# ---------------------------------------------------------------------------
-
-def _variants(value: str) -> set:
-    """Valeur secrète, sa forme base64 et, si elle est en base64, sa forme décodée."""
-    out = {value, base64.b64encode(value.encode()).decode()}
-    try:
-        decoded = base64.b64decode(value, validate=True).decode("utf-8")
-        if decoded.isprintable() and len(decoded) >= 4:
-            out.add(decoded)
-    except (binascii.Error, ValueError, UnicodeDecodeError):
-        pass
-    return {v for v in out if len(v) >= 4}
-
-
-def mask_secrets(text: str) -> tuple:
-    """(texte masqué, {type de secret: nombre}) : paramètres -D*password*, -DuserName, jetons, en-têtes
-    Authorization, mots de passe d'URL ou de JSON, et toute autre occurrence de ces valeurs (base64 comprise)."""
-    counts, values = {}, set()
-    for label, pattern in SECRET_PATTERNS:
-        def replace(match, label=label):
-            value = match.group(2).strip("\"'")
-            if value and value != MASK:
-                counts[label] = counts.get(label, 0) + 1
-                values.update(_variants(value))
-            quote = match.group(2)[0] if match.group(2)[:1] in "\"'" and len(match.group(2)) > 1 else ""
-            return f"{match.group(1)}{quote}{MASK}{quote}"
-        text = pattern.sub(replace, text)
-    for value in sorted(values, key=len, reverse=True):
-        text = text.replace(value, MASK)
-    return text, counts
 
 
 # ---------------------------------------------------------------------------
