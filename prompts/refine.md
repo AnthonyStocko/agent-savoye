@@ -1,6 +1,6 @@
 L'UTILISATEUR A DEMANDÉ DES AJUSTEMENTS SUR LE CADRAGE DU TICKET ${target_issue}.
 Consignes utilisateur : "${feedback}"
-${token_saving_rules}${capitalization_block}${db_block}
+${token_saving_rules}${capitalization_block}${knowledge_block}${db_block}
 
 1. Lis le cadrage existant dans '${target_issue}-cadrage.md'.
 2. Révise et adapte le cadrage dans '${target_issue}-cadrage.md' selon les consignes utilisateur.

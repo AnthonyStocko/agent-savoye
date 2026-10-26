@@ -1,5 +1,5 @@
 LE CADRAGE A ÉTÉ VALIDÉ PAR L'UTILISATEUR. GÉNÈRE MAINTENANT LE PATCH ET LES TESTS CUCUMBER POUR ${target_issue}.
-${token_saving_rules}${capitalization_block}${db_block}
+${token_saving_rules}${capitalization_block}${knowledge_block}${db_block}
 Consignes :
 1. Pars du cadrage validé '${target_issue}-cadrage.md' : c'est ta source de référence. Ne relis pas Jira et ne refais pas l'analyse ;
    ouvre uniquement les portions utiles des fichiers listés dans sa partie technique.

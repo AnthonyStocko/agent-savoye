@@ -405,6 +405,18 @@ def share_file(path: str, projet: str, doc_type: str, sujet: str, **fields) -> d
     return share_knowledge(_read_text(path), projet, doc_type, sujet, **fields) if path else {}
 
 
+def consult_knowledge(projet: str, **criteria) -> dict:
+    """
+    Consultation des connaissances partagées avant une analyse (knowledge_tools.consult) : message et documents
+    retenus affichés ; {"bloc": "", "documents": []} si la fonction est désactivée. Jamais bloquant.
+    """
+    if not knowledge_tools.enabled():
+        return {"bloc": "", "documents": []}
+    shared = knowledge_tools.consult(projet, **criteria)
+    print(f"[CONNAISSANCES] {shared['message']}" + "".join(f"\n    {p}" for p in shared["documents"]))
+    return shared
+
+
 def produced(path: str, since: float) -> bool:
     """Le fichier a-t-il été écrit pendant cette exécution ?"""
     return bool(path) and os.path.exists(path) and os.path.getmtime(path) >= since
@@ -1019,6 +1031,14 @@ def main():
     else:
         print("[MÉMOIRE] Aucun retour d'expérience pertinent trouvé.")
 
+    # Connaissances partagées : analyses antérieures du projet et du sujet, injectées comme données à vérifier
+    # (la génération Cucumber d'un client consulte les siennes dans run_cucumber_client)
+    shared = {"bloc": "", "documents": []} if is_cucumber_client else consult_knowledge(
+        target_project, client=ticket_client(args, target_project), tickets=[target_issue],
+        composants=jira_context.get("components", []),
+        query_text=f"{jira_context.get('summary', '')}\n{jira_context.get('description', '')[:3000]}")
+    knowledge_block = f"\n{shared['bloc']}\n" if shared["bloc"] else ""
+
     cadrage_file = f"{target_issue}-cadrage.md"
     release_note_file = f"{target_issue}-release-note.md"
     cadrage_before_run = _read_text(cadrage_file)
@@ -1048,6 +1068,7 @@ def main():
     # Variables communes des modèles de prompts (prompts/*.md)
     prompt_values = {
         "token_saving_rules": token_saving_rules, "capitalization_block": capitalization_block, "db_block": db_block,
+        "knowledge_block": knowledge_block,
         "target_issue": target_issue, "target_project": target_project, "conventions_path": conventions_path,
         "branch_rule": branch_rule, "repo_scope": repo_scope, "jira_fetch_step": jira_fetch_step,
         "cucumber_instruction": cucumber_instruction, "release_note_step": release_note_step,
@@ -1158,6 +1179,9 @@ def main():
             worktree_root=worktree_root, workspace_dir=workspace_dir,
         )
 
+    # Modèle de prompt sans ${knowledge_block} (prompt personnalisé, besoin...) : le bloc est ajouté en fin de prompt
+    if shared["bloc"] and shared["bloc"] not in prompt:
+        prompt += knowledge_block
     print(f"=== Exécution Étape: {args.step.upper()} ===")
     print(f"Projet Jira          : {target_project}")
     print(f"Ticket Cible         : {target_issue}")
@@ -1176,7 +1200,7 @@ def main():
     returncode, stdout_output, token_usage, session_limit_hit = run_claude(
         prompt, claude_model, add_dirs,
         ["Read", "Write", "Edit", "Grep", "Glob", "Bash", f"Bash({python_exe}:*)", "Bash(git:*)"],
-        effort=claude_effort_level)
+        extra_args=knowledge_tools.read_only_args() if shared["documents"] else (), effort=claude_effort_level)
     report_token_usage(target_issue, args.step, claude_model, token_usage, len(prompt), returncode,
                        claude_effort_level)
 
@@ -1188,7 +1212,8 @@ def main():
         # Connaissances partagées : champs communs des analyses du ticket
         knowledge = {"client": ticket_client(args, target_project), "tickets": [target_issue],
                      "composants": jira_context.get("components", []),
-                     "depots": knowledge_tools.repo_commits(local_std_repo, local_client_repo)}
+                     "depots": knowledge_tools.repo_commits(local_std_repo, local_client_repo),
+                     "sources": shared["documents"]}
         knowledge_subject = jira_context.get("summary") or target_issue
         if args.step in ("cadrage", "refine", "cadrage-reponses") and produced(cadrage_file, run_started_at):
             share_knowledge(cadrage_content, target_project, "cadrage", knowledge_subject, **knowledge)
@@ -2226,8 +2251,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                                                                else ""))
         if not init["ok"]:
             verify_mode, verify_message, unverified_status = "", init["message"], "environnement"
+    # Connaissances partagées du client (couverture, santé, à revoir, runs importés...), dans la partie fixe des lots
+    shared = consult_knowledge(project, client=client, tags=["cucumber"])
     fixed_values = {
         "client_name": client, "token_saving_rules": token_saving_rules,
+        "knowledge_block": f"\n{shared['bloc']}\n" if shared["bloc"] else "",
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
         "features_std": catalogue["features_std"],
         "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",
@@ -2476,7 +2504,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     coverage_file = cucumber_tools.write_coverage_summary(client, inventory, state)
     print(f"[CUCUMBER] Récapitulatif : {coverage_file}")
     # Connaissances partagées : un document de couverture par génération (pas par lot) et l'A_REVOIR.md livré
-    cucumber_knowledge = {"client": client, "tags": ["cucumber"],
+    cucumber_knowledge = {"client": client, "tags": ["cucumber"], "sources": shared["documents"],
                           "depots": knowledge_tools.repo_commits(worktree, local_cucumber_std_repo)}
     share_file(coverage_file, project, "cucumber-couverture", f"Couverture Cucumber {client}", **cucumber_knowledge)
     share_file(os.path.join(worktree, cucumber_a_revoir.A_REVOIR_FILE), project, "cucumber-a-revoir",

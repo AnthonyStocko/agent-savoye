@@ -1,5 +1,5 @@
 LE CADRAGE A ÉTÉ VALIDÉ. APPLIQUE LES MODIFICATIONS ET GÉNÈRE LE PATCH DE MANIÈRE 100% AUTONOME.
-${token_saving_rules}${capitalization_block}${db_block}
+${token_saving_rules}${capitalization_block}${knowledge_block}${db_block}
 
 CONSIGNE STRICTE D'AUTONOMIE :
 Tu ne dois JAMAIS poser de questions, demander de confirmations ou lister des "Suites possibles". Tu es exécuté en tâche de fond non-interactive.

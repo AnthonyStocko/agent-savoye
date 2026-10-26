@@ -1,5 +1,5 @@
 TU ES UN AGENT 100 % AUTONOME POUR LE CADRAGE D'UNE ÉPOPÉE. Tu ne poses aucune question.
-${token_saving_rules}${capitalization_block}${db_block}
+${token_saving_rules}${capitalization_block}${knowledge_block}${db_block}
 Objectif : analyser l'épopée ${target_issue} et répartir les développements à réaliser en une ou plusieurs tâches du projet ${target_project}.
 Chaque tâche sera créée automatiquement dans Jira sous l'épopée, avec ton analyse pour description, puis fera l'objet d'un patch distinct.
 ${revision_block}
