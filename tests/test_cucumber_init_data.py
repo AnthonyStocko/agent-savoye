@@ -291,3 +291,35 @@ def test_profile_runner_declared_overlay_prevents_creation(repo, tmp_path, monke
     declared = {**CONVENTIONS, "runner": {"classe": "cucumber.RunCucumberTest", "surcouche": True}}
     java = ct.client_java_context("clientx", repo, std_java, declared)
     assert java["overlay_run"] and not ct.needs_runner(java["runner_status"])
+
+
+def test_init_outside_root_is_named_in_the_path_gap():
+    conventions = {**CONVENTIONS, "init": [f"{RES}/features/01-Contexte/Init.feature"]}
+    gaps = ct.runner_gaps(runner(features=f"{RES}/features/clientx"), "cucumber.features.clientx", conventions)
+    assert gaps == [f"ajoute le chemin de features '{RES}/features/01-Contexte/' (actuel : {RES}/features/clientx) "
+                    f"pour inclure {RES}/features/01-Contexte/Init.feature (initialisation du client)"]
+
+
+def test_existing_runner_left_incomplete_by_the_lot_is_an_error(client_repo):
+    rel = "src/test/java/cucumber/RunnerTest.java"
+    write(os.path.join(client_repo, "pom.xml"), "<project/>")
+    write(os.path.join(client_repo, *rel.split("/")),
+          RUNNER.format(features=f"{RES}/features/", tags="@CLIENTX", plugins='"pretty"'))
+    git(client_repo, "add", "-A")
+    git(client_repo, "commit", "-qm", "runner client")
+    java = ct.client_java_context("clientx", client_repo, {"steps_root": "cucumber.features"}, CONVENTIONS)
+    assert ct.runner_to_complete(java["runner_status"]) and java["runner"]["path"] == rel
+    errors = ct.lot_runner_errors(client_repo, "HEAD", [], java, CONVENTIONS)
+    assert len(errors) == 3 and all("runner existant encore incomplet" in e for e in errors)
+    # Complété par le lot (Edit) : plus d'erreur, et jamais de second runner
+    write(os.path.join(client_repo, *rel.split("/")),
+          RUNNER.format(features=f"{RES}/features/", tags="not @A_REVOIR", plugins='"json:target/c.json"'))
+    assert ct.lot_runner_errors(client_repo, "HEAD", [rel], java, CONVENTIONS) == []
+
+
+def test_missing_runner_must_be_created_by_the_lot(client_repo):
+    java = {"overlay_run": False, "runner": None, "package_steps": "cucumber.features.clientx",
+            "class_suffix": "Clientx"}
+    errors = ct.lot_runner_errors(client_repo, "HEAD", [], java, CONVENTIONS)
+    assert len(errors) == 1 and "aucun runner" in errors[0] and INIT_REL in errors[0]
+    assert ct.lot_runner_errors(client_repo, "HEAD", [], {**java, "overlay_run": True}, CONVENTIONS) == []

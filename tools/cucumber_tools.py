@@ -1710,9 +1710,11 @@ def runner_gaps(runner: dict, package_steps: str, conventions: dict) -> list:
     dirs = [_feature_dir(p) for p in runner.get("features") or []]
     for needed in [root] + list(conventions.get("init") or []):
         if needed and dirs and not any(needed.startswith(d) for d in dirs):
-            gaps.append(f"ajoute le chemin de features '{root}' (actuel : {', '.join(runner['features'])}) pour "
-                        f"inclure {needed}")
-            break
+            path = needed if needed.endswith("/") else needed.rsplit("/", 1)[0] + "/"
+            # Init sous la racine déjà demandée : un seul chemin à ajouter
+            dirs.append(path)
+            gaps.append(f"ajoute le chemin de features '{path}' (actuel : {', '.join(runner['features'])}) pour "
+                        f"inclure {needed}" + (" (initialisation du client)" if needed != root else ""))
     # Tags : jamais de filtre sur le tag client (des scénarios actifs ne le portent pas) ; exclusion des scénarios
     # désactivés dans le runner, le filtre passé au job pouvant ne pas atteindre Cucumber
     client_tag, disabled = conventions.get("client_tag", ""), a_revoir_tag()
@@ -1887,9 +1889,11 @@ def client_java_context(client_name: str, worktree: str, std_java: dict, convent
 
 def lot_runner_errors(worktree: str, base: str, files: list, java: dict, conventions: dict) -> list:
     """
-    Runners écrits par un lot : un second runner (un runner client existe à `base`, ou le runner du Standard
+    Runners après un lot : un second runner (un runner client existe à `base`, ou le runner du Standard
     s'applique en surcouche) est une erreur ; un runner créé faute d'en avoir doit couvrir la glue, la racine et
-    l'init du client, son tag, et produire le rapport JSON (runner_gaps).
+    l'init du client, exclure les scénarios désactivés et produire le rapport JSON (runner_gaps). Le runner client
+    à compléter (java["runner"]) est relu sur disque : un écart restant est une erreur ; aucun runner alors qu'il
+    en faut un (ni runner client, ni surcouche) aussi.
     """
     texts = {f: _read_text_file(os.path.join(worktree, *f.split("/"))) for f in files
              if f.endswith(".java") and os.path.exists(os.path.join(worktree, *f.split("/")))}
@@ -1906,7 +1910,30 @@ def lot_runner_errors(worktree: str, base: str, files: list, java: dict, convent
         else:
             errors += [f"{runner['path']} : {gap}" for gap in runner_gaps(runner, java.get("package_steps", ""),
                                                                            conventions)]
+    if (java or {}).get("overlay_run"):
+        return errors
+    target = reference if reference and reference.get("path") in existing else None
+    if target and os.path.exists(os.path.join(worktree, *target["path"].split("/"))):
+        current = _disk_runner(worktree, target["path"])
+        gaps = runner_gaps(current, java.get("package_steps", ""), conventions) if current else [
+            "n'est plus un runner Cucumber (annotations retirées) : rétablis-le"]
+        errors += [f"{target['path']} : runner existant encore incomplet — {gap}" for gap in gaps]
+    elif java and not existing and not created:
+        instruction, _ = runner_status_for(java.get("package_steps", ""), [], [], java.get("class_suffix", ""),
+                                           conventions)
+        errors.append(f"aucun runner n'exécute les features du client : {instruction}")
     return errors
+
+
+def _disk_runner(worktree: str, path: str) -> dict:
+    """Runner `path` tel qu'il est sur disque (propriétés junit-platform / cucumber du worktree comprises)."""
+    text = _read_text_file(os.path.join(worktree, *path.split("/")))
+    resources = os.path.join(worktree, "src", "test", "resources")
+    properties = "\n".join(_read_text_file(os.path.join(resources, name))
+                           for name in ("junit-platform.properties", "cucumber.properties")
+                           if os.path.exists(os.path.join(resources, name)))
+    entries = runner_entries(java_classes({path: text}), {path: text}, properties)
+    return entries[0] if entries else {}
 
 
 def business_signatures(path: str, max_members: int = 20) -> list:
