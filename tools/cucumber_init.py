@@ -9,14 +9,20 @@ de l'initialisation de chacun de ses modules, à lancer séparément par son tag
 features/<client>/01-Contexte/<MOD>/ : Cucumber trie les features par chemin, l'initialisation passe ainsi avant
 toutes les autres features du client. La purge utilise le clear CUCUMBER_CLEAR_NAME par un step client (seul code
 Java ajouté, aucun step du Standard ne prend de clear nommé) ; les autres steps restent ceux du Standard.
+
+Chaque intégration échoue si un fichier finit en INTEGRATED_WITH_ERROR : les steps d'intégration sans attente du
+résultat (NON_CHECKING_STEPS) sont remplacés par leur équivalent qui l'attend. Un step absent de la bibliothèque de
+steps du client (ou de signature différente) est commenté avec « # TODO-VERSION: <raison> », jamais supprimé.
 """
 import os
 import posixpath
 import re
 import shutil
 
+from tools import cucumber_recreation, cucumber_versions
 from tools.cucumber_tools import (_git, add_worktree, cache_dir, format_patch, git_repos, init_patch_path,
                                   java_class_suffix, java_package_segment)
+from tools.cucumber_verify import _STEP_LINE
 
 INIT_MODULES = ("WMS", "TMS", "OMS")
 RESOURCES_DIR = "src/test/resources/cucumber"
@@ -25,6 +31,10 @@ STD_PURGE_STEP = "INIT- Purge de l'environnement"
 CLEAR_STEP = "INIT- Purge de l'environnement par le clear"
 GLOBAL_INIT_STEP = "INIT- Initialisation globale par fichiers via l'écran"
 SPEC_STEP = "INIT- Intégration des fichiers via l'écran"
+# Intégration sans attente du statut des fichiers -> équivalent qui échoue sur INTEGRATED_WITH_ERROR
+NON_CHECKING_STEPS = {"INIT- Demande d'intégration des fichiers via l'écran": SPEC_STEP}
+# Écarts de version qui empêchent le step de s'exécuter avec la bibliothèque du client : step commenté
+BLOCKING_GAPS = ("absent_bibliotheque", "signature")
 _MODULE_TOKEN = re.compile(r"[^a-z0-9]+")
 
 
@@ -169,26 +179,33 @@ def spec_steps(feature_rel: str, spec_files: list, indent: str, eol: str) -> lis
 
 
 def adapt_feature(text: str, module: str, client_name: str, clear: str, client_tag: str = "",
-                  spec_files: list = (), feature_rel: str = "") -> str:
+                  spec_files: list = (), feature_rel: str = "", recreation: list = ()) -> str:
     """
     Feature d'initialisation au nom du client, en trois étapes : clear `clear` (à la place de la purge Standard),
     initialisation globale par fichiers du Standard, puis intégration des `spec_files` (module spécifique du client,
     dans l'ordre) juste après l'initialisation globale. Tag @INIT_<MOD> -> @INIT_<CLIENT>_<MOD> plus le tag client
     `client_tag` (tag_client du profil, à défaut @<CLIENT>) pour ne pas être lancée avec l'initialisation Standard,
     titre préfixé du client comme ses autres features. Les autres steps et les données restent ceux du Standard.
+    `recreation` (cucumber_recreation.plan) : recréation des données d'initializers effacées par le clear, entre
+    l'initialisation globale et les fichiers du module spécifique.
     """
     client_tag = (client_tag or f"@{java_package_segment(client_name).upper()}").lstrip("@")
     lines = text.splitlines(keepends=True)
     global_init = next((i for i, line in enumerate(lines) if GLOBAL_INIT_STEP in line), None)
-    if spec_files and global_init is not None:
+    if (spec_files or recreation) and global_init is not None:
         line = lines[global_init]
         index = global_init + 1
         while index < len(lines) and lines[index].strip().startswith("|"):
             index += 1
-        lines[index:index] = spec_steps(feature_rel, spec_files, line[:len(line) - len(line.lstrip())],
-                                        _eol(line) or "\n")
+        indent, eol = line[:len(line) - len(line.lstrip())], _eol(line) or "\n"
+        lines[index:index] = (cucumber_recreation.feature_lines(list(recreation), indent, eol)
+                              + spec_steps(feature_rel, spec_files, indent, eol))
     for i, line in enumerate(lines):
-        if line.strip().split(" ", 1)[-1] == STD_PURGE_STEP:
+        step = line.strip().split(" ", 1)[-1]
+        if step in NON_CHECKING_STEPS:
+            lines[i] = line.replace(step, NON_CHECKING_STEPS[step])
+            continue
+        if step == STD_PURGE_STEP:
             keyword = line.strip().split(" ", 1)[0]
             lines[i] = line[:len(line) - len(line.lstrip())] + f'{keyword} {CLEAR_STEP} "{clear}"' + _eol(line)
             continue
@@ -204,13 +221,78 @@ def adapt_feature(text: str, module: str, client_name: str, clear: str, client_t
     return "".join(lines)
 
 
+def mark_version_gaps(text: str, library: dict, aligned: dict, version: str) -> tuple:
+    """
+    Steps d'une feature d'init incompatibles avec la bibliothèque `library` du client (instantané
+    cucumber_versions.std_snapshot) par rapport au Standard aligné `aligned` : absents ou de signature différente,
+    commentés (table et docstring comprises) sous « # TODO-VERSION: <raison> » ; autres écarts (endpoint, champs
+    POJO) signalés par un « # TODO-VERSION: à vérifier » sans commenter le step. Rien n'est supprimé.
+    Renvoie (texte, [raisons]).
+    """
+    lines, out, notes, i = text.splitlines(keepends=True), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        step = _STEP_LINE.match(line)
+        if not step or step.group(2).startswith(CLEAR_STEP):
+            out.append(line)
+            continue
+        indent, blocking = line[:len(line) - len(line.lstrip())], False
+        for d in cucumber_versions.step_differences(library, aligned, [step.group(2)]):
+            stops = d["nature"] in BLOCKING_GAPS
+            blocking = blocking or stops
+            reason = (f"{cucumber_versions.KINDS[d['nature']]} (bibliothèque {version}) : {d['detail']}" if stops
+                      else f"à vérifier — {cucumber_versions.KINDS[d['nature']]} : {d['detail']}")
+            out.append(f"{indent}# {cucumber_versions.TODO_MARKER} {reason}{_eol(line) or chr(10)}")
+            notes.append(f"{step.group(2)} : {reason}")
+        if not blocking:
+            out.append(line)
+            continue
+        out.append(_commented(line))
+        # Table et docstring du step commentées avec lui
+        in_doc = False
+        while i < len(lines) and (in_doc or lines[i].strip().startswith(("|", '"""'))):
+            in_doc = in_doc != lines[i].strip().startswith('"""')
+            out.append(_commented(lines[i]))
+            i += 1
+    return "".join(out), notes
+
+
+def _commented(line: str) -> str:
+    indent = line[:len(line) - len(line.lstrip())]
+    return f"{indent}# {line.lstrip()}" if line.strip() else line
+
+
+def initializer_limits(profile: dict) -> list:
+    """
+    Limites de l'extraction des initializers serveur, affichées avec l'initialisation : créations indirectes non
+    résolues (« partiel », jamais recréées), données au sort inconnu après le clear (non recréées).
+    """
+    data = list((profile or {}).get("server_initialized_data") or [])
+    survive = (profile or {}).get("initializers_survive_clear", "")
+    partial = [d for d in data if d.get("certitude") == "partiel" or not d.get("code")]
+    unknown = [d for d in data if d not in partial and d.get("statut") == "inconnu" and survive == ""]
+    out = []
+    if partial:
+        out.append(f"{len(partial)} création(s) d'initializer non résolue(s) (appel de service, code non littéral) : "
+                   f"jamais devinées — " + ", ".join(f"{d['classe']}.{d.get('expression') or d['entite']}"
+                                                    for d in partial[:5]))
+    if unknown:
+        out.append(f"{len(unknown)} donnée(s) d'initializer au sort inconnu après le clear : renseignez « données "
+                   f"des initializers conservées après un clear » dans le profil client")
+    return out
+
+
 def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name: str, base: str,
-                      modules: set, profile: dict = None) -> dict:
+                      modules: set, profile: dict = None, recreate=None) -> dict:
     """
     Écrit l'initialisation des `modules` retenus dans le worktree cucumber_<client>_init (repart de `base`), la
     commite en un seul commit et produit le patch init_patch_path(client). Renvoie {"modules", "fichiers", "patch",
-    "absents"} ; "patch" vaut '' s'il n'y a rien à livrer. Le Cucumber Standard n'est pas modifié. Lève RuntimeError,
-    notamment sans clear_name (profil client ou CUCUMBER_CLEAR_NAME) : le clear est propre à l'environnement.
+    "absents", "recreation"} ; "patch" vaut '' s'il n'y a rien à livrer. Le Cucumber Standard n'est pas modifié.
+    Données d'initializers effacées par le clear : recréées par un step du Standard reconnu, sinon par un step du
+    projet que `recreate(worktree, items)` fait écrire (appel Claude borné) et renvoie les erreurs restantes ; une
+    recréation non livrable reste commentée (TODO-INITIALIZER). Lève RuntimeError, notamment sans clear_name
+    (profil client ou CUCUMBER_CLEAR_NAME) : le clear est propre à l'environnement.
     """
     clear = clear_name(profile)
     if not clear:
@@ -221,9 +303,10 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     std = std_init_files(cucumber_std_dir)
     kept = sorted(m for m in modules if m in std)
     result = {"modules": kept, "fichiers": [], "patch": "", "absents": sorted(set(modules) - set(std)),
-              "avertissements": [] if spec_files else [
+              "avertissements": ([] if spec_files else [
                   "aucun fichier du module spécifique dans le profil client : après le clear, les données propres au "
-                  "client (documents, statuts, partenaires…) ne seront pas recréées"]}
+                  "client (documents, statuts, partenaires…) ne seront pas recréées"]) + initializer_limits(profile),
+              "todo_version": [], "recreation": {}}
     output = init_patch_path(client_name)
     if os.path.exists(output):
         os.remove(output)
@@ -231,6 +314,8 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
         return result
     worktree = add_worktree(cucumber_repo_dir, init_worktree_dir(client_name), init_branch(client_name), base,
                             reset=True)
+    library, aligned, version = _library_snapshots(cucumber_std_dir, (profile or {}).get("library_version", ""))
+    items = recreation_plan(cucumber_std_dir, client_name, profile)
     missing = [s for s in spec_files if not os.path.exists(os.path.join(worktree, *s.split("/")))]
     if missing:
         result["avertissements"].append(f"fichier(s) du module spécifique absent(s) de la base : {', '.join(missing)}")
@@ -241,9 +326,13 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
             os.makedirs(os.path.dirname(target), exist_ok=True)
             source = os.path.join(cucumber_std_dir, *rel.split("/"))
             if rel.endswith(".feature"):
+                text = adapt_feature(_read_text(source), module, client_name, clear, client_tag, spec_files,
+                                     target_rel, items)
+                if library:
+                    text, notes = mark_version_gaps(text, library, aligned, version)
+                    result["todo_version"] += [f"{target_rel} : {n}" for n in notes]
                 with open(target, "w", encoding="utf-8", newline="") as f:
-                    f.write(adapt_feature(_read_text(source), module, client_name, clear, client_tag, spec_files,
-                                          target_rel))
+                    f.write(text)
             else:
                 shutil.copyfile(source, target)
             result["fichiers"].append(client_path(rel, client_name))
@@ -253,7 +342,13 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     with open(target, "w", encoding="utf-8", newline="\n") as f:
         f.write(clear_step_java(client_name))
     result["fichiers"].append(java)
-    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java)
+    result["recreation"] = _recreate_project_steps(worktree, base, client_name, items, result["fichiers"], recreate)
+    result["avertissements"] += result["recreation"]["avertissements"]
+    if os.path.exists(os.path.join(worktree, *cucumber_recreation.java_path(client_name).split("/"))):
+        result["fichiers"].append(cucumber_recreation.java_path(client_name))
+    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java,
+         *([cucumber_recreation.java_path(client_name)] if cucumber_recreation.java_path(client_name)
+           in result["fichiers"] else []))
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return result
     commit = _git(worktree, "commit", "-m", f"Cucumber initialisation of {client_name} ({', '.join(kept)})")
@@ -262,6 +357,58 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     if format_patch(worktree, f"{base}..HEAD", output):
         result["patch"] = output
     return result
+
+
+def recreation_plan(cucumber_std_dir: str, client_name: str, profile: dict) -> list:
+    """Recréations des données d'initializers effacées (cucumber_recreation.plan) ; [] s'il n'y a rien à recréer."""
+    if not cucumber_recreation.to_recreate(profile):
+        return []
+    root = os.path.join(cucumber_std_dir, *RESOURCES_DIR.split("/"), "features")
+    texts = [_read_text(os.path.join(d, n)) for d, _, names in os.walk(root) for n in names if n.endswith(".feature")]
+    steps = cucumber_versions.std_snapshot(cucumber_std_dir, "HEAD")["steps"] if os.path.isdir(
+        os.path.join(cucumber_std_dir, ".git")) else {}
+    return cucumber_recreation.plan(profile, client_name, cucumber_recreation.std_creation_steps(steps, texts))
+
+
+def _recreate_project_steps(worktree: str, base: str, client_name: str, items: list, files: list, recreate) -> dict:
+    """
+    Steps « projet » de recréation : écrits par `recreate` (erreurs restantes renvoyées), sinon commentés dans les
+    features d'init (TODO-INITIALIZER) et classe de recréation retirée. Renvoie {standard, projet, non_livrees,
+    avertissements}.
+    """
+    project = [e for e in items if e["mode"] == "projet"]
+    out = {"standard": len(items) - len(project), "projet": len(project), "non_livrees": [], "avertissements": []}
+    if not project:
+        return out
+    errors = recreate(worktree, items) if recreate else ["aucun moyen d'écrire les steps du projet"]
+    if not errors:
+        return out
+    reason = errors[0][:150]
+    for rel in (f for f in files if f.endswith(".feature")):
+        path = os.path.join(worktree, *rel.split("/"))
+        text = cucumber_recreation.comment_project_steps(_read_text(path), items, reason)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+    java = cucumber_recreation.java_path(client_name)
+    if _git(worktree, "cat-file", "-e", f"{base}:{java}").returncode == 0:
+        _git(worktree, "checkout", base, "--", java)
+    elif os.path.exists(os.path.join(worktree, *java.split("/"))):
+        os.remove(os.path.join(worktree, *java.split("/")))
+    out["non_livrees"] = [f"{e['donnee'].get('entite')} {e['donnee']['code']}" for e in project]
+    out["avertissements"].append(f"{len(project)} recréation(s) de donnée d'initializer non livrée(s), commentée(s) "
+                                 f"sous {cucumber_recreation.TODO_MARKER} : {reason}")
+    return out
+
+
+def _library_snapshots(cucumber_std_dir: str, version: str) -> tuple:
+    """(bibliothèque, Standard aligné, version) : instantanés à comparer, ({}, {}, version) s'ils sont identiques
+    ou si la bibliothèque est introuvable dans le dépôt Standard."""
+    ref = cucumber_versions.library_ref(cucumber_std_dir, version)
+    if not ref:
+        return {}, {}, version
+    library, aligned = (cucumber_versions.std_snapshot(cucumber_std_dir, ref),
+                        cucumber_versions.std_snapshot(cucumber_std_dir, "HEAD"))
+    return ({}, {}, version) if library["commit"] == aligned["commit"] else (library, aligned, version)
 
 
 def _read_text(path: str) -> str:

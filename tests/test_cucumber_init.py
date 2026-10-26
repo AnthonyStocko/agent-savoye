@@ -192,3 +192,52 @@ def test_spec_file_name_relative_to_init_data_folder():
     feature = f"{RES}/features/clientx/01-Contexte/WMS/01-Initialisation.feature"
     assert ci.spec_file_name(feature, f"{RES}/files/clientx/01-Contexte/WMS/x.csv") == "x.csv"
     assert ci.spec_file_name(feature, f"{RES}/files/clientx/Spec/y.xml") == "../../Spec/y.xml"
+
+
+def _snapshot(steps):
+    return {"steps": {e: {"classe": "InitSteps", "methode": m, "params": p, "endpoints": eps, "pojos": []}
+                      for e, (m, p, eps) in steps.items()}, "pojos": {}}
+
+
+def test_non_checking_integration_is_replaced_by_the_checking_step():
+    text = INIT_FEATURE.format(m="WMS") + "    And INIT- Demande d'intégration des fichiers via l'écran\n"
+    adapted = ci.adapt_feature(text, "WMS", "clientx", CLEAR)
+    assert "Demande d'intégration" not in adapted and f"And {ci.SPEC_STEP}" in adapted
+
+
+def test_steps_incompatible_with_the_library_are_commented_never_deleted():
+    aligned = _snapshot({"INIT- Configuration du colisage": ("colisage", "", []),
+                         "INIT- Configuration TMS : {string}": ("tms", "String s, DataTable t", ["POST /tms"]),
+                         "INIT- Initialisation globale des règles": ("regles", "", ["POST /rules/v2"])})
+    library = _snapshot({"INIT- Configuration TMS : {string}": ("tms", "String s", ["POST /tms"]),
+                         "INIT- Initialisation globale des règles": ("regles", "", ["POST /rules"])})
+    text = ("  Scenario: Init\n"
+            f'    Given {ci.CLEAR_STEP} "{CLEAR}"\n'
+            "    And INIT- Configuration du colisage\n"
+            '    And INIT- Configuration TMS : "Système"\n'
+            "      | cle | valeur |\n      | a   | b      |\n"
+            "    Given INIT- Initialisation globale des règles\n")
+    marked, notes = ci.mark_version_gaps(text, library, aligned, "26.21")
+    lines = marked.splitlines()
+    assert "    # And INIT- Configuration du colisage" in lines
+    assert '    # And INIT- Configuration TMS : "Système"' in lines and "      # | a   | b      |" in lines
+    assert "    Given INIT- Initialisation globale des règles" in lines  # endpoint modifié : signalé, pas commenté
+    assert f'    Given {ci.CLEAR_STEP} "{CLEAR}"' in lines
+    assert len(notes) == 3 and sum(1 for line in lines if "# TODO-VERSION:" in line) == 3
+    assert any("step absent de la bibliothèque du client (bibliothèque 26.21)" in n for n in notes)
+    assert any(n.startswith("INIT- Initialisation globale des règles : à vérifier") for n in notes)
+    # Rien n'est supprimé : chaque ligne d'origine reste, commentée ou non
+    assert all(any(line.lstrip("# ").strip() == o.strip() for line in lines) for o in text.splitlines())
+
+
+def test_initializer_limits_are_shown():
+    data = [{"classe": "SiteInit", "entite": "Site", "code": "S1", "expression": "", "certitude": "certain",
+             "statut": "inconnu"},
+            {"classe": "SiteInit", "entite": "Site", "code": "S2", "expression": "", "certitude": "certain",
+             "statut": "survit"},
+            {"classe": "StockInit", "entite": "Stock", "code": "", "expression": "service.create()",
+             "certitude": "partiel", "statut": "inconnu"}]
+    limits = ci.initializer_limits({"server_initialized_data": data, "initializers_survive_clear": "faux"})
+    assert len(limits) == 1 and "StockInit.service.create()" in limits[0]
+    unknown = ci.initializer_limits({"server_initialized_data": data, "initializers_survive_clear": ""})
+    assert any("sort inconnu" in w for w in unknown)

@@ -1122,7 +1122,8 @@ with tab_cucumber:
                         st.success("Profil enregistré.")
                         st.rerun()
 
-    # 1 bis. Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token)
+    # 1 bis. Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token, sauf steps
+    # de recréation des données d'initializers effacées par le clear)
     detected_modules = cucumber_init.client_modules(inventory.get("depot_client", ""), inventory) if inventory else set()
     with st.container(horizontal=True, vertical_alignment="center"):
         init_modules = [m for m in cucumber_init.INIT_MODULES
@@ -1136,8 +1137,11 @@ with tab_cucumber:
                       "01-Contexte et ses fichiers de données) de chaque module coché, au nom du client (tag "
                       "@INIT_<CLIENT>_<MODULE>), sous features/<client>/01-Contexte/<MODULE>/ pour s'exécuter avant "
                       "ses autres features. Purge par le clear CUCUMBER_CLEAR_NAME (step client ajouté). Une "
-                      "initialisation par module : chacune purge l'environnement, à lancer séparément. Aucun appel "
-                      "à Claude."):
+                      "initialisation par module : chacune purge l'environnement, à lancer séparément. Après "
+                      "l'initialisation globale : recréation des données d'initializers serveur « effacées » par le "
+                      "clear (profil), par un step du Standard reconnu, sinon par des steps du projet écrits par un "
+                      "appel Claude borné et contrôlés ; une recréation non livrable reste commentée "
+                      "(TODO-INITIALIZER). Aucun appel à Claude sans donnée à recréer."):
         if not init_modules:
             st.error("Aucun module WMS, TMS ou OMS coché : pas de patch d'initialisation.")
         else:

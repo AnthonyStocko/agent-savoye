@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
+from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1655,11 +1655,87 @@ def detect_cucumber_profile(client: str, cucumber_repo_dir: str, base: str, loca
     return profile
 
 
+def initializer_sources(client_root: str, items: list, target_dir: str) -> dict:
+    """Sources des initializers des données à recréer, copiées dans `target_dir` pour être lues : {classe: copie}."""
+    repos, out = cucumber_tools.git_repos(client_root), {}
+    for item in items:
+        classe = item["donnee"].get("classe", "")
+        repo = repos.get(item["donnee"].get("depot", ""))
+        if not classe or classe in out or not repo:
+            continue
+        found = cucumber_tools._git(repo, "ls-files", f"*/{classe}.java").stdout.splitlines()
+        if found:
+            target = os.path.join(target_dir, f"{classe}.java")
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copyfile(os.path.join(repo, *found[0].split("/")), target)
+            out[classe] = target
+    return out
+
+
+def recreate_initializer_data(client: str, worktree: str, items: list, client_root: str, cucumber_std_dir: str,
+                              profile: dict) -> list:
+    """
+    Steps du projet de recréation des données d'initializers (point 5) : un appel Claude (cucumber_init_recreation)
+    puis au plus CUCUMBER_FIX_ATTEMPTS corrections, chacune contrôlée en Python (cucumber_recreation.check_project_steps,
+    puis compilation et dry-run des features d'init si CUCUMBER_COMPILE_CMD). Renvoie les erreurs restantes.
+    """
+    project = [e for e in items if e["mode"] == "projet"]
+    run_dir = cucumber_tools.cache_dir(client)
+    sources = initializer_sources(client_root, project, os.path.join(run_dir, "initializers"))
+    std_java = cucumber_tools.standard_java_catalogue(cucumber_std_dir, profile.get("server_version", ""))
+    std_expressions = cucumber_versions.std_snapshot(cucumber_std_dir, "HEAD")["steps"]
+    compile_cmd = os.getenv("CUCUMBER_COMPILE_CMD")
+    compile_cmd = cucumber_tools.DEFAULT_COMPILE_CMD if compile_cmd is None else compile_cmd.strip()
+    features = [os.path.relpath(os.path.join(d, n), worktree).replace("\\", "/")
+                for d, _, names in os.walk(os.path.join(worktree, *cucumber_init.RESOURCES_DIR.split("/"), "features"))
+                for n in names if n.endswith(".feature") and cucumber_init.INIT_DIR in d]
+    lines = [f"- « {e['expression']} » : {e['donnee'].get('entite')} {e['donnee']['code']} — initializer "
+             f"{e['donnee'].get('classe')} ({e['donnee'].get('depot')}) ; source : "
+             f"'{sources.get(e['donnee'].get('classe'), 'introuvable : Grep dans le dépôt ' + e['donnee'].get('depot', '?'))}'"
+             for e in project]
+    model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
+    errors = []
+    for attempt in range(1 + _env_int("CUCUMBER_FIX_ATTEMPTS", 2)):
+        prompt = render_prompt(
+            "cucumber_init_recreation", client_name=client, worktree=worktree,
+            java_path=cucumber_recreation.java_path(client),
+            package=f"cucumber.features.{cucumber_tools.java_package_segment(client)}",
+            clear_step_java=os.path.join(worktree, *cucumber_init.clear_step_path(client).split("/")),
+            java_std=std_java["java_std"], steps_example=std_java["steps_example"] or "aucune",
+            donnees="\n".join(lines), erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
+        effort = cucumber_fix_effort() if attempt else claude_effort("CLAUDE_EFFORT_CUCUMBER")
+        returncode, _, usage, limit_hit = run_cucumber_claude(
+            prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2), run_dir, effort)
+        report_token_usage(f"{client}-init", "cucumber-init-recreation", model, usage, len(prompt), returncode,
+                           effort)
+        if limit_hit:
+            return errors + ["quota ou budget atteint pendant l'écriture des steps de recréation"]
+        errors = cucumber_recreation.check_project_steps(worktree, items, std_expressions)
+        if not errors and compile_cmd:
+            try:
+                check = cucumber_tools.verify_build(cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
+                                                    compile_cmd, features, cucumber_tools.DEFAULT_DRY_RUN_CMD)
+            except RuntimeError as e:
+                check = {"ok": False, "environnement": True, "erreurs": [str(e)]}
+            if not check["ok"] and not check.get("environnement"):
+                errors = check["erreurs"]
+            elif not check["ok"]:
+                print(f"[CUCUMBER INIT] ⚠️ Compilation des steps de recréation non vérifiée (environnement Maven) : "
+                      f"{check['erreurs'][0] if check['erreurs'] else '?'}")
+        print(f"[CUCUMBER INIT] Steps de recréation, tentative {attempt + 1} : "
+              + ("OK" if not errors else f"{len(errors)} erreur(s) — {errors[0]}"))
+        if not errors:
+            return []
+    return errors
+
+
 def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str, cucumber_repo_dir: str,
                       base: str) -> int:
     """
-    Patch d'initialisation du client (0 token) : Init_<MODULE> du Cucumber Standard copiées pour les modules
-    --init-modules, à défaut ceux détectés dans les dépôts et l'inventaire du client. Renvoie le code de sortie.
+    Patch d'initialisation du client : Init_<MODULE> du Cucumber Standard copiées pour les modules --init-modules, à
+    défaut ceux détectés dans les dépôts et l'inventaire du client (0 token). Seule exception : les données
+    d'initializers effacées par le clear sans step du Standard reconnu, dont les steps du projet sont écrits par
+    un appel Claude borné (recreate_initializer_data). Renvoie le code de sortie.
     """
     client = args.client_name
     if args.init_modules.strip():
@@ -1679,13 +1755,22 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
     try:
         profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
-        result = cucumber_init.build_client_init(cucumber_repo_dir, local_cucumber_std_repo, client, base, modules,
-                                                 profile)
+        result = cucumber_init.build_client_init(
+            cucumber_repo_dir, local_cucumber_std_repo, client, base, modules, profile,
+            lambda worktree, items: recreate_initializer_data(client, worktree, items, local_client_repo,
+                                                              local_cucumber_std_repo, profile))
     except RuntimeError as e:
         print(f"[CUCUMBER INIT] ❌ {e}")
         return 1
     for warning in result.get("avertissements", []):
         print(f"[CUCUMBER INIT] ⚠️ {warning}")
+    for note in result.get("todo_version", []):
+        print(f"[CUCUMBER INIT] ⚠️ {cucumber_versions.TODO_MARKER} {note}")
+    recreation = result.get("recreation") or {}
+    if recreation.get("standard") or recreation.get("projet"):
+        print(f"[CUCUMBER INIT] Données d'initializers recréées : {recreation['standard']} par un step du Standard, "
+              f"{recreation['projet'] - len(recreation['non_livrees'])} par un step du projet"
+              + (f", {len(recreation['non_livrees'])} non livrée(s) (commentées)" if recreation["non_livrees"] else ""))
     if result["absents"]:
         print(f"[CUCUMBER INIT] ⚠️ Pas d'initialisation Standard pour : {', '.join(result['absents'])}")
     if not result["modules"]:

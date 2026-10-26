@@ -19,7 +19,8 @@ from tools.cucumber_tools import (CLIENT_REFS, STD_REFS, _git, _globs, _java_met
 
 DEFAULT_INITIALIZER_PATTERN = (r"\bclass\s+\w*Initiali[sz]er\w*|"
                                r"\bimplements\s+[^{]*?\b\w*Initiali[sz]er\b")
-STATUSES = {"recreee": "recréée après un clear", "survit": "survit au clear", "inconnu": "inconnu"}
+STATUSES = {"recreee": "recréée après un clear", "survit": "survit au clear",
+            "effacee": "effacée par le clear, à recréer par l'init", "inconnu": "inconnu"}
 _INIT_BY_ID = re.compile(r"\b(\w+)\s*\.\s*initByNaturalId\s*\(")
 _EXIST_OR_CREATE = re.compile(r"\b(\w+)\s*\.\s*(existOrCreate\w*)\s*\(")
 _NEW = re.compile(r"\bnew\s+([A-Z]\w*)\s*\(")
