@@ -167,7 +167,8 @@ def next_action(analysis: dict, bilan: dict) -> str:
     if exports:
         return f"Exporter les logs serveur des {len(exports)} échec(s) (fenêtres indiquées) puis les importer"
     if bilan["manuelles"]:
-        return f"Recréer dans l'init du projet les {len(bilan['manuelles'])} correction(s) manuelle(s) de l'environnement"
+        return (f"Générer l'initialisation client (étape Projet) : elle recrée les {len(bilan['manuelles'])} "
+                f"correction(s) manuelle(s) de l'environnement")
     green, failed = run_counts(analysis)
     if failed:
         return f"Traiter les {failed} échec(s) hors test (environnement, données, défauts) : voir A_REVOIR.md"
@@ -258,7 +259,9 @@ def bilan_markdown(bilan: dict, level: int = 2) -> str:
             lines.append(f"- Retirés du worktree après ce run : {', '.join(bilan['diagnostics_retires'])}")
     lines += ["", f"{section} Corrections manuelles de l'environnement : {len(bilan['manuelles'])}", ""]
     if bilan["manuelles"]:
-        lines.append("Interdites dans la durée : l'environnement doit pouvoir être reconstruit par l'init du projet.")
+        lines.append("Interdites dans la durée : l'environnement doit pouvoir être reconstruit par l'init du projet. "
+                     "« Générer l'initialisation client » transforme les corrections signalées en recréation dans "
+                     "l'init, suivie d'un contrôle de l'environnement en lecture seule.")
     lines += [f"- {m['description']} ({m['origine']}) → {m['recreation']}" for m in bilan["manuelles"]]
     return "\n".join(lines) + "\n"
 

@@ -3193,6 +3193,27 @@ def db_usage_lines(state: dict) -> list:
     return lines
 
 
+_RUNNER_MARKERS = re.compile(r"@CucumberOptions|Cucumber\.class|@Suite\b|@IncludeEngines|cucumber\.(?:glue|plugin|"
+                             r"filter\.tags|features)")
+
+
+def runner_report(worktree: str, base: str, runner: dict) -> list:
+    """
+    Section « Runner » du récapitulatif (point 8) : contrôle fait avant le premier lot (consigne donnée) et
+    modification du runner livrée dans le patch (fichier, lignes ajoutées / retirées, raison) ; [] sans contrôle.
+    """
+    if not runner or not base or not os.path.isdir(worktree):
+        return []
+    lines = ["", "## Runner", "", f"- Contrôle avant le premier lot : {runner.get('consigne', '?')}"]
+    changed = []
+    for line in _git(worktree, "diff", "--numstat", base, "HEAD", "--", "*.java", "*.properties").stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and _RUNNER_MARKERS.search(_read_text_file(os.path.join(worktree, *parts[2].split("/")))):
+            changed.append(f"- Modifié dans le patch : `{parts[2]}` (+{parts[0]} / -{parts[1]} ligne(s)) — raison : "
+                           f"{runner.get('consigne', '?')}")
+    return lines + (changed or ["- Aucune modification du runner dans le patch."])
+
+
 def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> str:
     """
     Récapitulatif <client>-cucumber-couverture.md : indicateurs globaux (réutilisation des steps Standard,
@@ -3353,6 +3374,7 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
             lines.append(f"- Lot {lot['numero']} : {label}")
             lines += [f"  - `{e}`" for e in (check.get("erreurs") or [])[:10]]
     lines += db_usage_lines(state)
+    lines += runner_report(worktree_dir(client_name), state.get("base", ""), state.get("runner") or {})
     already = [s for s in specs.values() if s.get("couverture") == "deja_couvert" and s["id"] not in selected]
     if already:
         lines += ["", "## Déjà couverts (non traités)", ""]

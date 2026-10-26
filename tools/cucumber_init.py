@@ -19,7 +19,7 @@ import posixpath
 import re
 import shutil
 
-from tools import cucumber_recreation, cucumber_versions
+from tools import cucumber_environment, cucumber_recreation, cucumber_versions
 from tools.cucumber_tools import (_git, add_worktree, cache_dir, format_patch, git_repos, init_patch_path,
                                   java_class_suffix, java_package_segment)
 from tools.cucumber_verify import _STEP_LINE
@@ -284,14 +284,17 @@ def initializer_limits(profile: dict) -> list:
 
 
 def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name: str, base: str,
-                      modules: set, profile: dict = None, recreate=None) -> dict:
+                      modules: set, profile: dict = None, recreate=None, environment: dict = None) -> dict:
     """
     Écrit l'initialisation des `modules` retenus dans le worktree cucumber_<client>_init (repart de `base`), la
     commite en un seul commit et produit le patch init_patch_path(client). Renvoie {"modules", "fichiers", "patch",
     "absents", "recreation"} ; "patch" vaut '' s'il n'y a rien à livrer. Le Cucumber Standard n'est pas modifié.
     Données d'initializers effacées par le clear : recréées par un step du Standard reconnu, sinon par un step du
     projet que `recreate(worktree, items)` fait écrire (appel Claude borné) et renvoie les erreurs restantes ; une
-    recréation non livrable reste commentée (TODO-INITIALIZER). Lève RuntimeError, notamment sans clear_name
+    recréation non livrable reste commentée (TODO-INITIALIZER). `environment` ({controles, recreations, writer}) :
+    scénarios de recréation des corrections manuelles puis de contrôle de l'environnement en lecture seule ajoutés
+    à chaque feature d'init (cucumber_environment), steps écrits par `writer(worktree, controles, recreations)` ;
+    non livrables, ils restent commentés (TODO-ENVIRONNEMENT). Lève RuntimeError, notamment sans clear_name
     (profil client ou CUCUMBER_CLEAR_NAME) : le clear est propre à l'environnement.
     """
     clear = clear_name(profile)
@@ -346,9 +349,13 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     result["avertissements"] += result["recreation"]["avertissements"]
     if os.path.exists(os.path.join(worktree, *cucumber_recreation.java_path(client_name).split("/"))):
         result["fichiers"].append(cucumber_recreation.java_path(client_name))
-    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java,
-         *([cucumber_recreation.java_path(client_name)] if cucumber_recreation.java_path(client_name)
-           in result["fichiers"] else []))
+    result["environnement"] = _environment_steps(worktree, base, client_name, result["fichiers"], environment)
+    result["avertissements"] += result["environnement"]["avertissements"]
+    if os.path.exists(os.path.join(worktree, *cucumber_environment.java_path(client_name).split("/"))):
+        result["fichiers"].append(cucumber_environment.java_path(client_name))
+    extra_java = [p for p in (cucumber_recreation.java_path(client_name), cucumber_environment.java_path(client_name))
+                  if p in result["fichiers"]]
+    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java, *extra_java)
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return result
     commit = _git(worktree, "commit", "-m", f"Cucumber initialisation of {client_name} ({', '.join(kept)})")
@@ -397,6 +404,45 @@ def _recreate_project_steps(worktree: str, base: str, client_name: str, items: l
     out["non_livrees"] = [f"{e['donnee'].get('entite')} {e['donnee']['code']}" for e in project]
     out["avertissements"].append(f"{len(project)} recréation(s) de donnée d'initializer non livrée(s), commentée(s) "
                                  f"sous {cucumber_recreation.TODO_MARKER} : {reason}")
+    return out
+
+
+def _environment_steps(worktree: str, base: str, client_name: str, files: list, environment: dict) -> dict:
+    """
+    Contrôles d'environnement et recréations des corrections manuelles (points 9g, 9h) ajoutés à la fin de chaque
+    feature d'init ; steps écrits par environment["writer"], sinon scénarios commentés (TODO-ENVIRONNEMENT) et
+    classe retirée. Renvoie {controles, recreations, livres, avertissements}.
+    """
+    checks = list((environment or {}).get("controles") or [])
+    recreations = list((environment or {}).get("recreations") or [])
+    out = {"controles": len(checks), "recreations": len(recreations), "livres": False, "avertissements": []}
+    if not checks and not recreations:
+        return out
+    lines = cucumber_environment.scenario_lines(client_name, checks, recreations)
+    originals = {}
+    for rel in (f for f in files if f.endswith(".feature")):
+        path = os.path.join(worktree, *rel.split("/"))
+        if GLOBAL_INIT_STEP not in _read_text(path):
+            continue
+        originals[path] = _read_text(path)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(originals[path].rstrip("\r\n") + "\n" + "\n".join(lines) + "\n")
+    writer = (environment or {}).get("writer")
+    errors = writer(worktree, checks, recreations) if writer else ["aucun moyen d'écrire les steps du projet"]
+    if not errors:
+        out["livres"] = True
+        return out
+    reason = errors[0][:150]
+    for path, text in originals.items():
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text.rstrip("\r\n") + "\n" + "\n".join(cucumber_environment.commented(lines, reason)) + "\n")
+    java = cucumber_environment.java_path(client_name)
+    if _git(worktree, "cat-file", "-e", f"{base}:{java}").returncode == 0:
+        _git(worktree, "checkout", base, "--", java)
+    elif os.path.exists(os.path.join(worktree, *java.split("/"))):
+        os.remove(os.path.join(worktree, *java.split("/")))
+    out["avertissements"].append(f"contrôle de l'environnement et recréations non livrés, commentés sous "
+                                 f"{cucumber_environment.TODO_MARKER} : {reason}")
     return out
 
 

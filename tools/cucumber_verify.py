@@ -763,7 +763,9 @@ _NOT_TEST_LEVELS = {"environnement": "env", "version": "env", "donnee_reference"
 
 def failure_kind(error_message: str) -> tuple:
     """
-    (nature, nom de l'exception) d'un message d'échec Cucumber : champ_absent (« expected:<X> but was:<null> » :
+    (nature, nom de l'exception) d'un message d'échec Cucumber : échecs connus des campagnes (KNOWN_FAILURES :
+    champ personnalisé non déclaré, longueur, brouillon incomplet, liste de choix vide, ordre non lançable, délai du
+    canal « form »), champ_absent (« expected:<X> but was:<null> » :
     champ contrôlé non renvoyé ou non mappé, cause « test »), donnee_reference, version (route, chemin ou champ
     inconnu, paramètre exigé : écart bibliothèque / serveur), environnement (champ exigé), bug_applicatif (erreur
     serveur), sinon échec du test : technique (colonne, fichier, code du step) ou assertion.
@@ -771,6 +773,10 @@ def failure_kind(error_message: str) -> tuple:
     message = str(error_message or "")
     exception = _EXCEPTION_NAME.search(message)
     name = exception.group(1).rsplit(".", 1)[-1] if exception else ""
+    # Enseignements des campagnes (point 9f) : nature fixée par le motif, piste donnée par failure_hint
+    known = next((nature for pattern, nature, _ in KNOWN_FAILURES if pattern.search(message)), "")
+    if known:
+        return known, name
     if _NULL_FIELD_FAILURE.search(message):
         return "champ_absent", name
     if _REFERENCE_FAILURE.search(message):
@@ -784,6 +790,36 @@ def failure_kind(error_message: str) -> tuple:
     if _APPLICATION_FAILURE.search(message):
         return "bug_applicatif", name
     return ("assertion" if _ASSERTION_FAILURE.search(message) else "technique"), name
+
+
+# Échecs connus (point 9f) : (motif, nature, piste de correction)
+KNOWN_FAILURES = (
+    (re.compile(r"Unable to find the custom field", re.I), "environnement",
+     "champ personnalisé non déclaré sur l'entité dans cet environnement : sa déclaration fait partie des données que "
+     "l'init du projet recrée (contrôle d'environnement) ; écris un champ personnalisé par le mécanisme prévu à cet "
+     "effet (à identifier dans le Standard, jamais deviné) et relis-le après écriture"),
+    (re.compile(r"taille de la valeur.{0,200}trop grande|value too long|exceeds? (?:the )?max(?:imum)? length", re.I),
+     "technique", "longueur maximale d'un code dépassée : raccourcis le code créé à la longueur du modèle de l'entité"),
+    (re.compile(r"La propri[ée]t[ée]\b.{0,120}\best requise", re.I), "technique",
+     "mise à jour par brouillon incomplète : repars du brouillon complet lu, ne modifie que les champs visés et renvoie "
+     "tous les attributs requis"),
+    (re.compile(r"liste de choix vide|aucun choix (?:n'est )?disponible|no (?:available )?(?:choices|options) "
+                r"(?:available|for)|empty (?:choice|option) list", re.I), "environnement",
+     "liste de choix vide sur un champ obligatoire : le paramétrage qui l'alimente manque dans l'environnement — à "
+     "créer dans le Background (ou à recréer par l'init du projet)"),
+    (re.compile(r"ne peut pas être lanc[ée]+|non lan[cç]able|cannot be (?:launched|started|released)", re.I),
+     "technique", "ordre non lançable après le contrôle du client : les données reprises du Standard ne respectent pas "
+     "une règle active du client ; crée dans le Background des données conformes (fichiers propres à la feature), "
+     "sans modifier l'init globale ni affaiblir la règle"),
+    (re.compile(r"(?:websocket|ws)\b.{0,80}\bform\b|\bform\b.{0,80}(?:websocket|ws)\b|canal\s*«?\s*form", re.I),
+     "technique", "écran attendu différent de l'écran reçu (délai sur le canal « form ») : ajoute un diagnostic "
+     "temporaire d'écran avant le step (titre, éléments, erreur, dernier bouton soumis), exécuté au run suivant"),
+)
+
+
+def failure_hint(error_message: str) -> str:
+    """Piste de correction d'un échec connu (KNOWN_FAILURES) ; '' sinon."""
+    return next((hint for pattern, _, hint in KNOWN_FAILURES if pattern.search(str(error_message or ""))), "")
 
 
 def failure_category(nature: str) -> str:

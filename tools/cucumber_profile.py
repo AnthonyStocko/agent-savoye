@@ -27,9 +27,11 @@ REPO_PROFILE = ".agent-savoye.json"
 REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
 FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
-          "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job")
+          "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
+          "environment_checks")
 # Champs dont l'absence est normale : vides sans avertissement
-OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job")
+OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
+                   "environment_checks")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
@@ -44,7 +46,9 @@ LABELS = {"features_root": "racine des features", "tag_client": "tag client", "i
           "workarounds": "contournements TODO-VERSION",
           "verify_branch": "branche lue par le job de vérification (l'agent y commite et pousse avant chaque vérification)",
           "verify_branch_param": "paramètre du job de vérification qui porte la branche",
-          "run_job": "job Jenkins qui exécute le dépôt client (lancement automatique d'un run)"}
+          "run_job": "job Jenkins qui exécute le dépôt client (lancement automatique d'un run)",
+          "environment_checks": "dépendances d'environnement contrôlées par l'init (champs personnalisés, "
+                                "documents, énumérations, paramétrages)"}
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _GLOBAL_INIT = "Initialisation globale par fichiers"
@@ -65,7 +69,7 @@ def empty_profile() -> dict:
                        for k in RUNNER_KEYS},
             "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
             "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
-            "verify_branch_param": "", "run_job": ""}
+            "verify_branch_param": "", "run_job": "", "environment_checks": []}
 
 
 def is_empty(value) -> bool:

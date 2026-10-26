@@ -11,8 +11,8 @@ import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
 from tools import (cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions,
-                   cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_journey,
-                   cucumber_profile, cucumber_run, cucumber_studio, cucumber_tools, cucumber_verify,
+                   cucumber_environment, cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers,
+                   cucumber_journey, cucumber_profile, cucumber_run, cucumber_studio, cucumber_tools, cucumber_verify,
                    integration_tools, jenkins_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
@@ -1309,6 +1309,23 @@ def render_cucumber_profile(ctx: dict, profile_doc: dict) -> None:
                 values["server_initialized_data"] = edited.to_dict("records")
                 st.caption(f"{cucumber_profile.LABELS['server_initialized_data']} ({origin('server_initialized_data')}"
                            f", {len(initialized)}) : codes « partiel » non résolus, jamais devinés.")
+            # Dépendances d'environnement contrôlées en lecture seule par l'init du projet (point 9g)
+            import pandas as pd
+            checks = pd.DataFrame(profile["environment_checks"] or [], columns=["type", "entite", "code"])
+            edited_checks = st.data_editor(
+                checks, hide_index=True, num_rows="dynamic", disabled=sources.get("environment_checks") == "depot",
+                column_config={"type": st.column_config.SelectboxColumn(
+                    "Type", options=list(cucumber_environment.TYPES), format_func=cucumber_environment.TYPES.get,
+                    required=True), "entite": st.column_config.TextColumn("Entité"),
+                    "code": st.column_config.TextColumn("Code", required=True)},
+                key=f"cucumber_env_checks_{cucumber_client}")
+            values["environment_checks"] = [
+                {k: str(v or "").strip() for k, v in row.items()} for row in edited_checks.to_dict("records")
+                if row.get("type") and str(row.get("code") or "").strip()]
+            st.caption(f"{cucumber_profile.LABELS['environment_checks']} ({origin('environment_checks')}) : ajoutées "
+                       f"à l'init du client par « Générer l'initialisation client », avec les champs personnalisés "
+                       f"introuvables relevés dans les runs importés ; un environnement incomplet y produit un seul "
+                       f"échec clair.")
             if profile["workarounds"]:
                 st.caption(f"{cucumber_profile.LABELS['workarounds']} ({len(profile['workarounds'])}, lecture "
                            f"seule) : " + " ; ".join(f"{w['fichier']}:{w['ligne']} {w['texte']}"

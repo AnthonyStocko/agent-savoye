@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_diagnostic, cucumber_run, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1596,8 +1596,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         lines = []
         for tag, item in bad.items():
             linked = tests.get(spec_of.get(item["id"], ""), [])
+            hint = cucumber_verify.failure_hint(item["motif"])
             lines.append(f"- {item['id']} [tag {tag}] : {item['motif']}" + (
-                f" ; test Standard lié : '{linked[0].get('extrait', linked[0]['path'])}'" if linked else ""))
+                f" ; test Standard lié : '{linked[0].get('extrait', linked[0]['path'])}'" if linked else "")
+                + (f" — piste : {hint}" if hint else ""))
             # Sortie d'un diagnostic temporaire exécuté au tour précédent
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
@@ -1771,6 +1773,8 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
     if context:
         new = cucumber_checks.new_features(worktree, base, [f for f in files if f.endswith(".feature")])
         errors += cucumber_init_data.check_lot_init(worktree, files, new, context.get("init"))
+        if context.get("longueurs"):
+            errors += cucumber_rules.check_code_lengths(worktree, sorted(new), context["longueurs"])
         errors += cucumber_verify.check_scenario_dependencies(worktree, sorted(
             f for f in new if os.path.exists(os.path.join(worktree, *f.split("/")))))
         errors += cucumber_verify.check_table_columns(worktree, base, [f for f in files if f.endswith(".feature")
@@ -1906,49 +1910,89 @@ def recreate_initializer_data(client: str, worktree: str, items: list, client_ro
     sources = initializer_sources(client_root, project, os.path.join(run_dir, "initializers"))
     std_java = cucumber_tools.standard_java_catalogue(cucumber_std_dir, profile.get("server_version", ""))
     std_expressions = cucumber_versions.std_snapshot(cucumber_std_dir, "HEAD")["steps"]
-    compile_cmd = os.getenv("CUCUMBER_COMPILE_CMD")
-    compile_cmd = cucumber_tools.DEFAULT_COMPILE_CMD if compile_cmd is None else compile_cmd.strip()
-    features = [os.path.relpath(os.path.join(d, n), worktree).replace("\\", "/")
-                for d, _, names in os.walk(os.path.join(worktree, *cucumber_init.RESOURCES_DIR.split("/"), "features"))
-                for n in names if n.endswith(".feature") and cucumber_init.INIT_DIR in d]
+    features = init_features(worktree)
     lines = [f"- « {e['expression']} » : {e['donnee'].get('entite')} {e['donnee']['code']} — initializer "
              f"{e['donnee'].get('classe')} ({e['donnee'].get('depot')}) ; source : "
              f"'{sources.get(e['donnee'].get('classe'), 'introuvable : Grep dans le dépôt ' + e['donnee'].get('depot', '?'))}'"
              for e in project]
+    values = {"client_name": client, "worktree": worktree, "java_path": cucumber_recreation.java_path(client),
+              "package": f"cucumber.features.{cucumber_tools.java_package_segment(client)}",
+              "clear_step_java": os.path.join(worktree, *cucumber_init.clear_step_path(client).split("/")),
+              "java_std": std_java["java_std"], "steps_example": std_java["steps_example"] or "aucune",
+              "donnees": "\n".join(lines)}
+    return write_init_steps(client, worktree, "cucumber_init_recreation", values,
+                            lambda: cucumber_recreation.check_project_steps(worktree, items, std_expressions),
+                            features, cucumber_std_dir, "Steps de recréation", "cucumber-init-recreation")
+
+
+def init_features(worktree: str) -> list:
+    """Features d'init du worktree d'initialisation (chemins relatifs)."""
+    return [os.path.relpath(os.path.join(d, n), worktree).replace("\\", "/")
+            for d, _, names in os.walk(os.path.join(worktree, *cucumber_init.RESOURCES_DIR.split("/"), "features"))
+            for n in names if n.endswith(".feature") and cucumber_init.INIT_DIR in d]
+
+
+def write_init_steps(client: str, worktree: str, prompt_name: str, values: dict, check, features: list,
+                     cucumber_std_dir: str, label: str, usage_step: str) -> list:
+    """
+    Steps du projet de l'init écrits par un appel Claude (`prompt_name`), puis au plus CUCUMBER_FIX_ATTEMPTS
+    corrections, chacune contrôlée en Python (`check()`, puis compilation et dry-run des features d'init si
+    CUCUMBER_COMPILE_CMD). Renvoie les erreurs restantes.
+    """
+    run_dir = cucumber_tools.cache_dir(client)
+    compile_cmd = os.getenv("CUCUMBER_COMPILE_CMD")
+    compile_cmd = cucumber_tools.DEFAULT_COMPILE_CMD if compile_cmd is None else compile_cmd.strip()
     model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
     errors = []
     for attempt in range(1 + _env_int("CUCUMBER_FIX_ATTEMPTS", 2)):
-        prompt = render_prompt(
-            "cucumber_init_recreation", client_name=client, worktree=worktree,
-            java_path=cucumber_recreation.java_path(client),
-            package=f"cucumber.features.{cucumber_tools.java_package_segment(client)}",
-            clear_step_java=os.path.join(worktree, *cucumber_init.clear_step_path(client).split("/")),
-            java_std=std_java["java_std"], steps_example=std_java["steps_example"] or "aucune",
-            donnees="\n".join(lines), erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
+        prompt = render_prompt(prompt_name, **values,
+                               erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
         effort = cucumber_fix_effort() if attempt else claude_effort("CLAUDE_EFFORT_CUCUMBER")
         returncode, _, usage, limit_hit = run_cucumber_claude(
             prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2), run_dir, effort)
-        report_token_usage(f"{client}-init", "cucumber-init-recreation", model, usage, len(prompt), returncode,
-                           effort)
+        report_token_usage(f"{client}-init", usage_step, model, usage, len(prompt), returncode, effort)
         if limit_hit:
-            return errors + ["quota ou budget atteint pendant l'écriture des steps de recréation"]
-        errors = cucumber_recreation.check_project_steps(worktree, items, std_expressions)
+            return errors + [f"quota ou budget atteint pendant l'écriture ({label.lower()})"]
+        errors = check()
         if not errors and compile_cmd:
             try:
-                check = cucumber_tools.verify_build(cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
+                build = cucumber_tools.verify_build(cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
                                                     compile_cmd, features, cucumber_tools.DEFAULT_DRY_RUN_CMD)
             except RuntimeError as e:
-                check = {"ok": False, "environnement": True, "erreurs": [str(e)]}
-            if not check["ok"] and not check.get("environnement"):
-                errors = check["erreurs"]
-            elif not check["ok"]:
-                print(f"[CUCUMBER INIT] ⚠️ Compilation des steps de recréation non vérifiée (environnement Maven) : "
-                      f"{check['erreurs'][0] if check['erreurs'] else '?'}")
-        print(f"[CUCUMBER INIT] Steps de recréation, tentative {attempt + 1} : "
+                build = {"ok": False, "environnement": True, "erreurs": [str(e)]}
+            if not build["ok"] and not build.get("environnement"):
+                errors = build["erreurs"]
+            elif not build["ok"]:
+                print(f"[CUCUMBER INIT] ⚠️ {label} : compilation non vérifiée (environnement Maven) : "
+                      f"{build['erreurs'][0] if build['erreurs'] else '?'}")
+        print(f"[CUCUMBER INIT] {label}, tentative {attempt + 1} : "
               + ("OK" if not errors else f"{len(errors)} erreur(s) — {errors[0]}"))
         if not errors:
             return []
     return errors
+
+
+def write_environment_steps(client: str, worktree: str, checks: list, recreations: list, cucumber_std_dir: str,
+                            profile: dict) -> list:
+    """
+    Steps du projet de l'init qui recréent les corrections manuelles de l'environnement et contrôlent ses
+    dépendances en lecture seule (points 9g, 9h, cucumber_environment). Renvoie les erreurs restantes.
+    """
+    std_java = cucumber_tools.standard_java_catalogue(cucumber_std_dir, profile.get("server_version", ""))
+    std_expressions = cucumber_versions.std_snapshot(cucumber_std_dir, "HEAD")["steps"]
+    controls, manual = cucumber_environment.prompt_items(checks, recreations)
+    values = {"client_name": client, "worktree": worktree, "java_path": cucumber_environment.java_path(client),
+              "package": f"cucumber.features.{cucumber_tools.java_package_segment(client)}",
+              "clear_step_java": os.path.join(worktree, *cucumber_init.clear_step_path(client).split("/")),
+              "java_std": std_java["java_std"], "steps_example": std_java["steps_example"] or "aucune",
+              "check_expression": cucumber_environment.check_expression(client),
+              "recreation_expression": cucumber_environment.recreation_expression(client),
+              "controles": controls, "recreations": manual}
+    return write_init_steps(client, worktree, "cucumber_init_environnement", values,
+                            lambda: cucumber_environment.check_steps(worktree, client, checks, recreations,
+                                                                     std_expressions),
+                            init_features(worktree), cucumber_std_dir, "Steps d'environnement",
+                            "cucumber-init-environnement")
 
 
 def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str, cucumber_repo_dir: str,
@@ -1977,10 +2021,15 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
     try:
         profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+        # Points 9g, 9h : dépendances d'environnement contrôlées et corrections manuelles recréées par l'init
+        environment = {"controles": cucumber_environment.dependencies(profile, cucumber_import.imports_dir(client)),
+                       "recreations": [m["description"] for m in cucumber_bilan.manual_corrections(client)],
+                       "writer": lambda worktree, checks, manual: write_environment_steps(
+                           client, worktree, checks, manual, local_cucumber_std_repo, profile)}
         result = cucumber_init.build_client_init(
             cucumber_repo_dir, local_cucumber_std_repo, client, base, modules, profile,
             lambda worktree, items: recreate_initializer_data(client, worktree, items, local_client_repo,
-                                                              local_cucumber_std_repo, profile))
+                                                              local_cucumber_std_repo, profile), environment)
     except RuntimeError as e:
         print(f"[CUCUMBER INIT] ❌ {e}")
         return 1
@@ -1993,6 +2042,11 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
         print(f"[CUCUMBER INIT] Données d'initializers recréées : {recreation['standard']} par un step du Standard, "
               f"{recreation['projet'] - len(recreation['non_livrees'])} par un step du projet"
               + (f", {len(recreation['non_livrees'])} non livrée(s) (commentées)" if recreation["non_livrees"] else ""))
+    env = result.get("environnement") or {}
+    if env.get("controles") or env.get("recreations"):
+        print(f"[CUCUMBER INIT] Environnement : {env['controles']} dépendance(s) contrôlée(s) en lecture seule, "
+              f"{env['recreations']} correction(s) manuelle(s) recréée(s) — "
+              + ("steps livrés" if env.get("livres") else f"non livrés ({cucumber_environment.TODO_MARKER})"))
     if result["absents"]:
         print(f"[CUCUMBER INIT] ⚠️ Pas d'initialisation Standard pour : {', '.join(result['absents'])}")
     if not result["modules"]:
@@ -2107,6 +2161,8 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
         lines.append(f"- {s['id']} [tag {s['tag']}] : en échec dans le run importé n° {lot['import']} — {s['step']} "
                      f"— {s['message']}" + (f" (correction n° {s['tentatives'] + 1} de cette cause : change "
                                             f"d'approche)" if s.get("tentatives") else ""))
+        hint = cucumber_verify.failure_hint(s["message"])
+        lines += [f"  - piste : {hint}"] if hint else []
         lines += [f"  - extrait des logs serveur : {e}" for e in s.get("preuves") or []]
         lines += [f"  - sortie du diagnostic temporaire : {s['diagnostic']}"] if s.get("diagnostic") else []
         lines += [f"  - décision humaine refusée : « {c} »" for c in s.get("refus") or []]
@@ -2438,9 +2494,16 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # Initialisation du client vue par les lots : features d'init et codes de référence du profil
     client_init = cucumber_profile.init_view(profile)
     conventions = cucumber_profile.conventions(profile)
+    # Longueur maximale du code de chaque entité (modèles des dépôts serveur), contrôlée après chaque lot (9b)
+    code_lengths = cucumber_rules.code_length_index(client, [local_std_repo, local_client_repo])
+    print(f"[CUCUMBER] Longueurs des codes : {len(code_lengths)} entité(s) trouvée(s) dans les modèles "
+          f"(défaut {cucumber_rules.DEFAULT_CODE_LENGTH} caractères sinon).")
     # Runner contrôlé avant le premier lot : sa correction éventuelle est livrée avec le premier lot
-    print(f"[CUCUMBER] Runner et glue : "
-          f"{cucumber_tools.client_java_context(client, worktree, std_java, conventions)['runner_status']}")
+    runner_check = cucumber_tools.client_java_context(client, worktree, std_java, conventions)
+    print(f"[CUCUMBER] Runner et glue : {runner_check['runner_status']}")
+    # Contrôle du runner avant le premier lot, repris dans le récapitulatif avec sa modification éventuelle (point 8)
+    state["runner"] = {"consigne": runner_check["runner_status"],
+                       "chemin": (runner_check.get("runner") or {}).get("path", "")}
     # Contenu injecté : partie fixe (en tête, identique pour tous les lots) et extraits du lot, chacun borné
     inline_max = _env_int("CUCUMBER_INLINE_MAX_CHARS", cucumber_tools.DEFAULT_INLINE_MAX_CHARS)
     recipe_examples = [r["exemple_local"] for s in specifics.values() for r in s.get("recettes") or []
@@ -2487,7 +2550,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         label = f"{lot['numero']}/{len(lots)}"
         print(f"\n[LOT {label}] " + " ; ".join(s["libelle"] for s in lot_specs))
         java = cucumber_tools.client_java_context(client, worktree, std_java, conventions)
-        context = {"init": client_init, "java": java, "conventions": conventions, "reference": reference}
+        context = {"init": client_init, "java": java, "conventions": conventions, "reference": reference,
+                   "longueurs": code_lengths}
         if lot.get("type") == "correction" and lot.get("resultats") is None:
             # Lot « correction » d'un import : scénarios existants, aucune génération
             results = []
