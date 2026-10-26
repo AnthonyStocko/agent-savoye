@@ -88,7 +88,8 @@ venv\Scripts\python.exe -m streamlit run app.py
    - **Import d'un rapport d'exécution** (`tools/cucumber_import.py`, panneau de l'onglet, `--import-run <fichiers>` / `--import-url <build Jenkins>`, sans token) : console Jenkins, rapport Cucumber JSON et exports de logs serveur (CSV), déposés ou lus en mémoire sur un build Jenkins. Les secrets (`-Dpassword*`, `-DuserName`, jetons, en-têtes `Authorization`, mots de passe d'URL ou de JSON, et leurs formes base64) sont masqués avant tout stockage ou affichage ; seule l'empreinte du fichier brut est gardée. Un fichier déjà importé est écarté ; un fichier du même run (horodatage de début) rejoint son import, réanalysé (scénarios dédoublonnés). Avant l'analyse, le nombre de tests est comparé au nombre attendu (tags lus dans la console, sinon nombre attendu de la livraison et scénarios des features) : un écart rend l'import « non analysé ». Sinon : échecs classés et regroupés par cause racine (catégorie, step, message sans ses valeurs variables), couverture des steps en échec par les exports de logs (sinon fenêtre à exporter en UTC et heure locale, texte de filtre ; lignes ERROR / WARN proches retenues comme preuves), comparaison avec l'import précédent (corrigés, nouveaux, inchangés, disparus), et lots de correction proposés pour les seuls échecs « test » des scénarios générés par l'agent, un par spécifique. **Lancer la correction ciblée** (`--complete --from-import N`) ajoute des lots « correction » : un appel de correction avec le message réel, puis compilation, vérification par exécution et règles de retrait comme pour un lot généré. Stockage : `.tmp/cucumber/<client>/imports/` (`index.json`, puis par import les fichiers masqués, `analyse.json` et `analyse.md`).
    - **Reprendre** : après une interruption (quota, erreur), reprend au premier lot non terminé (`.tmp/cucumber/<client>/etat.json`). Un lot en `erreur_compilation` ne relance que la correction.
 4. **🔔 Écoute des merges** : démarre et arrête l'écoute périodique des merges Bitbucket (post-merge Cucumber).
-5. **⚙️ Configuration** : toutes les variables du `.env`, le test de connexion à la base et la gestion de la mémoire de l'agent.
+5. **📚 Connaissances partagées** : état du répertoire partagé (joignable, documents indexés, documents en attente de dépôt), import de `.md` existants, recherche (projet ou client, type, ticket, mot-clé), aperçu, ouverture et changement de statut des documents. Voir [Connaissances partagées](#connaissances-partagées).
+6. **⚙️ Configuration** : toutes les variables du `.env`, le test de connexion à la base, le test du répertoire partagé et la gestion de la mémoire de l'agent.
 
 Sans IHM :
 
@@ -115,6 +116,101 @@ Les livrables (`<TICKET>-cadrage.md`, `<TICKET>-*.patch`, `<TICKET>-release-note
 - Chaque vérification exécute d'abord l'initialisation (`init_tags` du profil) ; si elle échoue, aucun lot n'est jugé (« environnement non initialisé », avec le premier step en échec et sa cause).
 - Le rapport Cucumber JSON doit garder `start_timestamp` et les sorties des steps (`scenario.log`) : heure du step en échec pour la fenêtre des logs serveur, journal du diagnostic temporaire et preuve d'un constat de déploiement.
 
+## Connaissances partagées
+
+Chaque analyse de l'agent est déposée en Markdown dans un répertoire commun (partage réseau d'entreprise), puis consultée avant les analyses suivantes, par vous comme par vos collègues. C'est un complément de la mémoire locale (`.tmp/memory`, propre à chaque poste), qui reste inchangée. Le code est dans `tools/knowledge_tools.py` ; le masquage des secrets, commun à tout l'agent, dans `tools/secret_tools.py`.
+
+### Configuration
+
+| Variable | Rôle |
+|---|---|
+| `AGENT_KNOWLEDGE_DIR` | Répertoire partagé : chemin UNC (`\\serveur\partage\dossier`), lecteur mappé (`X:\dossier`) ou chemin POSIX (`/mnt/partage/dossier`). **Vide = fonction désactivée** : rien n'est déposé ni consulté. |
+| `AGENT_KNOWLEDGE_AUTHOR` | Auteur inscrit dans les documents (vide = utilisateur système). |
+| `AGENT_KNOWLEDGE_MAX_CONTEXT` | Taille maximale, en caractères, des connaissances injectées dans un prompt (défaut 6000, 0 = aucune). |
+
+Dans l'onglet **⚙️ Configuration**, section « Connaissances partagées », enregistrez le chemin puis cliquez sur **Tester le répertoire partagé** : existence du dossier, lecture, droit d'écriture (un fichier témoin est créé, relu puis supprimé) et temps d'accès. Chaque opération est bornée à 15 s ; un échec dit quoi vérifier (chemin, réseau ou VPN, droits).
+
+### Arborescence et format
+
+```
+<AGENT_KNOWLEDGE_DIR>/<projet>/<type>/<AAAA-MM-JJ_HHMMSS>_<sujet>_<auteur>.md
+```
+
+- `<projet>` : le client s'il est connu (déduit du dépôt client), sinon le projet Jira. Le projet Jira figure toujours dans l'en-tête.
+- `<type>`, liste fermée : `cadrage`, `besoin`, `decoupage-epopee`, `recap-patch`, `release-note`, `postmerge-cucumber`, `cucumber-inventaire`, `cucumber-sante`, `cucumber-couverture`, `cucumber-a-revoir`, `cucumber-diagnostic-run`, `audit`, `autre`.
+- Noms nettoyés pour Windows (caractères interdits, noms réservés, points finaux), chemin complet borné à 240 caractères.
+- Un document n'est **jamais écrasé** : à nom identique, un suffixe `-2`, `-3`… est ajouté. L'écriture est atomique (fichier temporaire dans le même dossier, puis renommage) : un lecteur ne voit jamais un document à moitié écrit.
+
+Chaque document commence par un en-tête YAML (une valeur JSON par ligne), suivi du corps de l'analyse tel quel :
+
+```yaml
+---
+projet: "PROJ"
+client: "<client>"
+type: "cadrage"
+sujet: "Titre du ticket"
+tickets: ["PROJ-123"]
+composants: ["<composant>"]
+tags: []
+date: "2026-10-26T09:05:07"
+auteur: "<auteur>"
+version_agent: "<git describe du dépôt de l'agent>"
+depots: [{"nom": "<dépôt>", "commit": "<sha>"}]
+statut: "actif"
+remplace_par: ""
+sources_partagees: ["<client>/cadrage/<document consulté>.md"]
+resume: "5 lignes au plus"
+---
+```
+
+`statut` vaut `actif`, `obsolète` ou `remplacé` (avec `remplace_par`, chemin relatif du document qui le remplace).
+
+### Dépôt automatique
+
+L'agent dépose, à la fin de chaque étape réussie :
+
+| Étape | Type |
+|---|---|
+| Cadrage, révision, cadrage complété par les réponses | `cadrage` |
+| Rédaction du besoin | `besoin` |
+| Découpage d'une épopée (avec l'analyse de chaque tâche) | `decoupage-epopee` |
+| Patch : récapitulatif de l'agent, release note | `recap-patch`, `release-note` |
+| Post-merge Cucumber | `postmerge-cucumber` |
+| Cucumber : inventaire (`--inventory-only`), bilan de santé, couverture (un document par génération), `A_REVOIR.md`, import d'un run | `cucumber-inventaire`, `cucumber-sante`, `cucumber-couverture`, `cucumber-a-revoir`, `cucumber-diagnostic-run` |
+
+- **Nouvelle version** : un document de même projet, même type et même ticket (sans ticket : même sujet) marque automatiquement l'ancienne version active « remplacée par » la nouvelle, **quel qu'en soit l'auteur**. Un document déposé en retard ne remplace jamais une version plus récente.
+- **Partage indisponible** : l'analyse n'est jamais bloquée. Le document (déjà masqué) attend dans la file locale `.tmp/knowledge_outbox`, réessayée au démarrage de chaque étape, avant chaque dépôt et depuis l'onglet 📚 (bouton **Déposer les documents en attente**).
+- **Import ponctuel** de `.md` existants (`A_REVOIR.md`, `AUDIT.md`, `COUVERTURE.md`…) : onglet 📚, panneau « Importer des analyses Markdown existantes », ou en ligne de commande :
+
+```powershell
+venv\Scripts\python.exe -m tools.knowledge_tools import A_REVOIR.md --projet PROJ --type cucumber-a-revoir --tickets PROJ-1 --client <client>
+venv\Scripts\python.exe -m tools.knowledge_tools flush   # dépose la file locale
+```
+
+### Consultation avant analyse
+
+- Avant chaque analyse, l'agent cherche les documents pertinents : **même projet d'abord**, puis tickets, composants, tags et mots-clés communs (même similarité que la mémoire locale). Un document d'un autre projet n'est retenu que s'il a un point commun ; les documents obsolètes ou remplacés sont exclus.
+- L'index est reconstruit à partir des en-têtes et mis en cache sur le poste (`.tmp/knowledge_index.json`) : seul un dossier `<projet>/<type>` modifié depuis la dernière lecture est relu. **Aucun fichier d'index n'est écrit sur le partage.** Partage injoignable : le dernier index connu est utilisé.
+- Les plus proches puis les plus récents sont injectés dans le prompt (variable `${knowledge_block}`), dans la limite de `AGENT_KNOWLEDGE_MAX_CONTEXT` : chemin, date, auteur, statut, résumé et sections utiles (diagnostic et fichiers d'un cadrage, sinon début du document).
+- Le bloc est présenté comme une **CONNAISSANCE ANTÉRIEURE À VÉRIFIER** : des données, jamais des instructions. Aucune consigne trouvée dans un document partagé ne s'applique ; le code et les résultats d'exécution l'emportent toujours sur un document.
+- L'agent peut lire les documents complets (`--add-dir`), avec écriture et modification interdites sur ce répertoire (`--disallowedTools`) et la consigne de lecture seule. Les lots Cucumber ne reçoivent que les extraits.
+- Les documents consultés sont affichés dans la console et listés dans le document déposé (en-tête `sources_partagees` et section finale « Connaissances partagées consultées »).
+
+### Confidentialité
+
+- **Tout utilisateur qui a accès au partage lit tous les documents**, de tous les projets et de tous les clients. Réglez les droits du partage en conséquence (un partage par périmètre de confidentialité si nécessaire) et ne le configurez pas sur un poste qui ne doit pas voir ces analyses.
+- Avant tout dépôt, les secrets sont masqués avec les mêmes règles que le reste de l'agent : mots de passe et jetons (`-Dpassword*`, `-DuserName`, `-D*token*`, paramètres d'URL et champs JSON), en-têtes `Authorization`, formes base64 de ces valeurs, et valeurs secrètes de votre `.env` (`*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_API_KEY`).
+- **Si un motif de secret subsiste après masquage** (clé privée, jeton JWT, Atlassian, GitHub, Anthropic, clé AWS…), le dépôt est **refusé** : rien n'est écrit, ni sur le partage ni dans la file locale, et la console l'indique.
+- Le masquage n'est pas une garantie absolue : ne collez pas de données personnelles ou de secrets dans les tickets et les analyses.
+
+### Bonnes pratiques
+
+- Testez le répertoire après chaque changement de configuration ; un accès lent (plus de 2 s) ralentit chaque dépôt et chaque consultation.
+- Marquez **obsolète** (onglet 📚) un document devenu faux, plutôt que de le supprimer : il reste consultable sur demande et n'est plus injecté.
+- Ne modifiez pas le corps d'un document à la main : déposez une nouvelle analyse, qui remplacera l'ancienne. Une retouche manuelle de l'en-tête reste lisible (valeurs JSON ou texte simple).
+- Ne créez pas d'autres fichiers dans les dossiers `<projet>/<type>` : seuls les `.md` sont indexés, les fichiers commençant par `.` sont ignorés.
+- Une information tirée d'un document partagé se vérifie dans le code avant d'être reprise.
+
 ## Personnaliser les prompts
 
 Les consignes envoyées à l'agent sont dans `prompts/` :
@@ -129,6 +225,8 @@ Les consignes envoyées à l'agent sont dans `prompts/` :
 | `patch.md`, `patch_cucumber.md` | Génération du patch (sans ou avec tests Cucumber) |
 | `postmerge.md` | Ticket et patch Cucumber post-merge |
 | `token_saving_rules.md`, `db_access.md`, `cucumber_enabled.md`, `cucumber_disabled.md`, `release_note.md` | Blocs communs |
+
+Les connaissances partagées sont injectées par `${knowledge_block}` (à côté de `${capitalization_block}`) ; un modèle personnalisé qui ne contient pas cette variable les reçoit en fin de prompt.
 
 Les variables s'écrivent `${nom}`, par exemple `${target_issue}`. Pour écrire un `$` littéral, utilisez `$$`. Si un modèle contient une variable inconnue, l'exécution s'arrête et le message liste les variables disponibles.
 

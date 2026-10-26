@@ -489,3 +489,24 @@ def test_import_uploaded_text(share):
     meta, body = kt.read_document(result["chemin"])
     assert result["statut"] == kt.PUBLISHED and meta["projet"] == "PROJX" and meta["sujet"] == "AUDIT"
     assert meta["tickets"] == ["PROJX-4"] and "fuite" not in body and body.startswith("# Audit")
+
+
+# ---------------------------------------------------------------------------
+# Étape 6 : documentation et exemple de configuration
+# ---------------------------------------------------------------------------
+
+def test_env_example_has_no_company_value():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, ".env.example"), encoding="utf-8") as f:
+        values = dict(line.strip().split("=", 1) for line in f if line.startswith("AGENT_KNOWLEDGE_"))
+    assert values == {"AGENT_KNOWLEDGE_DIR": "", "AGENT_KNOWLEDGE_AUTHOR": "",
+                      "AGENT_KNOWLEDGE_MAX_CONTEXT": str(kt.DEFAULT_MAX_CONTEXT)}
+
+
+def test_readme_documents_confidentiality_and_format():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
+        readme = f.read()
+    assert "## Connaissances partagées" in readme and "lit tous les documents" in readme
+    assert all(f"`{doc_type}`" in readme for doc_type in kt.KNOWLEDGE_TYPES)
+    assert all(f"{field}:" in readme for field in kt.HEADER_FIELDS)
