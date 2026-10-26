@@ -630,6 +630,7 @@ def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_
              f"serveur {server or '?'}" + (f" — ⚠️ {gap}" if gap else " — alignés"),
              "- Compilation et dry-run : " + ("non lancés (CUCUMBER_COMPILE_CMD vide)" if not compile_cmd else
                                               "OK" if build["ok"] else f"{build['etape']} en échec"),
+             "- Verdict : " + ("sain" if ok else f"{sum(len(e) for e in sections.values())} défaut(s)"),
              f"- Scénarios actifs : {selection['attendu']} à la lecture des features" + (
                  f" ; nombre attendu (dry-runs) : {selection['nombre_attendu']}" if selection["nombre_attendu"]
                  else "")]

@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_checks, cucumber_coverage, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -2182,6 +2182,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                         depots=knowledge_tools.repo_commits(cucumber_repo_dir))
         return 0
 
+    # Tâches « partielles » de la vue Couverture (rapprochement partiel, scénarios faibles), calculées sur la
+    # génération en cours : leur lot doit tester l'EFFET, pas la configuration
+    partial = cucumber_coverage.partial_ids(cucumber_coverage.coverage_rows(client, inventory))
     # 2. Lots : complément, reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
     if complete_state and args.from_import:
         state = complete_state
@@ -2245,6 +2248,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                  "lots": lots}
         if cucumber_tools.load_state(client).get("lots"):
             print("⚠️ Nouvelle génération : les lots précédents (worktree, commits, etat.json) sont écrasés.")
+    state["partiels"] = sorted(set(state.get("partiels") or []) | {i for lot in cucumber_tools.pending_lots(state)
+                                                                    for i in lot["ids"] if i in partial})
     try:
         worktree = cucumber_tools.prepare_worktree(cucumber_repo_dir, client, state["base"], reset=not (resume_state or complete_state))
     except RuntimeError as e:
@@ -2299,6 +2304,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                         init_tags, init_sources)
         print(f"[CUCUMBER] {'✅' if init['ok'] else '🌐'} {init['message']}" + (f" ({init['build']})" if init["build"]
                                                                                else ""))
+        # Dernier résultat connu de l'init (parcours de l'onglet, étape Projet)
+        state["init"] = {**init, "date": datetime.now().isoformat(timespec="seconds")}
+        cucumber_tools.save_state(client, state)
         if not init["ok"]:
             verify_mode, verify_message, unverified_status = "", init["message"], "environnement"
     # Connaissances partagées du client (couverture, santé, à revoir, runs importés...), dans la partie fixe des lots
@@ -2371,7 +2379,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                   f"restant(s), à reprendre.")
             break
         processed += 1
-        lot_specs = [specifics[i] for i in lot["ids"] if i in specifics]
+        lot_specs = [{**specifics[i], "partiel": i in (state.get("partiels") or [])} for i in lot["ids"] if i in specifics]
         label = f"{lot['numero']}/{len(lots)}"
         print(f"\n[LOT {label}] " + " ; ".join(s["libelle"] for s in lot_specs))
         java = cucumber_tools.client_java_context(client, worktree, std_java, conventions)

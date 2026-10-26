@@ -9,8 +9,9 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import (cucumber_checks, cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers,
-                   cucumber_profile, cucumber_tools, cucumber_verify, integration_tools, knowledge_tools)
+from tools import (cucumber_checks, cucumber_coverage, cucumber_import, cucumber_init, cucumber_init_data,
+                   cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_studio, cucumber_tools,
+                   cucumber_verify, integration_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -756,10 +757,10 @@ def integration_option_label(ticket: dict) -> str:
     return label
 
 
-def render_cucumber_import(client: str, state: dict, cucumber_cmd: list) -> None:
+def render_cucumber_import(client: str, state: dict) -> None:
     """
-    Import d'un rapport d'exécution (onglet Cucumber, 0 token) : fichiers déposés ou build Jenkins, secrets masqués
-    en mémoire, puis dernière analyse (causes racine, comparaison, logs à exporter, lots de correction proposés).
+    Étape 5, import d'un rapport d'exécution (0 token) : fichiers déposés ou build Jenkins, secrets masqués en
+    mémoire, puis résultat du dernier import (tests, échecs, comparaison) et logs serveur à exporter.
     """
     st.markdown("#### :material/upload_file: Import d'un rapport d'exécution")
     with st.form(f"cucumber_import_{client}", border=True):
@@ -782,14 +783,9 @@ def render_cucumber_import(client: str, state: dict, cucumber_cmd: list) -> None
             cucumber_import.analyse(client, imported["numero"], state, cucumber_tools.worktree_dir(client))
         elif not imported["messages"]:
             st.warning("Aucun fichier à importer.")
-    index = cucumber_import.load_index(client)
-    if not index["imports"]:
-        st.caption("Aucun import pour ce client.")
-        return
-    numero = max(e["numero"] for e in index["imports"])
-    analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
-                                                      "analyse.json"), {}) or {}
+    numero, analysis = latest_import_analysis(client)
     if not analysis:
+        st.caption("Aucun import pour ce client.")
         return
     st.caption(f"Import n° {numero} — run {analysis.get('run') or '?'}"
                + (f", build #{analysis['build']}" if analysis.get("build") else "")
@@ -807,14 +803,40 @@ def render_cucumber_import(client: str, state: dict, cucumber_cmd: list) -> None
             st.metric(f"Corrigés depuis l'import n° {comparison['import']}", len(comparison["corriges"]), border=True)
             st.metric("Nouveaux", len(comparison["nouveaux"]), border=True)
             st.metric("Inchangés", len(comparison["inchanges"]), border=True)
-    if analysis["groupes"]:
-        st.dataframe([{"Scénarios": len(g["scenarios"]), "Cause": g["libelle"], "Catégorie": g["categorie"],
-                       "Step": g["step"], "Message": g["message"]} for g in analysis["groupes"]], hide_index=True)
     uncovered = [e for e in analysis["logs"] if e["a_exporter"]]
     if uncovered:
         with st.expander(f"Logs serveur à exporter ({len(uncovered)})", icon=":material/schedule:"):
             for entry in uncovered:
                 st.markdown(f"- `{entry['id']}` : {entry['a_exporter']}")
+
+
+def latest_import_analysis(client: str) -> tuple:
+    """(numéro, analyse) du dernier import ; (0, {}) sans import."""
+    index = cucumber_import.load_index(client)
+    if not index["imports"]:
+        return 0, {}
+    numero = max(e["numero"] for e in index["imports"])
+    return numero, cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
+                                                          "analyse.json"), {}) or {}
+
+
+def render_cucumber_corrections(client: str, cucumber_cmd: list, rows: list) -> None:
+    """
+    Étape 6 : causes racine du dernier import, lots de correction proposés (échecs « test » des scénarios de
+    l'agent) et tâches en échec de la vue Couverture.
+    """
+    failing = [r for r in rows if r["etat"] == "echec"]
+    if failing:
+        st.markdown(f"**{len(failing)} tâche(s) en échec**")
+        st.dataframe([{"Tâche": r["tache"], "Cause": r["cause"], "Dernière exécution": r["derniere"]}
+                      for r in failing], hide_index=True, width="stretch")
+    numero, analysis = latest_import_analysis(client)
+    if not analysis or analysis.get("non_analyse"):
+        st.caption("Aucun import analysé : importez la console et le rapport du run (étape Exécution).")
+        return
+    if analysis["groupes"]:
+        st.dataframe([{"Scénarios": len(g["scenarios"]), "Cause": g["libelle"], "Catégorie": g["categorie"],
+                       "Step": g["step"], "Message": g["message"]} for g in analysis["groupes"]], hide_index=True)
     if analysis["propositions"]:
         count = sum(len(p["scenarios"]) for p in analysis["propositions"])
         st.markdown(f"**{len(analysis['propositions'])} lot(s) de correction proposé(s)** ({count} scénario(s) de "
@@ -962,60 +984,57 @@ with tab_integration:
                                "Lancement tiendra compte des réponses présentes dans la description.")
 
 
-# ---------------------------------------------------------
-# ONGLET CUCUMBER : COUVERTURE DES SPÉCIFIQUES D'UN CLIENT
-# ---------------------------------------------------------
-with tab_cucumber:
-    st.markdown("### Tests Cucumber des spécifiques d'un client")
-    st.caption("L'agent inventorie les spécifiques du dépôt client (écarts avec le Standard), puis écrit les .feature et "
-               "Step Definitions qui les couvrent dans le dépôt <client>-cucumber, au formalisme du Cucumber Standard. "
-               "Le résultat est un patch local : rien n'est poussé.")
-
+def cucumber_header() -> dict:
+    """
+    Client et dépôts de l'onglet Cucumber (repliés une fois renseignés). Renvoie le contexte commun des étapes :
+    client, commande main.py, prêt ou non, capture de la référence Git du Standard.
+    """
     # Valeurs par défaut du .env, puis dernières valeurs saisies (conservées dans la session)
     st.session_state.setdefault("cucumber_repo", os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""))
     st.session_state.setdefault("cucumber_db_schema", os.getenv("DB_SCHEMA", ""))
     st.session_state.setdefault("cucumber_application", "")
     st.session_state.setdefault("cucumber_std_repo", os.getenv("BITBUCKET_CUCUMBER_STD_REPO", ""))
-
-    cucumber_repo_input = st.text_input(
-        "Dépôt Bitbucket du projet client :", key="cucumber_repo",
-        help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/CLIENT) ou chemin d'un clone local.",
-    ).strip()
-    # Nom du client recalculé quand le dépôt change, sauf s'il a été modifié à la main depuis
-    derived_client = cucumber_tools.client_name_from_repo(cucumber_repo_input)
-    if st.session_state.get("cucumber_client_derived") != derived_client:
-        st.session_state["cucumber_client_derived"] = derived_client
-        st.session_state["cucumber_client_name"] = derived_client
-
-    col_client, col_schema, col_app = st.columns(3)
-    with col_client:
-        cucumber_client = st.text_input(
-            "Nom du client :", key="cucumber_client_name",
-            help="Déduit du dépôt (clé du projet Bitbucket). Le dépôt cible est <client>-cucumber.",
-        ).strip().lower()
-    with col_schema:
-        cucumber_schema = st.text_input(
-            "Schéma BDD (optionnel) :", key="cucumber_db_schema",
-            help="Schéma de la base client consultable en lecture seule. Vide = l'agent n'utilise pas la base.",
+    filled = bool(st.session_state.get("cucumber_repo") and st.session_state.get("cucumber_client_name"))
+    with st.expander("Client et dépôts", icon=":material/settings:", expanded=not filled):
+        cucumber_repo_input = st.text_input(
+            "Dépôt Bitbucket du projet client :", key="cucumber_repo",
+            help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/CLIENT) ou chemin d'un clone local.",
         ).strip()
-    with col_app:
-        cucumber_application = st.text_input(
-            "Projet / Application Jira (optionnel) :", key="cucumber_application",
-            disabled=not os.getenv("JIRA_APPLICATION_FIELD", "").strip(),
-            help="Ex: APPLI. Les tickets Jira ayant cette valeur (champ JIRA_APPLICATION_FIELD) servent de "
-                 "référence fonctionnelle sur les spécifiques.",
-        ).strip()
-    if cucumber_client:
-        st.caption(f"Dépôt cible : **{cucumber_client}-cucumber** · identifiant de travail "
-                   f"**{cucumber_tools.work_id(cucumber_client)}**")
+        # Nom du client recalculé quand le dépôt change, sauf s'il a été modifié à la main depuis
+        derived_client = cucumber_tools.client_name_from_repo(cucumber_repo_input)
+        if st.session_state.get("cucumber_client_derived") != derived_client:
+            st.session_state["cucumber_client_derived"] = derived_client
+            st.session_state["cucumber_client_name"] = derived_client
 
-    cucumber_std_input = st.text_input(
-        "Dépôt Bitbucket du Cucumber Standard :", key="cucumber_std_repo",
-        help="URL de navigation (.../projects/X/repos/Y/browse), URL clonable (.../scm/x/y.git) ou chemin d'un "
-             "clone local, utilisé tel quel. Défaut : BITBUCKET_CUCUMBER_STD_REPO (onglet Configuration).",
-    ).strip()
-    # Référence Git du Standard lue dans le journal de la dernière exécution (pour ce dépôt seulement)
-    std_ref_slot = st.empty()
+        col_client, col_schema, col_app = st.columns(3)
+        with col_client:
+            cucumber_client = st.text_input(
+                "Nom du client :", key="cucumber_client_name",
+                help="Déduit du dépôt (clé du projet Bitbucket). Le dépôt cible est <client>-cucumber.",
+            ).strip().lower()
+        with col_schema:
+            cucumber_schema = st.text_input(
+                "Schéma BDD (optionnel) :", key="cucumber_db_schema",
+                help="Schéma de la base client consultable en lecture seule. Vide = l'agent n'utilise pas la base.",
+            ).strip()
+        with col_app:
+            cucumber_application = st.text_input(
+                "Projet / Application Jira (optionnel) :", key="cucumber_application",
+                disabled=not os.getenv("JIRA_APPLICATION_FIELD", "").strip(),
+                help="Ex: APPLI. Les tickets Jira ayant cette valeur (champ JIRA_APPLICATION_FIELD) servent de "
+                     "référence fonctionnelle sur les spécifiques.",
+            ).strip()
+        if cucumber_client:
+            st.caption(f"Dépôt cible : **{cucumber_client}-cucumber** · identifiant de travail "
+                       f"**{cucumber_tools.work_id(cucumber_client)}**")
+
+        cucumber_std_input = st.text_input(
+            "Dépôt Bitbucket du Cucumber Standard :", key="cucumber_std_repo",
+            help="URL de navigation (.../projects/X/repos/Y/browse), URL clonable (.../scm/x/y.git) ou chemin d'un "
+                 "clone local, utilisé tel quel. Défaut : BITBUCKET_CUCUMBER_STD_REPO (onglet Configuration).",
+        ).strip()
+        # Référence Git du Standard lue dans le journal de la dernière exécution (pour ce dépôt seulement)
+        std_ref_slot = st.empty()
 
     def show_std_ref() -> None:
         last = st.session_state.get("cucumber_std_ref") or {}
@@ -1029,7 +1048,6 @@ with tab_cucumber:
             show_std_ref()
 
     show_std_ref()
-
     cucumber_cmd = [
         sys.executable, "main.py",
         "--step", "generate-cucumber-client",
@@ -1039,34 +1057,151 @@ with tab_cucumber:
         "--db-schema", cucumber_schema,
         "--cucumber-std-repo", cucumber_std_input,
     ]
-    ready = bool(cucumber_repo_input and cucumber_client)
+    return {"client": cucumber_client, "cmd": cucumber_cmd, "ready": bool(cucumber_repo_input and cucumber_client),
+            "capture": capture_std_ref}
 
-    # 1. Inventaire des spécifiques (calculs Python, aucun token)
-    if st.button("Inventaire des spécifiques", use_container_width=True, icon=":material/inventory_2:",
-                 disabled=not ready, help="Prépare les dépôts, puis inventorie les spécifiques du client, les "
-                                          "catalogues Cucumber et les extraits Jira. Aucun appel à Claude."):
-        st.info(f"Inventaire des spécifiques {cucumber_client} en cours...")
-        if run_main_step(cucumber_cmd + ["--inventory-only"], on_line=capture_std_ref) == 0:
-            st.success("Inventaire terminé.")
-        else:
-            st.error("L'inventaire a échoué : voir le journal ci-dessus.")
 
-    # 1 ter. Bilan de santé du dépôt client avant génération (aucun token)
-    if st.button("Bilan de santé du dépôt client", use_container_width=True, icon=":material/health_and_safety:",
-                 disabled=not ready,
-                 help="Contrôle le dépôt <client>-cucumber tel quel : emplacement et casse du tag client de ses "
-                      "features, fichiers de données manquants (le dépôt client n'a pas ceux du Standard à "
-                      "l'exécution), puis compilation et dry-run de toutes ses features (steps non définis ou "
-                      "ambigus). Aucun appel à Claude."):
-        st.info(f"Bilan de santé de {cucumber_client}-cucumber en cours...")
-        code = run_main_step(cucumber_cmd + ["--health-only"], on_line=capture_std_ref)
-        if code == 0:
-            st.success("Dépôt client sain.")
-        elif code == 1:
-            st.warning("Le dépôt client a des défauts : voir le rapport ci-dessous. Les échecs qu'ils provoquent à "
-                       "l'exécution ne viendront pas des tests générés.", icon=":material/warning:")
-        else:
-            st.error("Le bilan de santé a échoué : voir le journal ci-dessus.")
+def render_cucumber_profile(ctx: dict, profile_doc: dict) -> None:
+    """Profil client : conventions détectées dans le dépôt <client>-cucumber, corrigeables (aucun token)."""
+    cucumber_client, ready = ctx["client"], ctx["ready"]
+    profile = cucumber_profile.effective_profile(profile_doc)
+    empty_fields = [cucumber_profile.LABELS[k] for k in cucumber_profile.FIELDS if cucumber_profile.is_empty(profile[k])]
+    with st.expander(("⚠️ " if empty_fields or not profile_doc else "") + "Profil client"
+                     + (f" — {len(empty_fields)} champ(s) vide(s)" if profile_doc and empty_fields else ""),
+                     expanded=bool(profile_doc) and bool(empty_fields)):
+        if st.button("Détecter le profil", icon=":material/manage_search:", disabled=not ready,
+                     help="Relit le dépôt <client>-cucumber à sa base : racine et tag des features, init, clear, "
+                          "fichiers du module spécifique, runner, codes de référence, version de la bibliothèque. "
+                          "La saisie enregistrée est conservée. Aucun appel à Claude."):
+            if run_main_step(ctx["cmd"] + ["--profile-only"], on_line=ctx["capture"]) == 0:
+                st.rerun()
+            st.error("Détection du profil impossible : voir le journal ci-dessus.")
+        if not profile_doc:
+            st.caption("Aucun profil : lancez l'inventaire ou « Détecter le profil ».")
+            return
+        st.caption(f"Détecté le {profile_doc.get('date', '?').replace('T', ' ')[:16]} · priorité : "
+                   f"{cucumber_profile.REPO_PROFILE} du dépôt > saisie > détection.")
+        for warning in profile["avertissements"]:
+            st.markdown(f":orange[⚠️ {warning}]")
+        sources = profile["sources"]
+
+        def origin(key: str) -> str:
+            return {"depot": "fixé par le dépôt", "saisi": "saisi", "detecte": "détecté"}.get(sources.get(key),
+                                                                                              "vide")
+        with st.form(f"cucumber_profile_{cucumber_client}"):
+            values = {}
+            with st.container(horizontal=True):
+                for key in ("features_root", "tag_client", "init_tags", "clear_name", "library_version",
+                            "server_version"):
+                    values[key] = st.text_input(f"{cucumber_profile.LABELS[key]} ({origin(key)})",
+                                                value=profile[key], disabled=sources.get(key) == "depot")
+            values["init_features"] = [line.strip() for line in st.text_area(
+                f"{cucumber_profile.LABELS['init_features']} ({origin('init_features')}), une par ligne",
+                value="\n".join(profile["init_features"]), disabled=sources.get("init_features") == "depot",
+                height=80).splitlines() if line.strip()]
+            options = list(dict.fromkeys(profile["spec_files"]
+                                         + (profile_doc.get("suggestions") or {}).get("spec_files", [])))
+            values["spec_files"] = st.multiselect(
+                f"{cucumber_profile.LABELS['spec_files']} ({origin('spec_files')}), dans l'ordre d'intégration",
+                options, default=profile["spec_files"], disabled=sources.get("spec_files") == "depot",
+                help="Intégrés par l'init après l'initialisation globale, dans l'ordre de sélection. Suggestions : "
+                     "fichiers de données du dépôt client hors initialisation Standard.")
+            values["protected_files"] = [line.strip() for line in st.text_area(
+                f"{cucumber_profile.LABELS['protected_files']} ({origin('protected_files')}, "
+                f"{len(profile['protected_files'])}), un par ligne",
+                value="\n".join(profile["protected_files"]), disabled=sources.get("protected_files") == "depot",
+                height=100, help="Features d'init et fichiers qu'elles intègrent, partagés par tous les tests : "
+                                 "toute modification par la génération est une erreur bloquante (fichier "
+                                 "restauré après le lot, patch refusé).").splitlines() if line.strip()]
+            codes = {}
+            with st.container(horizontal=True):
+                for category in cucumber_profile.REFERENCE_CATEGORIES:
+                    codes[category] = [c.strip() for c in st.text_input(
+                        cucumber_init_data.LABELS.get(category, category),
+                        value=", ".join((profile["reference_codes"] or {}).get(category) or []),
+                        disabled=sources.get("reference_codes") == "depot").split(",") if c.strip()]
+            values["reference_codes"] = codes
+            # Branche lue par le job de vérification : commitée et poussée avant chaque vérification
+            with st.container(horizontal=True):
+                for key in ("verify_branch", "verify_branch_param"):
+                    values[key] = st.text_input(
+                        f"{cucumber_profile.LABELS[key]} ({origin(key)})", value=profile[key],
+                        disabled=sources.get(key) == "depot",
+                        placeholder="" if key == "verify_branch" else cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
+                        help="Le worktree y est commité et poussé avant chaque vérification (jamais de push "
+                             "forcé). Vide : le job reçoit le commit de base et le patch du worktree." if key ==
+                        "verify_branch" else None)
+            # Données créées au démarrage par les initializers serveur : statut après un clear, saisi à la main
+            values["initializers_survive_clear"] = st.segmented_control(
+                f"{cucumber_profile.LABELS['initializers_survive_clear']} "
+                f"({origin('initializers_survive_clear')})", list(cucumber_profile.SURVIVE_CLEAR),
+                format_func=cucumber_profile.SURVIVE_CLEAR.get,
+                default=profile["initializers_survive_clear"] or "",
+                disabled=sources.get("initializers_survive_clear") == "depot",
+                help="Réponse globale, appliquée aux données dont le statut est « inconnu ».") or ""
+            initialized = profile["server_initialized_data"]
+            if initialized:
+                import pandas as pd
+                edited = st.data_editor(
+                    pd.DataFrame(initialized), hide_index=True, num_rows="fixed",
+                    column_order=("statut", "code", "entite", "classe", "depot", "mode", "certitude"),
+                    disabled=sources.get("server_initialized_data") == "depot" or [
+                        c for c in pd.DataFrame(initialized).columns if c != "statut"],
+                    column_config={"statut": st.column_config.SelectboxColumn(
+                        "Statut après un clear", options=list(cucumber_initializers.STATUSES),
+                        format_func=cucumber_initializers.STATUSES.get, required=True)},
+                    key=f"cucumber_initialized_{cucumber_client}")
+                values["server_initialized_data"] = edited.to_dict("records")
+                st.caption(f"{cucumber_profile.LABELS['server_initialized_data']} ({origin('server_initialized_data')}"
+                           f", {len(initialized)}) : codes « partiel » non résolus, jamais devinés.")
+            if profile["workarounds"]:
+                st.caption(f"{cucumber_profile.LABELS['workarounds']} ({len(profile['workarounds'])}, lecture "
+                           f"seule) : " + " ; ".join(f"{w['fichier']}:{w['ligne']} {w['texte']}"
+                                                     for w in profile["workarounds"][:10]))
+            runner_text = st.text_area(f"{cucumber_profile.LABELS['runner']} ({origin('runner')}, JSON)",
+                                       value=json.dumps(profile["runner"], ensure_ascii=False, indent=1),
+                                       disabled=sources.get("runner") == "depot", height=150)
+            if st.form_submit_button("Enregistrer le profil", icon=":material/save:"):
+                try:
+                    values["runner"] = json.loads(runner_text)
+                except ValueError:
+                    st.error("Runner : JSON invalide, profil non enregistré.")
+                else:
+                    depot = profile_doc.get("depot") or {}
+                    cucumber_profile.save_user_fields(
+                        cucumber_client, {k: v for k, v in values.items() if k not in depot})
+                    st.success("Profil enregistré.")
+                    st.rerun()
+
+
+def render_cucumber_project(ctx: dict, inventory: dict, profile_doc: dict, state: dict) -> None:
+    """Étape 1 : inventaire, bilan de santé, profil client, initialisation et dernier résultat de l'init."""
+    cucumber_client, ready, capture = ctx["client"], ctx["ready"], ctx["capture"]
+    with st.container(horizontal=True):
+        # Inventaire des spécifiques (calculs Python, aucun token)
+        if st.button("Inventaire des spécifiques", icon=":material/inventory_2:", disabled=not ready,
+                     help="Prépare les dépôts, puis inventorie les spécifiques du client, les catalogues Cucumber, "
+                          "les personnalisations Studio et les extraits Jira. Aucun appel à Claude."):
+            st.info(f"Inventaire des spécifiques {cucumber_client} en cours...")
+            if run_main_step(ctx["cmd"] + ["--inventory-only"], on_line=capture) == 0:
+                st.success("Inventaire terminé.")
+            else:
+                st.error("L'inventaire a échoué : voir le journal ci-dessus.")
+        # Bilan de santé du dépôt client avant génération (aucun token)
+        if st.button("Bilan de santé du dépôt client", icon=":material/health_and_safety:", disabled=not ready,
+                     help="Contrôle le dépôt <client>-cucumber tel quel : emplacement et casse du tag client de ses "
+                          "features, fichiers de données manquants (le dépôt client n'a pas ceux du Standard à "
+                          "l'exécution), puis compilation et dry-run de toutes ses features (steps non définis ou "
+                          "ambigus). Aucun appel à Claude."):
+            st.info(f"Bilan de santé de {cucumber_client}-cucumber en cours...")
+            code = run_main_step(ctx["cmd"] + ["--health-only"], on_line=capture)
+            if code == 0:
+                st.success("Dépôt client sain.")
+            elif code == 1:
+                st.warning("Le dépôt client a des défauts : voir le rapport ci-dessous. Les échecs qu'ils provoquent "
+                           "à l'exécution ne viendront pas des tests générés.", icon=":material/warning:")
+            else:
+                st.error("Le bilan de santé a échoué : voir le journal ci-dessus.")
     health_file = cucumber_checks.health_path(cucumber_client) if cucumber_client else ""
     if health_file and os.path.exists(health_file):
         with open(health_file, "r", encoding="utf-8", errors="replace") as f:
@@ -1078,121 +1213,11 @@ with tab_cucumber:
                          expanded=drifted):
             st.markdown(health)
 
-    inventory = cucumber_tools.load_inventory(cucumber_client) if cucumber_client else {}
+    render_cucumber_profile(ctx, profile_doc)
 
-    # 1 quater. Profil client : conventions détectées dans le dépôt <client>-cucumber, corrigeables (aucun token)
-    profile_doc = cucumber_profile.load_profile(cucumber_client) if cucumber_client else {}
-    profile = cucumber_profile.effective_profile(profile_doc)
-    empty_fields = [cucumber_profile.LABELS[k] for k in cucumber_profile.FIELDS if cucumber_profile.is_empty(profile[k])]
-    with st.expander(("⚠️ " if empty_fields or not profile_doc else "") + "Profil client"
-                     + (f" — {len(empty_fields)} champ(s) vide(s)" if profile_doc and empty_fields else ""),
-                     expanded=bool(profile_doc) and bool(empty_fields)):
-        if st.button("Détecter le profil", icon=":material/manage_search:", disabled=not ready,
-                     help="Relit le dépôt <client>-cucumber à sa base : racine et tag des features, init, clear, "
-                          "fichiers du module spécifique, runner, codes de référence, version de la bibliothèque. "
-                          "La saisie enregistrée est conservée. Aucun appel à Claude."):
-            if run_main_step(cucumber_cmd + ["--profile-only"], on_line=capture_std_ref) == 0:
-                st.rerun()
-            st.error("Détection du profil impossible : voir le journal ci-dessus.")
-        if not profile_doc:
-            st.caption("Aucun profil : lancez l'inventaire ou « Détecter le profil ».")
-        else:
-            st.caption(f"Détecté le {profile_doc.get('date', '?').replace('T', ' ')[:16]} · priorité : "
-                       f"{cucumber_profile.REPO_PROFILE} du dépôt > saisie > détection.")
-            for warning in profile["avertissements"]:
-                st.markdown(f":orange[⚠️ {warning}]")
-            sources = profile["sources"]
-
-            def origin(key: str) -> str:
-                return {"depot": "fixé par le dépôt", "saisi": "saisi", "detecte": "détecté"}.get(sources.get(key),
-                                                                                                  "vide")
-            with st.form(f"cucumber_profile_{cucumber_client}"):
-                values = {}
-                with st.container(horizontal=True):
-                    for key in ("features_root", "tag_client", "init_tags", "clear_name", "library_version",
-                                "server_version"):
-                        values[key] = st.text_input(f"{cucumber_profile.LABELS[key]} ({origin(key)})",
-                                                    value=profile[key], disabled=sources.get(key) == "depot")
-                values["init_features"] = [line.strip() for line in st.text_area(
-                    f"{cucumber_profile.LABELS['init_features']} ({origin('init_features')}), une par ligne",
-                    value="\n".join(profile["init_features"]), disabled=sources.get("init_features") == "depot",
-                    height=80).splitlines() if line.strip()]
-                options = list(dict.fromkeys(profile["spec_files"]
-                                             + (profile_doc.get("suggestions") or {}).get("spec_files", [])))
-                values["spec_files"] = st.multiselect(
-                    f"{cucumber_profile.LABELS['spec_files']} ({origin('spec_files')}), dans l'ordre d'intégration",
-                    options, default=profile["spec_files"], disabled=sources.get("spec_files") == "depot",
-                    help="Intégrés par l'init après l'initialisation globale, dans l'ordre de sélection. Suggestions : "
-                         "fichiers de données du dépôt client hors initialisation Standard.")
-                values["protected_files"] = [line.strip() for line in st.text_area(
-                    f"{cucumber_profile.LABELS['protected_files']} ({origin('protected_files')}, "
-                    f"{len(profile['protected_files'])}), un par ligne",
-                    value="\n".join(profile["protected_files"]), disabled=sources.get("protected_files") == "depot",
-                    height=100, help="Features d'init et fichiers qu'elles intègrent, partagés par tous les tests : "
-                                     "toute modification par la génération est une erreur bloquante (fichier "
-                                     "restauré après le lot, patch refusé).").splitlines() if line.strip()]
-                codes = {}
-                with st.container(horizontal=True):
-                    for category in cucumber_profile.REFERENCE_CATEGORIES:
-                        codes[category] = [c.strip() for c in st.text_input(
-                            cucumber_init_data.LABELS.get(category, category),
-                            value=", ".join((profile["reference_codes"] or {}).get(category) or []),
-                            disabled=sources.get("reference_codes") == "depot").split(",") if c.strip()]
-                values["reference_codes"] = codes
-                # Branche lue par le job de vérification : commitée et poussée avant chaque vérification
-                with st.container(horizontal=True):
-                    for key in ("verify_branch", "verify_branch_param"):
-                        values[key] = st.text_input(
-                            f"{cucumber_profile.LABELS[key]} ({origin(key)})", value=profile[key],
-                            disabled=sources.get(key) == "depot",
-                            placeholder="" if key == "verify_branch" else cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
-                            help="Le worktree y est commité et poussé avant chaque vérification (jamais de push "
-                                 "forcé). Vide : le job reçoit le commit de base et le patch du worktree." if key ==
-                            "verify_branch" else None)
-                # Données créées au démarrage par les initializers serveur : statut après un clear, saisi à la main
-                values["initializers_survive_clear"] = st.segmented_control(
-                    f"{cucumber_profile.LABELS['initializers_survive_clear']} "
-                    f"({origin('initializers_survive_clear')})", list(cucumber_profile.SURVIVE_CLEAR),
-                    format_func=cucumber_profile.SURVIVE_CLEAR.get,
-                    default=profile["initializers_survive_clear"] or "",
-                    disabled=sources.get("initializers_survive_clear") == "depot",
-                    help="Réponse globale, appliquée aux données dont le statut est « inconnu ».") or ""
-                initialized = profile["server_initialized_data"]
-                if initialized:
-                    import pandas as pd
-                    edited = st.data_editor(
-                        pd.DataFrame(initialized), hide_index=True, num_rows="fixed",
-                        column_order=("statut", "code", "entite", "classe", "depot", "mode", "certitude"),
-                        disabled=sources.get("server_initialized_data") == "depot" or [
-                            c for c in pd.DataFrame(initialized).columns if c != "statut"],
-                        column_config={"statut": st.column_config.SelectboxColumn(
-                            "Statut après un clear", options=list(cucumber_initializers.STATUSES),
-                            format_func=cucumber_initializers.STATUSES.get, required=True)},
-                        key=f"cucumber_initialized_{cucumber_client}")
-                    values["server_initialized_data"] = edited.to_dict("records")
-                    st.caption(f"{cucumber_profile.LABELS['server_initialized_data']} ({origin('server_initialized_data')}"
-                               f", {len(initialized)}) : codes « partiel » non résolus, jamais devinés.")
-                if profile["workarounds"]:
-                    st.caption(f"{cucumber_profile.LABELS['workarounds']} ({len(profile['workarounds'])}, lecture "
-                               f"seule) : " + " ; ".join(f"{w['fichier']}:{w['ligne']} {w['texte']}"
-                                                         for w in profile["workarounds"][:10]))
-                runner_text = st.text_area(f"{cucumber_profile.LABELS['runner']} ({origin('runner')}, JSON)",
-                                           value=json.dumps(profile["runner"], ensure_ascii=False, indent=1),
-                                           disabled=sources.get("runner") == "depot", height=150)
-                if st.form_submit_button("Enregistrer le profil", icon=":material/save:"):
-                    try:
-                        values["runner"] = json.loads(runner_text)
-                    except ValueError:
-                        st.error("Runner : JSON invalide, profil non enregistré.")
-                    else:
-                        depot = profile_doc.get("depot") or {}
-                        cucumber_profile.save_user_fields(
-                            cucumber_client, {k: v for k, v in values.items() if k not in depot})
-                        st.success("Profil enregistré.")
-                        st.rerun()
-
-    # 1 bis. Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token, sauf steps
-    # de recréation des données d'initializers effacées par le clear)
+    # Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token, sauf steps de
+    # recréation des données d'initializers effacées par le clear)
+    st.markdown("##### :material/restart_alt: Initialisation du client")
     detected_modules = cucumber_init.client_modules(inventory.get("depot_client", ""), inventory) if inventory else set()
     with st.container(horizontal=True, vertical_alignment="center"):
         init_modules = [m for m in cucumber_init.INIT_MODULES
@@ -1200,8 +1225,7 @@ with tab_cucumber:
                                        key=f"cucumber_init_{m}_{cucumber_client}_{inventory.get('genere_le', '')}")]
         st.caption(f"Modules détectés : {', '.join(sorted(detected_modules))}" if detected_modules else
                    "Aucun module détecté : lancez l'inventaire ou cochez les modules du client.")
-    if st.button("Générer l'initialisation client", use_container_width=True, icon=":material/play_circle:",
-                 disabled=not ready,
+    if st.button("Générer l'initialisation client", icon=":material/play_circle:", disabled=not ready,
                  help="Copie, dans <client>-cucumber, l'initialisation du Cucumber Standard (features/<MODULE>/"
                       "01-Contexte et ses fichiers de données) de chaque module coché, au nom du client (tag "
                       "@INIT_<CLIENT>_<MODULE>), sous features/<client>/01-Contexte/<MODULE>/ pour s'exécuter avant "
@@ -1215,250 +1239,16 @@ with tab_cucumber:
             st.error("Aucun module WMS, TMS ou OMS coché : pas de patch d'initialisation.")
         else:
             st.info(f"Initialisation {cucumber_client} ({', '.join(init_modules)}) en cours...")
-            if run_main_step(cucumber_cmd + ["--init-only", "--init-modules", ",".join(init_modules)],
-                             on_line=capture_std_ref) == 0:
+            if run_main_step(ctx["cmd"] + ["--init-only", "--init-modules", ",".join(init_modules)],
+                             on_line=capture) == 0:
                 st.success("Initialisation générée : voir le journal ci-dessus et les derniers livrables.")
             else:
                 st.error("La génération de l'initialisation a échoué : voir le journal ci-dessus.")
-
-    cucumber_state = cucumber_tools.load_state(cucumber_client) if cucumber_client else {}
-    selected_ids = []
-    if inventory.get("specifiques"):
-        specs = inventory["specifiques"]
-        counts = {k: sum(1 for s in specs if s["couverture"] == k) for k in ("non_couvert", "partiel", "deja_couvert")}
-        st.markdown(f"**{len(specs)} spécifique(s)** :gray[(inventaire du "
-                    f"{inventory['genere_le'].replace('T', ' ')[:16]})] · {counts['non_couvert']} non couvert(s) · "
-                    f"{counts['partiel']} partiel(s) · {counts['deja_couvert']} déjà couvert(s)")
-        table = [{"Traiter": s["couverture"] in ("non_couvert", "partiel"), "Spécifique": s["libelle"],
-                  "Type": s["type"], "Fichiers": s["nb_fichiers"], "Couverture": s["couverture"],
-                  "Tests Standard liés": len(s.get("tests_std") or []), "Jira": bool(s.get("jira")), "id": s["id"]}
-                 for s in specs]
-        edited = st.data_editor(
-            table, key=f"cucumber_selection_{cucumber_client}_{inventory['genere_le']}", hide_index=True,
-            width="stretch", height=320,
-            disabled=["Spécifique", "Type", "Fichiers", "Couverture", "Tests Standard liés", "Jira", "id"],
-            column_config={
-                "Traiter": st.column_config.CheckboxColumn("Traiter", width="small"),
-                "Fichiers": st.column_config.NumberColumn("Fichiers", width="small"),
-                "Tests Standard liés": st.column_config.NumberColumn(
-                    "Tests Standard liés", width="small",
-                    help="Features du Cucumber Standard rapprochées du spécifique (au plus 3, score ≥ "
-                         "CUCUMBER_STD_MATCH_MIN), dont l'agent part pour écrire ses tests. 0 = aucun équivalent."),
-                "Jira": st.column_config.CheckboxColumn("Jira", width="small", help="Tickets Jira associés"),
-                "id": st.column_config.TextColumn("id", width="small"),
-            },
-        )
-        selected_ids = [row["id"] for row in edited if row["Traiter"]]
-        linked = sum(1 for s in specs if s.get("tests_std"))
-        unresolved_steps = (inventory.get("catalogue_standard") or {}).get("nb_steps_non_resolus")
-        if unresolved_steps:
-            st.caption(f":orange[{unresolved_steps} step(s) du Cucumber Standard déclaré(s) par une constante non "
-                       f"résolue : absents du catalogue (voir le journal de l'inventaire).]")
-        with st.expander(f"Tests Standard liés : {linked}/{len(specs)} spécifique(s) avec au moins un équivalent"):
-            for s in specs:
-                tests = s.get("tests_std") or []
-                if not tests:
-                    st.markdown(f"- **{s['libelle']}** : :gray[aucun test Standard équivalent]")
-                    continue
-                st.markdown(f"- **{s['libelle']}**\n" + "\n".join(
-                    f"    - `{t['path'].split('features/', 1)[-1]}` — {t['feature']} :gray[(score {t['score']}, "
-                    f"{t['raison']})]" for t in tests))
-        batch_size = max(1, env_int("CUCUMBER_BATCH_SIZE", 3))
-        lot_count = -(-len(selected_ids) // batch_size)
-        average = cucumber_tools.lot_cost_average(os.path.join(".tmp", "token_usage.csv"))
-        if average["lots"]:
-            estimate = (f"≈ {lot_count * average['tokens'] / 1e6:.1f} M tokens, "
-                        f"≈ {lot_count * average['cout_usd']:.2f} $ (moyenne de {average['lots']} lot(s) précédent(s))")
-        else:
-            estimate = "coût inconnu (aucun lot exécuté jusqu'ici)"
-        st.caption(f"{len(selected_ids)} spécifique(s) coché(s) → {lot_count} lot(s) de {batch_size} · {estimate}")
-
-    # 2. Génération par lots (un appel Claude neuf par lot), reprise et complément
-    pending = cucumber_tools.pending_lots(cucumber_state)
-    completable = cucumber_tools.completable_specifics(cucumber_state) if cucumber_state.get("lots") else []
-    # Une nouvelle génération repart de la base : les lots d'une génération existante sont écrasés
-    existing = bool(cucumber_state.get("lots")) and os.path.isdir(cucumber_tools.worktree_dir(cucumber_client))
-    overwrite = True
-    if existing:
-        st.warning(f"Une génération existe déjà ({len(cucumber_state['lots'])} lot(s)) : une nouvelle génération "
-                   f"repart de la base et **les lots précédents seront écrasés** (commits, patch, récapitulatif). "
-                   f"Pour ajouter des tests sans rien perdre, utilisez « Compléter la génération ».",
-                   icon=":material/warning:")
-        overwrite = st.checkbox("Je confirme : les lots précédents seront écrasés",
-                                key=f"cucumber_overwrite_{cucumber_client}")
-    col_generate, col_resume, col_complete = st.columns([2, 1, 1])
-    with col_generate:
-        generate = st.button("Génération des tests Cucumber", type="primary", use_container_width=True,
-                             icon=":material/science:", disabled=not (ready and selected_ids and overwrite),
-                             help="Traite uniquement les spécifiques cochés. Lancez d'abord l'inventaire.")
-    with col_resume:
-        resume = st.button("Reprendre", use_container_width=True, icon=":material/play_arrow:",
-                           disabled=not (ready and pending),
-                           help=f"{len(pending)} lot(s) non terminé(s) lors de la dernière génération."
-                           if pending else "Aucun lot à reprendre.")
-    with col_complete:
-        complete = st.button("Compléter la génération", use_container_width=True, icon=":material/playlist_add:",
-                             disabled=not (ready and completable),
-                             help=f"{len(completable)} spécifique(s) non couvert(s) faute de step, d'endpoint, "
-                                  f"d'interaction ou de vérification : repris dans de nouveaux lots (recettes de "
-                                  f"test, synonymes), sans effacer les lots ni les commits précédents."
-                             if completable else "Aucun spécifique à compléter.")
-    if generate or resume or complete:
-        progress = st.progress(0.0, text="Préparation (inventaire, catalogues, worktree)...")
-
-        def show_lot_progress(line: str) -> None:
-            capture_std_ref(line)
-            match = re.match(r"\[LOT (\d+)/(\d+)\]", line)
-            if match:
-                current, total_lots = int(match.group(1)), int(match.group(2))
-                progress.progress(min((current - 1) / total_lots, 1.0), text=f"Lot {current}/{total_lots} en cours")
-
-        extra = ["--resume"] if resume else ["--complete"] if complete else ["--specifics", ",".join(selected_ids)]
-        returncode = run_main_step(cucumber_cmd + extra, on_line=show_lot_progress)
-        progress.progress(1.0, text="Terminé" if returncode == 0 else "Interrompu")
-        if returncode == 0:
-            st.success(f"Tests Cucumber des spécifiques {cucumber_client} générés.")
-        else:
-            st.error(f"Génération interrompue (code {returncode}) : utilisez « Reprendre » pour continuer.")
-        cucumber_state = cucumber_tools.load_state(cucumber_client)
-
-    if cucumber_state.get("lots"):
-        lot_rows = []
-        for lot in cucumber_state["lots"]:
-            tokens = lot.get("tokens") or {}
-            total_tokens = sum(v for k, v in tokens.items() if k != "cout_usd" and isinstance(v, (int, float)))
-            results = lot.get("resultats") or []
-            indicators = cucumber_tools.lot_indicators(lot)
-            lot_rows.append({
-                "Lot": lot["numero"], "Statut": lot.get("statut", ""), "Spécifiques": len(lot["ids"]),
-                "Couverts": sum(1 for r in results if r.get("statut") == "couvert"),
-                "Indirects": sum(1 for r in results if r.get("statut") == "couvert_indirectement"),
-                "Scénarios": indicators.get("scenarios"),
-                "Steps Standard (%)": indicators.get("reutilisation"),
-                "Steps créés": indicators.get("steps_crees"),
-                "Signalés": indicators.get("signales"), "Supprimés": indicators.get("supprimes"),
-                # Commandes base réellement lancées (journal de db_tools) et tables lues
-                "Base": (f"{len(lot['base'])} cmd : " + ", ".join(dict.fromkeys(
-                    t for e in lot["base"] for t in e.get("tables") or [])) if lot.get("base") else None),
-                "Tokens": total_tokens or None,
-                "Coût ($)": round(tokens["cout_usd"], 3) if isinstance(tokens.get("cout_usd"), (int, float)) else None,
-                "Erreur": lot.get("erreur", "") or ("tri Python, sans appel Claude" if lot.get("tri") else ""),
-            })
-        with st.expander(f"Lots de la dernière génération ({sum(1 for r in lot_rows if r['Statut'] == 'termine')}"
-                         f"/{len(lot_rows)} terminés)", expanded=bool(pending)):
-            controlled = [cucumber_tools.lot_indicators(lot) for lot in cucumber_state["lots"]]
-            controlled = [c for c in controlled if c]
-            std_steps = sum(c["steps_std"] for c in controlled)
-            all_steps = sum(c["steps_std"] + c["steps_client"] + c["non_definis"] for c in controlled)
-            if controlled:
-                st.caption(f"{sum(c['scenarios'] for c in controlled)} scénario(s) contrôlé(s) · réutilisation des "
-                           f"steps Standard : {round(100 * std_steps / all_steps) if all_steps else '—'} % · "
-                           f"{sum(c['signales'] for c in controlled)} signalé(s), "
-                           f"{sum(c['supprimes'] for c in controlled)} supprimé(s) à la revue")
-            st.dataframe(lot_rows, hide_index=True, width="stretch", column_config={
-                "Indirects": st.column_config.NumberColumn(
-                    "Indirects", help="Spécifiques couverts indirectement (listener, événement) par le test d'un "
-                                      "autre spécifique couvert"),
-                "Steps Standard (%)": st.column_config.NumberColumn(
-                    "Steps Standard (%)", help="Part des steps des nouveaux scénarios définis par le Cucumber Standard"),
-                "Signalés": st.column_config.NumberColumn(
-                    "Signalés", help="Scénarios signalés par les contrôles (doublon, sans assertion métier, "
-                                     "différence ou source absente), envoyés à la revue"),
-            })
-
-    # 3. Vérification par exécution et revue humaine des scénarios
-    verified_rows = cucumber_verify.scenario_rows(cucumber_state) if cucumber_state.get("lots") else []
-    if verified_rows:
-        indicators = cucumber_verify.verification_indicators(cucumber_state)
-        st.markdown("#### :material/fact_check: Vérification des scénarios")
-        if indicators["hors_test"]:
-            st.warning(f"**{indicators['hors_test']} échec(s) hors test**, ni corrigés ni retirés : "
-                       f"🌐 {indicators['environnement']} environnement (route, champ exigé, version, init en échec) · "
-                       f"📭 {indicators['donnee_reference']} donnée de référence absente · "
-                       f"🐞 {indicators['bug_applicatif']} bug applicatif probable · "
-                       f"⛓️ {indicators['cascade']} en cascade d'une mise en place en échec · "
-                       f"🚚 {indicators['deploiement']} déploiement en retard (extrait vérifié). Corrigez l'environnement "
-                       f"(profil et initialisation du client, bilan de santé) ou signalez le bug, puis relancez.",
-                       icon=":material/public:")
-            with st.expander("Scénarios non jugés : environnement, donnée de référence, bug applicatif, cascade, "
-                             "déploiement"):
-                st.dataframe([{k: row[k] for k in ("Lot", "Scénario", "Statut", "Motif", "Build")}
-                              for row in verified_rows if row["Statut"] in cucumber_verify.NOT_TEST_STATUSES],
-                             hide_index=True, width="stretch",
-                             column_config={"Build": st.column_config.LinkColumn("Build", display_text="Jenkins")})
-        if not indicators["verifies"] and not indicators["hors_test"]:
-            message = next((lot["execution"]["message"] for lot in cucumber_state["lots"] if lot.get("execution")), "")
-            st.warning(f"**Pertinence non vérifiée par exécution** : {message or 'aucun moyen d’exécution configuré'}. "
-                       "Configurez CUCUMBER_VERIFY_JOB ou CUCUMBER_VERIFY_LOCAL_CMD (onglet Configuration).",
-                       icon=":material/help:")
-        elif indicators["verifies"]:
-            def pct(value):
-                return "—" if value is None else f"{value} %"
-            st.caption(f"Pertinents : {pct(indicators['taux_pertinent'])} des {indicators['verifies']} vérifié(s) · "
-                       f"mutations détectées : {pct(indicators['taux_mutation'])} · overrides en échec sur le "
-                       f"Standard : {pct(indicators['taux_echec_standard'])} · {indicators['desactives']} désactivé(s) "
-                       f"(A_REVOIR.md) · {indicators['faibles']} faible(s) · validation humaine : {pct(indicators['taux_validation_humaine'])}")
-        st.dataframe([{k: v for k, v in row.items() if k != "tag"} for row in verified_rows], hide_index=True,
-                     width="stretch", column_config={
-                         "Build": st.column_config.LinkColumn("Build", display_text="Jenkins"),
-                         "Statut": st.column_config.TextColumn(
-                             "Statut", help="pertinent : passe sur le client, échoue sur le Standard (override) et "
-                                            "mutation détectée ; faible : mutation non détectée ou passe sur le "
-                                            "Standard ; invalide : échoue sur le client ; non_verifie : pas "
-                                            "d'exécution (jamais compté pertinent) ; environnement : route absente, "
-                                            "champ exigé ou version ; donnee_reference : code absent de "
-                                            "l'environnement ; bug_applicatif : erreur serveur ; cascade : une mise "
-                                            "en place de la feature a échoué avant lui ; deploiement : code ou "
-                                            "personnalisation déployés en retard (extrait vérifié dans le log). "
-                                            "Seuls invalide et faible sont corrigés ; rien n'est supprimé, les "
-                                            "blocages hors test prouvés sont désactivés (A_REVOIR.md)."),
-                         "Client": st.column_config.TextColumn("Client", width="small"),
-                         "Standard": st.column_config.TextColumn("Standard", width="small"),
-                         "Mutation": st.column_config.TextColumn("Mutation", width="small"),
-                         "Statique": st.column_config.TextColumn("Statique", width="small"),
-                     })
-        sample = cucumber_verify.review_sample(cucumber_state)
-        if sample:
-            unverified = sum(1 for item in sample if item["statut"] == "non_verifie")
-            with st.expander(f"Revue humaine : échantillon de {len(sample)} scénario(s), dont {unverified} non "
-                             f"vérifié(s) par l'exécution", expanded=True):
-                by_tag = {row["tag"]: row for row in verified_rows}
-                for item in sample:
-                    row = by_tag.get(item["tag"], {})
-                    with st.container(border=True):
-                        st.markdown(f"**{row.get('Scénario', item['id'])}** :gray[(lot {item['lot']}, {item['tag']}, "
-                                    f"{item['statut'].replace('_', ' ')})]")
-                        if item["statut"] == "non_verifie" and item.get("motif"):
-                            st.caption(f"Non vérifié : {item['motif']}")
-                        st.caption(f"Différence avec le Standard : {row.get('Différence avec le Standard') or '—'} · "
-                                   f"Source : {row.get('Source') or '—'} · "
-                                   f"Inspiré de : {row.get('Inspiré du Standard') or '—'}")
-                        verdict = (cucumber_state.get("verdicts") or {}).get(item["tag"])
-                        if verdict:
-                            st.markdown(f":gray[Verdict : **{verdict['verdict'].replace('_', ' ')}**"
-                                        + (f" — {verdict['motif']}" if verdict.get("motif") else "") + "]")
-                        with st.container(horizontal=True, vertical_alignment="bottom"):
-                            reason = st.text_input("Motif", key=f"verdict_motif_{item['tag']}",
-                                                   placeholder="Obligatoire si non pertinent")
-                            if st.button("Pertinent", key=f"verdict_ok_{item['tag']}", icon=":material/thumb_up:"):
-                                cucumber_verify.record_verdict(cucumber_client, cucumber_state, item, "pertinent",
-                                                               reason)
-                                cucumber_tools.save_state(cucumber_client, cucumber_state)
-                                st.rerun()
-                            if st.button("Non pertinent", key=f"verdict_ko_{item['tag']}",
-                                         icon=":material/thumb_down:", disabled=not reason.strip()):
-                                cucumber_verify.record_verdict(cucumber_client, cucumber_state, item,
-                                                               "non_pertinent", reason)
-                                cucumber_tools.save_state(cucumber_client, cucumber_state)
-                                st.rerun()
-                st.caption("Un verdict « Non pertinent » et son motif deviennent une consigne du projet, injectée "
-                           "dans les lots des prochaines générations.")
-
-    # 4. Import d'un rapport d'exécution (0 token) : secrets masqués en mémoire avant tout stockage
-    if cucumber_client:
-        render_cucumber_import(cucumber_client, cucumber_state, cucumber_cmd)
-
-    # Derniers livrables du client (affichés aussi après un rechargement de la page)
+    init = state.get("init") or {}
+    if init:
+        (st.success if init.get("ok") else st.error)(
+            f"Dernier lancement de l'initialisation ({init.get('date', '?').replace('T', ' ')[:16]}) : "
+            f"{init.get('message', '')}", icon=":material/check_circle:" if init.get("ok") else ":material/block:")
     if cucumber_client and os.path.exists(cucumber_tools.init_patch_path(cucumber_client)):
         init_patch = cucumber_tools.init_patch_path(cucumber_client)
         generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(init_patch)))
@@ -1469,24 +1259,488 @@ with tab_cucumber:
                 st.download_button("Télécharger le patch d'initialisation", f.read(),
                                    file_name=os.path.basename(init_patch), mime="text/x-diff",
                                    icon=":material/download:")
-    if cucumber_client and os.path.exists(cucumber_tools.patch_path(cucumber_client)):
-        patch_file = cucumber_tools.patch_path(cucumber_client)
-        coverage_file = cucumber_tools.coverage_path(cucumber_client)
+
+
+COVERAGE_COLUMNS = {
+    "Tâche": st.column_config.TextColumn("Tâche", width="large"),
+    "Risque": st.column_config.TextColumn("Risque", width="small", help="Risque métier proposé (nature et type du "
+                                                                        "spécifique), modifiable dans le détail"),
+    "Testabilité": st.column_config.TextColumn(
+        "Testabilité", width="small", help="Aujourd'hui : code spécifique et personnalisation Studio déployés, données "
+                                           "recréables par l'init, steps disponibles dans la bibliothèque"),
+    "Features": st.column_config.NumberColumn("Features", width="small", help="Features liées à la tâche"),
+}
+
+
+def coverage_table(rows: list) -> list:
+    """Lignes affichées de la vue Couverture (libellés métier)."""
+    return [{"État": cucumber_coverage.state_label(r), "Tâche": r["tache"], "Module": r["module"],
+             "Point d'entrée": r["point_entree"], "Risque": r["risque"], "Features": len(r["features"]),
+             "Testabilité": r["testabilite"], "Dernière exécution": r["derniere"],
+             "Tickets": ", ".join(r["tickets"])} for r in rows]
+
+
+def render_coverage_detail(client: str, row: dict) -> None:
+    """Détail d'une tâche : scénarios et dernier résultat, causes, défauts, comportements Studio, testabilité."""
+    with st.container(border=True):
+        st.markdown(f"**{row['tache']}** :gray[({row['id']})] — {cucumber_coverage.state_label(row)}")
+        if row["cause"]:
+            st.caption(f"Cause : {row['cause']}")
+        if row["scenarios"]:
+            st.dataframe([{"Scénario": s["id"].split("::", 1)[-1], "Feature": s["id"].split("::", 1)[0],
+                           "État": cucumber_coverage.STATES[s["etat"]][1] + " " + cucumber_coverage.STATES[s["etat"]][0]
+                           + (" (faible)" if s["faible"] else ""),
+                           "Cause": s["cause"], "Dernière exécution": s["derniere"]} for s in row["scenarios"]],
+                         hide_index=True, width="stretch")
+        else:
+            st.caption("Aucun scénario lié.")
+        if row["constats"]:
+            st.markdown("**Défauts et constats de l'agent**\n" + "\n".join(
+                f"- {cucumber_tools.constat_line(c)}" for c in row["constats"]))
+        if row["studio_a_calculer"]:
+            st.caption("Personnalisation Studio : relancez l'inventaire (étape Projet) pour lister ses comportements "
+                       "à couvrir.")
+        elif row["studio_total"]:
+            with st.expander(f"Comportements Studio à couvrir : "
+                             f"{cucumber_studio.counts_line(row['studio_total'])}"):
+                st.markdown("\n".join(f"- {cucumber_studio.behaviour_line(b)}" for b in row["studio"]))
+                shown = len(row["studio"])
+                if shown < sum(row["studio_total"].values()):
+                    st.caption(f"{shown} premiers affichés (écrans d'abord).")
+        with st.form(f"cucumber_coverage_override_{client}_{row['id']}", border=False):
+            with st.container(horizontal=True):
+                risk = st.segmented_control("Risque métier", cucumber_coverage.RISKS, default=row["risque"],
+                                            help=f"Proposé : {row['risque_propose']}")
+                answers = {key: st.selectbox(cucumber_coverage.CRITERIA[key].capitalize(), cucumber_coverage.ANSWERS,
+                                             index=cucumber_coverage.ANSWERS.index(answer),
+                                             help=reason or None)
+                           for key, (answer, reason) in row["criteres"].items()}
+            if st.form_submit_button("Enregistrer", icon=":material/save:"):
+                changed = {k: v for k, v in answers.items() if v != row["criteres"][k][0]}
+                previous = cucumber_coverage.load_overrides(client).get(row["id"], {})
+                cucumber_coverage.save_override(client, row["id"], {
+                    "risque": risk if risk and risk != row["risque_propose"] else "",
+                    "testabilite": {**(previous.get("testabilite") or {}), **changed}})
+                st.rerun()
+        render_coverage_knowledge(client, row)
+
+
+def render_coverage_knowledge(client: str, row: dict) -> None:
+    """Documents partagés liés à la tâche (le partage n'est lu qu'à la demande)."""
+    if not knowledge_tools.enabled():
+        return
+    if st.button("Documents partagés liés", icon=":material/library_books:", key=f"cucumber_docs_{row['id']}"):
+        with st.spinner("Lecture des en-têtes du répertoire partagé…"):
+            st.session_state["knowledge_index"] = knowledge_tools.load_index()
+    index = st.session_state.get("knowledge_index")
+    if index is None:
+        return
+    found = knowledge_tools.find_knowledge(index["documents"], projet=client, client=client, tickets=row["tickets"],
+                                           composants=[row["module"]], query_text=row["tache"])[:5]
+    if not found:
+        st.caption("Aucun document partagé lié.")
+    for item in found:
+        meta = item["doc"]["meta"]
+        st.markdown(f"- {meta.get('sujet', '')} :gray[({meta.get('type', '')}, {str(meta.get('date', ''))[:10]}, "
+                    f"{', '.join(item['raisons'])})] — `{item['doc']['chemin']}`")
+
+
+def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
+    """Étape 2 : tâches couvertes et non couvertes, deux taux, filtres, détail d'une ligne."""
+    if not rows:
+        st.info("Aucune tâche : lancez l'inventaire des spécifiques (étape Projet).", icon=":material/inventory_2:")
+        return
+    rates = cucumber_coverage.rates(rows)
+    with st.container(horizontal=True):
+        st.metric("Couverture réelle", f"{rates['reelle']} %", border=True,
+                  help="Tâches dont les scénarios actifs sont verts au dernier résultat connu")
+        st.metric("Couverture écrite", f"{rates['ecrite']} %", border=True,
+                  help="Tâches couvertes par des scénarios écrits, actifs ou désactivés")
+        st.metric("Partielles", rates["partielles"], border=True,
+                  help="Les tests ne vérifient qu'une configuration ou la présence d'une donnée")
+        st.metric("Non couvertes", rates["par_etat"]["non_couvert"], border=True)
+        st.metric("Non testables aujourd'hui", rates["par_etat"]["non_testable"], border=True)
+    st.caption(f"{rates['total']} tâche(s) de l'inventaire du {inventory['genere_le'].replace('T', ' ')[:16]} · "
+               + cucumber_coverage.legend())
+    client = ctx["client"]
+    with st.container(horizontal=True):
+        states = st.multiselect("État", list(cucumber_coverage.STATES),
+                                format_func=lambda k: " ".join(cucumber_coverage.STATES[k][1::-1]),
+                                key=f"cucumber_cov_states_{client}", placeholder="Tous")
+        modules = st.multiselect("Module", sorted({r["module"] for r in rows}), key=f"cucumber_cov_modules_{client}",
+                                 placeholder="Tous")
+        ticket = st.text_input("Ticket ou mot-clé", key=f"cucumber_cov_text_{client}").strip().casefold()
+        risks = st.pills("Risque", cucumber_coverage.RISKS, selection_mode="multi", key=f"cucumber_cov_risks_{client}")
+    shown = [r for r in rows if (not states or r["etat"] in states) and (not modules or r["module"] in modules)
+             and (not risks or r["risque"] in risks)
+             and (not ticket or ticket in (r["tache"] + " " + " ".join(r["tickets"])).casefold())]
+    selection = st.dataframe(coverage_table(shown), hide_index=True, width="stretch", height=380,
+                             column_config=COVERAGE_COLUMNS, on_select="rerun", selection_mode="single-row",
+                             key=f"cucumber_coverage_{client}_{len(shown)}")
+    picked = selection.selection.rows
+    if picked:
+        render_coverage_detail(client, shown[picked[0]])
+    else:
+        st.caption(f"{len(shown)} tâche(s) affichée(s) · sélectionnez une ligne pour son détail (scénarios, causes, "
+                   "défauts, comportements Studio, testabilité, documents partagés).")
+    specs = inventory.get("specifiques") or []
+    linked = sum(1 for s in specs if s.get("tests_std"))
+    unresolved_steps = (inventory.get("catalogue_standard") or {}).get("nb_steps_non_resolus")
+    if unresolved_steps:
+        st.caption(f":orange[{unresolved_steps} step(s) du Cucumber Standard déclaré(s) par une constante non "
+                   f"résolue : absents du catalogue (voir le journal de l'inventaire).]")
+    with st.expander(f"Tests Standard liés : {linked}/{len(specs)} tâche(s) avec au moins un équivalent"):
+        for s in specs:
+            tests = s.get("tests_std") or []
+            if not tests:
+                st.markdown(f"- **{s['libelle']}** : :gray[aucun test Standard équivalent]")
+                continue
+            st.markdown(f"- **{s['libelle']}**\n" + "\n".join(
+                f"    - `{t['path'].split('features/', 1)[-1]}` — {t['feature']} :gray[(score {t['score']}, "
+                f"{t['raison']})]" for t in tests))
+
+
+def selection_candidates(rows: list) -> list:
+    """Lignes proposées à la sélection (non couvertes, partielles, non testables), dans l'ordre proposé."""
+    return [r for r in rows if r["etat"] in cucumber_coverage.SELECTABLE_STATES]
+
+
+def selection_key(client: str, inventory: dict) -> str:
+    return f"cucumber_selection_{client}_{inventory.get('genere_le', '')}"
+
+
+def current_selection(candidates: list, key: str) -> list:
+    """
+    Tâches cochées : cases par défaut (non couvertes et partielles) puis modifications du tableau, lues dans la
+    session pour que le résumé du parcours, affiché avant le tableau, soit à jour.
+    """
+    edits = (st.session_state.get(key) or {}).get("edited_rows") or {}
+    selected = []
+    for index, row in enumerate(candidates):
+        checked = row["etat"] in ("non_couvert", "partiel")
+        checked = (edits.get(index) or edits.get(str(index)) or {}).get("Couvrir", checked)
+        if checked:
+            selected.append(row["id"])
+    return selected
+
+
+def run_cucumber_generation(ctx: dict, extra: list) -> int:
+    """Lance une génération (nouvelle, reprise, complément) avec la progression des lots."""
+    progress = st.progress(0.0, text="Préparation (inventaire, catalogues, worktree)...")
+
+    def show_lot_progress(line: str) -> None:
+        ctx["capture"](line)
+        match = re.match(r"\[LOT (\d+)/(\d+)\]", line)
+        if match:
+            current, total_lots = int(match.group(1)), int(match.group(2))
+            progress.progress(min((current - 1) / total_lots, 1.0), text=f"Lot {current}/{total_lots} en cours")
+    returncode = run_main_step(ctx["cmd"] + extra, on_line=show_lot_progress)
+    progress.progress(1.0, text="Terminé" if returncode == 0 else "Interrompu")
+    if returncode == 0:
+        st.success(f"Tests Cucumber des spécifiques {ctx['client']} générés.")
+    else:
+        st.error(f"Génération interrompue (code {returncode}) : utilisez « Reprendre » (étape Génération).")
+    return returncode
+
+
+def render_cucumber_selection(ctx: dict, inventory: dict, state: dict, rows: list) -> None:
+    """Étape 3 : choix des tâches à couvrir ou à compléter, puis génération des tests."""
+    client, ready = ctx["client"], ctx["ready"]
+    candidates = selection_candidates(rows)
+    if not candidates:
+        st.info("Aucune tâche non couverte, partielle ou non testable.", icon=":material/task_alt:")
+        return
+    st.caption("Ordre proposé : risque métier, puis testabilité, puis effort. Les tâches « non testables "
+               "aujourd'hui » ne sont pas cochées : sélectionnez-les en connaissance de cause. Pour une tâche "
+               "partielle, le lot teste l'EFFET (document généré, message envoyé, statut, champ enregistré), pas la "
+               "configuration.")
+    key = selection_key(client, inventory)
+    table = [{"Couvrir": r["etat"] in ("non_couvert", "partiel"), "État": cucumber_coverage.state_label(r),
+              "Tâche": r["tache"], "Module": r["module"], "Risque": r["risque"], "Testabilité": r["testabilite"],
+              "Effort": r["effort"], "Tickets": ", ".join(r["tickets"])} for r in candidates]
+    st.data_editor(table, key=key, hide_index=True, width="stretch", height=360,
+                   disabled=[c for c in table[0] if c != "Couvrir"],
+                   column_config={**COVERAGE_COLUMNS,
+                                  "Couvrir": st.column_config.CheckboxColumn("Couvrir", width="small"),
+                                  "Effort": st.column_config.NumberColumn(
+                                      "Effort", width="small", help="Estimation : fichiers, absence de test Standard "
+                                                                    "ou de step candidat, comportements Studio")})
+    selected = current_selection(candidates, key)
+    warnings = cucumber_coverage.selection_warnings(rows, selected)
+    accepted = True
+    if warnings:
+        st.warning(f"**{len(warnings)} tâche(s) non testable(s) aujourd'hui sélectionnée(s)** : leurs tests risquent "
+                   "d'échouer ou de rester partiels.\n\n" + "\n".join(f"- {w}" for w in warnings[:10]),
+                   icon=":material/warning:")
+        accepted = st.checkbox("Je génère aussi ces tâches", key=f"cucumber_untestable_{client}")
+    batch_size = max(1, env_int("CUCUMBER_BATCH_SIZE", 3))
+    lot_count = -(-len(selected) // batch_size)
+    average = cucumber_tools.lot_cost_average(os.path.join(".tmp", "token_usage.csv"))
+    estimate = (f"≈ {lot_count * average['tokens'] / 1e6:.1f} M tokens, ≈ {lot_count * average['cout_usd']:.2f} $ "
+                f"(moyenne de {average['lots']} lot(s) précédent(s))" if average["lots"] else
+                "coût inconnu (aucun lot exécuté jusqu'ici)")
+    st.caption(f"{len(selected)} tâche(s) cochée(s) → {lot_count} lot(s) de {batch_size}, regroupés par test Standard "
+               f"et par module · {estimate}")
+    existing = bool(state.get("lots")) and os.path.isdir(cucumber_tools.worktree_dir(client))
+    ids = ",".join(selected)
+    if st.button("Générer les tests", type="primary", icon=":material/science:",
+                 disabled=not (ready and selected and accepted),
+                 help="Ajoute des lots à la génération en cours, sans rien effacer." if existing else
+                 "Crée les lots des tâches cochées."):
+        run_cucumber_generation(ctx, ["--complete", "--specifics", ids] if existing else ["--specifics", ids])
+    if existing:
+        with st.expander("Nouvelle génération (repart de la base)", icon=":material/restart_alt:"):
+            st.warning(f"Une génération existe déjà ({len(state['lots'])} lot(s)) : une nouvelle génération repart "
+                       f"de la base et **les lots précédents seront écrasés** (commits, patch, récapitulatif).",
+                       icon=":material/warning:")
+            overwrite = st.checkbox("Je confirme : les lots précédents seront écrasés",
+                                    key=f"cucumber_overwrite_{client}")
+            if st.button("Nouvelle génération", icon=":material/delete_sweep:",
+                         disabled=not (ready and selected and accepted and overwrite)):
+                run_cucumber_generation(ctx, ["--specifics", ids])
+
+
+def lot_table(state: dict) -> list:
+    """Lignes du tableau des lots de la dernière génération."""
+    lot_rows = []
+    for lot in state["lots"]:
+        tokens = lot.get("tokens") or {}
+        total_tokens = sum(v for k, v in tokens.items() if k != "cout_usd" and isinstance(v, (int, float)))
+        results = lot.get("resultats") or []
+        indicators = cucumber_tools.lot_indicators(lot)
+        lot_rows.append({
+            "Lot": lot["numero"], "Statut": lot.get("statut", ""), "Spécifiques": len(lot["ids"]),
+            "Couverts": sum(1 for r in results if r.get("statut") == "couvert"),
+            "Indirects": sum(1 for r in results if r.get("statut") == "couvert_indirectement"),
+            "Scénarios": indicators.get("scenarios"),
+            "Steps Standard (%)": indicators.get("reutilisation"),
+            "Steps créés": indicators.get("steps_crees"),
+            "Signalés": indicators.get("signales"), "Supprimés": indicators.get("supprimes"),
+            # Commandes base réellement lancées (journal de db_tools) et tables lues
+            "Base": (f"{len(lot['base'])} cmd : " + ", ".join(dict.fromkeys(
+                t for e in lot["base"] for t in e.get("tables") or [])) if lot.get("base") else None),
+            "Tokens": total_tokens or None,
+            "Coût ($)": round(tokens["cout_usd"], 3) if isinstance(tokens.get("cout_usd"), (int, float)) else None,
+            "Erreur": lot.get("erreur", "") or ("tri Python, sans appel Claude" if lot.get("tri") else ""),
+        })
+    return lot_rows
+
+
+def render_cucumber_lots(state: dict, pending: list) -> None:
+    """Tableau des lots de la dernière génération et indicateurs de contrôle."""
+    lot_rows = lot_table(state)
+    with st.expander(f"Lots de la dernière génération ({sum(1 for r in lot_rows if r['Statut'] == 'termine')}"
+                     f"/{len(lot_rows)} terminés)", expanded=bool(pending)):
+        controlled = [c for c in (cucumber_tools.lot_indicators(lot) for lot in state["lots"]) if c]
+        std_steps = sum(c["steps_std"] for c in controlled)
+        all_steps = sum(c["steps_std"] + c["steps_client"] + c["non_definis"] for c in controlled)
+        if controlled:
+            st.caption(f"{sum(c['scenarios'] for c in controlled)} scénario(s) contrôlé(s) · réutilisation des "
+                       f"steps Standard : {round(100 * std_steps / all_steps) if all_steps else '—'} % · "
+                       f"{sum(c['signales'] for c in controlled)} signalé(s), "
+                       f"{sum(c['supprimes'] for c in controlled)} supprimé(s) à la revue")
+        st.dataframe(lot_rows, hide_index=True, width="stretch", column_config={
+            "Indirects": st.column_config.NumberColumn(
+                "Indirects", help="Spécifiques couverts indirectement (listener, événement) par le test d'un "
+                                  "autre spécifique couvert"),
+            "Steps Standard (%)": st.column_config.NumberColumn(
+                "Steps Standard (%)", help="Part des steps des nouveaux scénarios définis par le Cucumber Standard"),
+            "Signalés": st.column_config.NumberColumn(
+                "Signalés", help="Scénarios signalés par les contrôles (doublon, sans assertion métier, "
+                                 "différence ou source absente), envoyés à la revue"),
+        })
+
+
+def render_cucumber_verification(client: str, state: dict) -> None:
+    """Vérification par exécution des scénarios générés et revue humaine d'un échantillon."""
+    verified_rows = cucumber_verify.scenario_rows(state)
+    if not verified_rows:
+        return
+    indicators = cucumber_verify.verification_indicators(state)
+    st.markdown("##### :material/fact_check: Vérification des scénarios")
+    if indicators["hors_test"]:
+        st.warning(f"**{indicators['hors_test']} échec(s) hors test**, ni corrigés ni retirés : "
+                   f"🌐 {indicators['environnement']} environnement (route, champ exigé, version, init en échec) · "
+                   f"📭 {indicators['donnee_reference']} donnée de référence absente · "
+                   f"🐞 {indicators['bug_applicatif']} bug applicatif probable · "
+                   f"⛓️ {indicators['cascade']} en cascade d'une mise en place en échec · "
+                   f"🚚 {indicators['deploiement']} déploiement en retard (extrait vérifié). Corrigez l'environnement "
+                   f"(profil et initialisation du client, bilan de santé) ou signalez le bug, puis relancez.",
+                   icon=":material/public:")
+        with st.expander("Scénarios non jugés : environnement, donnée de référence, bug applicatif, cascade, "
+                         "déploiement"):
+            st.dataframe([{k: row[k] for k in ("Lot", "Scénario", "Statut", "Motif", "Build")}
+                          for row in verified_rows if row["Statut"] in cucumber_verify.NOT_TEST_STATUSES],
+                         hide_index=True, width="stretch",
+                         column_config={"Build": st.column_config.LinkColumn("Build", display_text="Jenkins")})
+    if not indicators["verifies"] and not indicators["hors_test"]:
+        message = next((lot["execution"]["message"] for lot in state["lots"] if lot.get("execution")), "")
+        st.warning(f"**Pertinence non vérifiée par exécution** : {message or 'aucun moyen d’exécution configuré'}. "
+                   "Configurez CUCUMBER_VERIFY_JOB ou CUCUMBER_VERIFY_LOCAL_CMD (onglet Configuration).",
+                   icon=":material/help:")
+    elif indicators["verifies"]:
+        def pct(value):
+            return "—" if value is None else f"{value} %"
+        st.caption(f"Pertinents : {pct(indicators['taux_pertinent'])} des {indicators['verifies']} vérifié(s) · "
+                   f"mutations détectées : {pct(indicators['taux_mutation'])} · overrides en échec sur le "
+                   f"Standard : {pct(indicators['taux_echec_standard'])} · {indicators['desactives']} désactivé(s) "
+                   f"(A_REVOIR.md) · {indicators['faibles']} faible(s) · validation humaine : "
+                   f"{pct(indicators['taux_validation_humaine'])}")
+    st.dataframe([{k: v for k, v in row.items() if k != "tag"} for row in verified_rows], hide_index=True,
+                 width="stretch", column_config={
+                     "Build": st.column_config.LinkColumn("Build", display_text="Jenkins"),
+                     "Statut": st.column_config.TextColumn(
+                         "Statut", help="pertinent : passe sur le client, échoue sur le Standard (override) et "
+                                        "mutation détectée ; faible : mutation non détectée ou passe sur le "
+                                        "Standard ; invalide : échoue sur le client ; non_verifie : pas "
+                                        "d'exécution (jamais compté pertinent) ; environnement : route absente, "
+                                        "champ exigé ou version ; donnee_reference : code absent de "
+                                        "l'environnement ; bug_applicatif : erreur serveur ; cascade : une mise "
+                                        "en place de la feature a échoué avant lui ; deploiement : code ou "
+                                        "personnalisation déployés en retard (extrait vérifié dans le log). "
+                                        "Seuls invalide et faible sont corrigés ; rien n'est supprimé, les "
+                                        "blocages hors test prouvés sont désactivés (A_REVOIR.md)."),
+                     "Client": st.column_config.TextColumn("Client", width="small"),
+                     "Standard": st.column_config.TextColumn("Standard", width="small"),
+                     "Mutation": st.column_config.TextColumn("Mutation", width="small"),
+                     "Statique": st.column_config.TextColumn("Statique", width="small"),
+                 })
+    sample = cucumber_verify.review_sample(state)
+    if not sample:
+        return
+    unverified = sum(1 for item in sample if item["statut"] == "non_verifie")
+    with st.expander(f"Revue humaine : échantillon de {len(sample)} scénario(s), dont {unverified} non "
+                     f"vérifié(s) par l'exécution", expanded=True):
+        by_tag = {row["tag"]: row for row in verified_rows}
+        for item in sample:
+            row = by_tag.get(item["tag"], {})
+            with st.container(border=True):
+                st.markdown(f"**{row.get('Scénario', item['id'])}** :gray[(lot {item['lot']}, {item['tag']}, "
+                            f"{item['statut'].replace('_', ' ')})]")
+                if item["statut"] == "non_verifie" and item.get("motif"):
+                    st.caption(f"Non vérifié : {item['motif']}")
+                st.caption(f"Différence avec le Standard : {row.get('Différence avec le Standard') or '—'} · "
+                           f"Source : {row.get('Source') or '—'} · "
+                           f"Inspiré de : {row.get('Inspiré du Standard') or '—'}")
+                verdict = (state.get("verdicts") or {}).get(item["tag"])
+                if verdict:
+                    st.markdown(f":gray[Verdict : **{verdict['verdict'].replace('_', ' ')}**"
+                                + (f" — {verdict['motif']}" if verdict.get("motif") else "") + "]")
+                with st.container(horizontal=True, vertical_alignment="bottom"):
+                    reason = st.text_input("Motif", key=f"verdict_motif_{item['tag']}",
+                                           placeholder="Obligatoire si non pertinent")
+                    if st.button("Pertinent", key=f"verdict_ok_{item['tag']}", icon=":material/thumb_up:"):
+                        cucumber_verify.record_verdict(client, state, item, "pertinent", reason)
+                        cucumber_tools.save_state(client, state)
+                        st.rerun()
+                    if st.button("Non pertinent", key=f"verdict_ko_{item['tag']}",
+                                 icon=":material/thumb_down:", disabled=not reason.strip()):
+                        cucumber_verify.record_verdict(client, state, item, "non_pertinent", reason)
+                        cucumber_tools.save_state(client, state)
+                        st.rerun()
+        st.caption("Un verdict « Non pertinent » et son motif deviennent une consigne du projet, injectée "
+                   "dans les lots des prochaines générations.")
+
+
+def render_cucumber_generation(ctx: dict, state: dict) -> None:
+    """Étape 4 : lots, contrôles, vérification par exécution, reprise, complément et patch."""
+    client, ready = ctx["client"], ctx["ready"]
+    if not state.get("lots"):
+        st.info("Aucune génération : choisissez les tâches à couvrir (étape Sélection).", icon=":material/science:")
+        return
+    pending = cucumber_tools.pending_lots(state)
+    completable = cucumber_tools.completable_specifics(state)
+    with st.container(horizontal=True):
+        resume = st.button("Reprendre", icon=":material/play_arrow:", disabled=not (ready and pending),
+                           help=f"{len(pending)} lot(s) non terminé(s) lors de la dernière génération."
+                           if pending else "Aucun lot à reprendre.")
+        complete = st.button("Compléter la génération", icon=":material/playlist_add:",
+                             disabled=not (ready and completable),
+                             help=f"{len(completable)} spécifique(s) non couvert(s) faute de step, d'endpoint, "
+                                  f"d'interaction ou de vérification : repris dans de nouveaux lots (recettes de "
+                                  f"test, synonymes), sans effacer les lots ni les commits précédents."
+                             if completable else "Aucun spécifique à compléter.")
+    if resume or complete:
+        run_cucumber_generation(ctx, ["--resume"] if resume else ["--complete"])
+        state = cucumber_tools.load_state(client)
+        pending = cucumber_tools.pending_lots(state)
+    render_cucumber_lots(state, pending)
+    render_cucumber_verification(client, state)
+    if os.path.exists(cucumber_tools.patch_path(client)):
+        patch_file = cucumber_tools.patch_path(client)
         generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(patch_file)))
         with st.container(border=True):
             st.markdown(f"**:material/description: Patch** `{patch_file}` :gray[(généré le {generated_at})]")
             with open(patch_file, "rb") as f:
                 st.download_button("Télécharger le patch", f.read(), file_name=os.path.basename(patch_file),
                                    mime="text/x-diff", icon=":material/download:")
-            review_file = os.path.join(cucumber_tools.worktree_dir(cucumber_client), "A_REVOIR.md")
-            if os.path.exists(review_file):
-                with st.expander("À revoir : défauts détectés, scénarios désactivés (livré dans le patch)"):
-                    with open(review_file, "r", encoding="utf-8", errors="replace") as f:
-                        st.markdown(f.read())
-            if os.path.exists(coverage_file):
-                with st.expander("Récapitulatif de couverture"):
-                    with open(coverage_file, "r", encoding="utf-8", errors="replace") as f:
-                        st.markdown(f.read())
+
+
+def render_cucumber_review(client: str) -> None:
+    """Étape 7 : A_REVOIR.md (défauts détectés, scénarios désactivés) et récapitulatif de couverture."""
+    review_file = os.path.join(cucumber_tools.worktree_dir(client), "A_REVOIR.md")
+    coverage_file = cucumber_tools.coverage_path(client)
+    if not os.path.exists(review_file) and not os.path.exists(coverage_file):
+        st.info("Aucun bilan : il est écrit à la fin d'une génération.", icon=":material/summarize:")
+        return
+    if os.path.exists(review_file):
+        with st.container(border=True):
+            st.markdown("**:material/rule: À revoir** :gray[(défauts détectés, scénarios désactivés ; livré dans "
+                        "le patch)]")
+            with open(review_file, "r", encoding="utf-8", errors="replace") as f:
+                st.markdown(f.read())
+    if os.path.exists(coverage_file):
+        with st.expander("Récapitulatif de couverture"):
+            with open(coverage_file, "r", encoding="utf-8", errors="replace") as f:
+                st.markdown(f.read())
+
+
+# ---------------------------------------------------------
+# ONGLET CUCUMBER : PARCOURS EN 7 ÉTAPES, DU CHOIX DES TÂCHES AU PATCH VERT
+# ---------------------------------------------------------
+with tab_cucumber:
+    st.markdown("### Tests Cucumber des spécifiques d'un client")
+    st.caption("L'agent inventorie les spécifiques du dépôt client (écarts avec le Standard), puis écrit les .feature et "
+               "Step Definitions qui les couvrent dans le dépôt <client>-cucumber, au formalisme du Cucumber Standard. "
+               "Le résultat est un patch local : rien n'est poussé.")
+    cucumber_ctx = cucumber_header()
+    cucumber_client = cucumber_ctx["client"]
+    cucumber_inventory = cucumber_tools.load_inventory(cucumber_client) if cucumber_client else {}
+    cucumber_profile_doc = cucumber_profile.load_profile(cucumber_client) if cucumber_client else {}
+    cucumber_state = cucumber_tools.load_state(cucumber_client) if cucumber_client else {}
+    cucumber_rows = (cucumber_coverage.coverage_rows(cucumber_client, cucumber_inventory, cucumber_state)
+                     if cucumber_inventory.get("specifiques") else [])
+    cucumber_selected = current_selection(selection_candidates(cucumber_rows),
+                                          selection_key(cucumber_client, cucumber_inventory))
+    cucumber_steps = cucumber_journey.journey(
+        cucumber_client, cucumber_inventory, cucumber_profile_doc, cucumber_state, cucumber_rows,
+        len(cucumber_selected), -(-len(cucumber_selected) // max(1, env_int("CUCUMBER_BATCH_SIZE", 3))))
+    with st.container(border=True):
+        st.markdown("  \n".join(f"{n}. " + cucumber_journey.step_line(s) for n, s in enumerate(cucumber_steps, 1)))
+    steps_by_key = {s["cle"]: s for s in cucumber_steps}
+    cucumber_step = st.segmented_control(
+        "Étape", list(steps_by_key), required=True, key=f"cucumber_step_{cucumber_client}",
+        default=cucumber_journey.next_step(cucumber_steps), label_visibility="collapsed",
+        format_func=lambda k: f"{cucumber_journey.STATUSES[steps_by_key[k]['etat']][0]} {steps_by_key[k]['titre']}")
+    if steps_by_key[cucumber_step]["action"]:
+        st.info(f"Action suivante : {steps_by_key[cucumber_step]['action']}", icon=":material/arrow_forward:")
+    if cucumber_step == "projet":
+        render_cucumber_project(cucumber_ctx, cucumber_inventory, cucumber_profile_doc, cucumber_state)
+    elif cucumber_step == "couverture":
+        render_cucumber_coverage(cucumber_ctx, cucumber_inventory, cucumber_rows)
+    elif cucumber_step == "selection":
+        render_cucumber_selection(cucumber_ctx, cucumber_inventory, cucumber_state, cucumber_rows)
+    elif cucumber_step == "generation":
+        render_cucumber_generation(cucumber_ctx, cucumber_state)
+    elif cucumber_step == "execution":
+        if cucumber_client:
+            render_cucumber_import(cucumber_client, cucumber_state)
+    elif cucumber_step == "correction":
+        if cucumber_client:
+            render_cucumber_corrections(cucumber_client, cucumber_ctx["cmd"], cucumber_rows)
+    elif cucumber_step == "bilan":
+        if cucumber_client:
+            render_cucumber_review(cucumber_client)
 
 
 def render_knowledge_outbox() -> None:

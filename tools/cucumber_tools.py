@@ -18,6 +18,8 @@ import unicodedata
 from collections import Counter
 from datetime import datetime
 
+from tools import cucumber_studio
+
 WORKSPACE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_ROOT = os.path.join(WORKSPACE_DIR, ".tmp", "cucumber")
 STD_CACHE_DIR = os.path.join(CACHE_ROOT, "_standard")
@@ -2743,19 +2745,21 @@ def studio_excerpt(original: str, customized: str, max_lines: int = DEFAULT_INLI
 def attach_studio_excerpts(inventory: dict, max_lines: int = DEFAULT_INLINE_STUDIO_LINES) -> int:
     """
     f["extrait_studio"] des customized.xml de chaque spécifique : fichier <client>/studio/<id>/<nom>.txt des
-    parties modifiées (studio_excerpt), la référence étant original.xml du dépôt client ou le fichier du Standard.
-    Renvoie le nombre de fichiers concernés (0 token, recalculé à chaque exécution).
+    parties modifiées (studio_excerpt), la référence étant original.xml du dépôt client ou le fichier du Standard ;
+    f["comportements_studio"] : différences structurées (cucumber_studio.behaviours, au plus MAX_BEHAVIOURS) et
+    f["nb_comportements_studio"] leur nombre par type, même avec `max_lines` à 0.
+    Renvoie le nombre de fichiers dont l'extrait est écrit (0 token, recalculé à chaque exécution).
     """
     directory = os.path.join(cache_dir(inventory["client"]), "studio")
     shutil.rmtree(directory, ignore_errors=True)
-    if max_lines <= 0:
-        return 0
     client_repos, std_repos = git_repos(inventory["depot_client"]), git_repos(inventory["standard"])
     refs = inventory.get("references", {})
     count = 0
     for spec in inventory["specifiques"]:
         for f in spec["fichiers"]:
             f.pop("extrait_studio", None)
+            f.pop("comportements_studio", None)
+            f.pop("nb_comportements_studio", None)
             if f["path"].rsplit("/", 1)[-1] != "customized.xml" or not f.get("local"):
                 continue
             original = ""
@@ -2769,7 +2773,14 @@ def attach_studio_excerpts(inventory: dict, max_lines: int = DEFAULT_INLINE_STUD
                 ref = pick_ref(std_repos[repo], STD_REFS) if repo in std_repos else ""
                 if ref:
                     original = _git(std_repos[repo], "show", f"{ref}:{path}").stdout
-            excerpt = studio_excerpt(original, _read_text_file(f["local"]), max_lines)
+            customized = _read_text_file(f["local"])
+            # Chaque différence avec la référence est un comportement à couvrir (vue Couverture, prompt des lots)
+            found = cucumber_studio.behaviours(original, customized, limit=None)
+            f["comportements_studio"] = found[:cucumber_studio.MAX_BEHAVIOURS]
+            f["nb_comportements_studio"] = dict(Counter(b["type"] for b in found))
+            if max_lines <= 0:
+                continue
+            excerpt = studio_excerpt(original, customized, max_lines)
             if not excerpt.strip():
                 continue
             target = os.path.join(directory, spec["id"], f["path"].replace("/", "__") + ".txt")
@@ -2910,6 +2921,12 @@ def lot_example(specifics: list) -> str:
     return max(tests, key=lambda t: t["score"])["extrait"] if tests else ""
 
 
+PARTIAL_RULE = ("- TÂCHE PARTIELLE : les tests existants ne vérifient qu'une configuration ou la présence d'une donnée. "
+                "Teste l'EFFET du spécifique (document généré, message envoyé avec son contenu, statut atteint, champ "
+                "enregistré relu), jamais la configuration seule.")
+MAX_LOT_BEHAVIOURS = 15
+
+
 def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) -> str:
     """
     Partie variable du prompt : recettes applicables (une fois chacune), puis les spécifiques du lot (steps
@@ -2956,6 +2973,14 @@ def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) 
         if spec.get("scenarios_existants"):
             lines.append("- Scénarios existants à compléter plutôt que dupliquer : "
                          + " ; ".join(spec["scenarios_existants"]))
+        if spec.get("partiel"):
+            lines.append(PARTIAL_RULE)
+        behaviours = cucumber_studio.spec_behaviours(spec)
+        if behaviours:
+            total = cucumber_studio.behaviour_counts(spec)
+            lines.append(f"- Comportements Studio à couvrir ({cucumber_studio.counts_line(total)} ; chaque scénario "
+                         f"vérifie au moins un élément qui n'existe que dans la personnalisation) :")
+            lines += [f"  - {cucumber_studio.behaviour_line(b)}" for b in behaviours[:MAX_LOT_BEHAVIOURS]]
         lines.append(f"- Tickets Jira : {ref(spec['jira'])}" if spec.get("jira") else "- Tickets Jira : aucun trouvé")
         if spec.get("tests_std"):
             lines.append("- Tests Standard équivalents (à lire avant d'écrire) :")
