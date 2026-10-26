@@ -1,0 +1,283 @@
+"""
+Décisions humaines de l'onglet Cucumber (point 7, D2, D3), 0 token.
+
+Les propositions qui changent le sens d'un test ne sont pas appliquées d'office : réalignement d'un attendu sur le
+code, changement des données d'un step existant, désactivation, test jugé tautologique, écart spécification / code.
+- En attente (D2) : le scénario concerné est désactivé provisoirement par le tag à revoir, avec le commentaire
+  « # Décision en attente : … » (désactivation : « décision en attente » dans son commentaire « # À revoir : … »).
+  La modification proposée (bloc du scénario corrigé) est gardée à part, dans la décision. L'agent poursuit le reste.
+- Valider : applique la modification (réalignement, données : scénario corrigé, actif ; désactivation : définitive) ;
+  Refuser : rétablit le scénario d'origine, actif, et le commentaire accompagne sa prochaine correction ; Commenter :
+  ajoute un avis sans trancher. Test tautologique et écart spécification / code : décisions d'information.
+- Historique (D3) : .tmp/cucumber/<client>/decisions.json, chaque action avec son auteur (AGENT_KNOWLEDGE_AUTHOR,
+  sinon l'utilisateur), sa date et son commentaire ; résumé dans le bilan (A_REVOIR.md, répertoire partagé).
+Une décision appliquée au worktree y est commitée, et le patch réécrit s'il existe (sans diagnostic temporaire).
+"""
+import os
+import re
+from datetime import datetime
+
+from tools import knowledge_tools
+from tools.cucumber_a_revoir import DISABLED_COMMENT, PENDING, REALIGNED, scenario_blocks
+from tools.cucumber_diagnostic import temporary_steps
+from tools.cucumber_tools import (_git, _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag,
+                                  cache_dir, patch_path, write_patch)
+from tools.cucumber_verify import _title_key, parse_scenarios
+
+TYPES = {"realignement": "réalignement d'un attendu sur le code", "donnees": "changement de données de test",
+         "desactivation": "désactivation", "tautologique": "test jugé tautologique",
+         "ecart_spec_code": "écart spécification / code"}
+# Décisions qui gardent une modification à part (scénario désactivé provisoirement en attendant)
+HELD_TYPES = ("realignement", "donnees")
+STATUSES = {"en_attente": "en attente", "validee": "validée", "refusee": "refusée"}
+PENDING_COMMENT = "# Décision en attente :"
+
+
+# ---------------------------------------------------------------------------
+# Stockage et historique
+# ---------------------------------------------------------------------------
+
+def decisions_path(client_name: str) -> str:
+    return os.path.join(cache_dir(client_name), "decisions.json")
+
+
+def load_decisions(client_name: str) -> list:
+    return (_read_json(decisions_path(client_name), {}) or {}).get("decisions", [])
+
+
+def save_decisions(client_name: str, decisions: list) -> None:
+    _write_json(decisions_path(client_name), {"decisions": decisions})
+
+
+def _event(action: str, comment: str = "", author: str = "") -> dict:
+    return {"date": datetime.now().isoformat(timespec="seconds"), "auteur": author or knowledge_tools.author(),
+            "action": action, "commentaire": " ".join(str(comment or "").split())[:500]}
+
+
+def pending(client_name: str) -> list:
+    return [d for d in load_decisions(client_name) if d["statut"] == "en_attente"]
+
+
+def propose(client_name: str, kind: str, proposal: str, **fields) -> dict:
+    """
+    Ajoute une décision en attente ({type, proposition, fichier, titre, scenario, lot, cause, preuve, reactivation,
+    avant, apres…}) ; une décision en attente du même type sur le même scénario (ou le même détail) est réutilisée.
+    """
+    decisions = load_decisions(client_name)
+    key = fields.get("scenario") or proposal
+    found = next((d for d in decisions if d["statut"] == "en_attente" and d["type"] == kind
+                  and (d.get("scenario") or d["proposition"]) == key), None)
+    if found:
+        return found
+    decision = {"id": f"d-{len(decisions) + 1}", "type": kind, "proposition": " ".join(proposal.split())[:600],
+                "statut": "en_attente", "historique": [_event("proposée par l'agent", author="agent")], **fields}
+    decisions.append(decision)
+    save_decisions(client_name, decisions)
+    return decision
+
+
+def refused_comments(client_name: str, identifier: str) -> list:
+    """Commentaires des décisions refusées sur un scénario : ils accompagnent sa prochaine correction."""
+    return [e["commentaire"] for d in load_decisions(client_name) if d.get("scenario") == identifier
+            and d["statut"] == "refusee" for e in d["historique"] if e["action"] == "refusée" and e["commentaire"]]
+
+
+# ---------------------------------------------------------------------------
+# Blocs de scénarios dans une feature
+# ---------------------------------------------------------------------------
+
+def _block_range(lines: list, title: str) -> tuple:
+    """(début, fin) du bloc d'un scénario : tags et commentaires au-dessus compris ; (-1, -1) s'il est absent."""
+    parsed = parse_scenarios("\n".join(lines))
+    starts = []
+    for scenario in parsed:
+        start = scenario["ligne"] - 1
+        while start > 0 and lines[start - 1].strip().startswith(("@", "#")):
+            start -= 1
+        starts.append(start)
+    for i, scenario in enumerate(parsed):
+        if _title_key(scenario["titre"]) == _title_key(title):
+            return starts[i], starts[i + 1] if i + 1 < len(parsed) else len(lines)
+    return -1, -1
+
+
+def _replace_block(worktree: str, rel: str, title: str, block: list) -> bool:
+    path = os.path.join(worktree, *rel.split("/"))
+    lines = _read_text_file(path).splitlines()
+    start, end = _block_range(lines, title)
+    if start < 0:
+        return False
+    # Lignes vides de fin de bloc conservées (séparation avec le scénario suivant)
+    trailing = [line for line in lines[start:end][::-1] if not line.strip()]
+    body = [line for line in block]
+    while body and not body[-1].strip():
+        body.pop()
+    _write_text(path, "\n".join(lines[:start] + body + trailing + lines[end:]) + "\n")
+    return True
+
+
+def _held_block(block: list, client_tag: str, note: str) -> list:
+    """Bloc d'origine désactivé provisoirement : commentaire de décision en attente, tag à revoir, sans tag client."""
+    tag = a_revoir_tag()
+    keyword = next(i for i, line in enumerate(block) if re.match(r"^\s*(Scenario|Scénario|Example|Exemple|Plan)",
+                                                                 line.strip()))
+    indent = re.match(r"^\s*", block[keyword]).group(0)
+    head = [line for line in block[:keyword] if not line.strip().startswith("@")]
+    tags = [t for line in block[:keyword] if line.strip().startswith("@") for t in line.split()
+            if t not in (client_tag, tag)]
+    return head + [f"{indent}{PENDING_COMMENT} {note}", indent + " ".join(tags + [tag])] + block[keyword:]
+
+
+def held_changes(worktree: str, before: dict, client_tag: str = "") -> list:
+    """
+    Modifications d'une correction qui changent le sens d'un scénario existant (features `before` {rel: texte}) :
+    attendu réaligné sur le code (« # Réaligné sur le code : »), ou valeur d'un step existant (Given / When, table
+    comprise) changée. Chaque bloc corrigé est remplacé dans le worktree par son bloc d'origine désactivé
+    provisoirement ; renvoie [{type, fichier, titre, avant, apres, proposition}].
+    """
+    held = []
+    for rel, text in before.items():
+        path = os.path.join(worktree, *rel.split("/"))
+        if not os.path.exists(path):
+            continue
+        old, new = scenario_blocks(text), scenario_blocks(_read_text_file(path))
+        for key, (scenario, block) in old.items():
+            if key not in new or new[key][1] == block:
+                continue
+            changed, new_block = new[key]
+            kind = _change_kind(scenario, changed, new_block)
+            if not kind:
+                continue
+            reference = next((line.strip()[len(REALIGNED):].strip() for line in new_block
+                              if line.strip().startswith(REALIGNED)), "")
+            proposal = (f"attendu réaligné sur le code ({reference})" if kind == "realignement" else
+                        "valeur d'un step existant changée par la correction")
+            held.append({"type": kind, "fichier": rel, "titre": scenario["titre"], "avant": block,
+                         "apres": new_block, "proposition": f"{rel} / {scenario['titre']} : {proposal}"})
+            _replace_block(worktree, rel, scenario["titre"], _held_block(block, client_tag, TYPES[kind]))
+    return held
+
+
+def _change_kind(old: dict, new: dict, new_block: list) -> str:
+    """« realignement », « donnees » ou '' (ajout de steps, de colonnes ou de lignes : correction ordinaire)."""
+    if any(line.strip().startswith(REALIGNED) for line in new_block):
+        return "realignement"
+    given = [(s["texte"], tuple(s.get("table") or [])) for s in old["steps"] if s["phase"] != "then"]
+    kept = {(s["texte"], tuple(s.get("table") or [])) for s in new["steps"] if s["phase"] != "then"}
+    return "" if all(step in kept for step in given) else "donnees"
+
+
+# ---------------------------------------------------------------------------
+# Valider, refuser, commenter
+# ---------------------------------------------------------------------------
+
+def _restore_active(block: list, client_tag: str) -> list:
+    """Bloc réactivé : commentaire de décision ou de désactivation retiré, tag à revoir retiré, tag client remis."""
+    tag = a_revoir_tag()
+    out, tagged = [], False
+    for line in block:
+        stripped = line.strip()
+        if stripped.startswith((PENDING_COMMENT, DISABLED_COMMENT)):
+            continue
+        if stripped.startswith("@"):
+            tags = [t for t in stripped.split() if t != tag]
+            if client_tag and client_tag not in tags:
+                tags.append(client_tag)
+            tagged = True
+            if tags:
+                out.append(re.match(r"^\s*", line).group(0) + " ".join(tags))
+            continue
+        if not tagged and client_tag and re.match(r"^\s*(Scenario|Scénario|Example|Exemple|Plan)", stripped):
+            out.append(re.match(r"^\s*", line).group(0) + client_tag)
+            tagged = True
+        out.append(line)
+    return out
+
+
+def _current_block(worktree: str, decision: dict) -> list:
+    lines = _read_text_file(os.path.join(worktree, *decision["fichier"].split("/"))).splitlines()
+    start, end = _block_range(lines, decision["titre"])
+    return lines[start:end] if start >= 0 else []
+
+
+def _apply(worktree: str, decision: dict, accepted: bool, client_tag: str) -> bool:
+    """Modifie le worktree selon la décision ; True si une feature a changé."""
+    if decision["type"] not in HELD_TYPES + ("desactivation",) or not decision.get("fichier"):
+        return False
+    current = _current_block(worktree, decision)
+    if not current:
+        return False
+    if decision["type"] in HELD_TYPES:
+        block = decision["apres"] if accepted else _restore_active(decision["avant"], client_tag)
+    elif accepted:
+        block = [line.replace(PENDING, "") if line.strip().startswith(DISABLED_COMMENT) else line for line in current]
+    else:
+        block = _restore_active(current, client_tag)
+    return block != current and _replace_block(worktree, decision["fichier"], decision["titre"], block)
+
+
+def commit_decision(worktree: str, client_name: str, base: str, files: list, message: str) -> bool:
+    """Commit dédié des features modifiées, puis patch réécrit s'il existe et qu'aucun diagnostic n'est en cours."""
+    _git(worktree, "add", "--", *files)
+    if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
+        return False
+    if _git(worktree, "commit", "-m", message).returncode != 0:
+        return False
+    if base and os.path.exists(patch_path(client_name)) and not temporary_steps(worktree):
+        write_patch(worktree, base, patch_path(client_name), client_name)
+    return True
+
+
+def resolve(client_name: str, decision_id: str, action: str, comment: str = "", worktree: str = "",
+            base: str = "", client_tag: str = "", author: str = "") -> dict:
+    """
+    « valider », « refuser » ou « commenter » une décision : worktree modifié et commité selon le type (voir
+    docstring du module), action historisée. Renvoie la décision à jour ({} si elle est inconnue).
+    """
+    decisions = load_decisions(client_name)
+    decision = next((d for d in decisions if d["id"] == decision_id), None)
+    if not decision:
+        return {}
+    if action == "commenter" or decision["statut"] != "en_attente":
+        decision["historique"].append(_event("commentée", comment, author))
+    else:
+        accepted = action == "valider"
+        changed = bool(worktree) and os.path.isdir(worktree) and _apply(worktree, decision, accepted, client_tag)
+        decision["statut"] = "validee" if accepted else "refusee"
+        decision["historique"].append(_event("validée" if accepted else "refusée", comment, author))
+        if changed:
+            commit_decision(worktree, client_name, base, [decision["fichier"]],
+                            f"Décision {'validée' if accepted else 'refusée'} ({TYPES[decision['type']]}) : "
+                            f"{decision['titre']}")
+    save_decisions(client_name, decisions)
+    return decision
+
+
+def held_scenario_ids(client_name: str) -> set:
+    """Scénarios désactivés provisoirement en attendant une décision."""
+    return {d.get("scenario", "") for d in pending(client_name)} - {""}
+
+
+def summary_lines(decisions: list, limit: int = 20) -> list:
+    """Résumé pour le bilan : décisions en attente, puis décisions prises (qui, quand, pourquoi)."""
+    lines = []
+    for d in sorted(decisions, key=lambda x: x["statut"] != "en_attente")[:limit]:
+        last = d["historique"][-1]
+        lines.append(f"- {TYPES[d['type']]} — {d['proposition']} : **{STATUSES[d['statut']]}**"
+                     + ("" if d["statut"] == "en_attente" else
+                        f" par {last['auteur']} le {last['date'][:10]}"
+                        + (f" — « {last['commentaire']} »" if last["commentaire"] else "")))
+    return lines
+
+
+def sync_state(state: dict, decision: dict) -> None:
+    """
+    État de la génération après une décision : le scénario n'attend plus de décision ; une désactivation refusée
+    sort des scénarios désactivés (A_REVOIR.md, bilan).
+    """
+    for lot in state.get("lots") or []:
+        if decision.get("scenario") in (lot.get("decisions_en_attente") or []) and decision["statut"] != "en_attente":
+            lot["decisions_en_attente"] = [i for i in lot["decisions_en_attente"] if i != decision["scenario"]]
+        if decision["type"] == "desactivation" and decision["statut"] == "refusee":
+            lot["a_revoir"] = [e for e in lot.get("a_revoir") or []
+                               if (e["fichier"], e["titre"]) != (decision.get("fichier"), decision.get("titre"))]

@@ -26,6 +26,7 @@ from tools.cucumber_tools import (_read_json, _write_json, a_revoir_tag, cache_d
                                   worktree_dir)
 from tools.cucumber_verify import NOT_TEST_STATUSES, all_verified, failure_category, scenario_id
 from tools.cucumber_a_revoir import DISABLED_COMMENT
+from tools.cucumber_decisions import PENDING_COMMENT
 
 # Clé : (libellé, pastille, couleur Streamlit)
 STATES = {
@@ -155,6 +156,8 @@ def _disabled_in(text: str, rel: str, tag: str) -> dict:
         stripped = line.strip()
         if stripped.startswith(DISABLED_COMMENT):
             cause = stripped[len(DISABLED_COMMENT):].strip()
+        elif stripped.startswith(PENDING_COMMENT):
+            cause = "décision en attente : " + stripped[len(PENDING_COMMENT):].strip()
         elif stripped.startswith("@"):
             tagged = tagged or tag in stripped.split()
         elif re.match(r"^(Scenario|Scénario|Scenario Outline|Plan du [Ss]cénario|Example|Exemple)\s*:", stripped):

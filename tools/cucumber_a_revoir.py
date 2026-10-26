@@ -21,7 +21,8 @@ import re
 from tools import cucumber_checks
 from tools.cucumber_tools import (_GHERKIN_STEP, _expression_regex, _git, _read_text_file, _write_text,
                                   a_revoir_tag, constat_line, excludes_tag, step_expressions)
-from tools.cucumber_verify import VERSION_GAP, _title_key, failure_kind, log_request, parse_scenarios
+from tools.cucumber_verify import (VERSION_GAP, _title_key, failure_kind, is_setup_scenario, log_request,
+                                   parse_scenarios)
 
 DEFAULT_MAX_RETRACT_PCT = 30
 A_REVOIR_FILE = "A_REVOIR.md"
@@ -30,6 +31,10 @@ END = "<!-- agent-savoye : fin de la section générée -->"
 REALIGNED = "# Réaligné sur le code :"
 DISABLED_COMMENT = "# À revoir :"
 UNPROVEN = "NON PROUVÉE"
+PROVEN = "cause PROUVÉE"
+# Désactivation proposée, en attente d'une décision humaine (D2) : marque du commentaire « # À revoir : »
+PENDING = " — décision en attente"
+SETUP_LABEL = "mise en place des seuls scénarios désactivés"
 FORBIDDEN_TAGS = ("@ignore", "@Ignore", "@wip", "@skip")
 # Cause hors test : libellé et condition de réactivation
 CAUSES = {
@@ -270,11 +275,54 @@ def _proof(item: dict, max_chars: int = 200) -> str:
     return " ".join(str(item.get("motif", "")).split())[:max_chars]
 
 
-def deactivate(worktree: str, rel: str, items: dict, client_tag: str) -> list:
+def disabled_comment(cause: str, item: dict, pending: bool = False) -> str:
+    """« # À revoir : <cause> — cause PROUVÉE | cause NON PROUVÉE [— décision en attente] — <preuve> — réactivation : … »."""
+    proven = proof_status(cause, item)[0]
+    return (f"{DISABLED_COMMENT} {CAUSES[cause][0]} — {PROVEN if proven else 'cause ' + UNPROVEN}"
+            f"{PENDING if pending else ''} — {_proof(item)} — réactivation : {CAUSES[cause][1]}")
+
+
+def _disable_at(lines: list, line: int, comment: str, client_tag: str) -> None:
+    """Désactive le scénario de la ligne `line` : tag à revoir (tag client retiré), commentaire au-dessus."""
+    tag = a_revoir_tag()
+    indent = re.match(r"^\s*", lines[line]).group(0)
+    if line > 0 and lines[line - 1].strip().startswith("@"):
+        tags = [t for t in lines[line - 1].split() if t != client_tag]
+        lines[line - 1] = indent + " ".join(tags + ([tag] if tag not in tags else []))
+        top = line - 1
+    else:
+        lines.insert(line, indent + tag)
+        top = line
+    if not (top > 0 and lines[top - 1].strip().startswith(DISABLED_COMMENT)):
+        lines.insert(top, f"{indent}{comment}")
+
+
+def _disable_unused_setup(lines: list, client_tag: str) -> list:
     """
-    Désactive dans la feature `rel` les scénarios {titre: (cause, résultat)} : commentaire « # À revoir : … » et tag
-    à revoir au-dessus du scénario, tag client retiré du scénario ; le tag client de la feature est déplacé sur les
-    scénarios restés actifs. Rien n'est supprimé. Renvoie les titres désactivés.
+    Mises en place (« Contexte… », @agent_<client>_<lot>_0) qui ne servent plus qu'à des scénarios désactivés :
+    désactivées avec eux. Renvoie leurs titres.
+    """
+    tag = a_revoir_tag()
+    parsed = parse_scenarios("\n".join(lines))
+    others = [s for s in parsed if not is_setup_scenario(s["titre"], s["tags"])]
+    if not others or any(tag not in s["tags"] for s in others):
+        return []
+    done = []
+    for scenario in sorted(parsed, key=lambda s: -s["ligne"]):
+        if is_setup_scenario(scenario["titre"], scenario["tags"]) and tag not in scenario["tags"]:
+            _disable_at(lines, scenario["ligne"] - 1, f"{DISABLED_COMMENT} {SETUP_LABEL} — réactivation : avec eux",
+                        client_tag)
+            done.append(scenario["titre"])
+    return done
+
+
+def deactivate(worktree: str, rel: str, items: dict, client_tag: str, pending: bool = False) -> list:
+    """
+    Désactive dans la feature `rel` les scénarios {titre: (cause, résultat)} : commentaire « # À revoir : … » (cause
+    PROUVÉE ou NON PROUVÉE, preuve, condition de réactivation ; « décision en attente » si `pending`) et tag à revoir
+    au-dessus du scénario, tag client retiré du scénario ; le tag client de la feature est déplacé sur les scénarios
+    restés actifs ; une mise en place qui ne sert plus qu'à des scénarios désactivés l'est aussi. Rien n'est
+    supprimé. Renvoie les titres désactivés.
     """
     path = os.path.join(worktree, *rel.split("/"))
     text = _read_text_file(path)
@@ -298,18 +346,7 @@ def deactivate(worktree: str, rel: str, items: dict, client_tag: str) -> list:
         has_tags = line > 0 and lines[line - 1].strip().startswith("@")
         if key in wanted:
             cause, item = wanted[key]
-            label = CAUSES[cause][0]
-            if has_tags:
-                lines[line - 1] = " ".join(t for t in lines[line - 1].split() if t != client_tag)
-                lines[line - 1] = indent + (lines[line - 1] + " " + tag if tag not in lines[line - 1].split()
-                                            else lines[line - 1]).strip()
-                top = line - 1
-            else:
-                lines.insert(line, indent + tag)
-                top = line
-            if not (top > 0 and lines[top - 1].strip().startswith(DISABLED_COMMENT)):
-                unproven = "" if proof_status(cause, item)[0] else f" ({UNPROVEN})"
-                lines.insert(top, f"{indent}{DISABLED_COMMENT} {label}{unproven} — {_proof(item)}")
+            _disable_at(lines, line, disabled_comment(cause, item, pending), client_tag)
             done.append(scenario["titre"])
         elif move_client and tag not in scenario["tags"]:
             if has_tags:
@@ -322,14 +359,17 @@ def deactivate(worktree: str, rel: str, items: dict, client_tag: str) -> list:
             kept = [t for t in lines[i].split() if t != client_tag]
             lines[i] = (re.match(r"^\s*", lines[i]).group(0) + " ".join(kept)) if kept else None
         lines = [line for line in lines if line is not None]
+    if done:
+        _disable_unused_setup(lines, client_tag)
     _write_text(path, "\n".join(lines) + "\n")
     return done
 
 
 def apply_decision(worktree: str, files: list, scenarios: dict, decision: dict, client_tag: str,
-                   located: dict) -> list:
+                   located: dict, pending: bool = False) -> list:
     """
-    Désactive les scénarios de decision["desactiver"] ; `located` : {tag: (feature, scénario)} (tagged_scenarios).
+    Désactive les scénarios de decision["desactiver"] ; `located` : {tag: (feature, scénario)} (tagged_scenarios) ;
+    `pending` : désactivation proposée, en attente d'une décision humaine (D2).
     Renvoie [{fichier, titre, id, cause, preuve, reactivation, prouvee, verification, heure}] pour A_REVOIR.md.
     """
     by_file = {}
@@ -339,7 +379,7 @@ def apply_decision(worktree: str, files: list, scenarios: dict, decision: dict, 
             by_file.setdefault(rel, {})[scenario["titre"]] = (cause, scenarios[tag])
     entries = []
     for rel, items in by_file.items():
-        deactivate(worktree, rel, items, client_tag)
+        deactivate(worktree, rel, items, client_tag, pending)
         for title, (cause, item) in items.items():
             proven, check = proof_status(cause, item)
             entries.append({"fichier": rel, "titre": title, "id": item.get("id", ""), "cause": cause,

@@ -1,3 +1,4 @@
+import difflib
 import glob
 import json
 import os
@@ -9,9 +10,10 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import (cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_import, cucumber_init,
-                   cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_studio,
-                   cucumber_tools, cucumber_verify, integration_tools, knowledge_tools)
+from tools import (cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions,
+                   cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_journey,
+                   cucumber_profile, cucumber_studio, cucumber_tools, cucumber_verify, integration_tools,
+                   knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -848,11 +850,82 @@ def latest_import_analysis(client: str) -> tuple:
                                                           "analyse.json"), {}) or {}
 
 
-def render_cucumber_corrections(client: str, cucumber_cmd: list, rows: list) -> None:
+def refresh_a_revoir(client: str, state: dict, decision: dict) -> None:
+    """A_REVOIR.md régénéré après une décision (scénarios désactivés à jour), commité dans le worktree."""
+    worktree = cucumber_tools.worktree_dir(client)
+    if decision.get("statut") == "en_attente" or not os.path.isdir(worktree):
+        return
+    specifics = {s["id"]: s for s in cucumber_tools.load_inventory(client).get("specifiques") or []}
+    if cucumber_a_revoir.write_a_revoir(worktree, state, specifics):
+        cucumber_decisions.commit_decision(worktree, client, state.get("base", ""), [cucumber_a_revoir.A_REVOIR_FILE],
+                                           f"A_REVOIR.md : décision {decision['id']} prise")
+
+
+def render_decision(client: str, decision: dict, state: dict, client_tag: str) -> None:
+    """Une décision en attente : proposition, preuve, modification gardée à part ; Valider, Refuser, Commenter."""
+    with st.container(border=True):
+        st.markdown(f"**{cucumber_decisions.TYPES[decision['type']].capitalize()}** :gray[({decision['id']}, "
+                    f"lot {decision.get('lot', '?')})] — {decision['proposition']}")
+        details = [f"preuve : `{decision['preuve']}`" if decision.get("preuve") else "",
+                   f"réactivation : {decision['reactivation']}" if decision.get("reactivation") else ""]
+        if any(details):
+            st.caption(" · ".join(d for d in details if d))
+        if decision.get("apres"):
+            with st.expander("Modification gardée à part", icon=":material/difference:"):
+                st.code("\n".join(difflib.unified_diff(decision["avant"], decision["apres"], "avant", "proposé",
+                                                        lineterm="")), language="diff")
+        comments = [e for e in decision["historique"] if e["commentaire"]]
+        for event in comments:
+            st.caption(f"{event['auteur']}, {event['date'][:16].replace('T', ' ')} : « {event['commentaire']} »")
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            comment = st.text_input("Commentaire (pourquoi)", key=f"decision_comment_{decision['id']}")
+            for action, label, icon in (("valider", "Valider", ":material/check:"),
+                                        ("refuser", "Refuser", ":material/close:"),
+                                        ("commenter", "Commenter", ":material/comment:")):
+                if st.button(label, key=f"decision_{action}_{decision['id']}", icon=icon,
+                             disabled=action == "commenter" and not comment.strip()):
+                    done = cucumber_decisions.resolve(client, decision["id"], action, comment,
+                                                      cucumber_tools.worktree_dir(client), state.get("base", ""),
+                                                      client_tag)
+                    cucumber_decisions.sync_state(state, done)
+                    cucumber_tools.save_state(client, state)
+                    refresh_a_revoir(client, state, done)
+                    st.rerun()
+
+
+def render_cucumber_decisions(client: str, state: dict) -> None:
+    """File des décisions humaines (point 7) : en attente, puis historique (qui, quand, pourquoi)."""
+    decisions = cucumber_decisions.load_decisions(client)
+    waiting = [d for d in decisions if d["statut"] == "en_attente"]
+    st.markdown(f"##### :material/gavel: Décisions en attente : {len(waiting)}")
+    st.caption("Ce qui change le sens d'un test (réalignement d'un attendu, données d'un step, désactivation, test "
+               "tautologique, écart spécification / code) attend votre décision ; le scénario concerné est désactivé "
+               "provisoirement et l'agent poursuit le reste. Valider applique la modification, Refuser rétablit le "
+               "scénario et transmet votre commentaire à sa prochaine correction.")
+    client_tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))["tag_client"]
+    for decision in waiting:
+        render_decision(client, decision, state, client_tag)
+    decided = [d for d in decisions if d["statut"] != "en_attente"]
+    if decided:
+        with st.expander(f"Historique des décisions ({len(decided)})", icon=":material/history:"):
+            st.dataframe([{"Décision": cucumber_decisions.TYPES[d["type"]], "Proposition": d["proposition"],
+                           "Statut": cucumber_decisions.STATUSES[d["statut"]], "Par": d["historique"][-1]["auteur"],
+                           "Le": d["historique"][-1]["date"][:16].replace("T", " "),
+                           "Pourquoi": d["historique"][-1]["commentaire"]} for d in decided],
+                         hide_index=True, width="stretch")
+
+
+def render_cucumber_corrections(client: str, cucumber_cmd: list, rows: list, state: dict) -> None:
     """
-    Étape 6 : causes racine du dernier import, lots de correction proposés (échecs « test » des scénarios de
-    l'agent) et tâches en échec de la vue Couverture.
+    Étape 6 : décisions en attente, causes racine du dernier import, lots de correction proposés (échecs « test »
+    des scénarios de l'agent), causes à prouver, diagnostics en attente du prochain run et tâches en échec.
     """
+    render_cucumber_decisions(client, state)
+    waiting = [t for lot in state.get("lots") or [] for t in lot.get("diagnostics_en_attente") or []]
+    if waiting:
+        st.info(f"{len(waiting)} step(s) de diagnostic temporaire en attente du prochain run (poussés sur la branche "
+                f"lue par le job) : leur sortie sera lue à l'import, puis ils seront retirés.",
+                icon=":material/troubleshoot:")
     failing = [r for r in rows if r["etat"] == "echec"]
     if failing:
         st.markdown(f"**{len(failing)} tâche(s) en échec**")
@@ -870,6 +943,13 @@ def render_cucumber_corrections(client: str, cucumber_cmd: list, rows: list) -> 
     if analysis["groupes"]:
         st.dataframe([{"Scénarios": len(g["scenarios"]), "Cause": g["libelle"], "Catégorie": g["categorie"],
                        "Step": g["step"], "Message": g["message"]} for g in analysis["groupes"]], hide_index=True)
+    for item in analysis.get("a_prouver") or []:
+        with st.container(border=True):
+            st.markdown(f"**Cause à prouver** — `{item['id']}` :gray[({len(item['tentatives'])} correction(s) sans "
+                        f"effet : l'agent arrête de deviner)]")
+            st.caption(f"Message : {item['message'][:300]}")
+            st.markdown("Essayé :\n" + "\n".join(f"- lot {t['lot']} : {t['correction']}" for t in item["tentatives"])
+                        + "\n\nMéthodes de preuve :\n" + "\n".join(f"- {m}" for m in item["methodes"]))
     if analysis["propositions"]:
         count = sum(len(p["scenarios"]) for p in analysis["propositions"])
         st.markdown(f"**{len(analysis['propositions'])} lot(s) de correction proposé(s)** ({count} scénario(s) de "
@@ -1791,7 +1871,7 @@ with tab_cucumber:
             render_cucumber_import(cucumber_client, cucumber_state)
     elif cucumber_step == "correction":
         if cucumber_client:
-            render_cucumber_corrections(cucumber_client, cucumber_ctx["cmd"], cucumber_rows)
+            render_cucumber_corrections(cucumber_client, cucumber_ctx["cmd"], cucumber_rows, cucumber_state)
     elif cucumber_step == "bilan":
         if cucumber_client:
             render_cucumber_review(cucumber_client, cucumber_state)
@@ -2356,6 +2436,11 @@ with tab_config:
                 value=env_int("CUCUMBER_LOG_EXPORT_MAX_LINES", 0),
                 help="Plafond de lignes de l'outil d'export des logs serveur (0 : inconnu) : rappelé dans les "
                      "fenêtres à exporter ; un export qui l'atteint est signalé.")
+            max_cause = st.number_input(
+                "CUCUMBER_MAX_CAUSE_ATTEMPTS", min_value=1, step=1, value=env_int("CUCUMBER_MAX_CAUSE_ATTEMPTS", 3),
+                help="Corrections infructueuses sur une même cause (même message, valeurs variables masquées) avant "
+                     "que l'agent arrête de deviner et propose une méthode de preuve.")
+        env_values["CUCUMBER_MAX_CAUSE_ATTEMPTS"] = str(int(max_cause))
         env_values["CUCUMBER_SLOW_SCENARIO_SECONDS"] = str(int(slow_seconds))
         env_values["CUCUMBER_LOG_EXPORT_MAX_LINES"] = str(int(export_cap)) if export_cap else ""
         jacoco = st.checkbox(

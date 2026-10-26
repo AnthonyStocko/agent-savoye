@@ -24,11 +24,12 @@ import os
 import re
 from datetime import datetime, timezone
 
-from tools import cucumber_profile, jenkins_tools
+from tools import cucumber_decisions, cucumber_profile, db_tools, jenkins_tools
+from tools.cucumber_diagnostic import TEMP_PREFIX
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
 from tools.cucumber_tools import _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag, cache_dir
-from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _duration, _timestamp, expected_count,
+from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _duration, _step_outputs, _timestamp, expected_count,
                                    failure_category, feature_texts, log_coverage, log_request, parse_cucumber_report,
                                    report_rel, report_test_count, scenario_id, selection_gap)
 
@@ -411,16 +412,81 @@ def agent_scenarios(state: dict) -> dict:
             for lot in state.get("lots", []) for tag, identifier in (lot.get("tags") or {}).items()}
 
 
-def correction_proposals(failures: dict, state: dict) -> list:
-    """Lots de correction proposés : échecs « test » des scénarios de l'agent, un lot par spécifique."""
-    ours, by_spec = agent_scenarios(state), {}
+DEFAULT_MAX_ATTEMPTS = 3
+
+
+def max_attempts() -> int:
+    """Corrections infructueuses tolérées sur une même cause (CUCUMBER_MAX_CAUSE_ATTEMPTS, 3 par défaut)."""
+    try:
+        return max(1, int(os.getenv("CUCUMBER_MAX_CAUSE_ATTEMPTS", "") or DEFAULT_MAX_ATTEMPTS))
+    except ValueError:
+        return DEFAULT_MAX_ATTEMPTS
+
+
+def attempts(identifier: str, message: str, state: dict) -> list:
+    """
+    Corrections déjà tentées sur ce scénario pour la même cause (même signature de message) : lots « correction »,
+    du plus ancien au plus récent, avec ce que la correction a déclaré faire.
+    """
+    signature = message_signature(message)
+    out = []
+    for lot in sorted(state.get("lots") or [], key=lambda x: x["numero"]):
+        item = next((s for s in lot.get("corrections") or [] if s.get("id") == identifier
+                     and message_signature(s.get("message", "")) == signature), None)
+        if item:
+            done = next((c.get("correction", "") for c in (lot.get("correction") or {}).get("corrections", [])
+                         if c.get("tag") == item.get("tag")), "")
+            out.append({"lot": lot["numero"], "import": lot.get("import"), "correction": done or "non décrite"})
+    return out
+
+
+def proof_methods(result: dict, db_configured: bool) -> list:
+    """Méthodes de preuve proposées quand l'agent arrête de deviner (3 tentatives infructueuses)."""
+    methods = []
+    if db_configured:
+        methods.append("lecture en base en lecture seule (outil base de l'agent) des données lues ou écrites par le "
+                       "step en échec, pour comparer l'état réel à l'attendu")
+    methods.append("requête de référence capturée depuis l'interface web (outils de développement du navigateur, "
+                   "onglet Réseau) en rejouant le scénario à la main, à comparer à la requête envoyée par le step")
+    methods.append("trace serveur : " + log_request({"heure": result.get("heure", ""), "step": result.get("step", ""),
+                                                     "motif": result.get("message", "")}))
+    return methods
+
+
+def correction_proposals(failures: dict, state: dict, extras: dict = None, db_configured: bool = False) -> tuple:
+    """
+    (lots de correction proposés, causes à prouver) pour les échecs « test » des scénarios de l'agent, un lot par
+    spécifique. `extras` : {id: {diagnostic, preuves, refus}} joints au scénario (sortie d'un diagnostic temporaire,
+    lignes de logs serveur, commentaires de décisions refusées). Après max_attempts() corrections infructueuses sur
+    la même cause, le scénario n'est plus proposé : il rejoint les causes à prouver, avec ce qui a été essayé et les
+    méthodes de preuve.
+    """
+    ours, by_spec, to_prove = agent_scenarios(state), {}, []
     for identifier, result in failures.items():
-        if identifier in ours and _category(result) == "test":
-            fichier, titre = identifier.split("::", 1)
-            by_spec.setdefault(ours[identifier]["spec"], []).append(
-                {"tag": ours[identifier]["tag"], "id": identifier, "fichier": fichier, "titre": titre,
-                 "step": result.get("step", ""), "message": result.get("message", "")})
-    return [{"spec": spec, "scenarios": items} for spec, items in sorted(by_spec.items())]
+        if identifier not in ours or _category(result) != "test":
+            continue
+        tried = attempts(identifier, result.get("message", ""), state)
+        if len(tried) >= max_attempts():
+            to_prove.append({"id": identifier, "message": result.get("message", ""), "step": result.get("step", ""),
+                             "tentatives": tried, "methodes": proof_methods(result, db_configured)})
+            continue
+        fichier, titre = identifier.split("::", 1)
+        by_spec.setdefault(ours[identifier]["spec"], []).append(
+            {"tag": ours[identifier]["tag"], "id": identifier, "fichier": fichier, "titre": titre,
+             "step": result.get("step", ""), "message": result.get("message", ""), "tentatives": len(tried),
+             **((extras or {}).get(identifier) or {})})
+    return [{"spec": spec, "scenarios": items} for spec, items in sorted(by_spec.items())], to_prove
+
+
+def diagnostic_outputs(report: list) -> dict:
+    """Sorties des scénarios qui ont exécuté un step TEMPORAIRE (diagnostic temporaire) : {id: texte}."""
+    out = {}
+    for identifier, _, element in _elements(report):
+        steps = element.get("steps") or []
+        if any(str(step.get("name", "")).startswith(TEMP_PREFIX) for step in steps):
+            text = " | ".join(o for step in steps for o in _step_outputs(step))
+            out[identifier] = " ".join(text.split())[:1500] or "(aucune sortie)"
+    return out
 
 
 def _count_gap(report: list, facts: dict, worktree: str, state: dict) -> str:
@@ -451,7 +517,8 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
     out = {"numero": numero, "run": entry["run"], "build": entry.get("build", ""), "console": facts,
            "fichiers": [{k: f[k] for k in ("nom", "type", "masques")} for f in files], "non_analyse": "",
            "tests": report_test_count(report), "groupes": [], "logs": [], "comparaison": {}, "propositions": [],
-           "resultats": {}, "init_en_echec": {}, "durees": {}, "avertissements": []}
+           "resultats": {}, "init_en_echec": {}, "durees": {}, "avertissements": [], "diagnostics": {},
+           "a_prouver": []}
     if facts.get("patch_non_applicable"):
         out["non_analyse"] = "patch non applicable : le run n'a pas exécuté les tests de cette version"
     elif not report:
@@ -484,7 +551,15 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
             out["comparaison"] = {"import": previous["numero"],
                                   **compare(previous_analysis["resultats"], results)}
         # Initialisation en échec : aucun scénario n'est jugé, aucune correction proposée
-        out["propositions"] = [] if out["init_en_echec"] else correction_proposals(failures, state)
+        out["diagnostics"] = diagnostic_outputs(report)
+        evidence = {e["id"]: e["preuves"] for e in out["logs"] if e.get("preuves")}
+        extras = {i: {k: v for k, v in (("diagnostic", out["diagnostics"].get(i, "")),
+                                        ("preuves", evidence.get(i, [])),
+                                        ("refus", cucumber_decisions.refused_comments(client_name, i))) if v}
+                  for i in failures}
+        if not out["init_en_echec"]:
+            out["propositions"], out["a_prouver"] = correction_proposals(failures, state, extras,
+                                                                         db_tools.is_db_configured())
     folder = os.path.join(imports_dir(client_name), str(numero))
     _write_json(os.path.join(folder, "analyse.json"), out)
     _write_text(os.path.join(folder, "analyse.md"), analysis_markdown(out))
@@ -527,6 +602,17 @@ def analysis_markdown(analysis: dict) -> str:
     uncovered = [entry for entry in analysis["logs"] if entry["a_exporter"]]
     if uncovered:
         lines += ["## Logs serveur à exporter", ""] + [f"- {e['id']} : {e['a_exporter']}" for e in uncovered] + [""]
+    if analysis.get("diagnostics"):
+        lines += ["## Sorties des diagnostics temporaires", ""]
+        lines += [f"- {i} : {text[:300]}" for i, text in analysis["diagnostics"].items()] + [""]
+    if analysis.get("a_prouver"):
+        lines += [f"## Causes à prouver après {max_attempts()} corrections infructueuses : "
+                  f"{len(analysis['a_prouver'])}", ""]
+        for item in analysis["a_prouver"]:
+            lines += [f"- {item['id']} — `{item['message'][:200]}`",
+                      "  - Essayé : " + " ; ".join(f"lot {t['lot']} : {t['correction']}" for t in item["tentatives"])]
+            lines += [f"  - Méthode de preuve : {m}" for m in item["methodes"]]
+        lines.append("")
     if analysis["propositions"]:
         lines += ["## Lots de correction proposés (échecs « test » des scénarios de l'agent)", ""]
         for p in analysis["propositions"]:

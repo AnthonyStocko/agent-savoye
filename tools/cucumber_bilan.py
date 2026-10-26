@@ -18,10 +18,10 @@ connaissances partagées (share_bilan).
 import os
 from datetime import datetime
 
-from tools import cucumber_import, knowledge_tools
+from tools import cucumber_decisions, cucumber_diagnostic, cucumber_import, knowledge_tools
 from tools.cucumber_a_revoir import A_REVOIR_FILE, CAUSES, UNPROVEN
 from tools.cucumber_tools import (CONSTAT_TYPES, _git, _read_json, _write_json, _write_text, cache_dir, patch_path,
-                                  write_patch)
+                                  save_state, write_patch)
 from tools.cucumber_verify import failure_category
 
 BEGIN = "<!-- agent-savoye : début du bilan du dernier run importé -->"
@@ -153,8 +153,13 @@ def next_action(analysis: dict, bilan: dict) -> str:
     init = analysis.get("init_en_echec") or {}
     if init:
         return f"Corriger l'initialisation du client ({init['step'] or init['id']} : {init['message'][:160]}), puis relancer"
+    if bilan.get("decisions_en_attente"):
+        return f"Trancher les {bilan['decisions_en_attente']} décision(s) en attente (étape Correction)"
     if analysis.get("propositions"):
         return f"Lancer la correction ciblée ({len(analysis['propositions'])} lot(s), étape Correction)"
+    if analysis.get("a_prouver"):
+        return (f"Apporter une preuve pour {len(analysis['a_prouver'])} cause(s) restées en échec après "
+                f"{cucumber_import.max_attempts()} corrections (méthodes proposées dans le bilan)")
     regressions = (analysis.get("comparaison") or {}).get("regressions", [])
     if regressions:
         return f"Examiner les {len(regressions)} régression(s) : scénarios verts au run précédent"
@@ -189,7 +194,10 @@ def build_bilan(client_name: str, analysis: dict, state: dict) -> dict:
              "verts": green, "echecs": failed, "regressions": comparison.get("regressions", []),
              "init_en_echec": analysis.get("init_en_echec") or {}, "non_analyse": analysis.get("non_analyse", ""),
              "lents": (analysis.get("durees") or {}).get("lents", []), "defauts": defects(state),
-             "corriges": fixed, "desactives": disabled(state), "doutes": doubts(state), "manuelles": manual}
+             "corriges": fixed, "desactives": disabled(state), "doutes": doubts(state), "manuelles": manual,
+             "a_prouver": analysis.get("a_prouver") or [], "diagnostics": analysis.get("diagnostics") or {},
+             "decisions": cucumber_decisions.summary_lines(cucumber_decisions.load_decisions(client_name)),
+             "decisions_en_attente": len(cucumber_decisions.pending(client_name))}
     bilan["prochaine_action"] = next_action(analysis, bilan)
     return bilan
 
@@ -234,6 +242,20 @@ def bilan_markdown(bilan: dict, level: int = 2) -> str:
     lines += ["", f"{section} Doutes sur le code fourni en spécification : {len(bilan['doutes'])}", ""]
     lines += [f"- {d['type']} ({d['certitude']}) : {d['detail']}" + (f" — {d['fichier']}" if d["fichier"] else "")
               + (f" — preuve : `{d['preuve']}`" if d["preuve"] else "") for d in bilan["doutes"]]
+    lines += ["", f"{section} Décisions humaines : {bilan.get('decisions_en_attente', 0)} en attente", ""]
+    lines += bilan.get("decisions") or []
+    to_prove = bilan.get("a_prouver") or []
+    if to_prove:
+        lines += ["", f"{section} Causes à prouver (l'agent a arrêté de deviner) : {len(to_prove)}", ""]
+        for item in to_prove:
+            lines.append(f"- {item['id']} — `{item['message'][:200]}` ; essayé : " + " ; ".join(
+                f"lot {t['lot']} : {t['correction']}" for t in item["tentatives"]))
+            lines += [f"  - Méthode de preuve : {m}" for m in item["methodes"]]
+    if bilan.get("diagnostics"):
+        lines += ["", f"{section} Diagnostics temporaires exécutés : {len(bilan['diagnostics'])}", ""]
+        lines += [f"- {i} : {text[:300]}" for i, text in bilan["diagnostics"].items()]
+        if bilan.get("diagnostics_retires"):
+            lines.append(f"- Retirés du worktree après ce run : {', '.join(bilan['diagnostics_retires'])}")
     lines += ["", f"{section} Corrections manuelles de l'environnement : {len(bilan['manuelles'])}", ""]
     if bilan["manuelles"]:
         lines.append("Interdites dans la durée : l'environnement doit pouvoir être reconstruit par l'init du projet.")
@@ -276,6 +298,7 @@ def after_import(client_name: str, analysis: dict, state: dict, worktree: str = 
     d'A_REVOIR.md commitée. Renvoie le bilan, avec "fichier" (bilan.md) et "a_revoir" (A_REVOIR.md mis à jour).
     """
     bilan = build_bilan(client_name, analysis, state)
+    bilan["diagnostics_retires"] = remove_run_diagnostics(client_name, analysis, state, worktree)
     folder = os.path.join(cucumber_import.imports_dir(client_name), str(analysis["numero"]))
     markdown = bilan_markdown(bilan)
     bilan["fichier"] = os.path.join(folder, "bilan.md")
@@ -284,6 +307,25 @@ def after_import(client_name: str, analysis: dict, state: dict, worktree: str = 
                                                                                  analysis["numero"])
     _write_json(os.path.join(folder, "bilan.json"), bilan)
     return bilan
+
+
+def remove_run_diagnostics(client_name: str, analysis: dict, state: dict, worktree: str) -> list:
+    """
+    Diagnostics temporaires gardés pour ce run (D7) : exécutés (sortie lue dans le rapport), ils sont retirés du
+    worktree (commit dédié) et les lots ne les attendent plus. Renvoie les fichiers modifiés.
+    """
+    waiting = [lot for lot in state.get("lots") or [] if lot.get("diagnostics_en_attente")]
+    if not analysis.get("diagnostics") or not waiting or not worktree or not os.path.isdir(worktree):
+        return []
+    removed = cucumber_diagnostic.remove_temporary(worktree)
+    if removed:
+        cucumber_decisions.commit_decision(worktree, client_name, state.get("base", ""), removed,
+                                           f"Retrait des diagnostics temporaires exécutés au run importé n° "
+                                           f"{analysis['numero']}")
+    for lot in waiting:
+        lot.pop("diagnostics_en_attente", None)
+    save_state(client_name, state)
+    return removed
 
 
 def latest_bilan(client_name: str) -> dict:

@@ -5,7 +5,7 @@ Bilan), 0 token : état de chaque étape, résumé en une ligne et action suivan
 import os
 import re
 
-from tools import cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_import
+from tools import cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_import
 from tools.cucumber_tools import (_read_json, completable_specifics, init_patch_path, patch_path, pending_lots,
                                   worktree_dir)
 
@@ -137,16 +137,28 @@ def execution_step(client_name: str, analysis: dict) -> dict:
     return _step("execution", "attention" if failed or slow else "fait", summary)
 
 
-def correction_step(rows: list, analysis: dict) -> dict:
-    """Lots de correction proposés au dernier import, tâches en échec pour une cause « test »."""
+def correction_step(client_name: str, rows: list, analysis: dict, state: dict) -> dict:
+    """
+    Décisions en attente, lots de correction proposés au dernier import, causes à prouver, diagnostics en attente
+    du prochain run, tâches en échec pour une cause « test ».
+    """
+    decisions = len(cucumber_decisions.pending(client_name)) if client_name else 0
     proposals = analysis.get("propositions") or []
+    to_prove = analysis.get("a_prouver") or []
+    diagnostics = sum(len(lot.get("diagnostics_en_attente") or []) for lot in state.get("lots") or [])
     failing = cucumber_coverage.failing_test_causes(rows)
-    if not proposals and not failing:
-        return _step("correction", "vide", "aucune correction en attente")
-    parts = [f"{len(proposals)} lot(s) de correction proposé(s)"] if proposals else []
+    parts = [f"{decisions} décision(s) en attente"] if decisions else []
+    parts += [f"{len(proposals)} lot(s) de correction proposé(s)"] if proposals else []
+    parts += [f"{len(to_prove)} cause(s) à prouver"] if to_prove else []
+    parts += [f"{diagnostics} diagnostic(s) en attente du prochain run"] if diagnostics else []
     parts += [f"{failing} tâche(s) en échec pour une cause « test »"] if failing else []
-    return _step("correction", "a_faire", ", ".join(parts),
-                 "Lancer la correction ciblée" if proposals else "Importer le dernier run pour le classer")
+    if not parts:
+        return _step("correction", "vide", "aucune correction en attente")
+    action = ("Trancher les décisions en attente" if decisions else "Lancer la correction ciblée" if proposals else
+              "Apporter une preuve pour les causes non résolues" if to_prove else
+              "Lancer le run suivant puis l'importer" if diagnostics else "Importer le dernier run pour le classer")
+    return _step("correction", "attention" if to_prove and not (decisions or proposals) else "a_faire",
+                 ", ".join(parts), action)
 
 
 def review_counts(state: dict) -> dict:
@@ -189,7 +201,8 @@ def journey(client_name: str, inventory: dict, profile_doc: dict, state: dict, r
     analysis = last_analysis(client_name) if client_name else {}
     return [project_step(client_name, inventory, profile_doc, state), coverage_step(rows),
             selection_step(selected, lots), generation_step(client_name, state),
-            execution_step(client_name, analysis), correction_step(rows, analysis), review_step(client_name, state)]
+            execution_step(client_name, analysis), correction_step(client_name, rows, analysis, state),
+            review_step(client_name, state)]
 
 
 def next_step(steps: list) -> str:

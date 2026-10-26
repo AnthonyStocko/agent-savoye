@@ -147,7 +147,8 @@ def test_deactivate_keeps_scenario_and_moves_client_tag(tmp_path, monkeypatch):
     assert CLIENT_TAG not in scenarios["Motif de blocage"]["tags"]
     assert CLIENT_TAG in scenarios["Statut du contenant"]["tags"]
     assert text.startswith("@WMS\nFeature: Stock")
-    assert "  # À revoir : environnement — non vérifié — environnement : No route found" in text
+    assert "  # À revoir : environnement — cause PROUVÉE — non vérifié — environnement : No route found" in text
+    assert "réactivation : réactiver quand l'environnement" in text
     assert 'Then STOCK- le motif est "DECANTING"' in text
     # Tag générique configurable
     monkeypatch.setenv("CUCUMBER_TAG_A_REVOIR", "DESACTIVE")

@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1480,6 +1480,50 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
     lot["revue"] = review
 
 
+def keep_diagnostics(lot: dict, label: str, worktree: str, mode: str, conventions: dict, push) -> None:
+    """
+    Diagnostics temporaires (D7) en fin de vérification : avec un moyen d'exécution, ils ont été exécutés et sont
+    retirés. Sans moyen d'exécution mais avec la branche lue par le job (profil), ils restent dans le worktree,
+    poussés sur cette branche, pour s'exécuter au prochain run ; ils sont retirés après l'import de ce run. Sinon,
+    retirés (ils ne s'exécuteraient jamais).
+    """
+    temporary = cucumber_diagnostic.temporary_steps(worktree)
+    if temporary and not mode and conventions.get("verify_branch"):
+        error = push()
+        if not error:
+            lot["diagnostics_en_attente"] = temporary
+            print(f"[LOT {label}] ⏳ {len(temporary)} step(s) de diagnostic temporaire gardé(s) pour le prochain run "
+                  f"(branche {conventions['verify_branch']}) : retirés automatiquement après son import.")
+            return
+        print(f"[LOT {label}] ⛔ Diagnostic temporaire non poussé ({error}) : retiré.")
+    elif temporary and not mode:
+        print(f"[LOT {label}] ⚠️ Diagnostic temporaire sans moyen d'exécution ni branche lue par le job (profil) : "
+              f"il ne s'exécuterait jamais, retiré.")
+    for rel in cucumber_diagnostic.remove_temporary(worktree):
+        print(f"[LOT {label}] 🧹 Diagnostic temporaire retiré : {rel}")
+    lot.pop("diagnostics_en_attente", None)
+
+
+def hold_meaning_changes(client: str, worktree: str, before: dict, client_tag: str, label: str, lot: dict) -> set:
+    """
+    D2 : réalignement d'un attendu sur le code ou valeur d'un step existant changée par une correction — la
+    modification est gardée à part dans une décision en attente, le scénario d'origine est désactivé
+    provisoirement. Renvoie les identifiants des scénarios concernés.
+    """
+    held = set()
+    for change in cucumber_decisions.held_changes(worktree, before, client_tag):
+        identifier = cucumber_verify.scenario_id(change["fichier"], change["titre"])
+        cucumber_decisions.propose(client, change["type"], change["proposition"], fichier=change["fichier"],
+                                   titre=change["titre"], scenario=identifier, lot=lot["numero"],
+                                   avant=change["avant"], apres=change["apres"])
+        held.add(identifier)
+        print(f"[LOT {label}] ✋ Décision en attente ({cucumber_decisions.TYPES[change['type']]}) : "
+              f"{change['proposition']} — scénario désactivé provisoirement, modification gardée à part.")
+    lot.setdefault("decisions_en_attente", [])
+    lot["decisions_en_attente"] = sorted(set(lot["decisions_en_attente"]) | held)
+    return held
+
+
 def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, base: str, files: list,
                          results: list, mode: str, mode_message: str, client: str, cucumber_std_dir: str,
                          compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
@@ -1577,13 +1621,14 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         violations = refused + cucumber_a_revoir.check_corrections(worktree, before)
         for error in violations:
             print(f"[LOT {label}] ⛔ {error}")
+        held = hold_meaning_changes(client, worktree, before, conventions.get("client_tag", ""), label, lot)
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         check = verify_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
                                     values, model, work_key, run_dir, on_usage, inspired_of(results), context,
                                     lot.setdefault("base", []))
         if not check["ok"] and not check.get("environnement"):
             break
-        bad = {t: v for t, v in bad.items() if t not in deployed}
+        bad = {t: v for t, v in bad.items() if t not in deployed and v["id"] not in held}
         present = cucumber_verify.tagged_scenarios(worktree, files, bad)
         for tag in set(bad) - set(present):
             result["scenarios"][tag].update(statut="supprime", motif="supprimé par la correction")
@@ -1600,16 +1645,29 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         # D7 : un diagnostic temporaire ne s'exécute qu'une fois, sa sortie est gardée dans le journal du scénario
         for rel in cucumber_diagnostic.remove_temporary(worktree):
             print(f"[LOT {label}] 🧹 Diagnostic temporaire exécuté puis retiré : {rel}")
-    for rel in cucumber_diagnostic.remove_temporary(worktree):
-        print(f"[LOT {label}] 🧹 Diagnostic temporaire retiré : {rel}")
+    keep_diagnostics(lot, label, worktree, mode, conventions, lambda: on_branch(base, sources)[0])
+    # Scénarios dont une modification attend une décision humaine : désactivés provisoirement, hors jugement
+    waiting = set(lot.get("decisions_en_attente") or [])
+    for item in result["scenarios"].values():
+        if item["id"] in waiting and "décision en attente" not in item.get("motif", ""):
+            item["motif"] = (item.get("motif", "") + " — décision en attente").strip(" —")
+    judged = {t: v for t, v in result["scenarios"].items() if v["id"] not in waiting}
     # RÈGLE 3 : désactivation des seuls blocages hors test prouvés, ou arrêt pour décision humaine
-    decision = cucumber_a_revoir.decide(result["scenarios"], spec_of) if mode else {
+    decision = cucumber_a_revoir.decide(judged, spec_of) if mode else {
         "desactiver": {}, "faibles": [], "bloquants": [], "arret": False, "motifs": []}
     located = cucumber_verify.tagged_scenarios(worktree, files, result["scenarios"])
+    # D2 : chaque désactivation est proposée (désactivation provisoire, décision en attente)
     disabled = cucumber_a_revoir.apply_decision(worktree, files, result["scenarios"], decision,
-                                                conventions.get("client_tag", ""), located)
+                                                conventions.get("client_tag", ""), located, pending=True)
     for entry in disabled:
-        print(f"[LOT {label}] 🔕 Désactivé ({cucumber_a_revoir.CAUSES[entry['cause']][0]}) : {entry['fichier']} / "
+        label_cause = cucumber_a_revoir.CAUSES[entry["cause"]][0]
+        cucumber_decisions.propose(
+            client, "desactivation", f"{entry['fichier']} / {entry['titre']} : {label_cause} ("
+            + (cucumber_a_revoir.PROVEN if entry["prouvee"] else "cause " + cucumber_a_revoir.UNPROVEN) + ")",
+            fichier=entry["fichier"], titre=entry["titre"], scenario=entry["id"], lot=lot["numero"],
+            cause=entry["cause"], preuve=entry["preuve"], reactivation=entry["reactivation"],
+            prouvee=entry["prouvee"])
+        print(f"[LOT {label}] 🔕 Désactivé, décision en attente ({label_cause}) : {entry['fichier']} / "
               f"{entry['titre']}")
     if disabled and not cucumber_a_revoir.runner_excludes_a_revoir(conventions.get("runner")):
         print(f"[LOT {label}] ⚠️ Le runner n'exclut pas {cucumber_a_revoir.a_revoir_tag()} : les scénarios désactivés "
@@ -2028,8 +2086,14 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     RÈGLE 3 suivent comme pour un lot généré. Renvoie les fichiers du lot.
     """
     files = sorted({s["fichier"] for s in lot["corrections"]})
-    lines = [f"- {s['id']} [tag {s['tag']}] : en échec dans le run importé n° {lot['import']} — {s['step']} — "
-             f"{s['message']}" for s in lot["corrections"]]
+    lines = []
+    for s in lot["corrections"]:
+        lines.append(f"- {s['id']} [tag {s['tag']}] : en échec dans le run importé n° {lot['import']} — {s['step']} "
+                     f"— {s['message']}" + (f" (correction n° {s['tentatives'] + 1} de cette cause : change "
+                                            f"d'approche)" if s.get("tentatives") else ""))
+        lines += [f"  - extrait des logs serveur : {e}" for e in s.get("preuves") or []]
+        lines += [f"  - sortie du diagnostic temporaire : {s['diagnostic']}"] if s.get("diagnostic") else []
+        lines += [f"  - décision humaine refusée : « {c} »" for c in s.get("refus") or []]
     print(f"[LOT {label}] Correction de {len(lines)} scénario(s) en échec dans l'import n° {lot['import']}.")
     prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
                            erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
@@ -2050,6 +2114,7 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     on_usage(usage)
     for error in cucumber_a_revoir.check_corrections(worktree, before):
         print(f"[LOT {label}] ⛔ {error}")
+    hold_meaning_changes(values.get("client_name", ""), worktree, before, values.get("client_tag", ""), label, lot)
     return list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
 
 
@@ -2463,6 +2528,12 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             for result in results:
                 for constat in result["constats"]:
                     print(f"[LOT {label}] Constat {result['id']} — {cucumber_tools.constat_line(constat)}")
+                    # Test jugé tautologique, écart spécification / code : soumis à une décision humaine
+                    if constat["type"] in ("tautologique", "ecart_spec_code"):
+                        cucumber_decisions.propose(
+                            client, constat["type"], f"{specifics.get(result['id'], {}).get('libelle', result['id'])}"
+                            f" : {constat['detail']}", spec=result["id"], lot=lot["numero"],
+                            fichier=constat.get("fichier", ""))
             # Contrôles de pertinence en Python, puis une revue bornée des seuls scénarios signalés
             review_cucumber_lot(lot, lot_specs, label, worktree, files, results, reference,
                                 {**fixed_values, **java}, model, work_key, run_dir, lambda usage: add_usage(lot, usage))
@@ -2560,7 +2631,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     temporary = cucumber_diagnostic.temporary_steps(worktree)
     state["steps_temporaires"] = temporary
     cucumber_tools.save_state(client, state)
-    if temporary:
+    waiting = [t for lot in lots for t in lot.get("diagnostics_en_attente") or []]
+    if temporary and set(temporary) <= set(waiting):
+        print(f"\n[CUCUMBER] ⏳ Patch non mis à jour : {len(temporary)} step(s) de diagnostic temporaire en attente "
+              f"du prochain run (retirés après son import) ; le patch précédent, sans diagnostic, est conservé.")
+    elif temporary:
         if os.path.exists(patch_file):
             os.remove(patch_file)
         print(f"\n[CUCUMBER] ⛔ Patch non produit : {len(temporary)} step(s) "
