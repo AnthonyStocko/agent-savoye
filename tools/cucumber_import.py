@@ -531,7 +531,9 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         failures = {i: r for i, r in results.items() if r["statut"] != "passe"}
         out["resultats"] = results
         out["groupes"] = group_failures(failures)
-        out["durees"] = slow_scenarios(scenario_durations(report, console), results)
+        durations = scenario_durations(report, console)
+        out["durees"] = {**slow_scenarios(durations, results),
+                         "par_scenario": {i: round(d, 1) for i, d in durations.items()}}
         out["init_en_echec"] = init_failure(report, results, *init_markers(client_name))
         out["avertissements"] = log_warnings([(f["nom"], f["texte"]) for f in files if f["type"] == "logs"],
                                              failures)

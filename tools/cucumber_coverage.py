@@ -21,7 +21,7 @@ import os
 import re
 from datetime import datetime
 
-from tools import cucumber_import, cucumber_studio
+from tools import cucumber_audit, cucumber_import, cucumber_studio
 from tools.cucumber_tools import (_read_json, _write_json, a_revoir_tag, cache_dir, latest_results, load_state,
                                   worktree_dir)
 from tools.cucumber_verify import NOT_TEST_STATUSES, all_verified, failure_category, scenario_id
@@ -194,10 +194,13 @@ def verified_results(state: dict) -> dict:
 
 def scenario_status(identifier: str, sources: dict) -> dict:
     """
-    État d'un scénario : {id, etat (vert | echec | desactive | non_execute), faible, cause, nature, derniere}.
-    Ordre : désactivé dans le worktree, dernier import, vérification du lot.
+    État d'un scénario : {id, etat (vert | echec | desactive | non_execute), faible, cause, nature, derniere,
+    audit, audit_motifs}. Ordre : désactivé dans le worktree, dernier import, vérification du lot ; verdict du
+    dernier audit joint.
     """
-    out = {"id": identifier, "etat": "non_execute", "faible": False, "cause": "", "nature": "", "derniere": ""}
+    audited = (sources.get("audit") or {}).get(identifier) or {}
+    out = {"id": identifier, "etat": "non_execute", "faible": False, "cause": "", "nature": "", "derniere": "",
+           "audit": audited.get("verdict", ""), "audit_motifs": audited.get("motifs") or []}
     if identifier in sources["desactives"]:
         return {**out, "etat": "desactive", "cause": sources["desactives"][identifier]}
     imported = sources["imports"].get(identifier)
@@ -267,6 +270,10 @@ def spec_state(spec: dict, result: dict, scenarios: list, testable: dict) -> tup
         green = [s for s in active if s["etat"] == "vert"]
         if green and all(s["faible"] for s in green):
             return "partiel", "scénarios « faibles » : ils passent aussi sans le spécifique"
+        # Audit (9i) : scénarios qui ne vérifient qu'une configuration ou la présence d'une donnée
+        if all(s["faible"] or s.get("audit") == "partiel" for s in active):
+            motifs = [m for s in active for m in s.get("audit_motifs") or []]
+            return "partiel", "audit : " + (motifs[0] if motifs else "scénarios partiels")
         return ("vert", "") if green else ("non_execute", "")
     if result.get("statut") == "non_couvert" and result.get("raison"):
         return "non_testable", result["raison"]
@@ -292,7 +299,8 @@ def last_execution(scenarios: list) -> str:
 def coverage_sources(client_name: str, state: dict) -> dict:
     """Résultats croisés une fois pour toutes les lignes : imports, vérifications, scénarios désactivés."""
     return {"imports": import_results(client_name), "verifies": verified_results(state),
-            "desactives": disabled_scenarios(worktree_dir(client_name))}
+            "desactives": disabled_scenarios(worktree_dir(client_name)),
+            "audit": cucumber_audit.load_audit(client_name).get("scenarios") or {}}
 
 
 def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources: dict = None) -> list:

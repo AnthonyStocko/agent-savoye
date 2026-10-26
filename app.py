@@ -10,10 +10,10 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import (cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions,
-                   cucumber_environment, cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers,
-                   cucumber_journey, cucumber_profile, cucumber_run, cucumber_studio, cucumber_tools, cucumber_verify,
-                   integration_tools, jenkins_tools, knowledge_tools)
+from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage,
+                   cucumber_decisions, cucumber_environment, cucumber_import, cucumber_init, cucumber_init_data,
+                   cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run, cucumber_studio,
+                   cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -1462,7 +1462,9 @@ def render_coverage_detail(client: str, row: dict) -> None:
             st.dataframe([{"Scénario": s["id"].split("::", 1)[-1], "Feature": s["id"].split("::", 1)[0],
                            "État": cucumber_coverage.STATES[s["etat"]][1] + " " + cucumber_coverage.STATES[s["etat"]][0]
                            + (" (faible)" if s["faible"] else ""),
-                           "Cause": s["cause"], "Dernière exécution": s["derniere"]} for s in row["scenarios"]],
+                           "Cause": s["cause"], "Dernière exécution": s["derniere"],
+                           "Audit": cucumber_audit.VERDICTS.get(s.get("audit"), "—"),
+                           "Constats de l'audit": " ; ".join(s.get("audit_motifs") or [])} for s in row["scenarios"]],
                          hide_index=True, width="stretch")
         else:
             st.caption("Aucun scénario lié.")
@@ -1535,6 +1537,7 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
     st.caption(f"{rates['total']} tâche(s) de l'inventaire du {inventory['genere_le'].replace('T', ' ')[:16]} · "
                + cucumber_coverage.legend())
     client = ctx["client"]
+    render_cucumber_audit(client, inventory, rows)
     with st.container(horizontal=True):
         states = st.multiselect("État", list(cucumber_coverage.STATES),
                                 format_func=lambda k: " ".join(cucumber_coverage.STATES[k][1::-1]),
@@ -1570,6 +1573,28 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
             st.markdown(f"- **{s['libelle']}**\n" + "\n".join(
                 f"    - `{t['path'].split('features/', 1)[-1]}` — {t['feature']} :gray[(score {t['score']}, "
                 f"{t['raison']})]" for t in tests))
+
+
+def render_cucumber_audit(client: str, inventory: dict, rows: list) -> None:
+    """
+    Action « Auditer » (point 9i, 0 token) : chaque scénario lié à une tâche détecte-t-il l'absence du spécifique,
+    qualité de ses assertions, robustesse, durée ; les verdicts « partiel » alimentent l'état partiel.
+    """
+    audit = cucumber_audit.load_audit(client)
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if st.button("Auditer les tests", icon=":material/policy:", key=f"cucumber_audit_{client}",
+                     help="Pour chaque scénario lié à une tâche : détecte-t-il l'absence du spécifique (exécution, "
+                          "sinon éléments propres cités), qualité des assertions, robustesse (attente fixe, date en "
+                          "dur, comptage global, dépendance à un autre scénario), durée au dernier run. Aucun appel "
+                          "à Claude."):
+            state = cucumber_tools.load_state(client)
+            verified = {k: v["statut"] for k, v in cucumber_coverage.verified_results(state).items()}
+            audit = cucumber_audit.run_audit(client, inventory, rows, verified)
+            st.rerun()
+        st.caption(cucumber_audit.summary_line(audit) + (
+            f" · {len(audit['introuvables'])} scénario(s) introuvable(s) dans les features"
+            if audit.get("introuvables") else "") if audit else
+                   "Aucun audit : les tests existants n'ont pas encore été évalués.")
 
 
 def selection_candidates(rows: list) -> list:

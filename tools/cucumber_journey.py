@@ -5,8 +5,8 @@ Bilan), 0 token : état de chaque étape, résumé en une ligne et action suivan
 import os
 import re
 
-from tools import (cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_import,
-                   cucumber_profile, cucumber_run)
+from tools import (cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions,
+                   cucumber_import, cucumber_profile, cucumber_run)
 from tools.cucumber_tools import (_read_json, completable_specifics, init_patch_path, patch_path, pending_lots,
                                   worktree_dir)
 
@@ -53,16 +53,18 @@ def project_step(client_name: str, inventory: dict, profile_doc: dict, state: di
     return _step("projet", status, " · ".join(parts), action)
 
 
-def coverage_step(rows: list) -> dict:
+def coverage_step(rows: list, client_name: str = "") -> dict:
     """Taux réel et écrit, partielles ; action : choisir les tâches à couvrir, sinon exécuter les tests écrits."""
     if not rows:
         return _step("couverture", "vide", "aucune tâche inventoriée", "Lancer l'inventaire (étape Projet)")
     count = cucumber_coverage.rates(rows)["par_etat"]
     to_cover = count["non_couvert"] + count["partiel"]
+    audited = cucumber_audit.summary_line(cucumber_audit.load_audit(client_name)) if client_name else ""
     summary = cucumber_coverage.summary_line(rows) + "".join(
         f", {count[key]} {label}" for key, label in (("echec", "en échec"), ("desactive", "désactivée(s)"),
                                                      ("non_execute", "jamais exécutée(s)"),
                                                      ("non_testable", "non testable(s) aujourd'hui")) if count[key])
+    summary += f" · {audited}" if audited else ""
     if to_cover:
         return _step("couverture", "a_faire", summary, f"Choisir parmi les {to_cover} tâche(s) non couvertes ou "
                                                        f"partielles")
@@ -208,7 +210,7 @@ def journey(client_name: str, inventory: dict, profile_doc: dict, state: dict, r
             selected: int = 0, lots: int = 0) -> list:
     """Les 7 étapes du parcours, dans l'ordre."""
     analysis = last_analysis(client_name) if client_name else {}
-    return [project_step(client_name, inventory, profile_doc, state), coverage_step(rows),
+    return [project_step(client_name, inventory, profile_doc, state), coverage_step(rows, client_name),
             selection_step(selected, lots), generation_step(client_name, state),
             execution_step(client_name, analysis, profile_doc, state), correction_step(client_name, rows, analysis, state),
             review_step(client_name, state)]
