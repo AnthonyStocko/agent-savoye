@@ -135,3 +135,28 @@ def failed_stage(build_url: str) -> str:
                      if s.get("status") in ("FAILED", "FAILURE")), "")
     except (requests.RequestException, ValueError):
         return ""
+
+
+def build_info(build_url: str) -> dict:
+    """Build terminé : {"url", "numero", "resultat", "debut" (ms), "artifacts"} ; {} si introuvable."""
+    _, auth = _jenkins()
+    try:
+        response = requests.get(f"{build_url.rstrip('/')}/api/json", auth=auth, timeout=20,
+                                params={"tree": "number,result,timestamp,artifacts[relativePath]"})
+        if response.status_code != 200:
+            return {}
+        build = response.json()
+        return {"url": build_url.rstrip("/"), "numero": build.get("number"), "resultat": build.get("result") or "",
+                "debut": build.get("timestamp"), "artifacts": [a["relativePath"] for a in build.get("artifacts") or []]}
+    except (requests.RequestException, ValueError):
+        return {}
+
+
+def build_bytes(build_url: str, relative: str) -> bytes:
+    """Contenu d'un fichier d'un build (consoleText, artifact/<chemin>), en mémoire seulement ; b'' si absent."""
+    _, auth = _jenkins()
+    try:
+        response = requests.get(f"{build_url.rstrip('/')}/{relative}", auth=auth, timeout=120)
+        return response.content if response.status_code == 200 else b""
+    except requests.RequestException:
+        return b""

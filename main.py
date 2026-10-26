@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
+from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -809,6 +809,9 @@ def main():
     parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : patch d'initialisation du client (copie des Init_<MODULE> du Cucumber Standard pour ses modules), sans appel à Claude")
     parser.add_argument("--profile-only", action="store_true", help="generate-cucumber-client : détecte le profil client (racine et tag des features, init, clear, fichiers du module spécifique, runner, codes de référence, version de la bibliothèque) dans le dépôt <client>-cucumber, sans appel à Claude")
     parser.add_argument("--health-only", action="store_true", help="generate-cucumber-client : bilan de santé du dépôt <client>-cucumber avant génération (emplacement et tags des features, fichiers de données manquants, compilation et dry-run de toutes ses features), sans appel à Claude")
+    parser.add_argument("--import-run", nargs="*", default=None, help="generate-cucumber-client : import d'un rapport d'exécution (console Jenkins, rapport Cucumber JSON, exports de logs serveur CSV), secrets masqués avant stockage, analysé sans appel à Claude")
+    parser.add_argument("--import-url", default="", help="generate-cucumber-client : import d'un build Jenkins (console et rapports Cucumber JSON lus en mémoire), analysé sans appel à Claude")
+    parser.add_argument("--from-import", type=int, default=0, help="generate-cucumber-client --complete : lots « correction » des échecs « test » des scénarios de l'agent de l'import n° N")
     parser.add_argument("--server-log", default="", help="generate-cucumber-client : export de logs serveur à contrôler (avec --log-scenario) : couvre-t-il l'heure du step en échec ? (l'outil d'export peut garder les seules lignes les plus récentes), sans appel à Claude")
     parser.add_argument("--log-scenario", default="", help="generate-cucumber-client --server-log : identifiant ou tag @agent_… du scénario en échec (dernière génération)")
     parser.add_argument("--init-modules", default="", help="generate-cucumber-client --init-only : modules retenus parmi WMS, TMS, OMS, séparés par des virgules (défaut : détectés dans les dépôts et l'inventaire du client)")
@@ -1787,6 +1790,84 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     return 0
 
 
+def run_cucumber_import(client: str, paths: list, build_url: str = "") -> int:
+    """
+    Import d'un rapport d'exécution (0 token, cucumber_import) : fichiers lus et masqués en mémoire, ou build
+    Jenkins ; analyse affichée et écrite dans imports/<n>/analyse.md. Renvoie 0 si l'import est analysé, 1 sinon,
+    2 si rien n'a été importé.
+    """
+    files = {}
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                files[os.path.basename(path)] = f.read()
+        except OSError as e:
+            print(f"[CUCUMBER IMPORT] ❌ {path} illisible : {e}")
+    if build_url:
+        fetched = cucumber_import.build_files(build_url)
+        print(f"[CUCUMBER IMPORT] Build {build_url} : {', '.join(fetched) or 'rien de lisible'}")
+        files.update(fetched)
+    imported = cucumber_import.import_files(client, files, build_url)
+    for message in imported["messages"]:
+        print(f"[CUCUMBER IMPORT] {message}")
+    if not imported["numero"]:
+        print("[CUCUMBER IMPORT] Rien de nouveau à importer.")
+        return 2
+    analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client),
+                                       cucumber_tools.worktree_dir(client))
+    print_import(analysis)
+    return 1 if analysis["non_analyse"] else 0
+
+
+def print_import(analysis: dict) -> None:
+    """Résumé console d'une analyse d'import."""
+    label = f"[CUCUMBER IMPORT] Import n° {analysis['numero']}"
+    if analysis["non_analyse"]:
+        print(f"{label} ⛔ non analysé : {analysis['non_analyse']}")
+        return
+    failures = sum(len(g["scenarios"]) for g in analysis["groupes"])
+    print(f"{label} : {analysis['tests']} test(s), {failures} échec(s), {len(analysis['groupes'])} cause(s) racine.")
+    for group in analysis["groupes"][:10]:
+        print(f"    {len(group['scenarios'])} × {group['libelle']} ({group['categorie']}) — {group['step']} — "
+              f"{group['message'][:160]}")
+    comparison = analysis.get("comparaison") or {}
+    if comparison:
+        print(f"{label} : par rapport à l'import n° {comparison['import']} — {len(comparison['corriges'])} corrigé(s), "
+              f"{len(comparison['nouveaux'])} nouveau(x), {len(comparison['inchanges'])} inchangé(s), "
+              f"{len(comparison['disparus'])} disparu(s).")
+    for entry in (e for e in analysis["logs"] if e["a_exporter"]):
+        print(f"{label} : logs à exporter pour {entry['id']} : {entry['a_exporter']}")
+    if analysis["propositions"]:
+        print(f"{label} : {len(analysis['propositions'])} lot(s) de correction proposé(s) ("
+              f"{sum(len(p['scenarios']) for p in analysis['propositions'])} scénario(s)) : --complete --from-import "
+              f"{analysis['numero']} pour les lancer.")
+    print(f"{label} : rapport analyse.md dans le dossier de l'import.")
+
+
+def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model: str, work_key: str,
+                       run_dir: str, on_usage) -> list:
+    """
+    Lot « correction » (import d'un rapport d'exécution) : un appel de correction avec le message réel de chaque
+    scénario (cucumber_client_fix.md), contrôlé (RÈGLE 3c). La compilation, la vérification par exécution et la
+    RÈGLE 3 suivent comme pour un lot généré. Renvoie les fichiers du lot.
+    """
+    files = sorted({s["fichier"] for s in lot["corrections"]})
+    lines = [f"- {s['id']} [tag {s['tag']}] : en échec dans le run importé n° {lot['import']} — {s['step']} — "
+             f"{s['message']}" for s in lot["corrections"]]
+    print(f"[LOT {label}] Correction de {len(lines)} scénario(s) en échec dans l'import n° {lot['import']}.")
+    prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
+                           erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
+    before = cucumber_a_revoir.snapshot(worktree, files)
+    effort = cucumber_fix_effort()
+    returncode, _, usage, _ = run_cucumber_claude(prompt, model, CUCUMBER_TOOLS,
+                                                  str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort)
+    report_token_usage(work_key, "cucumber-import-fix", model, usage, len(prompt), returncode, effort)
+    on_usage(usage)
+    for error in cucumber_a_revoir.check_corrections(worktree, before):
+        print(f"[LOT {label}] ⛔ {error}")
+    return list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
+
+
 def check_server_log(client: str, path: str, scenario: str) -> int:
     """
     Import d'un export de logs serveur (0 token) : l'export couvre-t-il l'heure du step en échec du scénario
@@ -1860,6 +1941,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     client = args.client_name
     if args.server_log:
         return check_server_log(client, args.server_log, args.log_scenario)
+    if args.import_run is not None or args.import_url:
+        return run_cucumber_import(client, args.import_run or [], args.import_url)
     base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
     if not base:
         print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")
@@ -1929,7 +2012,18 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         return 0
 
     # 2. Lots : complément, reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
-    if complete_state:
+    if complete_state and args.from_import:
+        state = complete_state
+        analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(args.from_import),
+                                                          "analyse.json"), {}) or {}
+        if analysis.get("non_analyse") or not analysis.get("propositions"):
+            print(f"[CUCUMBER] Import n° {args.from_import} : " + (analysis.get("non_analyse") or
+                  "aucune correction proposée (ou import inconnu)") + ".")
+            return 0
+        new_lots = cucumber_import.add_correction_lots(state, analysis)
+        print(f"[CUCUMBER] Import n° {args.from_import} : {len(new_lots)} lot(s) « correction » ajouté(s) ("
+              f"{sum(len(lot['corrections']) for lot in new_lots)} scénario(s)), lots précédents conservés.")
+    elif complete_state:
         state = complete_state
         cucumber_tools.drop_excluded(state, specifics)
         wanted = [i.strip() for i in args.specifics.split(",") if i.strip()] if args.specifics else \
@@ -2105,7 +2199,13 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"\n[LOT {label}] " + " ; ".join(s["libelle"] for s in lot_specs))
         java = cucumber_tools.client_java_context(client, worktree, std_java, conventions)
         context = {"init": client_init, "java": java, "conventions": conventions, "reference": reference}
-        if lot.get("statut") in ("erreur_compilation", "decision_humaine") and lot.get("resultats") is not None:
+        if lot.get("type") == "correction" and lot.get("resultats") is None:
+            # Lot « correction » d'un import : scénarios existants, aucune génération
+            results = []
+            lot.setdefault("tokens", {})
+            files = run_correction_lot(lot, label, worktree, {**fixed_values, **java}, model, work_key, run_dir,
+                                       lambda usage: add_usage(lot, usage))
+        elif lot.get("statut") in ("erreur_compilation", "decision_humaine") and lot.get("resultats") is not None:
             # Reprise d'un lot écrit mais qui ne compilait pas, ou arrêté pour décision humaine : correction et
             # vérification seules
             results, files = lot["resultats"], lot.get("fichiers") or []

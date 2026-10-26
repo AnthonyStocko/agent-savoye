@@ -9,8 +9,8 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import (cucumber_checks, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_profile,
-                   cucumber_tools, cucumber_verify, integration_tools)
+from tools import (cucumber_checks, cucumber_import, cucumber_init, cucumber_init_data, cucumber_initializers,
+                   cucumber_profile, cucumber_tools, cucumber_verify, integration_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -755,6 +755,74 @@ def integration_option_label(ticket: dict) -> str:
     return label
 
 
+def render_cucumber_import(client: str, state: dict, cucumber_cmd: list) -> None:
+    """
+    Import d'un rapport d'exécution (onglet Cucumber, 0 token) : fichiers déposés ou build Jenkins, secrets masqués
+    en mémoire, puis dernière analyse (causes racine, comparaison, logs à exporter, lots de correction proposés).
+    """
+    st.markdown("#### :material/upload_file: Import d'un rapport d'exécution")
+    with st.form(f"cucumber_import_{client}", border=True):
+        uploaded = st.file_uploader(
+            "Console Jenkins, rapport Cucumber JSON, exports de logs serveur (CSV)", accept_multiple_files=True,
+            type=["txt", "log", "json", "csv"],
+            help="Les secrets (-Dpassword, -DuserName, jetons, valeurs base64) sont masqués avant tout stockage ; "
+                 "seule l'empreinte du fichier brut est gardée.")
+        build_url = st.text_input("Ou URL d'un build Jenkins", placeholder="https://jenkins/job/…/123/",
+                                  help="Console et rapports Cucumber JSON du build, lus en mémoire.")
+        submitted = st.form_submit_button("Importer et analyser", icon=":material/analytics:")
+    if submitted:
+        files = {f.name: f.getvalue() for f in uploaded or []}
+        if build_url.strip():
+            files.update(cucumber_import.build_files(build_url.strip()))
+        imported = cucumber_import.import_files(client, files, build_url.strip())
+        for message in imported["messages"]:
+            st.info(message, icon=":material/info:")
+        if imported["numero"]:
+            cucumber_import.analyse(client, imported["numero"], state, cucumber_tools.worktree_dir(client))
+        elif not imported["messages"]:
+            st.warning("Aucun fichier à importer.")
+    index = cucumber_import.load_index(client)
+    if not index["imports"]:
+        st.caption("Aucun import pour ce client.")
+        return
+    numero = max(e["numero"] for e in index["imports"])
+    analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
+                                                      "analyse.json"), {}) or {}
+    if not analysis:
+        return
+    st.caption(f"Import n° {numero} — run {analysis.get('run') or '?'}"
+               + (f", build #{analysis['build']}" if analysis.get("build") else "")
+               + " · " + ", ".join(f"{f['nom']} ({f['type']})" for f in analysis["fichiers"]))
+    if analysis["non_analyse"]:
+        st.error(f"Non analysé : {analysis['non_analyse']}", icon=":material/block:")
+        return
+    failures = sum(len(g["scenarios"]) for g in analysis["groupes"])
+    comparison = analysis.get("comparaison") or {}
+    with st.container(horizontal=True):
+        st.metric("Tests", analysis["tests"], border=True)
+        st.metric("Échecs", failures, border=True)
+        st.metric("Causes racine", len(analysis["groupes"]), border=True)
+        if comparison:
+            st.metric(f"Corrigés depuis l'import n° {comparison['import']}", len(comparison["corriges"]), border=True)
+            st.metric("Nouveaux", len(comparison["nouveaux"]), border=True)
+            st.metric("Inchangés", len(comparison["inchanges"]), border=True)
+    if analysis["groupes"]:
+        st.dataframe([{"Scénarios": len(g["scenarios"]), "Cause": g["libelle"], "Catégorie": g["categorie"],
+                       "Step": g["step"], "Message": g["message"]} for g in analysis["groupes"]], hide_index=True)
+    uncovered = [e for e in analysis["logs"] if e["a_exporter"]]
+    if uncovered:
+        with st.expander(f"Logs serveur à exporter ({len(uncovered)})", icon=":material/schedule:"):
+            for entry in uncovered:
+                st.markdown(f"- `{entry['id']}` : {entry['a_exporter']}")
+    if analysis["propositions"]:
+        count = sum(len(p["scenarios"]) for p in analysis["propositions"])
+        st.markdown(f"**{len(analysis['propositions'])} lot(s) de correction proposé(s)** ({count} scénario(s) de "
+                    f"l'agent en échec pour une cause « test ») ; les autres échecs relèvent d'actions humaines.")
+        if st.button("Lancer la correction ciblée", icon=":material/build:", key=f"cucumber_import_fix_{numero}"):
+            st.info(f"Correction de l'import n° {numero} en cours...")
+            run_main_step(cucumber_cmd + ["--complete", "--from-import", str(numero)])
+
+
 with tab_integration:
     st.markdown("### 1. Critères de Recherche Jira")
     integration_criteria = search_criteria_form("integ_")
@@ -1381,6 +1449,10 @@ with tab_cucumber:
                                 st.rerun()
                 st.caption("Un verdict « Non pertinent » et son motif deviennent une consigne du projet, injectée "
                            "dans les lots des prochaines générations.")
+
+    # 4. Import d'un rapport d'exécution (0 token) : secrets masqués en mémoire avant tout stockage
+    if cucumber_client:
+        render_cucumber_import(cucumber_client, cucumber_state, cucumber_cmd)
 
     # Derniers livrables du client (affichés aussi après un rechargement de la page)
     if cucumber_client and os.path.exists(cucumber_tools.init_patch_path(cucumber_client)):
