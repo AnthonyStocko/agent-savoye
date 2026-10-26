@@ -439,3 +439,53 @@ def test_read_only_access_for_the_agent(base, rule):
     args = kt.read_only_args(base)
     assert args[:2] == ("--add-dir", kt.normalize_dir(base)) and args[2] == "--disallowedTools"
     assert args[3:] == (f"Write({rule})", f"Edit({rule})")
+
+
+# ---------------------------------------------------------------------------
+# Étape 5 : onglet (recherche, chemin sûr, changement de statut, import d'un fichier déposé)
+# ---------------------------------------------------------------------------
+
+def test_tab_search_filters(indexed, share):
+    documents = kt.load_index()["documents"]
+    rel = {k: kt.relative_path(str(share), p) for k, p in indexed.items()}
+    chemins = lambda **kw: [d["chemin"] for d in kt.search_documents(documents, **kw)]  # noqa: E731
+    assert chemins()[0] == rel["other_client"] and rel["old"] not in chemins()
+    assert set(chemins(projet="clientfictif")) == {rel["ticket"], rel["health"], rel["unrelated"]}
+    assert set(chemins(projet="PROJY")) == {rel["other_client"]}
+    assert chemins(doc_type="cucumber-sante") == [rel["health"]]
+    assert chemins(ticket="projx-1") == [rel["ticket"]]
+    assert set(chemins(ticket="projx-1", include_obsolete=True)) == {rel["ticket"], rel["old"]}
+    assert chemins(keyword="STOCK FAUX") == [rel["ticket"]] and chemins(keyword="réservations") == [rel["other_client"]]
+    assert chemins(keyword="introuvable") == []
+
+
+def test_absolute_path_stays_inside_the_share(share):
+    assert kt.absolute_path("ClientFictif/cadrage/a.md") == os.path.join(str(share), "ClientFictif", "cadrage", "a.md")
+    for bad in ("../dehors.md", "ClientFictif/../../dehors.md", "ClientFictif/cadrage/a.txt"):
+        with pytest.raises(ValueError):
+            kt.absolute_path(bad)
+
+
+def test_set_status_from_the_tab(indexed, share):
+    rel = {k: kt.relative_path(str(share), p) for k, p in indexed.items()}
+    body_before = kt.read_document(indexed["ticket"])[1]
+    assert kt.set_status(rel["ticket"], kt.STATUS_OBSOLETE)["ok"]
+    assert kt.read_document(indexed["ticket"])[0]["statut"] == kt.STATUS_OBSOLETE
+    replaced = kt.set_status(rel["ticket"], kt.STATUS_REPLACED, rel["health"])
+    meta, body = kt.read_document(indexed["ticket"])
+    assert replaced["ok"] and meta["remplace_par"] == rel["health"] and body == body_before
+    assert kt.set_status(rel["ticket"], kt.STATUS_ACTIVE)["ok"]
+    assert kt.read_document(indexed["ticket"])[0]["remplace_par"] == ""
+    assert not kt.set_status(rel["ticket"], kt.STATUS_REPLACED)["ok"]
+    assert not kt.set_status(rel["ticket"], kt.STATUS_REPLACED, rel["ticket"])["ok"]
+    assert not kt.set_status(rel["ticket"], kt.STATUS_REPLACED, "ClientFictif/cadrage/absent.md")["ok"]
+    assert not kt.set_status("../dehors.md", kt.STATUS_OBSOLETE)["ok"]
+    assert not kt.set_status(rel["ticket"], "supprimé")["ok"]
+
+
+def test_import_uploaded_text(share):
+    text = "---\nprojet: \"ANCIEN\"\n---\n# Audit\n\nConstat : -Dpassword=fuite\n"
+    result = kt.import_text("AUDIT.md", text, "PROJX", "audit", tickets=["PROJX-4", ""], client="ClientFictif")
+    meta, body = kt.read_document(result["chemin"])
+    assert result["statut"] == kt.PUBLISHED and meta["projet"] == "PROJX" and meta["sujet"] == "AUDIT"
+    assert meta["tickets"] == ["PROJX-4"] and "fuite" not in body and body.startswith("# Audit")

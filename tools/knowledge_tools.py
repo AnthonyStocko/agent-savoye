@@ -654,12 +654,18 @@ def import_markdown(path: str, projet: str, doc_type: str, tickets=(), client: s
     """
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
-            _, body = parse_document(f.read())
+            text = f.read()
     except (OSError, UnicodeDecodeError) as e:
         return {"statut": FAILED, "chemin": "", "message": f"{path} illisible ({e})", "remplacements": []}
-    return publish_knowledge(body, projet, doc_type, sujet or os.path.splitext(os.path.basename(path))[0],
-                             client=client, tickets=tickets, composants=composants, tags=tags,
-                             sources=())
+    return import_text(os.path.basename(path), text, projet, doc_type, tickets, client, sujet, composants, tags)
+
+
+def import_text(name: str, text: str, projet: str, doc_type: str, tickets=(), client: str = "", sujet: str = "",
+                composants=(), tags=()) -> dict:
+    """import_markdown d'un contenu déjà lu (fichier déposé dans l'IHM) ; `name` donne le sujet par défaut."""
+    _, body = parse_document(text)
+    return publish_knowledge(body, projet, doc_type, sujet or os.path.splitext(os.path.basename(name))[0],
+                             client=client, tickets=tickets, composants=composants, tags=tags, sources=())
 
 
 def _cli(argv=None) -> int:
@@ -952,6 +958,78 @@ def read_only_args(base: str = None) -> tuple:
     rule_path = "/" + posix if posix.startswith("/") else "//" + posix
     rule_path = rule_path.rstrip("/")
     return ("--add-dir", base, "--disallowedTools", f"Write({rule_path}/**)", f"Edit({rule_path}/**)")
+
+
+# ---------------------------------------------------------------------------
+# Onglet « Connaissances partagées » : recherche, chemin d'un document, changement de statut
+# ---------------------------------------------------------------------------
+
+def search_documents(documents: list, projet: str = "", doc_type: str = "", ticket: str = "", keyword: str = "",
+                     include_obsolete: bool = False) -> list:
+    """
+    Filtre de l'onglet (critères facultatifs, sans tenir compte de la casse) : projet (dossier, projet Jira ou
+    client), type exact, ticket, mot-clé (sujet, résumé, titres, composants, tags, auteur). Plus récents d'abord.
+    """
+    projet, ticket, keyword = projet.strip().casefold(), ticket.strip().casefold(), keyword.strip().casefold()
+    out = []
+    for doc in documents:
+        meta = doc.get("meta") or {}
+        if not include_obsolete and meta.get("statut", STATUS_ACTIVE) != STATUS_ACTIVE:
+            continue
+        if doc_type and meta.get("type") != doc_type:
+            continue
+        if projet and projet not in {doc["chemin"].split("/", 1)[0].casefold(),
+                                     str(meta.get("projet", "")).casefold(), str(meta.get("client", "")).casefold()}:
+            continue
+        if ticket and ticket not in {str(t).casefold() for t in meta.get("tickets") or []}:
+            continue
+        haystack = " ".join([str(meta.get(k, "")) for k in ("sujet", "resume", "auteur")]
+                            + [" ".join(map(str, meta.get(k) or [])) for k in ("composants", "tags")]
+                            + list(doc.get("titres") or [])).casefold()
+        if keyword and keyword not in haystack:
+            continue
+        out.append(doc)
+    return sorted(out, key=lambda d: str((d.get("meta") or {}).get("date", "")), reverse=True)
+
+
+def absolute_path(relative: str, base: str = None) -> str:
+    """Chemin d'un document du répertoire partagé ; ValueError si `relative` sort du répertoire ou n'est pas un .md."""
+    base = normalize_dir(base) if base else knowledge_dir()
+    if not base:
+        raise ValueError("répertoire partagé non configuré")
+    path = os.path.normpath(os.path.join(base, *str(relative or "").replace("\\", "/").split("/")))
+    root = os.path.normpath(base)
+    if not path.lower().endswith(".md") or os.path.commonpath([os.path.normcase(path), os.path.normcase(root)]) \
+            != os.path.normcase(root):
+        raise ValueError(f"document hors du répertoire partagé : {relative}")
+    return path
+
+
+def set_status(relative: str, statut: str, remplace_par: str = "", base: str = None) -> dict:
+    """
+    Action « marquer obsolète / remplacé par » de l'onglet : en-tête seul modifié, par écriture atomique. Remettre
+    « actif » efface « remplacé par ». Renvoie {"ok", "message"}.
+    """
+    base = normalize_dir(base) if base else knowledge_dir()
+    try:
+        path = absolute_path(relative, base)
+        if not os.path.isfile(path):
+            raise ValueError(f"document introuvable : {relative}")
+        replacement = ""
+        if statut == STATUS_REPLACED:
+            replacement = str(remplace_par or "").strip().replace("\\", "/")
+            if not replacement:
+                raise ValueError("indiquez le document qui le remplace")
+            target = absolute_path(replacement, base)
+            if not os.path.isfile(target):
+                raise ValueError(f"document de remplacement introuvable : {replacement}")
+            if os.path.normcase(target) == os.path.normcase(path):
+                raise ValueError("un document ne peut pas se remplacer lui-même")
+        update_header(path, statut=statut, remplace_par=replacement)
+    except (ValueError, OSError) as e:
+        return {"ok": False, "message": str(e)}
+    label = f"remplacé par {replacement}" if replacement else statut
+    return {"ok": True, "message": f"{relative} : {label}"}
 
 
 if __name__ == "__main__":
