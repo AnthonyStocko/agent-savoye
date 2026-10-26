@@ -93,9 +93,10 @@ def test_failures_grouped_compared_and_proposed(setup):
         start="2026-10-24T08:00:00Z").encode()})
     comparison = cimp.analyse(CLIENT, second["numero"], state, repo)["comparaison"]
     assert comparison["import"] == first["numero"] and comparison["corriges"] == [f"{REL}::S0"]
-    assert comparison["nouveaux"] == [f"{REL}::S3"] and len(comparison["inchanges"]) == 2
+    assert comparison["regressions"] == [f"{REL}::S3"] and comparison["nouveaux"] == []
+    assert len(comparison["inchanges"]) == 2
     md = open(os.path.join(cimp.imports_dir(CLIENT), str(second["numero"]), "analyse.md"), encoding="utf-8").read()
-    assert "Corrigés : 1 ; nouveaux : 1" in md
+    assert "Corrigés : 1 ; nouveaux : 0 ; régressions : 1" in md
 
 
 def test_server_log_export_must_cover_failed_steps(setup):

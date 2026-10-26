@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_checks, cucumber_coverage, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_diagnostic, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1975,9 +1975,15 @@ def run_cucumber_import(client: str, paths: list, build_url: str = "", project: 
     analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client),
                                        cucumber_tools.worktree_dir(client))
     print_import(analysis)
-    share_file(os.path.join(cucumber_import.imports_dir(client), str(analysis["numero"]), "analyse.md"),
-               project or client.upper(), "cucumber-diagnostic-run", f"Run importé n° {analysis['numero']}",
-               client=client, tags=["cucumber"])
+    # Bilan (défauts en tête, corrigés, désactivés, doutes, corrections manuelles, prochaine action) : IHM,
+    # A_REVOIR.md du worktree et répertoire partagé
+    bilan = cucumber_bilan.after_import(client, analysis, cucumber_tools.load_state(client),
+                                        cucumber_tools.worktree_dir(client))
+    print(f"[CUCUMBER IMPORT] Bilan : {bilan['fichier']}" + (" ; A_REVOIR.md mis à jour et commité"
+                                                             if bilan["a_revoir"] else ""))
+    print(f"[CUCUMBER IMPORT] Prochaine action : {bilan['prochaine_action']}")
+    if knowledge_tools.enabled():
+        print(knowledge_tools.publish_line(cucumber_bilan.share_bilan(client, bilan, project)))
     return 1 if analysis["non_analyse"] else 0
 
 
@@ -1992,11 +1998,19 @@ def print_import(analysis: dict) -> None:
     for group in analysis["groupes"][:10]:
         print(f"    {len(group['scenarios'])} × {group['libelle']} ({group['categorie']}) — {group['step']} — "
               f"{group['message'][:160]}")
+    init = analysis.get("init_en_echec") or {}
+    if init:
+        print(f"{label} ⛔ initialisation en échec, aucun scénario jugé : {init['id']} — {init['step']} — "
+              f"{init['message'][:200]}")
+    for warning in analysis.get("avertissements") or []:
+        print(f"{label} ⚠️ {warning}")
     comparison = analysis.get("comparaison") or {}
     if comparison:
         print(f"{label} : par rapport à l'import n° {comparison['import']} — {len(comparison['corriges'])} corrigé(s), "
-              f"{len(comparison['nouveaux'])} nouveau(x), {len(comparison['inchanges'])} inchangé(s), "
-              f"{len(comparison['disparus'])} disparu(s).")
+              f"{len(comparison['nouveaux'])} nouveau(x), {len(comparison.get('regressions', []))} régression(s), "
+              f"{len(comparison['inchanges'])} inchangé(s), {len(comparison['disparus'])} disparu(s).")
+    for slow in ((analysis.get("durees") or {}).get("lents") or [])[:10]:
+        print(f"{label} ⏱️ {slow['id']} : {slow['motif']}")
     for entry in (e for e in analysis["logs"] if e["a_exporter"]):
         print(f"{label} : logs à exporter pour {entry['id']} : {entry['a_exporter']}")
     if analysis["propositions"]:
@@ -2021,11 +2035,18 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
                            erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
     effort = cucumber_fix_effort()
-    returncode, _, usage, _ = run_cucumber_claude(prompt, model, lot_tools(values),
-                                                  str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort,
-                                                  db_log=lot.setdefault("base", []),
-                                                  db_step="correction d'un run importé")
+    returncode, output, usage, _ = run_cucumber_claude(prompt, model, lot_tools(values),
+                                                       str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort,
+                                                       db_log=lot.setdefault("base", []),
+                                                       db_step="correction d'un run importé")
     report_token_usage(work_key, "cucumber-import-fix", model, usage, len(prompt), returncode, effort)
+    # Ce que la correction a fait (bilan après le prochain import) : corrections, restantes, réalignés, constats
+    fixed = cucumber_diagnostic.parse_fix_result(output)
+    cucumber_tools.normalize_constats(fixed)
+    lot["correction"] = {"corrections": [c for c in fixed.get("corrections") or [] if isinstance(c, dict)][:30],
+                         "restantes": [str(r) for r in fixed.get("restantes") or []][:30],
+                         "realignes": [str(r) for r in fixed.get("realignes") or []][:30],
+                         "constats": fixed["constats"]}
     on_usage(usage)
     for error in cucumber_a_revoir.check_corrections(worktree, before):
         print(f"[LOT {label}] ⛔ {error}")

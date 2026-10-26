@@ -73,6 +73,9 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 Signale ce que tu as constaté sans pouvoir le régler, plutôt que de le contourner. Un constat par fait, avec le fichier en cause s'il y en a un :
 - « donnee_introuvable » : une donnée nécessaire (code, paramètre, référentiel) n'existe ni dans l'initialisation du client ni au Standard, et tu ne peux pas la créer dans le Background. N'invente jamais un code à la place.
 - « ecart_spec_code » : le ticket Jira ou la spécification décrit un comportement, le code du spécifique en fait un autre. Le scénario teste le code ; le constat cite les deux.
+- « defaut_code » : défaut dans le code spécifique ou la personnalisation Studio (accolade mal placée, condition jamais vraie, variable de process jamais remplie…) : « fichier », « ligne », « extrait » (copié du code), « effet » observé ou attendu, « correction » suggérée.
+- « comportement_surprenant » : comportement du code fourni qui étonne sans être un défaut certain (traitement conditionné au niveau de log, valeur par défaut inattendue…).
+Pour ces constats, « certitude » vaut « prouvé » (preuve d'exécution citée dans « preuve » : message d'échec, sortie d'un step, valeur lue en base), « probable » (lecture du code) ou « à vérifier ».
 Une cause que tu DÉDUIS (« traitement sauté », « personnalisation absente ») sans preuve directe (trace serveur, écran reçu, valeur lue) s'écrit « NON PROUVÉE : <cause> — à vérifier par <preuve attendue> » dans le détail du constat.
 - « tautologique » : scénario envisagé puis écarté car il ne vérifiait que sa propre mise en place.
 
@@ -83,7 +86,7 @@ Aucun texte hors du JSON final. Ta réponse finale est UNIQUEMENT ce bloc JSON (
   {"id": "<id du spécifique>", "statut": "couvert|couvert_indirectement|non_couvert", "couvert_par": "<id du spécifique qui le couvre, si couvert_indirectement>",
    "scenarios": [{"nom": "<Feature> / <Scenario>", "fichier": "<chemin relatif au worktree du .feature>", "difference_standard": "<une phrase : ce qui diffère du Standard>", "source": "<fichier du spécifique, ticket Jira, paramètre>"}],
    "fichiers": ["<chemin relatif au worktree>"], "classes_java": ["<chemin relatif au worktree>"], "inspire_de": ["<chemin Standard> / <scénario>"], "raison": "<si non couvert>",
-   "constats": [{"type": "donnee_introuvable|ecart_spec_code|tautologique", "detail": "<une phrase>", "fichier": "<chemin, si utile>"}]}
+   "constats": [{"type": "donnee_introuvable|ecart_spec_code|defaut_code|comportement_surprenant|tautologique", "detail": "<une phrase>", "fichier": "<chemin, si utile>", "ligne": "<n°>", "extrait": "<code copié>", "effet": "<effet>", "correction": "<correction suggérée>", "certitude": "prouvé|probable|à vérifier", "preuve": "<extrait exact du journal>"}]}
 ]
 ```
 Un objet par spécifique du lot, dans l'ordre. « fichiers » : les .feature ; « classes_java » : les classes Java créées ou complétées pour ce spécifique ; « inspire_de » : les scénarios Standard dont tu es parti (vide si aucun). « difference_standard » et « source » sont obligatoires pour chaque scénario. « couvert_par » : seulement pour « couvert_indirectement » (pas de scénario propre).

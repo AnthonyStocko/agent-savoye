@@ -796,6 +796,14 @@ def failure_category(nature: str) -> str:
     return nature if nature in NOT_TEST_NATURES or nature == "cascade" else "test"
 
 
+def report_rel(uri) -> str:
+    """Chemin d'une feature du rapport Cucumber JSON (uri absolue, file: ou classpath:), relatif au dépôt si possible."""
+    uri = str(uri or "").replace("\\", "/")
+    if "src/test/resources/" in uri:
+        return "src/test/resources/" + uri.split("src/test/resources/", 1)[1]
+    return re.sub(r"^(file|classpath):/*", "", uri)
+
+
 def parse_cucumber_report(report: list) -> dict:
     """
     Rapport Cucumber JSON -> {(fichier relatif, titre): {statut: passe|echoue|indefini|cascade, step, phase, message,
@@ -806,9 +814,7 @@ def parse_cucumber_report(report: list) -> dict:
     rank = {"passe": 0, "indefini": 1, "cascade": 2, "echoue": 3}
     results = {}
     for feature in report if isinstance(report, list) else []:
-        uri = str(feature.get("uri", "")).replace("\\", "/")
-        rel = "src/test/resources/" + uri.split("src/test/resources/", 1)[1] if "src/test/resources/" in uri else \
-            re.sub(r"^(file|classpath):/*", "", uri)
+        rel = report_rel(feature.get("uri", ""))
         background, setup_failed = [], None
         for element in feature.get("elements") or []:
             if element.get("type") == "background":
@@ -1251,9 +1257,12 @@ def log_request(item: dict) -> str:
     window = log_window(item.get("heure", ""))
     if not window:
         return "exporter les logs serveur du step en échec (heure inconnue : rapport sans start_timestamp)"
+    cap = os.getenv("CUCUMBER_LOG_EXPORT_MAX_LINES", "").strip()
     return (f"exporter les logs serveur du {window['debut_utc']} au {window['fin_utc']} UTC (heure locale : "
             f"{window['debut_local']} → {window['fin_local']}), filtre « {log_filter(item)} », puis vérifier à "
-            f"l'import que l'export couvre {window['heure']} UTC")
+            f"l'import que l'export couvre {window['heure']} UTC"
+            + (f" (l'outil d'export garde au plus {cap} lignes, les plus récentes : un export qui les atteint a "
+               f"perdu le début de la fenêtre)" if cap.isdigit() and int(cap) > 0 else ""))
 
 
 def log_coverage(text: str, when: str) -> tuple:

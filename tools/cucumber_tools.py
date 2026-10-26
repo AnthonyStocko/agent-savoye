@@ -3028,13 +3028,22 @@ def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) 
 
 CONSTAT_TYPES = {"donnee_introuvable": "donnée introuvable",
                  "ecart_spec_code": "écart entre spécification et code",
+                 "defaut_code": "défaut du code spécifique ou du Studio",
+                 "comportement_surprenant": "comportement surprenant du code fourni",
                  "tautologique": "scénario tautologique écarté"}
+# Défauts et doutes sur le code fourni (bilan après import) ; leur certitude : « prouvé » exige une preuve citée
+DOUBT_TYPES = ("ecart_spec_code", "defaut_code", "comportement_surprenant")
+CERTAINTIES = ("prouvé", "probable", "à vérifier")
+# Champs facultatifs d'un constat (défaut ou doute sur le code fourni) et leur longueur maximale
+CONSTAT_FIELDS = {"ligne": 20, "extrait": 300, "effet": 300, "preuve": 300, "correction": 300}
 MAX_CONSTATS = 10
 
 
 def normalize_constats(result: dict) -> list:
     """
-    « constats » d'un résultat de lot (champ facultatif) ramenés à [{type, detail, fichier}] : entrée sans détail
+    « constats » d'un résultat de lot ou de correction (champ facultatif) ramenés à [{type, detail, fichier,
+    ligne, extrait, effet, preuve, correction}] (champs facultatifs gardés s'ils sont remplis), plus « certitude »
+    pour les DOUBT_TYPES (« prouvé » sans preuve ramené à « probable », « à vérifier » par défaut) : entrée sans détail
     ignorée, type hors CONSTAT_TYPES rangé en « autre », au plus MAX_CONSTATS. Le résultat est mis à jour.
     """
     constats = []
@@ -3045,16 +3054,27 @@ def normalize_constats(result: dict) -> list:
         if not isinstance(item, dict) or not str(item.get("detail") or "").strip():
             continue
         kind = str(item.get("type") or "").strip().lower()
-        constats.append({"type": kind if kind in CONSTAT_TYPES else "autre",
-                         "detail": " ".join(str(item["detail"]).split())[:500],
-                         "fichier": str(item.get("fichier") or "").strip()})
+        constat = {"type": kind if kind in CONSTAT_TYPES else "autre",
+                   "detail": " ".join(str(item["detail"]).split())[:500],
+                   "fichier": str(item.get("fichier") or "").strip()}
+        constat.update({k: " ".join(str(item[k]).split())[:size] for k, size in CONSTAT_FIELDS.items()
+                        if str(item.get(k) or "").strip()})
+        if constat["type"] in DOUBT_TYPES:
+            certainty = str(item.get("certitude") or "").strip().lower()
+            certainty = certainty if certainty in CERTAINTIES else "à vérifier"
+            constat["certitude"] = "probable" if certainty == "prouvé" and not constat.get("preuve") else certainty
+        if item.get("tag"):
+            constat["tag"] = str(item["tag"]).strip()
+        constats.append(constat)
     result["constats"] = constats[:MAX_CONSTATS]
     return result["constats"]
 
 
 def constat_line(constat: dict) -> str:
+    where = constat.get("fichier", "") + (f":{constat['ligne']}" if constat.get("ligne") else "")
     return (f"{CONSTAT_TYPES.get(constat['type'], 'constat')} : {constat['detail']}"
-            + (f" ({constat['fichier']})" if constat.get("fichier") else ""))
+            + (f" ({where})" if where else "")
+            + (f" — {constat['certitude']}" if constat.get("certitude") else ""))
 
 
 def parse_lot_result(text: str):

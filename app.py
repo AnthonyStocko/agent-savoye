@@ -9,9 +9,9 @@ import time
 import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
-from tools import (cucumber_checks, cucumber_coverage, cucumber_import, cucumber_init, cucumber_init_data,
-                   cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_studio, cucumber_tools,
-                   cucumber_verify, integration_tools, knowledge_tools)
+from tools import (cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_import, cucumber_init,
+                   cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_studio,
+                   cucumber_tools, cucumber_verify, integration_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -760,7 +760,8 @@ def integration_option_label(ticket: dict) -> str:
 def render_cucumber_import(client: str, state: dict) -> None:
     """
     Étape 5, import d'un rapport d'exécution (0 token) : fichiers déposés ou build Jenkins, secrets masqués en
-    mémoire, puis résultat du dernier import (tests, échecs, comparaison) et logs serveur à exporter.
+    mémoire, analyse puis bilan (A_REVOIR.md, répertoire partagé) ; résultat du dernier import (tests, échecs,
+    comparaison, initialisation en échec, scénarios anormalement longs) et logs serveur à exporter.
     """
     st.markdown("#### :material/upload_file: Import d'un rapport d'exécution")
     with st.form(f"cucumber_import_{client}", border=True):
@@ -780,7 +781,8 @@ def render_cucumber_import(client: str, state: dict) -> None:
         for message in imported["messages"]:
             st.info(message, icon=":material/info:")
         if imported["numero"]:
-            cucumber_import.analyse(client, imported["numero"], state, cucumber_tools.worktree_dir(client))
+            refresh_bilan(client, cucumber_import.analyse(client, imported["numero"], state,
+                                                          cucumber_tools.worktree_dir(client)), state)
         elif not imported["messages"]:
             st.warning("Aucun fichier à importer.")
     numero, analysis = latest_import_analysis(client)
@@ -793,6 +795,12 @@ def render_cucumber_import(client: str, state: dict) -> None:
     if analysis["non_analyse"]:
         st.error(f"Non analysé : {analysis['non_analyse']}", icon=":material/block:")
         return
+    init = analysis.get("init_en_echec") or {}
+    if init:
+        st.error(f"**Initialisation en échec : aucun scénario n'est jugé.** {init['id']} — premier step en échec : "
+                 f"`{init['step'] or '—'}` — cause : {init['message']}", icon=":material/block:")
+    for warning in analysis.get("avertissements") or []:
+        st.warning(warning, icon=":material/schedule:")
     failures = sum(len(g["scenarios"]) for g in analysis["groupes"])
     comparison = analysis.get("comparaison") or {}
     with st.container(horizontal=True):
@@ -802,12 +810,32 @@ def render_cucumber_import(client: str, state: dict) -> None:
         if comparison:
             st.metric(f"Corrigés depuis l'import n° {comparison['import']}", len(comparison["corriges"]), border=True)
             st.metric("Nouveaux", len(comparison["nouveaux"]), border=True)
+            st.metric("Régressions", len(comparison.get("regressions", [])), border=True,
+                      help="Scénarios verts au run précédent, en échec dans celui-ci")
             st.metric("Inchangés", len(comparison["inchanges"]), border=True)
+    durations = analysis.get("durees") or {}
+    if durations.get("lents"):
+        with st.expander(f"Scénarios anormalement longs : {len(durations['lents'])} (médiane "
+                         f"{durations['mediane']} s, run de {durations['total']} s)", icon=":material/timer:"):
+            st.dataframe([{"Scénario": e["id"].split("::", 1)[-1], "Feature": e["id"].split("::", 1)[0],
+                           "Durée (s)": e["secondes"], "Motif": e["motif"]} for e in durations["lents"]],
+                         hide_index=True, width="stretch")
     uncovered = [e for e in analysis["logs"] if e["a_exporter"]]
     if uncovered:
         with st.expander(f"Logs serveur à exporter ({len(uncovered)})", icon=":material/schedule:"):
             for entry in uncovered:
                 st.markdown(f"- `{entry['id']}` : {entry['a_exporter']}")
+
+
+def refresh_bilan(client: str, analysis: dict, state: dict) -> None:
+    """Bilan d'un import (A_REVOIR.md commité, bilan.md), déposé dans le répertoire partagé ; résultat affiché."""
+    bilan = cucumber_bilan.after_import(client, analysis, state, cucumber_tools.worktree_dir(client))
+    shared = cucumber_bilan.share_bilan(client, bilan)
+    st.success(f"Bilan du run n° {bilan['import']} écrit" + (" et ajouté à A_REVOIR.md (commité)" if bilan["a_revoir"]
+                                                              else "") + f". Prochaine action : "
+               f"{bilan['prochaine_action']}", icon=":material/summarize:")
+    if shared:
+        st.caption(knowledge_tools.publish_line(shared))
 
 
 def latest_import_analysis(client: str) -> tuple:
@@ -834,6 +862,11 @@ def render_cucumber_corrections(client: str, cucumber_cmd: list, rows: list) -> 
     if not analysis or analysis.get("non_analyse"):
         st.caption("Aucun import analysé : importez la console et le rapport du run (étape Exécution).")
         return
+    init = analysis.get("init_en_echec") or {}
+    if init:
+        st.error(f"Initialisation en échec au run n° {numero} : aucun scénario n'est jugé ni corrigé. Corrigez "
+                 f"l'initialisation ({init['step'] or init['id']} — {init['message']}), puis relancez le run.",
+                 icon=":material/block:")
     if analysis["groupes"]:
         st.dataframe([{"Scénarios": len(g["scenarios"]), "Cause": g["libelle"], "Catégorie": g["categorie"],
                        "Step": g["step"], "Message": g["message"]} for g in analysis["groupes"]], hide_index=True)
@@ -1676,17 +1709,38 @@ def render_cucumber_generation(ctx: dict, state: dict) -> None:
                                    mime="text/x-diff", icon=":material/download:")
 
 
-def render_cucumber_review(client: str) -> None:
-    """Étape 7 : A_REVOIR.md (défauts détectés, scénarios désactivés) et récapitulatif de couverture."""
+def render_manual_correction(client: str, state: dict) -> None:
+    """Signalement d'une correction faite à la main sur l'environnement : historisée, reprise dans le bilan."""
+    with st.form(f"cucumber_manual_{client}", border=True):
+        st.markdown("**:material/build_circle: Signaler une correction manuelle de l'environnement**")
+        st.caption("Interdite dans la durée : le bilan indique comment la recréer dans l'init du projet.")
+        description = st.text_area("Correction faite (donnée créée, paramétrage modifié…)", height=80)
+        if st.form_submit_button("Signaler", icon=":material/flag:") and description.strip():
+            cucumber_bilan.add_manual_correction(client, description)
+            numero, analysis = latest_import_analysis(client)
+            if analysis:
+                refresh_bilan(client, analysis, state)
+            st.rerun()
+
+
+def render_cucumber_review(client: str, state: dict) -> None:
+    """
+    Étape 7 : bilan du dernier run importé (défauts en tête, corrigés, désactivés, doutes, corrections manuelles,
+    prochaine action), signalement d'une correction manuelle, A_REVOIR.md et récapitulatif de couverture.
+    """
+    bilan = cucumber_bilan.latest_bilan(client)
+    if bilan:
+        with st.container(border=True):
+            st.markdown(cucumber_bilan.bilan_markdown(bilan, level=4))
+    render_manual_correction(client, state)
     review_file = os.path.join(cucumber_tools.worktree_dir(client), "A_REVOIR.md")
     coverage_file = cucumber_tools.coverage_path(client)
-    if not os.path.exists(review_file) and not os.path.exists(coverage_file):
-        st.info("Aucun bilan : il est écrit à la fin d'une génération.", icon=":material/summarize:")
+    if not bilan and not os.path.exists(review_file) and not os.path.exists(coverage_file):
+        st.info("Aucun bilan : il est écrit après chaque import de run et à la fin d'une génération.",
+                icon=":material/summarize:")
         return
     if os.path.exists(review_file):
-        with st.container(border=True):
-            st.markdown("**:material/rule: À revoir** :gray[(défauts détectés, scénarios désactivés ; livré dans "
-                        "le patch)]")
+        with st.expander("A_REVOIR.md (livré dans le patch)", icon=":material/rule:", expanded=not bilan):
             with open(review_file, "r", encoding="utf-8", errors="replace") as f:
                 st.markdown(f.read())
     if os.path.exists(coverage_file):
@@ -1740,7 +1794,7 @@ with tab_cucumber:
             render_cucumber_corrections(cucumber_client, cucumber_ctx["cmd"], cucumber_rows)
     elif cucumber_step == "bilan":
         if cucumber_client:
-            render_cucumber_review(cucumber_client)
+            render_cucumber_review(cucumber_client, cucumber_state)
 
 
 def render_knowledge_outbox() -> None:
@@ -2291,6 +2345,19 @@ with tab_config:
         env_values["CUCUMBER_VERIFY_TIMEOUT"] = str(int(verify_timeout))
         env_values["CUCUMBER_VERIFY_FIX_ATTEMPTS"] = str(int(verify_fixes))
         env_values["CUCUMBER_REVIEW_SAMPLE"] = str(int(review_sample))
+        with st.container(horizontal=True):
+            slow_seconds = st.number_input(
+                "CUCUMBER_SLOW_SCENARIO_SECONDS", min_value=10, step=30,
+                value=env_int("CUCUMBER_SLOW_SCENARIO_SECONDS", 300),
+                help="Import d'un run : un scénario est anormalement long au-delà de cette durée (ou de 3 fois la "
+                     "durée médiane du run).")
+            export_cap = st.number_input(
+                "CUCUMBER_LOG_EXPORT_MAX_LINES", min_value=0, step=1000,
+                value=env_int("CUCUMBER_LOG_EXPORT_MAX_LINES", 0),
+                help="Plafond de lignes de l'outil d'export des logs serveur (0 : inconnu) : rappelé dans les "
+                     "fenêtres à exporter ; un export qui l'atteint est signalé.")
+        env_values["CUCUMBER_SLOW_SCENARIO_SECONDS"] = str(int(slow_seconds))
+        env_values["CUCUMBER_LOG_EXPORT_MAX_LINES"] = str(int(export_cap)) if export_cap else ""
         jacoco = st.checkbox(
             "CUCUMBER_JACOCO", value=os.getenv("CUCUMBER_JACOCO", "").strip() == "1",
             help="Environnement client lancé avec l'agent JaCoCo : part des classes de chaque spécifique exécutées "

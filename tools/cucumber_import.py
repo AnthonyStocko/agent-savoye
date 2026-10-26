@@ -10,9 +10,11 @@ Import d'un rapport d'exécution (point 8, onglet Cucumber, main.py --import-run
   nombre attendu de la livraison et scénarios des features) ; un écart = run sur une autre version du code ou
   sélection inopérante, l'import est « non analysé ».
 - Analyse : classement de chaque échec (cucumber_verify.failure_kind), regroupement par cause racine (catégorie,
-  step, signature du message), couverture des steps en échec par les exports de logs (sinon fenêtre à exporter),
-  comparaison avec l'import précédent (corrigés, nouveaux, inchangés, disparus), lots de correction proposés pour
-  les seuls échecs « test » des scénarios générés par l'agent.
+  step, signature du message), couverture des steps en échec par les exports de logs (sinon fenêtre à exporter ;
+  export hors de la fenêtre des échecs ou au plafond de lignes de l'outil signalé), comparaison avec l'import
+  précédent (corrigés, nouveaux, régressions, inchangés, disparus), durée de chaque scénario (rapport JSON, sinon
+  horodatages de la console) et scénarios anormalement longs, lots de correction proposés pour les seuls échecs
+  « test » des scénarios générés par l'agent. Initialisation en échec : aucun scénario jugé, aucune correction.
 
 Stockage : .tmp/cucumber/<client>/imports/index.json et imports/<n>/ (fichiers masqués, analyse.json, analyse.md).
 """
@@ -22,13 +24,13 @@ import os
 import re
 from datetime import datetime, timezone
 
-from tools import jenkins_tools
+from tools import cucumber_profile, jenkins_tools
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
 from tools.cucumber_tools import _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag, cache_dir
-from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _timestamp, expected_count, failure_category,
-                                   feature_texts, log_coverage, log_request, parse_cucumber_report, report_test_count,
-                                   scenario_id, selection_gap)
+from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _duration, _timestamp, expected_count,
+                                   failure_category, feature_texts, log_coverage, log_request, parse_cucumber_report,
+                                   report_rel, report_test_count, scenario_id, selection_gap)
 
 _TESTS_RUN = re.compile(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)")
 # Valeur entre guillemets, sinon jusqu'à un guillemet, une option suivante (« -X ») ou la fin de la ligne
@@ -233,16 +235,172 @@ def _log_evidence(texts: list, when: str) -> list:
 
 
 def compare(previous: dict, current: dict) -> dict:
-    """Corrigés, nouveaux, inchangés (message changé ou non) et disparus entre deux analyses ({id: résultat})."""
+    """
+    Corrigés, nouveaux (absents du run précédent), régressions (verts au run précédent), inchangés (message changé
+    ou non) et disparus entre deux analyses ({id: résultat}).
+    """
     failing = lambda d: {i for i, r in d.items() if r["statut"] != "passe"}  # noqa: E731
     before, now = failing(previous), failing(current)
     unchanged = sorted(before & now)
     return {"corriges": sorted(i for i in before - now if i in current),
-            "nouveaux": sorted(now - before),
+            "nouveaux": sorted(i for i in now - before if i not in previous),
+            "regressions": sorted(i for i in now - before if i in previous),
             "inchanges": unchanged,
             "message_change": sorted(i for i in unchanged if message_signature(previous[i].get("message", ""))
                                      != message_signature(current[i].get("message", ""))),
             "disparus": sorted(i for i in previous if i not in current)}
+
+
+# ---------------------------------------------------------------------------
+# Durées, initialisation en échec, exports de logs
+# ---------------------------------------------------------------------------
+
+DEFAULT_SLOW_SECONDS = 300
+SLOW_FACTOR = 3
+_TIMEOUT_MESSAGE = re.compile(r"(?i)time ?out|timed out|délai|expir|awaitility|condition .* within")
+_CONSOLE_STAMP = re.compile(r"^\[?(?:(\d{4}-\d{2}-\d{2})[T ])?(\d{2}:\d{2}:\d{2})")
+_CONSOLE_SCENARIO = re.compile(r"\b(?:Scenario Outline|Scenario Template|Scenario|Example|Plan du [Ss]cénario|Scénario|"
+                               r"Exemple)\s*:\s*(.+?)\s*(?:#.*)?$")
+_INIT_TAG = re.compile(r"^@INIT_", re.I)
+
+
+def _elements(report: list):
+    """(identifiant, feature, élément) des scénarios du rapport, dans l'ordre d'exécution (Background exclu)."""
+    for feature in report if isinstance(report, list) else []:
+        rel = _rel(report_rel(feature.get("uri", "")))
+        for element in feature.get("elements") or []:
+            if element.get("type") != "background":
+                yield scenario_id(rel, str(element.get("name", ""))), feature, element
+
+
+def report_durations(report: list) -> dict:
+    """Durée de chaque scénario d'après le rapport JSON (steps et Background, en secondes) : {id: secondes}."""
+    durations = {}
+    for feature in report if isinstance(report, list) else []:
+        rel, background = _rel(report_rel(feature.get("uri", ""))), 0.0
+        for element in feature.get("elements") or []:
+            seconds = sum(_duration(step) for step in element.get("steps") or [])
+            if element.get("type") == "background":
+                background = seconds
+                continue
+            identifier = scenario_id(rel, str(element.get("name", "")))
+            # Exemples d'un Scenario Outline : durées additionnées
+            durations[identifier] = durations.get(identifier, 0.0) + seconds + background
+            background = 0.0
+    return durations
+
+
+def console_durations(text: str) -> dict:
+    """
+    Durée de chaque scénario d'après les horodatages de la console (plugin d'horodatage de Jenkins) : écart entre
+    sa ligne « Scenario: » et la ligne de scénario suivante (à défaut, la dernière ligne horodatée). {titre: secondes}.
+    """
+    marks, last = [], None
+    for line in (text or "").splitlines():
+        stamp = _CONSOLE_STAMP.match(line.strip())
+        if not stamp:
+            continue
+        moment = datetime.fromisoformat(f"{stamp.group(1) or '2000-01-01'}T{stamp.group(2)}")
+        last = moment
+        found = _CONSOLE_SCENARIO.search(line)
+        if found:
+            marks.append((found.group(1).strip(), moment))
+    durations = {}
+    for (title, start), following in zip(marks, marks[1:] + [(None, last)]):
+        seconds = (following[1] - start).total_seconds()
+        if seconds >= 0:
+            durations[title] = durations.get(title, 0.0) + seconds
+    return durations
+
+
+def scenario_durations(report: list, console: str = "") -> dict:
+    """Durées {id: secondes} : rapport JSON, sinon horodatages de la console (scénario reconnu par son titre)."""
+    durations = {i: d for i, d in report_durations(report).items() if d > 0}
+    by_title = console_durations(console) if console else {}
+    for identifier, _, element in _elements(report):
+        title = str(element.get("name", "")).strip()
+        if identifier not in durations and title in by_title:
+            durations[identifier] = by_title[title]
+    return durations
+
+
+def slow_threshold() -> float:
+    """Seuil absolu d'un scénario anormalement long (CUCUMBER_SLOW_SCENARIO_SECONDS, 300 s par défaut)."""
+    try:
+        return float(os.getenv("CUCUMBER_SLOW_SCENARIO_SECONDS", "") or DEFAULT_SLOW_SECONDS)
+    except ValueError:
+        return float(DEFAULT_SLOW_SECONDS)
+
+
+def slow_scenarios(durations: dict, results: dict) -> dict:
+    """
+    Scénarios anormalement longs : au-delà du seuil absolu ou de SLOW_FACTOR fois la durée médiane, et échecs sur
+    une attente expirée. {"mediane", "total", "lents": [{id, secondes, motif}]} (plus longs d'abord).
+    """
+    values = sorted(durations.values())
+    median = values[len(values) // 2] if values else 0.0
+    limit = min(slow_threshold(), SLOW_FACTOR * median) if median else slow_threshold()
+    slow = []
+    for identifier, seconds in durations.items():
+        result = results.get(identifier) or {}
+        if result.get("statut") == "echoue" and _TIMEOUT_MESSAGE.search(result.get("message", "")):
+            slow.append({"id": identifier, "secondes": round(seconds),
+                         "motif": "attente expirée : " + result["message"][:120]})
+        elif seconds >= max(limit, 1):
+            slow.append({"id": identifier, "secondes": round(seconds),
+                         "motif": f"{round(seconds)} s pour une médiane de {round(median)} s"})
+    return {"mediane": round(median), "total": round(sum(values)),
+            "lents": sorted(slow, key=lambda e: -e["secondes"])}
+
+
+def init_markers(client_name: str) -> tuple:
+    """(features d'init, tags d'init) du profil client."""
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name))
+    return set(profile["init_features"]), set(re.findall(r"@[\w-]+", profile["init_tags"] or ""))
+
+
+def init_failure(report: list, results: dict, features=(), tags=()) -> dict:
+    """
+    Premier scénario d'initialisation en échec (feature d'init du profil, tag d'init du profil ou @INIT_*) :
+    {id, step, message, nature} ; {} si l'initialisation passe ou n'est pas dans le run.
+    """
+    for identifier, feature, element in _elements(report):
+        names = [t.get("name", "") for t in (feature.get("tags") or []) + (element.get("tags") or [])
+                 if isinstance(t, dict)]
+        is_init = identifier.split("::", 1)[0] in features or any(n in tags or _INIT_TAG.match(n) for n in names)
+        result = results.get(identifier) or {}
+        if is_init and result.get("statut") not in (None, "passe"):
+            return {"id": identifier, "step": result.get("step", ""), "message": result.get("message", ""),
+                    "nature": result.get("nature", "") or result.get("statut", "")}
+    return {}
+
+
+def export_line_cap() -> int:
+    """Plafond de lignes de l'outil d'export des logs serveur (CUCUMBER_LOG_EXPORT_MAX_LINES, 0 : inconnu)."""
+    try:
+        return int(os.getenv("CUCUMBER_LOG_EXPORT_MAX_LINES", "") or 0)
+    except ValueError:
+        return 0
+
+
+def log_warnings(logs: list, failures: dict) -> list:
+    """
+    Avertissements sur les exports de logs ([(nom, texte)]) : export qui ne couvre l'heure d'aucun échec (fenêtre
+    à exporter en UTC et en heure locale, texte à filtrer), export qui atteint le plafond de lignes de l'outil.
+    """
+    timed = [(i, r) for i, r in failures.items() if r.get("heure")]
+    cap, warnings = export_line_cap(), []
+    for name, text in logs:
+        lines = len((text or "").splitlines())
+        if cap and lines >= cap:
+            warnings.append(f"export « {name} » : {lines} lignes, le plafond de l'outil d'export ({cap}) — les "
+                            f"lignes les plus anciennes ont pu être perdues : resserrez la fenêtre ou le filtre")
+        if timed and not any(log_coverage(text, r["heure"])[0] for _, r in timed):
+            result = timed[0][1]
+            warnings.append(f"export « {name} » hors de la fenêtre des échecs ({log_coverage(text, result['heure'])[1]})"
+                            f" : " + log_request({"heure": result["heure"], "step": result.get("step", ""),
+                                                  "motif": result.get("message", "")}))
+    return warnings
 
 
 def agent_scenarios(state: dict) -> dict:
@@ -287,12 +445,13 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
     entry = next(e for e in index["imports"] if e["numero"] == numero)
     files = _stored(client_name, entry)
     report = merge_reports([json.loads(f["texte"]) for f in files if f["type"] == "cucumber_json"])
-    facts = next((console_facts(f["texte"]) for f in files if f["type"] == "console"), {})
+    console = "\n".join(f["texte"] for f in files if f["type"] == "console")
+    facts = console_facts(console) if console else {}
     logs = [f["texte"] for f in files if f["type"] == "logs"]
     out = {"numero": numero, "run": entry["run"], "build": entry.get("build", ""), "console": facts,
            "fichiers": [{k: f[k] for k in ("nom", "type", "masques")} for f in files], "non_analyse": "",
            "tests": report_test_count(report), "groupes": [], "logs": [], "comparaison": {}, "propositions": [],
-           "resultats": {}}
+           "resultats": {}, "init_en_echec": {}, "durees": {}, "avertissements": []}
     if facts.get("patch_non_applicable"):
         out["non_analyse"] = "patch non applicable : le run n'a pas exécuté les tests de cette version"
     elif not report:
@@ -305,6 +464,10 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         failures = {i: r for i, r in results.items() if r["statut"] != "passe"}
         out["resultats"] = results
         out["groupes"] = group_failures(failures)
+        out["durees"] = slow_scenarios(scenario_durations(report, console), results)
+        out["init_en_echec"] = init_failure(report, results, *init_markers(client_name))
+        out["avertissements"] = log_warnings([(f["nom"], f["texte"]) for f in files if f["type"] == "logs"],
+                                             failures)
         for identifier, result in list(failures.items())[:30]:
             item = {"step": result.get("step", ""), "motif": result.get("message", ""), "heure": result.get("heure")}
             covered = [log_coverage(text, item["heure"] or "") for text in logs]
@@ -320,7 +483,8 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         if previous_analysis.get("resultats"):
             out["comparaison"] = {"import": previous["numero"],
                                   **compare(previous_analysis["resultats"], results)}
-        out["propositions"] = correction_proposals(failures, state)
+        # Initialisation en échec : aucun scénario n'est jugé, aucune correction proposée
+        out["propositions"] = [] if out["init_en_echec"] else correction_proposals(failures, state)
     folder = os.path.join(imports_dir(client_name), str(numero))
     _write_json(os.path.join(folder, "analyse.json"), out)
     _write_text(os.path.join(folder, "analyse.md"), analysis_markdown(out))
@@ -337,12 +501,24 @@ def analysis_markdown(analysis: dict) -> str:
         return "\n".join(lines + ["", f"**Non analysé** : {analysis['non_analyse']}", ""])
     failures = sum(len(g["scenarios"]) for g in analysis["groupes"])
     lines += ["", f"{analysis['tests']} test(s), {failures} échec(s), {len(analysis['groupes'])} cause(s) racine.", ""]
+    init = analysis.get("init_en_echec") or {}
+    if init:
+        lines += ["## ⛔ Initialisation en échec : aucun scénario n'est jugé", "", f"- Scénario : {init['id']}",
+                  f"- Premier step en échec : `{init['step'] or '—'}`", f"- Cause : {init['message']}", ""]
+    lines += [f"- ⚠️ {w}" for w in analysis.get("avertissements") or []]
     comparison = analysis.get("comparaison") or {}
     if comparison:
         lines += [f"## Comparaison avec l'import n° {comparison['import']}", "",
                   f"- Corrigés : {len(comparison['corriges'])} ; nouveaux : {len(comparison['nouveaux'])} ; "
+                  f"régressions : {len(comparison.get('regressions', []))} ; "
                   f"inchangés : {len(comparison['inchanges'])} (message changé : "
                   f"{len(comparison['message_change'])}) ; disparus : {len(comparison['disparus'])}", ""]
+        lines += [f"  - régression : {i}" for i in comparison.get("regressions", [])[:20]]
+    slow = (analysis.get("durees") or {}).get("lents") or []
+    if slow:
+        lines += ["", f"## Scénarios anormalement longs : {len(slow)} (médiane {analysis['durees']['mediane']} s)", ""]
+        lines += [f"- {e['id']} : {e['secondes']} s — {e['motif']}" for e in slow[:20]]
+        lines.append("")
     lines += ["## Causes racine", ""]
     for g in analysis["groupes"]:
         lines += [f"### {g['libelle']} ({g['categorie']}) — {len(g['scenarios'])} scénario(s)", "",

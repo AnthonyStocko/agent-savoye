@@ -173,7 +173,8 @@ def import_results(client_name: str) -> dict:
     for entry in sorted(index.get("imports", []), key=lambda e: e["numero"]):
         analysis = _read_json(os.path.join(cucumber_import.imports_dir(client_name), str(entry["numero"]),
                                            "analyse.json"), {}) or {}
-        if analysis.get("non_analyse"):
+        # Run non analysé ou initialisation en échec : aucun scénario n'y est jugé
+        if analysis.get("non_analyse") or analysis.get("init_en_echec"):
             continue
         for identifier, r in (analysis.get("resultats") or {}).items():
             results[identifier] = {"statut": r.get("statut", ""), "nature": r.get("nature", ""),

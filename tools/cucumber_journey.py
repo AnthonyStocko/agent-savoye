@@ -5,7 +5,7 @@ Bilan), 0 token : état de chaque étape, résumé en une ligne et action suivan
 import os
 import re
 
-from tools import cucumber_checks, cucumber_coverage, cucumber_import
+from tools import cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_import
 from tools.cucumber_tools import (_read_json, completable_specifics, init_patch_path, patch_path, pending_lots,
                                   worktree_dir)
 
@@ -123,9 +123,18 @@ def execution_step(client_name: str, analysis: dict) -> dict:
     if analysis.get("non_analyse"):
         return _step("execution", "attention", f"dernier import (n° {analysis['numero']}) non analysé : "
                                                f"{analysis['non_analyse']}", "Importer le bon run")
+    init = analysis.get("init_en_echec") or {}
+    if init:
+        return _step("execution", "attention", f"dernier run (import n° {analysis['numero']}) : initialisation en "
+                                               f"échec, aucun scénario jugé ({init['message'][:100]})",
+                     "Corriger l'initialisation du client puis relancer le run")
     green, failed = run_counts(analysis)
-    summary = f"dernier run : {green} vert(s) / {failed} échec(s) (import n° {analysis['numero']})"
-    return _step("execution", "attention" if failed else "fait", summary)
+    comparison = analysis.get("comparaison") or {}
+    slow = (analysis.get("durees") or {}).get("lents") or []
+    summary = (f"dernier run : {green} vert(s) / {failed} échec(s) (import n° {analysis['numero']})"
+               + (f", {len(comparison['regressions'])} régression(s)" if comparison.get("regressions") else "")
+               + (f", {len(slow)} scénario(s) anormalement long(s)" if slow else ""))
+    return _step("execution", "attention" if failed or slow else "fait", summary)
 
 
 def correction_step(rows: list, analysis: dict) -> dict:
@@ -152,7 +161,18 @@ def review_counts(state: dict) -> dict:
 
 
 def review_step(client_name: str, state: dict) -> dict:
-    """Défauts détectés dans le code spécifique, scénarios désactivés, arrêts pour décision humaine."""
+    """
+    Bilan du dernier run importé (prochaine action), à défaut A_REVOIR.md : défauts détectés dans le code
+    spécifique, scénarios désactivés, arrêts pour décision humaine.
+    """
+    bilan = cucumber_bilan.latest_bilan(client_name)
+    if bilan:
+        summary = (f"run n° {bilan['import']} : {len(bilan['defauts'])} défaut(s) détecté(s), "
+                   f"{len(bilan['corriges'])} corrigé(s), {len(bilan['desactives'])} désactivé(s), "
+                   f"{len(bilan['doutes'])} doute(s), {len(bilan['manuelles'])} correction(s) manuelle(s)")
+        done = bilan["prochaine_action"].startswith("Livrer")
+        return _step("bilan", "fait" if done else "attention" if bilan["defauts"] or bilan["manuelles"]
+                     else "a_faire", summary, bilan["prochaine_action"])
     if not os.path.exists(os.path.join(worktree_dir(client_name), "A_REVOIR.md")):
         return _step("bilan", "vide", "aucun bilan")
     counts = review_counts(state)

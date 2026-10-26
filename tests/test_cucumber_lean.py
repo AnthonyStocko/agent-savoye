@@ -310,7 +310,7 @@ def test_lot_result_constats_are_normalized():
     results = ct.parse_lot_result(text)
     assert results[0]["constats"] == [
         {"type": "donnee_introuvable", "detail": "code transporteur absent", "fichier": "a.feature"},
-        {"type": "ecart_spec_code", "detail": "Jira : seuil 10 ; code : 12", "fichier": ""},
+        {"type": "ecart_spec_code", "detail": "Jira : seuil 10 ; code : 12", "fichier": "", "certitude": "à vérifier"},
         {"type": "autre", "detail": "texte libre", "fichier": ""},
         {"type": "autre", "detail": "x", "fichier": ""}]
     assert results[1]["constats"] == []
@@ -335,6 +335,6 @@ def test_system_prompt_describes_constats(main_module):
              "class_suffix features_root client_tag clear_name tag_a_revoir knowledge_block").split()
     text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
                                      tour_alerte=30)
-    assert "=== CONSTATS" in text and '"constats": [{"type": "donnee_introuvable|ecart_spec_code|tautologique"' in text
+    assert "=== CONSTATS" in text and '"constats": [{"type": "donnee_introuvable|ecart_spec_code|defaut_code|comportement_surprenant|tautologique"' in text
     assert all(kind in text for kind in ct.CONSTAT_TYPES) and "Il n'est pas tautologique" in text
     assert "=== CONTRÔLES (Then) ===" in text and "jamais un comptage ou une recherche globale" in text
