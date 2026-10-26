@@ -257,7 +257,9 @@ def proof_status(cause: str, item: dict) -> tuple:
     if cause == "bug_applicatif":
         return False, f"erreur serveur constatée, défaut produit déduit : le confirmer par la trace serveur ; {logs}"
     if cause == "deploiement":
-        return False, f"comparer la version déployée au dépôt (écran reçu, valeur lue) ; {logs}"
+        # Constat de l'agent dont l'extrait a été retrouvé dans le journal de l'exécution (D8)
+        return (True, "") if item.get("preuve_verifiee") else (
+            False, f"comparer la version déployée au dépôt (écran reçu, valeur lue) ; {logs}")
     nature = failure_kind(item.get("motif", ""))[0]
     if nature == cause or (cause == "environnement" and nature == "version"):
         return True, ""

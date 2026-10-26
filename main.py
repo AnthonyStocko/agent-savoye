@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_checks, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
+from tools import cucumber_a_revoir, cucumber_checks, cucumber_diagnostic, cucumber_init, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1394,18 +1394,28 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             linked = tests.get(spec_of.get(item["id"], ""), [])
             lines.append(f"- {item['id']} [tag {tag}] : {item['motif']}" + (
                 f" ; test Standard lié : '{linked[0].get('extrait', linked[0]['path'])}'" if linked else ""))
+            # Sortie d'un diagnostic temporaire exécuté au tour précédent
+            lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         effort = cucumber_fix_effort()
-        returncode, _, usage, limit_hit = run_cucumber_claude(
+        returncode, output, usage, limit_hit = run_cucumber_claude(
             prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort)
         report_token_usage(work_key, "cucumber-verify-fix", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
             break
-        violations = cucumber_a_revoir.check_corrections(worktree, before)
+        # D8 : déploiement retenu seulement si l'extrait cité par l'agent est dans le journal de l'exécution
+        deployed, refused = cucumber_diagnostic.deployment_findings(
+            cucumber_diagnostic.parse_fix_result(output), result["scenarios"])
+        for tag, update in deployed.items():
+            result["scenarios"][tag].update(update)
+            print(f"[LOT {label}] 🚚 {result['scenarios'][tag]['id']} : {update['motif']}")
+        for error in refused:
+            print(f"[LOT {label}] ⛔ {error}")
+        violations = refused + cucumber_a_revoir.check_corrections(worktree, before)
         for error in violations:
             print(f"[LOT {label}] ⛔ {error}")
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
@@ -1413,6 +1423,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
                                     values, model, work_key, run_dir, on_usage, inspired_of(results), context)
         if not check["ok"] and not check.get("environnement"):
             break
+        bad = {t: v for t, v in bad.items() if t not in deployed}
         present = cucumber_verify.tagged_scenarios(worktree, files, bad)
         for tag in set(bad) - set(present):
             result["scenarios"][tag].update(statut="supprime", motif="supprimé par la correction")
@@ -1426,6 +1437,11 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
                                                f"lot{number}-r{attempt + 1}", sources)
             builds += again["builds"]
             result["scenarios"].update(again["scenarios"])
+        # D7 : un diagnostic temporaire ne s'exécute qu'une fois, sa sortie est gardée dans le journal du scénario
+        for rel in cucumber_diagnostic.remove_temporary(worktree):
+            print(f"[LOT {label}] 🧹 Diagnostic temporaire exécuté puis retiré : {rel}")
+    for rel in cucumber_diagnostic.remove_temporary(worktree):
+        print(f"[LOT {label}] 🧹 Diagnostic temporaire retiré : {rel}")
     # RÈGLE 3 : désactivation des seuls blocages hors test prouvés, ou arrêt pour décision humaine
     decision = cucumber_a_revoir.decide(result["scenarios"], spec_of) if mode else {
         "desactiver": {}, "faibles": [], "bloquants": [], "arret": False, "motifs": []}
@@ -2150,8 +2166,17 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     protected = cucumber_checks.check_protected_files(worktree, state["base"], profile["protected_files"],
                                                       restore=False)
     state["fichiers_proteges_touches"] = [e.split(" : ", 1)[0] for e in protected["erreurs"]]
+    temporary = cucumber_diagnostic.temporary_steps(worktree)
+    state["steps_temporaires"] = temporary
     cucumber_tools.save_state(client, state)
-    if protected["erreurs"]:
+    if temporary:
+        if os.path.exists(patch_file):
+            os.remove(patch_file)
+        print(f"\n[CUCUMBER] ⛔ Patch non produit : {len(temporary)} step(s) "
+              f"{cucumber_diagnostic.TEMP_PREFIX} encore présent(s) (diagnostic temporaire non retiré) :")
+        print("\n".join(f"    {t}" for t in temporary))
+        exit_code = 1
+    elif protected["erreurs"]:
         if os.path.exists(patch_file):
             os.remove(patch_file)
         print(f"\n[CUCUMBER] ⛔ Patch non produit : {len(protected['erreurs'])} fichier(s) de l'init globale "

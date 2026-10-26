@@ -8,6 +8,7 @@ Vérification des tests Cucumber générés pour un client (étape generate-cucu
 
 Claude n'est appelé (hors de ce module) que pour corriger, de façon bornée.
 """
+import base64
 import difflib
 import json
 import os
@@ -818,6 +819,7 @@ def parse_cucumber_report(report: list) -> dict:
             started, elapsed = _timestamp(element.get("start_timestamp")), 0.0
             background = []
             statuses = []
+            outputs = [o for st in steps for o in _step_outputs(st)]
             for step in steps:
                 phase = _phase_of(step.get("keyword", ""), phase)
                 status = (step.get("result") or {}).get("status", "")
@@ -829,7 +831,7 @@ def parse_cucumber_report(report: list) -> dict:
                                "phase": phase, "message": " ".join(error.split())[:300], "nature": nature,
                                "exception": exception,
                                "heure": (started + timedelta(seconds=elapsed)).isoformat(timespec="seconds")
-                               if started else ""}
+                               if started else "", "erreur": error}
                 elapsed += _duration(step)
             if not outcome:
                 if any(s in ("undefined", "pending", "ambiguous") for s in statuses) or not statuses:
@@ -838,6 +840,9 @@ def parse_cucumber_report(report: list) -> dict:
                     outcome = {"statut": "passe", "step": "", "phase": "", "message": ""}
                 else:
                     outcome = {"statut": "indefini", "step": "", "phase": "", "message": "steps ignorés"}
+            # Journal du scénario (message d'échec complet, sorties des steps) : preuve des constats de l'agent
+            outcome["sorties"] = outputs[:MAX_OUTPUTS]
+            outcome["journal"] = " | ".join([outcome.pop("erreur", "")] + outputs)[:MAX_JOURNAL_CHARS]
             title = str(element.get("name", "")).strip()
             if setup_failed and outcome["statut"] != "passe":
                 outcome = {**outcome, "statut": "cascade", "cause": setup_failed[2],
@@ -849,6 +854,22 @@ def parse_cucumber_report(report: list) -> dict:
             if key not in results or rank[outcome["statut"]] > rank[results[key]["statut"]]:
                 results[key] = outcome
     return results
+
+
+MAX_OUTPUTS = 20
+MAX_JOURNAL_CHARS = 4000
+
+
+def _step_outputs(step: dict) -> list:
+    """Sorties d'un step du rapport : scenario.log (output) et pièces jointes texte (embeddings)."""
+    outputs = [str(o) for o in step.get("output") or [] if str(o).strip()]
+    for embedding in step.get("embeddings") or []:
+        if str(embedding.get("mime_type", "")).startswith("text/"):
+            try:
+                outputs.append(base64.b64decode(embedding.get("data", "")).decode("utf-8", "replace"))
+            except (ValueError, TypeError):
+                continue
+    return outputs
 
 
 def _timestamp(value) -> datetime:
@@ -1187,7 +1208,8 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
                     if status == "cascade" else "",
                     # Step en échec et son heure (UTC) : fenêtre d'export des logs serveur
                     **{k: (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get(k, "")
-                       for k in ("step", "heure")}}
+                       for k in ("step", "heure", "journal")},
+                    "sorties": (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get("sorties") or []}
     return {"scenarios": out, "builds": builds, "classes_executees": executed}
 
 
@@ -1264,15 +1286,24 @@ def init_tags() -> str:
     return os.getenv("CUCUMBER_INIT_TAGS", "").strip()
 
 
+CAUSE_LABELS = {"environnement": "environnement", "version": VERSION_GAP, "donnee_reference": "donnée de référence "
+                                                                                       "absente",
+                "bug_applicatif": APPLICATION_BUG, "champ_absent": "champ contrôlé non renvoyé (test)",
+                "assertion": "assertion (test)", "technique": "erreur du test (step, colonne, fichier)"}
+
+
 def run_init(mode: str, worktree: str, base: str, build_fn, tags: str, sources: dict = None) -> dict:
     """
     Exécute une fois, avant de juger les lots, l'initialisation `tags` sur CUCUMBER_VERIFY_ENV. Renvoie {ok, message,
-    build} : ok faux si l'exécution échoue ou si un scénario de l'initialisation ne passe pas.
+    build} : ok faux si l'exécution échoue ou si un scénario de l'initialisation ne passe pas ; le message donne
+    alors le premier step en échec et sa cause.
     """
     run = run_tags(mode, worktree, base, build_fn, tags, os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), {}, "init",
                    sources)
-    failed = [f"{title} : {r['step']} — {r['message']}".strip(" —") for (_, title), r in run["resultats"].items()
-              if r["statut"] != "passe"]
+    failed = [f"{title} : {r['step']} — {r['message']}".strip(" —")
+              + (f" (cause : {CAUSE_LABELS.get(r.get('cause') or r.get('nature'), r.get('nature'))})"
+                 if r.get("nature") or r.get("cause") else "")
+              for (_, title), r in run["resultats"].items() if r["statut"] != "passe"]
     if not run["ok"] or not run["resultats"] or failed:
         reason = (failed[0] if failed else run["message"] if not run["ok"] else f"aucun scénario pour {tags}")[:300]
         return {"ok": False, "message": f"environnement non initialisé ({tags}) : {reason}", "build": run["build"]}
@@ -1302,9 +1333,9 @@ def all_verified(state: dict) -> list:
 
 LEVEL_ICONS = {"ok": "✅", "ko": "❌", "nv": "⚪", "env": "🌐", "ref": "📭", "bug": "🐞", "cascade": "⛓️"}
 # Statuts hors jugement du test : l'exécution n'a pas pu trancher (moyen d'exécution, environnement, mise en place)
-UNJUDGED = ("non_verifie", "environnement", "donnee_reference", "bug_applicatif", "cascade")
+UNJUDGED = ("non_verifie", "environnement", "donnee_reference", "bug_applicatif", "cascade", "deploiement")
 # Statuts affichés à part dans l'IHM et le récapitulatif : l'échec ne vient pas du test
-NOT_TEST_STATUSES = ("environnement", "donnee_reference", "bug_applicatif", "cascade")
+NOT_TEST_STATUSES = ("environnement", "donnee_reference", "bug_applicatif", "cascade", "deploiement")
 
 
 def scenario_rows(state: dict) -> list:
@@ -1460,6 +1491,7 @@ def verification_indicators(state: dict) -> dict:
             "donnee_reference": sum(1 for s in items if s["statut"] == "donnee_reference"),
             "bug_applicatif": sum(1 for s in items if s["statut"] == "bug_applicatif"),
             "cascade": sum(1 for s in items if s["statut"] == "cascade"),
+            "deploiement": sum(1 for s in items if s["statut"] == "deploiement"),
             "hors_test": sum(1 for s in items if s["statut"] in NOT_TEST_STATUSES),
             "pertinents": sum(1 for s in verified if s["statut"] == "pertinent"),
             "taux_pertinent": rate(sum(1 for s in verified if s["statut"] == "pertinent"), len(verified)),

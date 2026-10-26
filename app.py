@@ -1300,10 +1300,12 @@ with tab_cucumber:
                        f"🌐 {indicators['environnement']} environnement (route, champ exigé, version, init en échec) · "
                        f"📭 {indicators['donnee_reference']} donnée de référence absente · "
                        f"🐞 {indicators['bug_applicatif']} bug applicatif probable · "
-                       f"⛓️ {indicators['cascade']} en cascade d'une mise en place en échec. Corrigez l'environnement "
+                       f"⛓️ {indicators['cascade']} en cascade d'une mise en place en échec · "
+                       f"🚚 {indicators['deploiement']} déploiement en retard (extrait vérifié). Corrigez l'environnement "
                        f"(profil et initialisation du client, bilan de santé) ou signalez le bug, puis relancez.",
                        icon=":material/public:")
-            with st.expander("Scénarios non jugés : environnement, donnée de référence, bug applicatif, cascade"):
+            with st.expander("Scénarios non jugés : environnement, donnée de référence, bug applicatif, cascade, "
+                             "déploiement"):
                 st.dataframe([{k: row[k] for k in ("Lot", "Scénario", "Statut", "Motif", "Build")}
                               for row in verified_rows if row["Statut"] in cucumber_verify.NOT_TEST_STATUSES],
                              hide_index=True, width="stretch",
@@ -1330,8 +1332,10 @@ with tab_cucumber:
                                             "d'exécution (jamais compté pertinent) ; environnement : route absente, "
                                             "champ exigé ou version ; donnee_reference : code absent de "
                                             "l'environnement ; bug_applicatif : erreur serveur ; cascade : une mise "
-                                            "en place de la feature a échoué avant lui. Seuls invalide et faible "
-                                            "sont corrigés puis retirés vers le patch « à revoir »."),
+                                            "en place de la feature a échoué avant lui ; deploiement : code ou "
+                                            "personnalisation déployés en retard (extrait vérifié dans le log). "
+                                            "Seuls invalide et faible sont corrigés ; rien n'est supprimé, les "
+                                            "blocages hors test prouvés sont désactivés (A_REVOIR.md)."),
                          "Client": st.column_config.TextColumn("Client", width="small"),
                          "Standard": st.column_config.TextColumn("Standard", width="small"),
                          "Mutation": st.column_config.TextColumn("Mutation", width="small"),

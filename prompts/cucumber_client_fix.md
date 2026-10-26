@@ -22,10 +22,13 @@ ${fichiers}
    - « donnée de référence absente » : crée la donnée dans le Background par un step existant ; si c'est impossible, laisse le scénario tel quel et signale-le dans « restantes » (il sera désactivé avec sa preuve, jamais supprimé) ;
    - « passe sur le Standard » : le scénario ne vérifie pas ce que l'override change ; cible l'assertion sur la valeur ou le comportement propre au client (cf. commentaires `# Standard : … / Client : …` et test Standard lié) ;
    - « mutation non détectée » ou « aucun attendu à fausser » : renforce les assertions des Then avec des valeurs métier précises (table de données, valeurs attendues) pour qu'une valeur faussée fasse échouer le test ;
+   - message d'échec qui ne permet pas de trancher : tu peux ajouter un DIAGNOSTIC TEMPORAIRE — une méthode de step du projet (package ${package_steps}) dont l'expression commence par « TEMPORAIRE- », qui AFFICHE l'état réel par `scenario.log(...)` (écran reçu, valeur lue, statut) sans aucune assertion, appelée dans le scénario AVANT le step en échec (après, elle ne s'exécuterait pas). Il est exécuté une seule fois puis retiré automatiquement ; sa sortie te sera donnée (« sortie du diagnostic ») à la correction suivante. Jamais de step TEMPORAIRE pour faire passer un test : un patch qui en contient est refusé ;
+   - code ou personnalisation déployés plus anciens que le dépôt (écran reçu sans l'élément que la personnalisation ajoute, champ jamais posé alors que le code le pose sans condition) : ne touche pas au scénario et ajoute un constat « deploiement » avec son tag et, en « preuve », un extrait COPIÉ MOT POUR MOT du message d'échec ou de la sortie du diagnostic (vérifié automatiquement : un extrait absent du journal fait refuser le constat) ;
    - cause hors du test (environnement, version, défaut produit) : ne touche pas au scénario, explique-la dans « restantes ». Une cause que tu déduis sans preuve directe (trace serveur, écran reçu, valeur lue) s'écrit « NON PROUVÉE : <cause> — vérification : <preuve attendue> » ; si la preuve est dans les logs serveur, indique une fenêtre étroite (deux minutes autour du step en échec, en UTC et en heure locale) et un texte de filtre : l'outil d'export garde les lignes les plus récentes et peut perdre le step.
 
 === RÉPONSE FINALE ===
 Aucun texte hors du JSON final. Ta réponse finale est UNIQUEMENT ce bloc JSON (cette règle remplace « Réponse finale : 10 lignes maximum ») :
 ```json
-{"corrigees": <nombre>, "restantes": ["<erreur restante : cause>"], "realignes": ["<scénario : fichier du code>"]}
+{"corrigees": <nombre>, "restantes": ["<erreur restante : cause>"], "realignes": ["<scénario : fichier du code>"],
+ "constats": [{"tag": "@agent_…", "type": "deploiement", "detail": "<une phrase>", "preuve": "<extrait exact du journal>"}]}
 ```
