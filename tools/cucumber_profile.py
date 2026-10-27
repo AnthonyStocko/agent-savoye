@@ -6,7 +6,8 @@ features et tags de son initialisation, clear de son environnement, fichiers d'i
 spécifique, fichiers protégés de l'init globale, runner, codes de référence créés par l'init, version de la
 bibliothèque de steps et version du serveur (celle du Standard applicatif), données créées par les initializers
 serveur et leur sort après un clear, contournements TODO-VERSION du dépôt, branche lue par le job de vérification
-(verify_branch) et paramètre du job qui la porte. Rien n'est propre à un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
+(verify_branch) et paramètre du job qui la porte, correspondance « paramètre du job → rôle » (job_roles :
+détectée sur les paramètres du job par cucumber_job, enregistrée par record_job_roles). Rien n'est propre à un client dans le code : tout vient de la détection dans le dépôt, de la saisie dans l'IHM ou d'un fichier versionné
 dans le dépôt client. Priorité : dépôt (.agent-savoye.json) > saisie (cache) > détection ; un champ non détecté
 reste vide, avec un avertissement.
 
@@ -28,10 +29,10 @@ REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
 FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
           "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-          "environment_checks", "reponses")
+          "environment_checks", "reponses", "job_roles")
 # Champs dont l'absence est normale : vides sans avertissement
 OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-                   "environment_checks", "reponses")
+                   "environment_checks", "reponses", "job_roles")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
@@ -49,7 +50,8 @@ LABELS = {"features_root": "racine des features", "tag_client": "tag client", "i
           "run_job": "job Jenkins qui exécute le dépôt client (lancement automatique d'un run)",
           "environment_checks": "dépendances d'environnement contrôlées par l'init (champs personnalisés, "
                                 "documents, énumérations, paramétrages)",
-          "reponses": "réponses de l'utilisateur aux questions des tâches à confirmer"}
+          "reponses": "réponses de l'utilisateur aux questions des tâches à confirmer",
+          "job_roles": "correspondance paramètre du job → rôle (branche, dépôt, arguments, attente, artefact monté)"}
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _GLOBAL_INIT = "Initialisation globale par fichiers"
@@ -70,7 +72,7 @@ def empty_profile() -> dict:
                        for k in RUNNER_KEYS},
             "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
             "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
-            "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": []}
+            "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": [], "job_roles": {}}
 
 
 def is_empty(value) -> bool:
@@ -194,12 +196,22 @@ def refresh_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir:
     detected, suggestions, warnings = detect_profile(client_name, worktree, ref, cucumber_std_dir, std_runners,
                                                      server_version)
     document = load_profile(client_name)
+    # Rôles des paramètres du job : détectés sur Jenkins (record_job_roles), pas dans le dépôt
+    detected["job_roles"] = (document.get("detecte") or {}).get("job_roles") or {}
     depot = repo_profile(worktree, ref)
     if depot.pop("_erreur", ""):
         warnings.append(f"{REPO_PROFILE} du dépôt client illisible : ignoré")
     document.update(detecte=detected, depot=depot, suggestions=suggestions, avertissements_detection=warnings,
                     date=datetime.now().isoformat(timespec="seconds"))
     document.setdefault("saisi", {})
+    _write_json(profile_path(client_name), document)
+    return document
+
+
+def record_job_roles(client_name: str, roles: dict) -> dict:
+    """Rôles détectés sur les paramètres du job (cucumber_job.detect_roles), enregistrés comme détection."""
+    document = load_profile(client_name)
+    document.setdefault("detecte", {})["job_roles"] = {k: v for k, v in (roles or {}).items() if v}
     _write_json(profile_path(client_name), document)
     return document
 
@@ -216,6 +228,9 @@ def effective_profile(document: dict) -> dict:
                 if key == "server_initialized_data" and source != "detecte":
                     # Statuts choisis appliqués aux données détectées, sans les remplacer
                     value = cucumber_initializers.merge_statuses(profile[key], value)
+                elif key == "job_roles":
+                    # Rôles choisis appliqués par-dessus les rôles détectés
+                    value = {**profile[key], **{k: v for k, v in value.items() if v}}
                 profile[key], sources[key] = value, source
     warnings = list((document or {}).get("avertissements_detection") or [])
     warnings += [f"{LABELS[k]} vide : à renseigner dans le profil client" for k in FIELDS
@@ -355,4 +370,5 @@ def conventions(profile: dict) -> dict:
             "initializers_survive_clear": profile.get("initializers_survive_clear", ""),
             "workarounds": list(profile.get("workarounds") or []),
             "verify_branch": profile.get("verify_branch", ""),
-            "verify_branch_param": profile.get("verify_branch_param", "") or DEFAULT_VERIFY_BRANCH_PARAM}
+            "verify_branch_param": profile.get("verify_branch_param", "") or DEFAULT_VERIFY_BRANCH_PARAM,
+            "job_roles": dict(profile.get("job_roles") or {})}

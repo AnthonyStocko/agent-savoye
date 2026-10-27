@@ -24,7 +24,8 @@ import os
 import re
 from datetime import datetime
 
-from tools import cucumber_audit, cucumber_import, cucumber_links, cucumber_profile, cucumber_studio, cucumber_testability
+from tools import (cucumber_audit, cucumber_import, cucumber_job, cucumber_links, cucumber_profile, cucumber_studio,
+                   cucumber_testability)
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _write_json, a_revoir_tag, cache_dir,
                                   git_repos, latest_results, load_state, studio_dependencies, worktree_dir)
 from tools.cucumber_verify import NOT_TEST_STATUSES, all_verified, failure_category, scenario_id
@@ -411,10 +412,11 @@ def business_sentence(spec: dict, state_key: str, evaluation: dict, cause: str =
 
 
 def testability(spec: dict, result: dict, scenarios: list, index: dict = None, profile: dict = None,
-                init_state: str = "", title: str = "") -> dict:
+                init_state: str = "", title: str = "", deployed: dict = None) -> dict:
     """
     Facteurs de testabilité DÉTECTÉS (jamais saisis), chacun (réponse, preuve) parmi oui / non / non déterminé :
-    code et personnalisation Studio déployés (dernier run, blocage prouvé), données recréables (init détectée,
+    code et personnalisation Studio déployés (dernier run, blocage prouvé ; code : `deployed`, publication de
+    l'artefact testé comparée au dernier commit de la tâche, cucumber_job.deployment), données recréables (init détectée,
     dernier run), steps disponibles (steps candidats, scénario vert, blocage prouvé). Un facteur non déterminé ne
     bloque pas. Synthèse « testabilite » (testable, à confirmer, non testable), « raisons » et « evaluation »
     (cucumber_testability.assess, réponses proposées et questions précises).
@@ -424,12 +426,16 @@ def testability(spec: dict, result: dict, scenarios: list, index: dict = None, p
     natures = {s["nature"] for s in scenarios}
     blocked = evaluation["etat"] == "non_testable"
     criteria = {}
+    deployed = deployed or {}
     for key, applies in (("code", any(f["path"].endswith(".java") for f in spec.get("fichiers") or [])),
                          ("studio", bool(studio_files(spec)))):
         if applies:
             criteria[key] = (("non", evaluation["preuve"]) if blocked and evaluation["blocage"] == "non_deploye" else
+                             ("non", f"version testée antérieure au code : {deployed['preuve']}")
+                             if key == "code" and deployed.get("etat") == "non_deploye" else
                              ("non", "échec « déploiement » d'un scénario lié au dernier run")
                              if "deploiement" in natures else ("oui", "scénario lié vert au dernier run") if green else
+                             ("oui", deployed["preuve"]) if key == "code" and deployed.get("etat") == "deploye" else
                              (UNDETERMINED, "aucun scénario lié exécuté"))
     criteria["donnees"] = (("non", evaluation["preuve"]) if blocked and evaluation["blocage"] == "donnee_impossible"
                            else ("oui", "scénario lié vert au dernier run") if green else
@@ -523,6 +529,8 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name)) if client_name else {}
     init_state = init_state_of(client_name, profile) if client_name else ""
     links = load_ticket_links(client_name) if client_name else {}
+    # Version testée au dernier run : code de chaque tâche dans l'artefact monté (deploiement.json)
+    deployed = (cucumber_job.load_deployment(client_name).get("taches") or {}) if client_name else {}
     specifics = {s["id"]: s for s in inventory.get("specifiques") or []}
     lots_of = {r.get("id"): lot["numero"] for lot in state.get("lots") or [] for r in lot.get("resultats") or []}
     rows = {}
@@ -530,7 +538,7 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
         result, override = results.get(spec["id"], {}), overrides.get(spec["id"], {})
         scenarios = linked_scenarios(spec, result, sources)
         title = business_title(spec, links.get(spec["id"]))
-        testable = testability(spec, result, scenarios, index, profile, init_state, title)
+        testable = testability(spec, result, scenarios, index, profile, init_state, title, deployed.get(spec["id"]))
         # Tests existants rattachés (cache présent) : le rapprochement par mots-clés de l'inventaire ne décide plus
         judged = {**spec, "couverture": "non_couvert"} if sources.get("existants") else spec
         state_key, cause = spec_state(judged, result, scenarios, testable)

@@ -42,22 +42,31 @@ def _job_path(job_name: str) -> str:
     return "/".join(f"job/{part}" for part in job_name.strip().strip("/").split("/") if part)
 
 
-def job_parameters(job_name: str) -> dict:
-    """Paramètres acceptés par un job : {nom: type Jenkins} ; {} si le job est introuvable ou Jenkins injoignable."""
+def job_definitions(job_name: str) -> dict:
+    """
+    Paramètres d'un job et leur valeur actuelle (configuration du job) : {nom: {"type", "defaut"}} ; defaut vaut None
+    si Jenkins ne la donne pas (mot de passe, fichier). {} si le job est introuvable ou Jenkins injoignable. Les
+    valeurs peuvent contenir des identifiants : ni affichées, ni journalisées, ni stockées par l'appelant.
+    """
     jenkins_url, auth = _jenkins()
     if not jenkins_url or not job_name.strip():
         return {}
     try:
-        response = requests.get(f"{jenkins_url}/{_job_path(job_name)}/api/json", auth=auth, timeout=20,
-                                params={"tree": "property[parameterDefinitions[name,type]]"})
+        response = requests.get(f"{jenkins_url}/{_job_path(job_name)}/api/json", auth=auth, timeout=20, params={
+            "tree": "property[parameterDefinitions[name,type,defaultParameterValue[value]]]"})
         if response.status_code != 200:
             print(f"[JENKINS] Job {job_name} introuvable ({response.status_code}).")
             return {}
-        return {p["name"]: p.get("type", "") for prop in response.json().get("property", [])
-                for p in prop.get("parameterDefinitions") or []}
+        return {p["name"]: {"type": p.get("type", ""), "defaut": (p.get("defaultParameterValue") or {}).get("value")}
+                for prop in response.json().get("property", []) for p in prop.get("parameterDefinitions") or []}
     except (requests.RequestException, ValueError) as e:
         print(f"[JENKINS] Impossible de lire les paramètres du job {job_name} : {e}")
         return {}
+
+
+def job_parameters(job_name: str) -> dict:
+    """Paramètres acceptés par un job : {nom: type Jenkins} ; {} si le job est introuvable ou Jenkins injoignable."""
+    return {name: d["type"] for name, d in job_definitions(job_name).items()}
 
 
 def trigger_job(job_name: str, parameters: dict) -> str:

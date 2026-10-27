@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import env_tools
-from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage,
+from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_import, cucumber_preflight,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
                    cucumber_links, cucumber_results, cucumber_studio, cucumber_testability, cucumber_tools,
@@ -793,11 +793,16 @@ def render_cucumber_run(ctx: dict, state: dict) -> None:
             st.caption("Lancement automatique indisponible, à renseigner : " + ", ".join(missing) + ". Sinon, "
                        "importez la console et le rapport ci-dessous.")
             return
-        st.caption(f"Job **{job}** sur la branche **{branch}** : le worktree y est commité et poussé (jamais de push "
-                   f"forcé), le commit est contrôlé sur origin avant le lancement, puis le build est suivi et sa "
-                   f"console et ses rapports Cucumber JSON sont importés.")
+        st.caption(f"Job **{job}** sur la branche de travail **{branch}** : le worktree y est commité et poussé "
+                   f"(jamais de push forcé), le commit est contrôlé en tête de la branche distante avant le lancement "
+                   f"(configuration actuelle du job, attente décochée, filtre de tags dans ses arguments), puis le "
+                   f"build est suivi et sa console et ses rapports Cucumber JSON sont importés.")
+        tested = cucumber_job.deployment_line(cucumber_job.load_deployment(client))
+        if tested:
+            st.caption(f":material/inventory_2: {tested}")
         with st.container(horizontal=True, vertical_alignment="bottom"):
-            tags = st.text_input("Tags (paramètre TAGS du job, vide : tous les scénarios actifs)",
+            tags = st.text_input("Tags (filtre -Dcucumber.filter.tags ajouté aux arguments du job, vide : tous "
+                                 "les scénarios actifs)",
                                  key=f"cucumber_run_tags_{client}", placeholder="Ex. @agent_<client>_3")
             launch = st.button("Pousser et lancer le run", icon=":material/play_arrow:", type="primary",
                                disabled=not ctx["ready"])
@@ -812,6 +817,11 @@ def render_cucumber_run(ctx: dict, state: dict) -> None:
         if last:
             st.caption(f"Dernier lancement : {last['date'].replace('T', ' ')[:16]} · commit {last['commit'][:10]} · "
                        f"{last['message']}" + (f" · [build]({last['build']})" if last.get("build") else ""))
+            if last.get("selection"):
+                st.warning(f"Filtre de tags : {last['selection']}", icon=":material/filter_alt:")
+            elif last.get("ok") and last.get("tags"):
+                st.caption(f":material/check: Filtre « {last['tags']} » vérifié : le nombre de tests exécutés est "
+                           f"celui attendu.")
 
 
 def render_cucumber_import(client: str, state: dict) -> None:
@@ -1365,6 +1375,16 @@ def profile_field_inputs(client: str, fields: list, profile: dict, profile_doc: 
         values["environment_checks"] = [{k: str(v or "").strip() for k, v in row.items()}
                                         for row in edited.to_dict("records")
                                         if row.get("type") and str(row.get("code") or "").strip()]
+    if "job_roles" in fields:
+        st.markdown(f"**{cucumber_profile.LABELS['job_roles']}**")
+        st.caption("Nom du paramètre du job qui porte chaque rôle (détecté sur le job, vide : aucun). Les valeurs "
+                   "des arguments ne sont jamais affichées ni enregistrées.")
+        roles = profile.get("job_roles") or {}
+        values["job_roles"] = {}
+        with st.container(horizontal=True):
+            for role, label in cucumber_job.ROLES.items():
+                values["job_roles"][role] = st.text_input(role, value=roles.get(role, ""), help=label,
+                                                          key=f"cucumber_job_role_{client}_{role}").strip()
     if "runner" in fields:
         values["runner"] = st.text_area(f"{cucumber_profile.LABELS['runner']} (JSON)",
                                         value=json.dumps(profile["runner"], ensure_ascii=False, indent=1), height=150)
@@ -3107,6 +3127,15 @@ with tab_config:
         env_values["JENKINS_USER"] = st.text_input("JENKINS_USER", value=os.getenv("JENKINS_USER", ""))
         env_values["JENKINS_API_TOKEN"] = st.text_input("JENKINS_API_TOKEN", value=os.getenv("JENKINS_API_TOKEN", ""),
                                                         type="password")
+        with st.container(horizontal=True):
+            env_values["MAVEN_REPOSITORY_URL"] = st.text_input(
+                "MAVEN_REPOSITORY_URL", value=os.getenv("MAVEN_REPOSITORY_URL", ""),
+                help="Dépôt Maven où est publié l'artefact monté par le job (maven-metadata.xml) : sa date de "
+                     "publication, comparée aux commits des tâches, dit quel code a été testé.")
+            env_values["MAVEN_REPOSITORY_USER"] = st.text_input(
+                "MAVEN_REPOSITORY_USER", value=os.getenv("MAVEN_REPOSITORY_USER", ""))
+            env_values["MAVEN_REPOSITORY_PASSWORD"] = st.text_input(
+                "MAVEN_REPOSITORY_PASSWORD", value=os.getenv("MAVEN_REPOSITORY_PASSWORD", ""), type="password")
         env_values["JENKINS_CUCUMBER_JOB"] = st.text_input("JENKINS_CUCUMBER_JOB", value=os.getenv("JENKINS_CUCUMBER_JOB", ""),
                                                            help="Job pré-rempli après génération d'un patch. "
                                                                 "Ex: ODATIO_CUCUMBER_NIGHTLY")
@@ -3243,8 +3272,10 @@ with tab_config:
         env_values["CUCUMBER_VERIFY_JOB"] = st.text_input(
             "CUCUMBER_VERIFY_JOB", value=os.getenv("CUCUMBER_VERIFY_JOB", ""),
             placeholder="Vide = pas de job (ex. CUCUMBER-VERIFY-PATCH)",
-            help="Job Jenkins dédié acceptant PATCH (fichier .patch du lot), TAGS et ENV, et archivant le rapport "
-                 "Cucumber JSON. Ses paramètres sont vérifiés avant chaque génération : aucun push n'est fait.")
+            help="Job Jenkins de vérification. Avec un paramètre fichier PATCH (.patch du lot), TAGS et ENV : aucun "
+                 "push. Sans PATCH : le job lit la branche de travail du profil client, où l'agent pousse ses tests "
+                 "(jamais la branche d'intégration) ; les rôles de ses paramètres (branche, dépôt, arguments, "
+                 "attente) sont détectés et corrigeables dans le profil client.")
         with st.container(horizontal=True):
             env_values["CUCUMBER_VERIFY_ENV"] = st.text_input(
                 "CUCUMBER_VERIFY_ENV", value=os.getenv("CUCUMBER_VERIFY_ENV", ""),

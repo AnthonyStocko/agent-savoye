@@ -18,7 +18,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 
-from tools import jenkins_tools, memory_tools
+from tools import cucumber_job, jenkins_tools, memory_tools
 from tools.cucumber_tools import (_HTTP_CALL, _expression_regex, _first_argument, _git, _http_path, _java_methods,
                                   _read_text_file, _resolve, _step_prefix, _string_constants, _write_text,
                                   WORKSPACE_DIR, a_revoir_tag, blob_texts, disk_class_constants, extract_cucumber,
@@ -167,7 +167,11 @@ def selection_gap(report: list, texts, tags: str) -> str:
     désactivés exclus ou non : les deux sont admis) ; '' si conforme. Un écart signale un run sur une autre version
     du code ou une sélection de tags inopérante : le rapport n'est jamais analysé comme un résultat de test.
     """
-    executed = report_test_count(report)
+    return count_gap(report_test_count(report), texts, tags)
+
+
+def count_gap(executed: int, texts, tags: str) -> str:
+    """Écart entre un nombre de tests exécutés (rapport ou console) et celui attendu pour `tags` ; '' si conforme."""
     texts = list(texts)
     expected, active = expected_count(texts, tags), expected_count(texts, tags, a_revoir_tag())
     if executed in (expected, active):
@@ -757,11 +761,13 @@ def job_sources(cucumber_repo: str, base_branch: str, base_commit: str, standard
             "CUCUMBER_SPEC_COMMIT": base_commit, "CUCUMBER_STANDARD_COMMIT": standard_commit}
 
 
-def execution_mode() -> tuple:
+def execution_mode(profile: dict = None, base_branch: str = "") -> tuple:
     """
-    ("jenkins" | "local" | "", message) : job CUCUMBER_VERIFY_JOB s'il accepte PATCH (fichier), TAGS, ENV et
-    CUCUMBER_SPEC_REPOSITORY, sinon commande CUCUMBER_VERIFY_LOCAL_CMD, sinon aucun moyen d'exécution (niveau 1
-    seulement). Job sans CUCUMBER_SPEC_COMMIT / CUCUMBER_STANDARD_COMMIT : utilisable, avec un avertissement.
+    ("jenkins" | "branche" | "local" | "", message) : job CUCUMBER_VERIFY_JOB s'il accepte PATCH (fichier), TAGS, ENV
+    et CUCUMBER_SPEC_REPOSITORY ; sinon, avec `profile`, le même job lisant la branche de travail de l'agent
+    (« branche » : rôles branche et arguments du job, cucumber_job ; branche de travail distincte de `base_branch`) ;
+    sinon commande CUCUMBER_VERIFY_LOCAL_CMD, sinon aucun moyen d'exécution (niveau 1 seulement). Job sans
+    CUCUMBER_SPEC_COMMIT / CUCUMBER_STANDARD_COMMIT : utilisable, avec un avertissement.
     """
     job = os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
     reasons = []
@@ -773,6 +779,15 @@ def execution_mode() -> tuple:
             return "jenkins", f"job Jenkins {job}" + (
                 f" (⚠️ paramètres {', '.join(unpinned)} absents du job : l'application du patch peut échouer si la "
                 f"branche a avancé depuis la base)" if unpinned else "")
+        if parameters and profile is not None:
+            from tools.cucumber_run import branch_errors
+            info = cucumber_job.prepare(job, profile)
+            problems = info["erreurs"] + branch_errors(profile.get("verify_branch", ""), base_branch)
+            if not problems:
+                return "branche", (f"job Jenkins {job} sur la branche de travail {profile['verify_branch']} "
+                                   f"(paramètre {info['roles']['branche']}, filtre de tags dans "
+                                   f"{info['roles']['arguments']})")
+            reasons.append(f"job {job} inutilisable sur la branche de travail ({problems[0]})")
         reasons.append(f"job {job} inutilisable (" + (f"paramètres absents : {', '.join(missing)}" if parameters
                                                       and missing else "PATCH n'est pas un paramètre fichier"
                                                       if parameters else "introuvable") + ")")
@@ -1016,6 +1031,8 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
     `tags` (selection_gap) : non analysé (ok faux, ecart_selection). Renvoie {ok, message, build, resultats}.
     """
     started = time.time()
+    if mode == "branche":
+        return run_on_branch(worktree, tags, env, overrides, label, sources or {})
     if mode == "local":
         command = os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", "").strip()
         if env and "{env}" not in command:
@@ -1078,6 +1095,81 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
         return {"ok": False, "message": gap, "build": build["url"], "resultats": {}, "ecart_selection": True}
     return {"ok": True, "message": f"build {build['result']}", "build": build["url"],
             "resultats": parse_cucumber_report(report), "artefacts": build["artifacts"]}
+
+
+def branch_sources(profile: dict, repository: str) -> dict:
+    """Contexte d'une exécution « branche » : profil (branche de travail, rôles du job) et dépôt client."""
+    return {"profil": profile, "depot": repository}
+
+
+def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: str, sources: dict) -> dict:
+    """
+    Exécution sur la branche de travail (job CUCUMBER_VERIFY_JOB sans patch) : `overrides` écrits et commités, le
+    worktree poussé (jamais forcé) puis contrôlé en tête de la branche distante, fichiers d'origine rétablis par un
+    commit local ; job lancé avec sa configuration actuelle, la branche, le dépôt et le filtre de tags dans ses
+    arguments, attente décochée ; après le build, console (consoleText) et Cucumber.json archivé lus, secrets
+    masqués. Sans rapport JSON, résultats lus dans la console. Renvoie {ok, message, build, resultats}.
+    """
+    from tools import cucumber_checks
+    from tools.cucumber_import import console_facts, console_results
+    from tools.secret_tools import mask_secrets
+    profile, job = sources.get("profil") or {}, os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
+    branch = (profile.get("verify_branch") or "").strip()
+    info = cucumber_job.prepare(job, profile)
+    if info["erreurs"] or not branch:
+        return {"ok": False, "message": (info["erreurs"] or ["branche de travail non renseignée (profil client)"])[0],
+                "build": "", "resultats": {}}
+    originals = {rel: _read_text_file(os.path.join(worktree, *rel.split("/"))) for rel in overrides}
+    try:
+        for rel, text in overrides.items():
+            _write_text(os.path.join(worktree, *rel.split("/")), text)
+        error, _ = cucumber_checks.push_for_verification(worktree, branch, f"Cucumber verification ({label})")
+        head = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    finally:
+        if overrides:
+            for rel, text in originals.items():
+                _write_text(os.path.join(worktree, *rel.split("/")), text)
+            _git(worktree, "add", "--", *overrides)
+            _git(worktree, "commit", "-q", "-m", f"Cucumber verification ({label}) : fichiers d'origine rétablis")
+    if error:
+        return {"ok": False, "message": f"non vérifié : {error}", "build": "", "resultats": {}}
+    params = cucumber_job.build_parameters(info["definitions"], info["roles"], branch, sources.get("depot", ""),
+                                           tags, head, env)
+    queue = jenkins_tools.trigger_job(job, params)
+    if not queue:
+        return {"ok": False, "message": "lancement du job Jenkins impossible", "build": "", "resultats": {}}
+    build = jenkins_tools.wait_build_result(queue, _timeout())
+    if not build["url"]:
+        return {"ok": False, "message": f"build non abouti : {build['result']}", "build": "", "resultats": {}}
+    console = mask_secrets(jenkins_tools.build_bytes(build["url"], "consoleText").decode("utf-8", "replace"))[0]
+    folder = os.path.join(os.path.dirname(worktree), "verification")
+    _write_text(os.path.join(folder, f"{label}-console.txt"), console)
+    report = []
+    for artifact in (a for a in build["artifacts"] if a.lower().endswith(".json") and "cucumber" in a.lower()):
+        text = mask_secrets(jenkins_tools.build_bytes(build["url"], f"artifact/{artifact}").decode("utf-8",
+                                                                                                    "replace"))[0]
+        try:
+            data = json.loads(text) if text.strip() else []
+        except ValueError:
+            data = []
+        report += data if isinstance(data, list) else []
+    if report:
+        gap = selection_gap(report, feature_texts(worktree), tags)
+        if gap:
+            return {"ok": False, "message": gap, "build": build["url"], "resultats": {}, "ecart_selection": True}
+        return {"ok": True, "message": f"build {build['result']}", "build": build["url"],
+                "resultats": parse_cucumber_report(report), "artefacts": build["artifacts"]}
+    results = {key: {k: v for k, v in r.items() if k != "erreur"} | {"journal": r.get("erreur", "")[:MAX_JOURNAL_CHARS]}
+               for key, r in console_results(console).items()}
+    if not results:
+        return {"ok": False, "message": f"build {build['result']} sans rapport Cucumber JSON ni scénario lisible dans "
+                                        f"la console", "build": build["url"], "resultats": {}}
+    run = (console_facts(console).get("tests") or {}).get("executes")
+    gap = count_gap(run, feature_texts(worktree), tags) if run is not None else ""
+    if gap:
+        return {"ok": False, "message": gap, "build": build["url"], "resultats": {}, "ecart_selection": True}
+    return {"ok": True, "message": f"build {build['result']} (résultats lus dans la console)", "build": build["url"],
+            "resultats": results}
 
 
 def _patch_not_applicable(build: dict, patch_file: str, label: str) -> bool:

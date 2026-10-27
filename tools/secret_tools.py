@@ -1,7 +1,8 @@
 """
 Masquage des secrets, commun à tout l'agent (import de rapports Cucumber, dépôt des connaissances partagées) :
 paramètres -D*password*, -DuserName, jetons, en-têtes Authorization, mots de passe d'URL ou de JSON, leurs formes
-base64, et les valeurs secrètes de la configuration (.env : *_TOKEN, *_SECRET, *_PASSWORD, *_API_KEY).
+base64, les valeurs secrètes de la configuration (.env : *_TOKEN, *_SECRET, *_PASSWORD, *_API_KEY) et celles lues
+pendant l'exécution (register_secrets : identifiants des arguments d'un job Jenkins, gardés en mémoire seulement).
 
 `remaining_secrets` contrôle un texte déjà masqué : tout motif de secret qui subsiste interdit son dépôt.
 """
@@ -32,6 +33,15 @@ TELLTALE_PATTERNS = (
 # Variables de configuration dont la valeur est un secret
 _SECRET_ENV_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)$", re.I)
 MIN_ENV_SECRET_LEN = 6
+# Valeurs secrètes lues pendant l'exécution (arguments d'un job Jenkins) : en mémoire seulement, jamais écrites
+_RUNTIME_SECRETS = set()
+
+
+def register_secrets(values) -> None:
+    """Valeurs secrètes connues de ce processus (ex. identifiants des arguments d'un job), masquées partout ensuite."""
+    for value in values or ():
+        if value and len(value.strip()) >= 4:
+            _RUNTIME_SECRETS.update(_variants(value.strip()))
 
 
 def _variants(value: str) -> set:
@@ -59,8 +69,11 @@ def mask_secrets(text: str) -> tuple:
             quote = match.group(2)[0] if match.group(2)[:1] in "\"'" and len(match.group(2)) > 1 else ""
             return f"{match.group(1)}{quote}{MASK}{quote}"
         text = pattern.sub(replace, text)
-    for value in sorted(values, key=len, reverse=True):
-        text = text.replace(value, MASK)
+    for value in sorted(values | _RUNTIME_SECRETS, key=len, reverse=True):
+        if value in text:
+            text = text.replace(value, MASK)
+            if value in _RUNTIME_SECRETS:
+                counts["argument du job"] = counts.get("argument du job", 0) + 1
     return text, counts
 
 
@@ -97,4 +110,6 @@ def remaining_secrets(text: str, environ=None) -> list:
     for name, value in env_secrets(environ).items():
         if any(variant in (text or "") for variant in _variants(value)):
             found.append(("configuration", name))
+    if any(value in (text or "") for value in _RUNTIME_SECRETS):
+        found.append(("argument du job", "valeur lue dans la configuration du job"))
     return found

@@ -142,7 +142,7 @@ def test_views_for_checks(client_repo, std_dir, cache):
         "features_root": f"{RES}/features/{CLIENT}/", "client_tag": CLIENT_TAG, "init": [INIT_REL],
         "library_version": "26.21", "server_version": "26.30", "server_initialized_data": [],
         "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
-        "verify_branch_param": "CUCUMBER_SPEC_BRANCH"}
+        "verify_branch_param": "CUCUMBER_SPEC_BRANCH", "job_roles": {}}
     assert INIT_REL in cp.conventions(effective)["protected_files"]
 
 
