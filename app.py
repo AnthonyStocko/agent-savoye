@@ -1820,7 +1820,8 @@ def render_task_row(client: str, row: dict) -> None:
     cols[0].checkbox("Choisir", key=f"cucumber_pick_{client}_{row['id']}", label_visibility="collapsed")
     cols[1].caption(row["module"] or "—")
     cols[2].button(row["titre"], type="tertiary", key=f"cucumber_open_{client}_{row['id']}",
-                   on_click=st.session_state.update, kwargs={f"cucumber_card_{client}": row["id"]})
+                   on_click=st.session_state.update, kwargs={f"cucumber_card_{client}": row["id"],
+                                                             f"cucumber_card_origine_{client}": "liste"})
     cols[3].markdown(cucumber_coverage.short_state(row))
 
 
@@ -1878,7 +1879,9 @@ def render_zone_tasks(ctx: dict, rows: list) -> None:
         for spec_id in picked:
             st.session_state.pop(f"cucumber_pick_{client}_{spec_id}", None)
     opened = st.session_state.get(f"cucumber_card_{client}")
-    if opened in by_id:
+    from_results = st.session_state.get(f"cucumber_card_origine_{client}") == "resultats" and opened in (
+        cucumber_tools.load_state(client).get("generations") or {})
+    if opened in by_id and not from_results:
         render_task_card(ctx, by_id[opened])
         st.button("Fermer le détail", type="tertiary", icon=":material/close:", key=f"cucumber_close_{client}",
                   on_click=st.session_state.pop, args=(f"cucumber_card_{client}", None))
@@ -1917,11 +1920,17 @@ def render_zone_results(ctx: dict, rows: list) -> None:
             def open_button(spec_id=spec_id):
                 st.button("Ouvrir", icon=":material/open_in_new:", type="tertiary",
                           key=f"cucumber_result_card_{client}_{spec_id}", on_click=st.session_state.update,
-                          kwargs={f"cucumber_card_{client}": spec_id})
+                          kwargs={f"cucumber_card_{client}": spec_id, f"cucumber_card_origine_{client}": "resultats"})
             if kind == "test_ecrit":
                 render_modifications(client, spec_id, "resultat", open_button)
             else:
                 open_button()
+        if st.session_state.get(f"cucumber_card_origine_{client}") == "resultats" and \
+                st.session_state.get(f"cucumber_card_{client}") == spec_id and spec_id in by_id:
+            render_task_card(ctx, by_id[spec_id])
+            st.button("Fermer le détail", type="tertiary", icon=":material/close:",
+                      key=f"cucumber_close_resultat_{client}", on_click=st.session_state.pop,
+                      args=(f"cucumber_card_{client}", None))
     if len(ordered) > 15:
         st.toggle(f"Afficher les {len(ordered)} résultats", key=f"cucumber_resultats_tout_{client}")
 

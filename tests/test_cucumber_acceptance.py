@@ -336,3 +336,17 @@ def test_generation_section_with_init_patch_and_patch_renders_once(project):
     assert not at.exception, [e.value for e in at.exception]
     labels = [str(b.proto.label) for b in at.get("download_button")]
     assert labels.count("Télécharger le patch d'initialisation") == 1
+
+
+def test_open_from_results_shows_detail_under_the_result(project):
+    """« Ouvrir » dans la zone Résultats : le détail s'affiche sous ce résultat (pas plus haut, hors de vue)."""
+    at = app_at()
+    [b for b in at.button if b.key == f"cucumber_result_card_{CLIENT}_sp-a"][0].click().run()
+    assert not at.exception, [e.value for e in at.exception]
+    titles = [m.value for m in at.markdown if m.value.startswith("#### ")]
+    zones = titles.index("#### À tester"), titles.index("#### Résultats")
+    assert zones[1] == zones[0] + 1                                   # rien d'ouvert dans « À tester »
+    assert len(titles) > zones[1] + 1                                 # le détail suit « Résultats »
+    assert at.session_state[f"cucumber_card_{CLIENT}"] == "sp-a"
+    [b for b in at.button if b.key == f"cucumber_close_resultat_{CLIENT}"][0].click().run()
+    assert f"cucumber_card_{CLIENT}" not in at.session_state
