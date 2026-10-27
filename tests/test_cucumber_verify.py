@@ -189,3 +189,23 @@ def test_apply_overrides_restores_and_removes(tmp_path):
     assert (tmp_path / "a.feature").read_text() == "mut\n" and (tmp_path / "b_mut.feature").exists()
     restore()
     assert (tmp_path / "a.feature").read_text() == "orig\n" and not (tmp_path / "b_mut.feature").exists()
+
+
+def test_override_without_standard_env(monkeypatch, tmp_path):
+    from tests.conftest import write
+    rel = "src/test/resources/cucumber/features/acme/prix.feature"
+    write(str(tmp_path / rel), PRICE_FEATURE)
+    copy = rel[:-8] + "_mut.feature"
+    monkeypatch.delenv("CUCUMBER_VERIFY_ENV_STD", raising=False)
+    monkeypatch.setattr(cv, "run_tags", lambda *a, **k: {"ok": True, "message": "ok", "build": "b", "resultats": {
+        (rel, "Prix client"): {"statut": "passe", "step": "", "phase": "", "message": ""},
+        (copy, "Prix client"): {"statut": "echoue", "step": "Then", "phase": "then", "message": "expected",
+                                "nature": "assertion", "exception": ""}}})
+    scenarios = {"@agent_acme_1_1": f"{rel}::Prix client"}
+    kinds = {"@agent_acme_1_1": "override"}
+    monkeypatch.delenv("CUCUMBER_VERIFY_REQUIRE_STD", raising=False)
+    result = cv.verify_lot("jenkins", str(tmp_path), "HEAD", None, [rel], scenarios, kinds, "lot1")
+    assert result["scenarios"]["@agent_acme_1_1"]["statut"] == "pertinent"
+    monkeypatch.setenv("CUCUMBER_VERIFY_REQUIRE_STD", "1")
+    result = cv.verify_lot("jenkins", str(tmp_path), "HEAD", None, [rel], scenarios, kinds, "lot1")
+    assert result["scenarios"]["@agent_acme_1_1"]["statut"] == "non_verifie"
