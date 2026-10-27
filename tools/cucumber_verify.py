@@ -601,11 +601,12 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
     patch_file = os.path.join(os.path.dirname(worktree), "verification", f"{label}.patch")
     _write_text(patch_file, patch)
     parameters = {"TAGS": tags, "ENV": env, **{k: v for k, v in (sources or {}).items() if v}}
-    queue = jenkins_tools.trigger_cucumber_job_with_file(
-        os.getenv("CUCUMBER_VERIFY_JOB", "").strip(), parameters, "PATCH", patch_file)
-    if not queue:
-        return {"ok": False, "message": "lancement du job Jenkins impossible", "build": "", "resultats": {}}
-    build = jenkins_tools.wait_build_result(queue, _timeout())
+    # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
+    build = jenkins_tools.run_exclusive(os.getenv("CUCUMBER_VERIFY_JOB", "").strip(), parameters, "PATCH",
+                                        patch_file, _timeout())
+    if build["result"] == "INDISPONIBLE" and not build["url"]:
+        return {"ok": False, "message": f"job Jenkins non lancé ({build.get('message', 'indisponible')})",
+                "build": "", "resultats": {}}
     if build["result"] not in ("SUCCESS", "UNSTABLE") and _patch_not_applicable(build, patch_file, label):
         return {"ok": False, "message": PATCH_NOT_APPLICABLE, "build": build["url"], "resultats": {}}
     reports = [a for a in build["artifacts"] if a.lower().endswith(".json") and "cucumber" in a.lower()]

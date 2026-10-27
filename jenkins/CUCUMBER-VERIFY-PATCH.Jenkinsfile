@@ -19,7 +19,8 @@ pipeline {
         string(name: 'CUCUMBER_STANDARD_BRANCH', defaultValue: 'development', description: 'Branche du Cucumber Standard')
         string(name: 'CUCUMBER_STANDARD_COMMIT', defaultValue: '', description: 'Commit du Cucumber Standard (vide = dernier commit de la branche)')
     }
-    options { timeout(time: 60, unit: 'MINUTES') }
+    // Un seul build à la fois : un second lancement attend en file la fin du premier
+    options { timeout(time: 60, unit: 'MINUTES'); disableConcurrentBuilds() }
     stages {
         stage('Sources') {
             steps {
