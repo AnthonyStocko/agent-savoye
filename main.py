@@ -393,12 +393,17 @@ DB_BLOCK_WORDING = {
         "db_max_commands": "8",
     },
     "generate-cucumber-client": {
-        "db_usage": "le paramétrage qui active ou conditionne les spécifiques du lot, ainsi que les valeurs de "
-                    "référence utiles aux jeux de données des scénarios",
+        "db_usage": "le paramétrage qui active ou conditionne les spécifiques du lot, et surtout les données de "
+                    "référence réelles des jeux de données des scénarios : codes de site, de dépôt, d'article, de "
+                    "client, de type ou de statut qui existent vraiment et sont actifs, valeurs de paramètres en "
+                    "vigueur, données dont dépend une règle du spécifique (seuil, condition, branche du code)",
         "db_findings_target": "le champ « raison » du JSON final (paramétrage constaté), et appuie les jeux de "
-                              "données des scénarios sur ces valeurs réelles",
+                              "données des scénarios sur ces valeurs réelles (commentaire Gherkin "
+                              "`# Donnée : <table>.<colonne>` sur la valeur reprise) plutôt que sur des valeurs "
+                              "inventées ; les données que le scénario crée lui-même restent créées par les steps "
+                              "Standard, comme dans le test Standard équivalent",
         "db_private_targets": "dans les scénarios,\n  les Step Definitions ni le JSON final",
-        "db_max_commands": "3",
+        "db_max_commands": os.getenv("CUCUMBER_DB_MAX_COMMANDS", "").strip() or "6",
     },
 }
 
@@ -1702,9 +1707,12 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             results, files = lot["resultats"], lot.get("fichiers") or []
             print(f"[LOT {label}] Reprise de la correction ({len(files)} fichier(s)).")
         else:
+            # Accès base en lecture seule pour tous les lots dès que le schéma est donné (données de référence
+            # réelles des jeux de données) ; CUCUMBER_DB_ALL_LOTS=0 : lots de paramétrage seulement
             has_parameters = any(s["type"] == "parametrage" for s in lot_specs)
+            all_lots = os.getenv("CUCUMBER_DB_ALL_LOTS", "1").strip() != "0"
             db_block = build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
-                                      step="generate-cucumber-client") if has_parameters else ""
+                                      step="generate-cucumber-client") if has_parameters or all_lots else ""
             # Exemple du lot : la feature Standard la mieux classée, à défaut les exemples globaux
             example = cucumber_tools.lot_example(lot_specs)
             values = {**fixed_values, "examples": f"'{example}'"} if example else fixed_values
