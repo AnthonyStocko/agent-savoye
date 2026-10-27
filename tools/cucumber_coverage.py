@@ -25,8 +25,8 @@ import re
 from datetime import datetime
 
 from tools import cucumber_audit, cucumber_import, cucumber_profile, cucumber_studio, cucumber_testability
-from tools.cucumber_tools import (_read_json, _write_json, a_revoir_tag, cache_dir, latest_results, load_state,
-                                  worktree_dir)
+from tools.cucumber_tools import (_git, _read_json, _read_text_file, _write_json, a_revoir_tag, cache_dir,
+                                  git_repos, latest_results, load_state, studio_dependencies, worktree_dir)
 from tools.cucumber_verify import NOT_TEST_STATUSES, all_verified, failure_category, scenario_id
 from tools.cucumber_a_revoir import DISABLED_COMMENT
 from tools.cucumber_decisions import PENDING_COMMENT
@@ -39,6 +39,7 @@ STATES = {
     "non_execute": ("couvert, jamais exécuté", "🔵", "blue"),
     "partiel": ("partiel", "🟣", "violet"),
     "non_couvert": ("non couvert", "⚪", "gray"),
+    "en_attente": ("couverte par une autre tâche, en attente de sa génération", "🔗", "blue"),
     "a_confirmer": ("testable, informations à confirmer", "🟡", "orange"),
     "non_testable": ("non testable aujourd'hui", "⚫", "gray"),
     "sans_objet": ("sans objet", "▫️", "gray"),
@@ -268,15 +269,6 @@ _ACTIONS = ("rendu", "création", "création ou mise à jour", "mise à jour", "
             "réapprovisionnement", "inventaire", "fusion", "expédition", "préparation", "réception", "retour")
 
 
-def ticket_titles(spec: dict) -> list:
-    """Titres des tickets Jira du spécifique (extrait Jira : « ## CLE-1 — Titre »)."""
-    path = spec.get("jira") or ""
-    if not path or not os.path.exists(path):
-        return []
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return [m.group(2).strip() for m in re.finditer(r"^##\s+([A-Z][A-Z0-9]+-\d+)\s*[—–-]\s*(.+)$", f.read(), re.M)]
-
-
 def split_words(token: str) -> list:
     """Mots accolés d'un nom (« dispatchadvice » → dispatch, advice) d'après le vocabulaire ; [token] sinon."""
     vocabulary = sorted(set(GLOSSARY) | _TECHNICAL_WORDS, key=len, reverse=True)
@@ -292,15 +284,86 @@ def split_words(token: str) -> list:
     return words
 
 
-def business_title(spec: dict) -> str:
+_TICKET_KEY = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+_STATUS_SUFFIX = re.compile(r"\s*\[[^\]]*\]\s*$")
+
+
+def ticket_links_path(client_name: str) -> str:
+    return os.path.join(cache_dir(client_name), "tickets_verifies.json")
+
+
+def strip_status(summary: str) -> str:
+    """Titre d'un ticket sans son statut Jira (« … [Analysée] » → « … »)."""
+    return _STATUS_SUFFIX.sub("", " ".join((summary or "").replace("\xa0", " ").split()))
+
+
+def candidate_tickets(spec: dict) -> dict:
+    """Tickets de l'extrait Jira du spécifique (rapprochés par mots-clés, non vérifiés) : {clé: titre}."""
+    path = spec.get("jira") or ""
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return {m.group(1): strip_status(m.group(2))
+                for m in re.finditer(r"^##\s+([A-Z][A-Z0-9]+-\d+)\s*[—–-]\s*(.+)$", f.read(), re.M)}
+
+
+def verify_ticket_links(client_name: str, inventory: dict, client_root: str, tickets: list) -> dict:
     """
-    Titre métier d'une tâche : titre de son premier ticket Jira, sinon déduit du nom du processus ou du dossier
-    (vocabulaire générique : « render-reportdoc-request » → « Rendu : document, demande »).
+    Liens ticket ↔ tâche VÉRIFIÉS (0 token, lecture seule) : clé d'un ticket Jira connu dans le message d'un commit
+    qui modifie les fichiers de la tâche, ou référence explicite dans l'un de ses fichiers ; le plus souvent lié
+    d'abord, puis le plus ancien. Le rapprochement par mots-clés de l'inventaire n'en est pas un. {id: [{"cle", "titre", "preuve"}]}, écrit dans tickets_verifies.json.
     """
-    titles = ticket_titles(spec)
-    if titles:
-        return titles[0]
+    known = {t["key"]: strip_status(t.get("summary", "")) for t in tickets or [] if t.get("key")}
+    repos = git_repos(client_root)
+    out = {}
+    for spec in inventory.get("specifiques") or []:
+        titles = {**candidate_tickets(spec), **known}
+        found = {}
+        by_repo = {}
+        for item in spec.get("fichiers") or []:
+            by_repo.setdefault(item.get("repo", ""), []).append(item.get("path", ""))
+        count = {}
+        for repo, paths in by_repo.items():
+            if repo not in repos:
+                continue
+            log = _git(repos[repo], "log", "--reverse", "--format=%h%x1f%s%n%b%x1e", "--", *paths).stdout
+            for entry in log.split("\x1e"):
+                sha, _, message = entry.strip().partition("\x1f")
+                for key in set(_TICKET_KEY.findall(message)):
+                    found.setdefault(key, f"commit {sha} de {repo} qui modifie les fichiers de la tâche")
+                    count[key] = count.get(key, 0) + 1
+        for item in spec.get("fichiers") or []:
+            local = item.get("local") or ""
+            if local and os.path.isfile(local):
+                for key in _TICKET_KEY.findall(_read_text_file(local)):
+                    found.setdefault(key, f"référence dans {item.get('repo', '')}/{item.get('path', '')}")
+                    count[key] = count.get(key, 0) + 1
+        # Ticket le plus souvent lié aux fichiers de la tâche, puis le plus ancien (celui qui l'a créée)
+        order = list(found)
+        links = [{"cle": k, "titre": titles[k], "preuve": found[k]}
+                 for k in sorted(order, key=lambda k: (-count.get(k, 0), order.index(k))) if titles.get(k)]
+        if links:
+            out[spec["id"]] = links
+    _write_json(ticket_links_path(client_name), out)
+    return out
+
+
+def load_ticket_links(client_name: str) -> dict:
+    return _read_json(ticket_links_path(client_name), {}) or {}
+
+
+def business_title(spec: dict, links: list = None) -> str:
+    """
+    Titre métier d'une tâche : titre (sans statut Jira) d'un ticket dont le lien est VÉRIFIÉ (verify_ticket_links),
+    sinon déduit du nom du processus ou du dossier (vocabulaire générique : « render-reportdoc-request » →
+    « Rendu : document, demande »).
+    """
     name = (spec.get("libelle") or spec.get("id") or "").split("·")[-1].strip()
+    # Nature d'un élément Studio dans le titre : un événement, son déclencheur et leur processus se distinguent
+    kind = next((label for token, label in (("listener", " (déclencheur)"), ("event", " (événement)"))
+                 if re.search(rf"(^|[-_]){token}([-_]|$)", name.lower())), "")
+    if links:
+        return links[0]["titre"] + kind
     words = []
     for token in (w for t in re.split(r"[-_./\s]+", name.lower()) if t for w in split_words(t)):
         if token and token not in _TECHNICAL_WORDS:
@@ -308,14 +371,14 @@ def business_title(spec: dict) -> str:
             if word not in words:
                 words.append(word)
     if not words:
-        return name
+        return name + kind
     action = next((w for w in words if w in _ACTIONS), "")
     others = [w for w in words if w != action]
     text = f"{action} : {', '.join(others)}" if action and others else action or ", ".join(others)
-    return text[:1].upper() + text[1:]
+    return text[:1].upper() + text[1:] + kind
 
 
-def business_sentence(spec: dict, state_key: str, evaluation: dict, cause: str = "") -> str:
+def business_sentence(spec: dict, state_key: str, evaluation: dict, cause: str = "", title: str = "") -> str:
     """
     Une phrase métier sur ce qu'il faut tester (résumé du lot, sinon déduite du type et des comportements Studio),
     ou sur ce qui bloque (non testable, sans objet). Jamais la raison technique recopiée.
@@ -327,7 +390,7 @@ def business_sentence(spec: dict, state_key: str, evaluation: dict, cause: str =
         return f"Aucun comportement propre au client à tester. Preuve : {evaluation.get('preuve') or cause or '—'}"
     if evaluation.get("resume"):
         return evaluation["resume"]
-    title = business_title(spec).lower()
+    title = (title or business_title(spec)).lower()
     counts = cucumber_studio.behaviour_counts(spec)
     if counts:
         return (f"Vérifier le comportement propre au client ({cucumber_studio.counts_line(counts)}) de la "
@@ -338,7 +401,7 @@ def business_sentence(spec: dict, state_key: str, evaluation: dict, cause: str =
 
 
 def testability(spec: dict, result: dict, scenarios: list, index: dict = None, profile: dict = None,
-                init_state: str = "") -> dict:
+                init_state: str = "", title: str = "") -> dict:
     """
     Facteurs de testabilité DÉTECTÉS (jamais saisis), chacun (réponse, preuve) parmi oui / non / non déterminé :
     code et personnalisation Studio déployés (dernier run, blocage prouvé), données recréables (init détectée,
@@ -346,7 +409,7 @@ def testability(spec: dict, result: dict, scenarios: list, index: dict = None, p
     bloque pas. Synthèse « testabilite » (testable, à confirmer, non testable), « raisons » et « evaluation »
     (cucumber_testability.assess, réponses proposées et questions précises).
     """
-    evaluation = cucumber_testability.assess(result, index or {}, profile or {}, business_title(spec))
+    evaluation = cucumber_testability.assess(result, index or {}, profile or {}, title or business_title(spec))
     green = any(s["etat"] == "vert" for s in scenarios)
     natures = {s["nature"] for s in scenarios}
     blocked = evaluation["etat"] == "non_testable"
@@ -445,11 +508,15 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
     index = cucumber_testability.load_index(client_name) if client_name else {}
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name)) if client_name else {}
     init_state = init_state_of(client_name, profile) if client_name else ""
+    links = load_ticket_links(client_name) if client_name else {}
+    specifics = {s["id"]: s for s in inventory.get("specifiques") or []}
+    lots_of = {r.get("id"): lot["numero"] for lot in state.get("lots") or [] for r in lot.get("resultats") or []}
     rows = {}
-    for spec in inventory.get("specifiques") or []:
+    for spec in specifics.values():
         result, override = results.get(spec["id"], {}), overrides.get(spec["id"], {})
         scenarios = linked_scenarios(spec, result, sources)
-        testable = testability(spec, result, scenarios, index, profile, init_state)
+        title = business_title(spec, links.get(spec["id"]))
+        testable = testability(spec, result, scenarios, index, profile, init_state, title)
         state_key, cause = spec_state(spec, result, scenarios, testable)
         rows[spec["id"]] = {
             "id": spec["id"], "tache": spec["libelle"], "module": module_of(spec), "point_entree": entry_point(spec),
@@ -457,17 +524,106 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
             "risque_propose": proposed_risk(spec), "features": sorted({s["id"].split("::", 1)[0] for s in scenarios}),
             "etat": state_key, "cause": cause, "testabilite": testable["testabilite"],
             "criteres": testable["criteres"], "raisons": testable["raisons"], "derniere": last_execution(scenarios),
-            "evaluation": testable["evaluation"], "titre": business_title(spec),
-            "phrase": business_sentence(spec, state_key, testable["evaluation"], cause),
+            "evaluation": testable["evaluation"], "titre": title, "tickets_verifies": links.get(spec["id"]) or [],
+            "phrase": business_sentence(spec, state_key, testable["evaluation"], cause, title),
+            "relance_inutile": useless_relaunch(spec, result, lots_of.get(spec["id"]), profile)
+            if state_key in ("non_couvert", "partiel", "a_confirmer") else {},
             "scenarios": scenarios, "effort": effort(spec), "constats": result.get("constats") or [],
             "studio": cucumber_studio.spec_behaviours(spec), "studio_total": cucumber_studio.behaviour_counts(spec),
             "studio_a_calculer": studio_pending(spec),
-            "couvert_par": result.get("couvert_par", "") if result.get("statut") == "couvert_indirectement" else ""}
-    for row in rows.values():
-        covering = rows.get(row["couvert_par"])
-        if covering and not row["scenarios"]:
-            row["etat"], row["cause"] = covering["etat"], f"couvert indirectement par {covering['tache']}"
+            "couvert_par": "", "chaine": [], "chaine_titre": ""}
+    propagate(rows, coverage_links(specifics, results))
     return selection_order(list(rows.values()))
+
+
+def useless_relaunch(spec: dict, result: dict, lot: int, profile: dict) -> dict:
+    """
+    Dernier lot de la tâche sans rien écrit, entrées inchangées depuis (code, profil client, réponses : empreinte
+    task_inputs) : {"lot", "raison"} — relancer donnerait le même résultat ; {} sinon (ou empreinte inconnue).
+    """
+    if not result or result.get("scenarios") or result.get("fichiers") or not result.get("entrees"):
+        return {}
+    if result["entrees"] != cucumber_testability.task_inputs(spec, profile):
+        return {}
+    return {"lot": lot, "raison": result.get("resume") or cucumber_testability.summary(result.get("raison", ""))}
+
+
+def coverage_links(specifics: dict, results: dict) -> dict:
+    """
+    Couverture indirecte {id: (id de la tâche qui la couvre, origine)} : éléments Studio sans logique propre (XML,
+    studio_dependencies), puis tâches déclarées « couvert_indirectement » par leur lot (statut déclaré gardé même
+    si la tâche qui couvre n'est pas encore couverte).
+    """
+    links = {i: (d["couvert_par"], d["raison"]) for i, d in studio_dependencies(specifics).items() if d["couvert_par"]}
+    for i, result in results.items():
+        declared = result.get("statut_declare") or result.get("statut")
+        if declared == "couvert_indirectement" and result.get("couvert_par") and i not in links:
+            links[i] = (result["couvert_par"], "déclaré par le lot " + (result.get("raison") or "")[:120])
+    return links
+
+
+def resolve_chain(start: str, links: dict) -> tuple:
+    """(chaîne [start, …, fin], cycle) : suit les liens de couverture indirecte jusqu'à une tâche sans lien."""
+    chain = [start]
+    while chain[-1] in links:
+        target = links[chain[-1]][0]
+        if target in chain:
+            return chain + [target], True
+        chain.append(target)
+    return chain, False
+
+
+def propagate(rows: dict, links: dict) -> None:
+    """
+    État des tâches couvertes indirectement, d'après la FIN de leur chaîne (qui doit avoir un vrai test) : test vert,
+    en échec, désactivé, jamais exécuté ou partiel → même état (« couvert indirectement par … ») ; pas encore de test
+    → « en_attente » (attend sa génération) ; non testable → même blocage ; cycle, ou chaîne sans aucun vrai test →
+    « non_couvert », la tâche se teste elle-même. Une tâche qui a ses propres scénarios garde son état.
+    """
+    for spec_id, row in rows.items():
+        if spec_id not in links or row["scenarios"]:
+            continue
+        chain, cycle = resolve_chain(spec_id, links)
+        row["chaine"] = chain
+        end = rows.get(chain[-1])
+        names = " → ".join(rows[i]["titre"] if i in rows else i for i in chain)
+        if cycle:
+            row["etat"], row["cause"] = "non_couvert", f"cycle de couverture indirecte ({names}) : aucune tâche de " \
+                                                       f"la chaîne n'a de vrai test, celle-ci se teste elle-même"
+        elif end is None or end["etat"] == "sans_objet":
+            row["etat"], row["cause"] = "non_couvert", f"la chaîne de couverture ({names}) n'aboutit à aucun vrai test"
+        elif end["scenarios"]:
+            row["etat"], row["cause"] = end["etat"], f"couvert indirectement par « {end['titre']} »"
+            row["couvert_par"] = end["id"]
+        elif end["etat"] == "non_testable":
+            row["etat"], row["cause"] = "non_testable", f"dépend de « {end['titre']} » : {end['cause']}"
+            row["couvert_par"] = end["id"]
+        else:
+            row["etat"], row["cause"] = "en_attente", f"couverte par « {end['titre']} », pas encore testée"
+            row["couvert_par"] = end["id"]
+        if row["etat"] != "non_couvert":
+            row["chaine_titre"] = end["titre"]
+            row["phrase"] = (f"Couverte par « {end['titre']} » : son test couvre aussi cette tâche."
+                             + ("" if end["scenarios"] else " Générez d'abord celui-ci."))
+            row["relance_inutile"] = {}
+
+
+def substitute_dependents(rows: list, ids: list) -> tuple:
+    """
+    Tâches cochées qui dépendent d'une autre (en attente de sa génération) : (identifiants à générer, la tâche dont
+    elles dépendent à leur place ; substitutions [(dépendante, tâche couvrante)]).
+    """
+    by_id = {r["id"]: r for r in rows}
+    out, substitutions = [], []
+    for i in ids:
+        row = by_id.get(i) or {}
+        target = row.get("couvert_par") if row.get("etat") == "en_attente" else ""
+        if target:
+            substitutions.append((i, target))
+            i = target
+        if i not in out:
+            out.append(i)
+    return out, substitutions
 
 
 def selection_order(rows: list) -> list:

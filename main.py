@@ -2468,6 +2468,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             client, profile, cucumber_tools.load_inventory(client), cucumber_profile.base_worktree_dir(client),
             std_features_dir(local_cucumber_std_repo), cucumber_testability.document_paths(client))
         cucumber_testability.save_index(client, index)
+        # Liens ticket ↔ tâche vérifiés (commit qui modifie ses fichiers, référence explicite) : titres métier
+        links = cucumber_coverage.verify_ticket_links(client, inventory, local_client_repo,
+                                                      cucumber_tools.cached_tickets(client, max_age_s=10 ** 9) or [])
+        print(f"[CUCUMBER DÉTECTION] Tickets Jira liés de façon vérifiée : {sum(map(len, links.values()))} "
+              f"lien(s) sur {len(links)} tâche(s)")
         if cucumber_tools.load_state(client).get("lots"):
             retro = cucumber_testability.retro(client, index=index, profile=profile)
             print(f"[CUCUMBER TESTABILITÉ] {cucumber_testability.retro_line(retro)}")
@@ -2511,6 +2516,16 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         for i in wanted:
             reason = " ".join(((previous.get(i) or {}).get("raison") or "").split())
             print(f"  - {i} — {specifics[i]['libelle']}" + (f" : {reason[:160]}" if reason else ""))
+        # Tri sans token : un élément Studio sans logique propre ne part jamais dans un lot Claude
+        wanted, sorted_out = cucumber_tools.presort(wanted, specifics)
+        if sorted_out:
+            sorted_lot = cucumber_tools.add_sorted_lot(state, sorted_out)
+            print(f"[CUCUMBER] Tri sans appel Claude (lot {sorted_lot['numero']}) : " + " ; ".join(
+                f"{r['id']} — {r['raison']}" for r in sorted_out))
+        if not wanted:
+            cucumber_tools.save_state(client, state)
+            print("[CUCUMBER] Aucun spécifique à confier à un lot Claude.")
+            return 0
         new_lots = cucumber_tools.add_completion_lots(state, wanted, _env_int("CUCUMBER_BATCH_SIZE", 3), specifics)
         others = len(cucumber_tools.pending_lots(state)) - len(new_lots)
         print(f"[CUCUMBER] Complément : lot(s) {new_lots[0]['numero']} à {new_lots[-1]['numero']} ajouté(s), lots "
@@ -2801,6 +2816,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             print(f"[LOT {label}] ❌ {len(outside)} fichier(s) hors du commit (absents du patch) : "
                   f"{', '.join(outside[:10])}")
         lot["hors_commit"] = outside
+        # Empreinte des entrées de chaque tâche (code, profil client, réponses) : pas de relance inutile
+        for result in results:
+            if result.get("id") in specifics:
+                result["entrees"] = cucumber_testability.task_inputs(specifics[result["id"]], profile)
         lot.update(resultats=results, fichiers=files, commit=committed or lot.get("commit", False),
                    fin=datetime.now().isoformat(timespec="seconds"),
                    verification={k: check.get(k) for k in ("ok", "etape", "erreurs", "environnement")} if files

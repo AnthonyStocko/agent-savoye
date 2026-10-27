@@ -60,16 +60,16 @@ def card_keys(at, kind: str) -> list:
 
 def test_business_title_and_sentence(project):
     spec = ct.load_inventory(CLIENT)["specifiques"][0]
-    assert cov.business_title(spec) == "Rendu : document, demande"
+    assert cov.business_title(spec) == "Rendu : document, demande (déclencheur)"
     row = cov.coverage_rows(CLIENT, ct.load_inventory(CLIENT))[0]
-    assert row["titre"] == "Rendu : document, demande" and PROCESS not in row["phrase"]
+    assert row["titre"] == "Rendu : document, demande (déclencheur)" and PROCESS not in row["phrase"]
     assert "fixtures" not in row["phrase"]
 
 
 def test_card_proposes_answer_asks_precise_question_and_saves_automatically(project):
     at = open_card(project)
     markdown = " ".join(m.value for m in at.markdown)
-    assert "Rendu : document, demande" in markdown and "Réponse proposée" in markdown
+    assert "Rendu : document, demande (déclencheur)" in markdown and "Réponse proposée" in markdown
     assert "DOC_FICTIF_A, DOC_FICTIF_B" in markdown and "DOC_FICTIF_Z est cité mais introuvable" in markdown
     assert "Quelle donnée, clé ou valeur faut-il" not in markdown
     # Champ de saisie : seulement la question sans réponse proposée (pas de champ avant « Corriger »)
@@ -124,3 +124,36 @@ def test_testable_card_shows_only_title_sentence_and_generate(project):
     generate = [b for b in at.button if (b.key or "").startswith("cucumber_card_generate_")][0]
     assert not generate.disabled
     assert any(CLIENT_TAG not in m.value and "🟢" not in m.value and "non couvert" in m.value for m in at.markdown)
+
+
+def test_waiting_card_opens_covering_task_and_useless_relaunch_is_explained(project):
+    inventory = ct.load_inventory(CLIENT)
+    inventory["specifiques"].append({"id": "sp-2", "libelle": "app · dossier", "type": "extension",
+                                     "nature": "objet métier", "depot": "app", "dossier": "dossier",
+                                     "fichiers": [{"repo": "app", "path": "Dossier.java", "blob": "b"}]})
+    ct.save_inventory(CLIENT, inventory)
+    state = ct.load_state(CLIENT)
+    state["lots"][0]["ids"].append("sp-2")
+    state["lots"][0]["resultats"].append({"id": "sp-2", "statut": "non_couvert", "statut_declare":
+                                          "couvert_indirectement", "couvert_par": "sp-1"})
+    ct.save_state(CLIENT, state)
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_step_{CLIENT}"] = "couverture"
+    at.session_state[f"cucumber_card_{CLIENT}"] = "sp-2"
+    at.run()
+    assert not at.exception
+    assert not [b for b in at.button if (b.key or "").startswith("cucumber_card_generate_")]
+    opener = [b for b in at.button if (b.key or "").startswith("cucumber_card_open_")]
+    assert len(opener) == 1 and opener[0].label == "Ouvrir « Rendu : document, demande (déclencheur) »"
+    opener[0].click().run()
+    assert at.session_state[f"cucumber_card_{CLIENT}"] == "sp-1"
+    # Dernier lot sans rien écrit, entrées inchangées : la carte explique au lieu de proposer une relance
+    profile = cp.effective_profile(cp.load_profile(CLIENT))
+    spec = ct.load_inventory(CLIENT)["specifiques"][0]
+    state = ct.load_state(CLIENT)
+    state["lots"][0]["resultats"][0].update(resume="Aucun scénario écrit.", entrees=cte.task_inputs(spec, profile))
+    cte.save_index(CLIENT, {v: [{"source": "init", "ou": "init.feature:3"}] for v in (*DOC_KEYS, "DOC_FICTIF_Z")})
+    ct.save_state(CLIENT, state)
+    at = open_card(project)
+    assert not [b for b in at.button if (b.key or "").startswith("cucumber_card_generate_")]
+    assert any("la relancer donnerait le même résultat" in c.value for c in at.caption)

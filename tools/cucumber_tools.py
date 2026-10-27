@@ -2671,6 +2671,40 @@ def studio_event(spec: dict) -> dict:
             "logique": bool(tags - {"variable", "variables", "description"})}
 
 
+def studio_dependencies(specifics: dict) -> dict:
+    """
+    Éléments Studio sans logique propre (déclaration d'événement ou de variables seulement, listener sans condition
+    ni transformation), classés par analyse du XML, sans appel Claude : {id: {"couvert_par" (id du processus de
+    l'inventaire qui l'utilise, '' s'il est du Standard), "processus", "raison", "preuve"}}.
+    """
+    processes = {s.get("dossier", "").rsplit("/", 1)[-1]: s for s in specifics.values()
+                 if s.get("nature") == "processus" and s.get("dossier")}
+    events = {i: studio_event(s) for i, s in specifics.items() if s.get("nature") == "processus"}
+    listeners = [e for e in events.values() if e.get("type") == "listener"]
+    out = {}
+    for i, event in events.items():
+        if not event or event["logique"]:
+            continue
+        via = [(event["nom"], event["execute"])] if event["type"] == "listener" else [
+            (e["nom"], e["execute"]) for e in listeners if e["on_event"] == event["nom"]]
+        via = [(name, process) for name, process in via if process]
+        if not via:
+            continue
+        listener, process_name = next(((n, p) for n, p in via if p in processes and not events.get(
+            processes[p]["id"])), via[0])
+        process = processes.get(process_name)
+        what = ("listener sans logique propre (aucune condition, mappings $event.* seuls)" if event["type"] ==
+                "listener" else "événement sans logique propre (déclaration de variables seulement)")
+        out[i] = {"couvert_par": process["id"] if process and not events.get(process["id"]) else "",
+                  "processus": process_name,
+                  "raison": f"{what}, couvert par le processus qui l'utilise : {process_name}"
+                            + ("" if event["type"] == "listener" else f" (déclenché par {listener})"),
+                  "preuve": f"{specifics[i].get('dossier', '')}/customized.xml : "
+                            + ("mappings $event.* seuls" if event["type"] == "listener" else
+                               "éléments <variable> seuls, aucune condition, action ni écran")}
+    return out
+
+
 def _is_technical(spec: dict) -> bool:
     """Ni fichier Java, ni processus Studio, ni paramètre (et tous ses fichiers sont listés)."""
     files = spec.get("fichiers", [])
@@ -2682,37 +2716,23 @@ def _is_technical(spec: dict) -> bool:
 def presort(spec_ids: list, specifics: dict) -> tuple:
     """
     Tri sans token des spécifiques sélectionnés. Renvoie (identifiants laissés aux lots, résultats déjà conclus) :
-    listener ou événement sans logique propre -> « couvert_indirectement » par le processus qu'il déclenche, si
-    celui-ci est sélectionné (ou déjà couvert) ; spécifique purement technique -> « non_couvert » (TECHNICAL_REASON).
+    élément Studio sans logique propre (studio_dependencies) -> « couvert_indirectement » par le processus de
+    l'inventaire qui l'utilise, quel que soit son état (aucun lot pour lui), ou « sans objet » si ce processus est
+    du Standard ; spécifique purement technique -> « non_couvert » (TECHNICAL_REASON).
     """
-    selected = set(spec_ids)
-    processes = {s["dossier"].rsplit("/", 1)[-1]: s for s in specifics.values() if s.get("nature") == "processus"}
-    events = {i: studio_event(s) for i, s in specifics.items() if s.get("nature") == "processus"}
-    listeners = [e for e in events.values() if e.get("type") == "listener"]
-
-    def target(process_name: str):
-        process = processes.get(process_name)
-        if process and (process["id"] in selected or process.get("couverture") == "deja_couvert") \
-                and not events.get(process["id"]):
-            return process
-        return None
+    dependencies = studio_dependencies(specifics)
     remaining, results = [], []
     for i in spec_ids:
-        spec, event = specifics[i], events.get(i) or {}
+        dependency = dependencies.get(i)
         result = None
-        if event and not event["logique"]:
-            via = [(event["nom"], event["execute"])] if event["type"] == "listener" else [
-                (e["nom"], e["execute"]) for e in listeners if e["on_event"] == event["nom"]]
-            found = next(((name, target(process)) for name, process in via if target(process)), None)
-            if found:
-                listener, process = found
-                how = (f"listener sans logique propre (aucune condition, mappings $event.* seuls) qui déclenche "
-                       f"{process['dossier']}" if event["type"] == "listener" else
-                       f"événement sans logique propre (variables seules), déclenché vers {process['dossier']} "
-                       f"par {listener}")
-                result = {"id": i, "statut": "couvert_indirectement", "couvert_par": process["id"],
-                          "raison": f"{how} (tri automatique, sans appel Claude)"}
-        elif _is_technical(spec):
+        if dependency and dependency["couvert_par"]:
+            result = {"id": i, "statut": "couvert_indirectement", "couvert_par": dependency["couvert_par"],
+                      "raison": f"{dependency['raison']} (tri automatique, sans appel Claude)",
+                      "preuve": dependency["preuve"]}
+        elif dependency:
+            result = {"id": i, "statut": "non_couvert", "raison": f"{dependency['raison']}, processus du Standard",
+                      "sans_objet": {"preuve": dependency["preuve"]}}
+        elif _is_technical(specifics[i]):
             result = {"id": i, "statut": "non_couvert", "raison": TECHNICAL_REASON}
         if result:
             results.append({"scenarios": [], "fichiers": [], "classes_java": [], "inspire_de": [], "tri": True,
@@ -2726,6 +2746,17 @@ def presort_lot(results: list, number: int) -> dict:
     """Lot terminé sans appel Claude, portant les résultats du tri Python."""
     return {"numero": number, "ids": [r["id"] for r in results], "statut": "termine", "tri": True,
             "resultats": results, "commit": False, "fin": datetime.now().isoformat(timespec="seconds")}
+
+
+def add_sorted_lot(state: dict, results: list) -> dict:
+    """
+    Complément : lot du tri sans token ajouté à la suite, ses spécifiques retirés de leurs anciens lots (résultats
+    gardés dans « historique »). Renvoie le lot ajouté.
+    """
+    lot = presort_lot(results, max((lot["numero"] for lot in state.get("lots", [])), default=0) + 1)
+    _take_from_lots(state, {i: lot["numero"] for i in lot["ids"]})
+    state["lots"] = state.get("lots", []) + [lot]
+    return lot
 
 
 # ---------------------------------------------------------------------------
@@ -2899,7 +2930,13 @@ def add_completion_lots(state: dict, spec_ids: list, batch_size: int, specifics:
     new = make_lots(spec_ids, batch_size, specifics)
     for lot in new:
         lot.update(numero=lot["numero"] + start, complement=True)
-    taken = {i: lot["numero"] for lot in new for i in lot["ids"]}
+    _take_from_lots(state, {i: lot["numero"] for lot in new for i in lot["ids"]})
+    state["lots"] = state.get("lots", []) + new
+    return new
+
+
+def _take_from_lots(state: dict, taken: dict) -> None:
+    """Spécifiques `taken` ({id: lot qui les reprend}) retirés de leurs anciens lots, résultats en « historique »."""
     for lot in state.get("lots", []):
         moved = [i for i in lot["ids"] if i in taken]
         if not moved:
@@ -2911,8 +2948,6 @@ def add_completion_lots(state: dict, spec_ids: list, batch_size: int, specifics:
             lot["resultats"] = [r for r in lot["resultats"] if r.get("id") not in taken]
         if not lot["ids"] and lot.get("statut") != "termine":
             lot["statut"] = "exclu"
-    state["lots"] = state.get("lots", []) + new
-    return new
 
 
 def requalify_indirect(state: dict, inventory: dict) -> list:

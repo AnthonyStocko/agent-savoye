@@ -53,7 +53,7 @@ def test_presort_listener_event_and_technical(tmp_path):
         # Listener avec condition : logique propre, laissé à Claude
         _studio(tmp_path, "sp-if", "spec-wms-preparation-listener-managedangerous",
                 LISTENER.format(event="trigger", process=process, condition="<if>$event.name != null</if>")),
-        # Process déclenché non sélectionné : listener laissé à Claude
+        # Process déclenché absent de l'inventaire (Standard) : sans objet, sans lot Claude
         _studio(tmp_path, "sp-orphan", "spec-wms-preparation-listener-render-btocinvoice",
                 LISTENER.format(event="e", process="spec-wms-preparation-process-render-btocclientx", condition="")),
         {"id": "sp-tech", "libelle": "wms · config", "type": "extension", "nature": "objet métier", "depot": "wms",
@@ -66,17 +66,18 @@ def test_presort_listener_event_and_technical(tmp_path):
     specifics = {s["id"]: s for s in specs}
     wanted = [s["id"] for s in specs]
     remaining, results = ct.presort(wanted, specifics)
-    assert remaining == ["sp-proc", "sp-if", "sp-orphan", "sp-java"]
+    assert remaining == ["sp-proc", "sp-if", "sp-java"]
     by_id = {r["id"]: r for r in results}
     assert by_id["sp-lis"]["statut"] == by_id["sp-evt"]["statut"] == "couvert_indirectement"
     assert by_id["sp-lis"]["couvert_par"] == by_id["sp-evt"]["couvert_par"] == "sp-proc"
     assert by_id["sp-tech"] == {"id": "sp-tech", "statut": "non_couvert", "raison": ct.TECHNICAL_REASON,
                                 "scenarios": [], "fichiers": [], "classes_java": [], "inspire_de": [], "tri": True}
-    # Process non sélectionné : le listener reste à traiter
-    remaining, _ = ct.presort(["sp-lis"], specifics)
-    assert remaining == ["sp-lis"]
+    assert by_id["sp-orphan"]["sans_objet"]["preuve"].endswith("mappings $event.* seuls")
+    # Process non sélectionné : le listener est quand même classé sans lot Claude (analyse du XML)
+    remaining, sorted_out = ct.presort(["sp-lis"], specifics)
+    assert remaining == [] and sorted_out[0]["couvert_par"] == "sp-proc"
     lot = ct.presort_lot(results, 4)
-    assert lot["statut"] == "termine" and lot["tri"] and lot["ids"] == ["sp-lis", "sp-evt", "sp-tech"]
+    assert lot["statut"] == "termine" and lot["tri"] and lot["ids"] == ["sp-lis", "sp-evt", "sp-orphan", "sp-tech"]
     # Le statut « couvert_indirectement » du tri reste soumis à la requalification finale
     state = {"lots": [lot]}
     assert set(ct.requalify_indirect(state, {"specifiques": specs})) == {"sp-lis", "sp-evt"}

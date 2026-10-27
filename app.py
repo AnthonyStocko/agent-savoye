@@ -1478,8 +1478,12 @@ GENERABLE_STATES = ("non_couvert", "partiel", "a_confirmer")
 
 
 def generable(row: dict) -> bool:
-    """Tâche à générer : non couverte, partielle ou à confirmer, sans réponse attendue."""
-    return row["etat"] in GENERABLE_STATES and not (row.get("evaluation") or {}).get("attendues")
+    """
+    Tâche à générer : non couverte, partielle ou à confirmer, sans réponse attendue, et pas de relance inutile
+    (dernier lot sans rien écrit, entrées inchangées).
+    """
+    return (row["etat"] in GENERABLE_STATES and not (row.get("evaluation") or {}).get("attendues")
+            and not row.get("relance_inutile"))
 
 
 def coverage_table(rows: list, key: str) -> list:
@@ -1557,6 +1561,10 @@ def render_card_details(ctx: dict, row: dict) -> None:
     client, evaluation = ctx["client"], row.get("evaluation") or {}
     st.caption(f"Identifiant : {row['id']} · {row['tache']} · point d'entrée : {row['point_entree']}"
                + (f" · tickets : {', '.join(row['tickets'])}" if row["tickets"] else ""))
+    for link in row.get("tickets_verifies") or []:
+        st.caption(f"Ticket lié (vérifié) : {link['cle']} — {link['titre']} ({link['preuve']})")
+    if row.get("chaine"):
+        st.caption(f"Couverture indirecte : {' → '.join(row['chaine'])} · {row['cause']}")
     if evaluation.get("raison"):
         st.caption(f"Raison technique de l'agent : {evaluation['raison']}")
     for search in evaluation.get("recherches") or []:
@@ -1614,13 +1622,24 @@ def render_task_card(ctx: dict, row: dict) -> None:
                 render_proposal(client, row, proposal)
             for question in evaluation.get("questions") or []:
                 render_question(client, row, question)
+        relaunch = row.get("relance_inutile") or {}
         with st.container(horizontal=True, vertical_alignment="center"):
-            if st.button("Générer le test", type="primary", icon=":material/science:",
-                         key=f"cucumber_card_generate_{client}_{row['id']}",
-                         disabled=not (ctx["ready"] and generable(row))):
-                generate_tasks(ctx, [row["id"]])
-            if expected:
-                st.caption(f"{expected} réponse(s) attendue(s)")
+            if row["etat"] == "en_attente" and row.get("couvert_par"):
+                # Une seule action : ouvrir la tâche dont elle dépend (son test couvrira celle-ci)
+                st.button(f"Ouvrir « {row['chaine_titre']} »", type="primary", icon=":material/arrow_forward:",
+                          key=f"cucumber_card_open_{client}_{row['id']}", on_click=st.session_state.update,
+                          kwargs={f"cucumber_card_{client}": row["couvert_par"]})
+            elif relaunch:
+                st.caption(f":material/block: Dernière génération (lot {relaunch.get('lot') or '?'}) sans test : "
+                           f"{relaunch['raison']} Code, profil client et réponses inchangés depuis : la relancer "
+                           f"donnerait le même résultat.")
+            else:
+                if st.button("Générer le test", type="primary", icon=":material/science:",
+                             key=f"cucumber_card_generate_{client}_{row['id']}",
+                             disabled=not (ctx["ready"] and generable(row))):
+                    generate_tasks(ctx, [row["id"]])
+                if expected:
+                    st.caption(f"{expected} réponse(s) attendue(s)")
         with st.expander("Détails", icon=":material/info:"):
             render_card_details(ctx, row)
 
@@ -1690,16 +1709,23 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
                    disabled=[c for c in (table[0] if table else {}) if c != "Générer"],
                    column_config=COVERAGE_COLUMNS)
     checked = [r for r, line in zip(shown, coverage_table(shown, list_key)) if line["Générer"]]
-    ready_ids = [r["id"] for r in checked if generable(r)]
-    waiting = len(checked) - len(ready_ids)
+    by_id = {r["id"]: r for r in rows}
+    # Tâche dépendante cochée : proposer de générer à sa place la tâche dont elle dépend
+    wanted, substitutions = cucumber_coverage.substitute_dependents(rows, [r["id"] for r in checked])
+    if substitutions and not st.checkbox(
+            "Générer à leur place la tâche dont elles dépendent : " + " ; ".join(
+                f"« {by_id[d]['titre']} » → « {by_id[t]['titre']} »" for d, t in substitutions if t in by_id),
+            value=True, key=f"cucumber_substitute_{client}"):
+        wanted = [r["id"] for r in checked]
+    ready_ids = [i for i in wanted if i in by_id and generable(by_id[i])]
+    waiting = len(wanted) - len(ready_ids)
     with st.container(horizontal=True, vertical_alignment="center"):
         if st.button(f"Générer les tests sélectionnés ({len(ready_ids)})", type="primary", icon=":material/science:",
                      disabled=not (ctx["ready"] and ready_ids), key=f"cucumber_generate_checked_{client}"):
             generate_tasks(ctx, ready_ids)
         if waiting:
-            st.caption(f"{waiting} tâche(s) cochée(s) ignorée(s) : réponses attendues, déjà couvertes, non testables "
-                       f"ou sans objet.")
-    by_id = {r["id"]: r for r in shown}
+            st.caption(f"{waiting} tâche(s) cochée(s) ignorée(s) : réponses attendues, relance inutile, déjà "
+                       f"couvertes, en attente d'une autre tâche, non testables ou sans objet.")
     card = st.selectbox("Ouvrir la carte d'une tâche", [""] + list(by_id), key=f"cucumber_card_{client}",
                         format_func=lambda i: "—" if not i else f"{by_id[i]['titre']} "
                                                               f"({cucumber_coverage.STATES[by_id[i]['etat']][0]})")

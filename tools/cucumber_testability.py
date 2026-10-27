@@ -24,6 +24,7 @@ RÉPONSES : chaque confirmation, correction ou réponse est enregistrée aussit�
 « reponses », clé de la proposition ou de la question) ; elle est injectée dans tous les lots, et la même question
 n'est jamais reposée.
 """
+import hashlib
 import json
 import os
 import re
@@ -223,6 +224,18 @@ def save_answer(client_name: str, question: str, answer: str, task: str = "", ke
     document["saisi"]["reponses"] = saved
     _write_json(cucumber_profile.profile_path(client_name), document)
     return entry
+
+
+def task_inputs(spec: dict, profile: dict) -> str:
+    """
+    Empreinte des entrées d'une tâche : code (fichiers du spécifique et leur blob), profil client (champs), réponses
+    de l'utilisateur. Inchangée : relancer le lot donnerait le même résultat.
+    """
+    data = {"fichiers": sorted((f.get("repo", ""), f.get("path", ""), f.get("blob", ""))
+                               for f in spec.get("fichiers") or []),
+            "profil": {k: (profile or {}).get(k) for k in cucumber_profile.FIELDS if k != "reponses"},
+            "reponses": sorted((k, a.get("reponse", "")) for k, a in answers(profile or {}).items())}
+    return hashlib.sha1(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16]
 
 
 def answers_block(profile: dict) -> str:
