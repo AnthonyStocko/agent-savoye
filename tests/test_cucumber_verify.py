@@ -141,3 +141,51 @@ def test_run_tags_sends_sources_and_detects_unapplicable_patch(monkeypatch, repo
     assert not result["ok"] and result["message"] == cv.PATCH_NOT_APPLICABLE
     level = ("nv", result["message"])
     assert cv.final_status({"client": level}) == ("non_verifie", cv.PATCH_NOT_APPLICABLE)
+
+
+PRICE_FEATURE = """Feature: Prix
+  @agent_acme_1 @agent_acme_1_1
+  Scenario: Prix client
+    Given un article "A"
+    Then le prix de "A" vaut "12"
+
+  @agent_acme_1 @agent_acme_1_2
+  Scenario: Sans valeur
+    Then le prix est calculé
+"""
+
+
+def test_client_and_mutation_in_one_build(monkeypatch, tmp_path):
+    from tests.conftest import write
+    rel = "src/test/resources/cucumber/features/acme/prix.feature"
+    write(str(tmp_path / rel), PRICE_FEATURE)
+    monkeypatch.delenv("CUCUMBER_VERIFY_MERGE_MUTATION", raising=False)
+    calls = []
+    copy = rel[:-8] + "_mut.feature"
+
+    def run_tags(mode, worktree, base, build_fn, tags, env, overrides, label, sources=None):
+        calls.append((tags, sorted(overrides), label))
+        assert '"12_MUT"' in overrides[copy] and "@agent_acme_1_1_mut" in overrides[copy]
+        assert "@agent_acme_1_1 " not in overrides[copy]
+        return {"ok": True, "message": "ok", "build": "b1", "resultats": {
+            (rel, "Prix client"): {"statut": "passe", "step": "", "phase": "", "message": ""},
+            (rel, "Sans valeur"): {"statut": "passe", "step": "", "phase": "", "message": ""},
+            (copy, "Prix client"): {"statut": "echoue", "step": "Then le prix", "phase": "then",
+                                    "message": "expected 12_MUT", "nature": "assertion", "exception": ""}}}
+    monkeypatch.setattr(cv, "run_tags", run_tags)
+    scenarios = {"@agent_acme_1_1": f"{rel}::Prix client", "@agent_acme_1_2": f"{rel}::Sans valeur"}
+    result = cv.verify_lot("jenkins", str(tmp_path), "HEAD", None, [rel], scenarios, {}, "lot1")
+    assert len(calls) == 1 and calls[0][1] == [copy]
+    assert calls[0][0] == "@agent_acme_1_1 or @agent_acme_1_2 or @agent_acme_1_1_mut"
+    assert result["scenarios"]["@agent_acme_1_1"]["statut"] == "pertinent"
+    assert result["scenarios"]["@agent_acme_1_2"]["statut"] == "non_verifie"
+    assert result["builds"][0]["execution"] == "client + mutation"
+
+
+def test_apply_overrides_restores_and_removes(tmp_path):
+    from tests.conftest import write
+    write(str(tmp_path / "a.feature"), "orig\n")
+    restore = cv._apply_overrides(str(tmp_path), {"a.feature": "mut\n", "b_mut.feature": "copy\n"})
+    assert (tmp_path / "a.feature").read_text() == "mut\n" and (tmp_path / "b_mut.feature").exists()
+    restore()
+    assert (tmp_path / "a.feature").read_text() == "orig\n" and not (tmp_path / "b_mut.feature").exists()

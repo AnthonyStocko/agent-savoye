@@ -153,3 +153,32 @@ def test_override_standard_version_exported(tmp_path, monkeypatch):
     assert "local_standard" not in files["src/main/java/com/acme/NewThing.java"]
     spec = next(s for s in inventory["specifiques"] if any(f["path"] == java for f in s["fichiers"]))
     assert f"Version Standard (avant override" in ct.lot_block([{**spec, "couverture": "non_couvert"}])
+
+
+def test_followup_resumes_lot_session(main_module, monkeypatch, tmp_path):
+    system = tmp_path / "sys.md"
+    system.write_text("regles")
+    calls = []
+
+    def fake(prompt, model, tools, turns, run_dir, effort, system_file="", resume=""):
+        calls.append((model, effort, system_file, resume))
+        if resume == "dead":
+            return 1, "No conversation found", {}, False
+        return 0, "{}", {"session_id": "s2"}, False
+    monkeypatch.setattr(main_module, "run_cucumber_claude", fake)
+    monkeypatch.delenv("CUCUMBER_RESUME_SESSION", raising=False)
+    lot = {"session": "s1", "modele": "opus", "effort": "high", "systeme": str(system)}
+    out = main_module.cucumber_followup(lot, "p", "haiku", "low", ["Read"], "10", str(tmp_path))
+    assert calls[-1] == ("opus", "high", str(system), "s1") and out[4:] == ("opus", "high")
+    assert lot["session"] == "s2"
+    lot["session"] = "dead"
+    out = main_module.cucumber_followup(lot, "p", "haiku", "low", ["Read"], "10", str(tmp_path))
+    assert calls[-1] == ("haiku", "low", "", "") and "session" not in lot and out[4:] == ("haiku", "low")
+    monkeypatch.setenv("CUCUMBER_RESUME_SESSION", "0")
+    main_module.cucumber_followup({"session": "s1"}, "p", "haiku", "low", ["Read"], "10", str(tmp_path))
+    assert calls[-1][3] == ""
+
+
+def test_session_id_parsed(main_module):
+    text, usage = main_module.parse_claude_output('{"type": "result", "result": "ok", "session_id": "abc"}')
+    assert text == "ok" and usage["session_id"] == "abc"

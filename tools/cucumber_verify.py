@@ -569,8 +569,7 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
             return {"ok": False, "message": "CUCUMBER_VERIFY_LOCAL_CMD sans {env} : environnement non sélectionnable",
                     "build": "", "resultats": {}}
         build = build_fn()
-        for rel, text in overrides.items():
-            _write_text(os.path.join(build, *rel.split("/")), text)
+        restore = _apply_overrides(build, overrides)
         for old in _report_files(build):
             os.remove(old)
         command = command.replace("{tags}", tags).replace("{env}", env)
@@ -581,6 +580,8 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
         except subprocess.TimeoutExpired:
             return {"ok": False, "message": f"délai CUCUMBER_VERIFY_TIMEOUT dépassé ({_timeout()} s)", "build": "",
                     "resultats": {}}
+        finally:
+            restore()
         report = [r for path in _report_files(build) for r in _read_report(path)]
         if not report:
             tail = " | ".join(line.strip() for line in output.strip().splitlines()[-3:])
@@ -589,15 +590,15 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
         return {"ok": True, "message": f"exécution locale en {time.time() - started:.0f} s", "build": "",
                 "resultats": parse_cucumber_report(report)}
     # Jenkins : patch du worktree depuis la base (fichiers mutés écrits le temps de produire le patch)
-    originals = {rel: _read_text_file(os.path.join(worktree, *rel.split("/"))) for rel in overrides}
+    restore = _apply_overrides(worktree, overrides)
     try:
-        for rel, text in overrides.items():
-            _write_text(os.path.join(worktree, *rel.split("/")), text)
         _git(worktree, "add", "-N", ".")
         patch = _git(worktree, "diff", base, "--", ".", ":(exclude)target", ":(exclude)**/target/**").stdout
     finally:
-        for rel, text in originals.items():
-            _write_text(os.path.join(worktree, *rel.split("/")), text)
+        restore()
+        if overrides:
+            # Copies mutées ajoutées en intention (add -N) : retirées de l'index avec leur fichier
+            _git(worktree, "reset", "-q", "--", *overrides)
     patch_file = os.path.join(os.path.dirname(worktree), "verification", f"{label}.patch")
     _write_text(patch_file, patch)
     parameters = {"TAGS": tags, "ENV": env, **{k: v for k, v in (sources or {}).items() if v}}
@@ -620,6 +621,29 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
                 "resultats": {}}
     return {"ok": True, "message": f"build {build['result']}", "build": build["url"],
             "resultats": parse_cucumber_report(report), "artefacts": build["artifacts"]}
+
+
+def _apply_overrides(root: str, overrides: dict):
+    """
+    Écrit les `overrides` {chemin relatif: texte} dans `root` (fichiers remplacés ou copies nouvelles) ; renvoie
+    la fonction qui remet `root` dans son état d'origine (contenus restaurés, fichiers nouveaux supprimés).
+    """
+    originals = {}
+    for rel, text in overrides.items():
+        path = os.path.join(root, *rel.split("/"))
+        originals[path] = _read_text_file(path) if os.path.exists(path) else None
+        _write_text(path, text)
+
+    def restore():
+        for path, text in originals.items():
+            if text is None:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                _write_text(path, text)
+    return restore
 
 
 def _patch_not_applicable(build: dict, patch_file: str, label: str) -> bool:
@@ -714,6 +738,35 @@ def mutate_feature(text: str, tags: set) -> tuple:
 # Vérification d'un lot : 3 exécutions au plus (client, Standard pour les overrides, mutation)
 # ---------------------------------------------------------------------------
 
+MUTATION_SUFFIX = "_mut"
+
+
+def mutation_copies(worktree: str, rels, tags) -> tuple:
+    """
+    Copies mutées des features du lot, à jouer DANS LE MÊME BUILD que les originales (un seul build Cucumber à la
+    fois : client et mutation fusionnés) : <feature>_mut.feature, attendus des Then faussés (mutate_feature) et
+    tags @agent_… renommés <tag>_mut pour être sélectionnés à part. Renvoie ({chemin relatif: texte},
+    {tag: nombre de valeurs faussées}, {tag: chemin de la copie}).
+    """
+    copies, counts, where = {}, {}, {}
+    for rel in sorted(set(rels)):
+        text, mutations = mutate_feature(_read_text_file(os.path.join(worktree, *rel.split("/"))), set(tags))
+        if not mutations:
+            continue
+        lines = [" ".join(t + MUTATION_SUFFIX if t.startswith("@agent_") else t for t in line.split())
+                 if line.strip().startswith("@") else line for line in text.splitlines()]
+        copy = rel[:-len(".feature")] + MUTATION_SUFFIX + ".feature"
+        copies[copy] = "\n".join(lines) + "\n"
+        counts.update(mutations)
+        where.update({tag: copy for tag in mutations})
+    return copies, counts, where
+
+
+def merged_mutation() -> bool:
+    """CUCUMBER_VERIFY_MERGE_MUTATION (défaut 1) : mutation jouée dans le build client, pas dans un build à part."""
+    return os.getenv("CUCUMBER_VERIFY_MERGE_MUTATION", "1").strip() != "0"
+
+
 PASSES_STILL = "passe encore"
 NO_VALUE_TO_MUTATE = "assertion sans valeur à vérifier en revue"
 
@@ -774,9 +827,14 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     found = tagged_scenarios(worktree, files, scenarios)
     key_of = {tag: (rel, s["titre"]) for tag, (rel, s) in found.items()}
     builds, out = [], {}
-    client = run_tags(mode, worktree, base, build_fn, tags, os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), {},
-                      f"{label}-client", sources)
-    builds.append({"execution": "client", "build": client["build"], "message": client["message"]})
+    # Client et mutation dans le même build (copies <feature>_mut.feature, tags <tag>_mut) : un build de moins
+    copies, counts, copy_of = mutation_copies(worktree, [k[0] for k in key_of.values()], scenarios) \
+        if merged_mutation() else ({}, {}, {})
+    mutated_tags = sorted(t + MUTATION_SUFFIX for t in counts)
+    client = run_tags(mode, worktree, base, build_fn, " or ".join([tags] + mutated_tags),
+                      os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), copies, f"{label}-client", sources)
+    builds.append({"execution": "client" + (" + mutation" if copies else ""), "build": client["build"],
+                   "message": client["message"]})
     levels = {tag: {"client": _level(client["resultats"].get(key_of.get(tag, ("", ""))), False)
                     if client["ok"] else ("nv", client["message"])} for tag in scenarios}
     passing = [t for t in scenarios if levels[t]["client"][0] == "ok"]
@@ -792,7 +850,14 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     elif overrides:
         for tag in overrides:
             levels[tag]["standard"] = ("nv", "CUCUMBER_VERIFY_ENV_STD non configuré")
-    if passing:
+    if passing and merged_mutation():
+        for tag in passing:
+            if not counts.get(tag):
+                levels[tag]["mutation"] = ("nv", NO_VALUE_TO_MUTATE)
+            else:
+                result = client["resultats"].get((copy_of[tag], key_of[tag][1])) if tag in key_of else None
+                levels[tag]["mutation"] = _level(result, True)
+    elif passing:
         mutated, counts = {}, {}
         for rel in {key_of[t][0] for t in passing if t in key_of}:
             text, mutations = mutate_feature(_read_text_file(os.path.join(worktree, *rel.split("/"))), set(passing))
@@ -822,7 +887,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
         status, reason = final_status(levels[tag])
         out[tag] = {"id": identifier, "statut": status, "motif": reason, "type": kinds.get(tag, ""),
                     "niveaux": {k: list(v) for k, v in levels[tag].items()},
-                    "build": next((b["build"] for b in builds if b["execution"] == "client"), "")}
+                    "build": next((b["build"] for b in builds if b["execution"].startswith("client")), "")}
     return {"scenarios": out, "builds": builds, "classes_executees": executed}
 
 
