@@ -235,3 +235,35 @@ def test_initializer_data_found_in_init_is_usable_in_lot_prompt():
     assert "ne t'y fie pas" in cp.initializers_block(data, "")
     block = cp.initializers_block(data, "", present_codes={DOC_KEYS[0]})
     assert "ne t'y fie pas" not in block and "recréées par l'init du projet), utilisables" in block
+
+
+OUTLINE_NEGATIVE = (f"{CLIENT_TAG}\nFeature: Exclusion du rendu\n"
+                    "  Scenario Outline: La réédition d'un document exclu n'est pas rendue\n"
+                    "    When PARAM- Réédition du document avec les caractéristiques suivantes\n"
+                    "      | refReportDocCode | key   |\n"
+                    "      | <doc>            | <key> |\n"
+                    "    Then REPORT- <X> documents générés répondant aux caractéristiques\n"
+                    "      | X | refReportDoc.code |\n"
+                    "      | 0 | <doc>             |\n\n"
+                    "    Examples:\n      | doc          | key |\n      | DOC_FICTIF_A | K1  |\n")
+TITLED_WITNESS = ("  Scenario: Témoin - la réédition d'un document non exclu déclenche le rendu\n"
+                  "    When PARAM- Réédition du document avec les caractéristiques suivantes\n"
+                  "      | refReportDocCode | key |\n"
+                  "      | DOC_FICTIF_C     | K2  |\n"
+                  "    Then REPORT- <X> documents générés répondant aux caractéristiques\n"
+                  "      | X | refReportDoc.code |\n"
+                  "      | 1 | DOC_FICTIF_C      |\n")
+
+
+def test_witness_titled_not_excluded_and_negative_outline(tmp_path):
+    """Un témoin intitulé « … non exclu … » n'est pas négatif ; un plan de scénario à 0 instance l'est."""
+    root = str(tmp_path / "wt")
+    rel = f"{RES}/features/{CLIENT}/Exclusion.feature"
+    write(os.path.join(root, *rel.split("/")), OUTLINE_NEGATIVE + "\n" + TITLED_WITNESS)
+    assert cv.check_positive_witness(root, [rel]) == []
+    scenarios = cv.parse_scenarios(OUTLINE_NEGATIVE + "\n" + TITLED_WITNESS)
+    assert [cv.is_negative(s) for s in scenarios] == [True, False]
+    # Le plan de scénario négatif seul : erreur de lot
+    write(os.path.join(root, *rel.split("/")), OUTLINE_NEGATIVE)
+    errors = cv.check_positive_witness(root, [rel])
+    assert len(errors) == 1 and "« La réédition d'un document exclu n'est pas rendue » sans témoin" in errors[0]

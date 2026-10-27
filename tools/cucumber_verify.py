@@ -362,11 +362,26 @@ _NEGATIVE = re.compile(r"(?i)\b(n'est pas|n'a pas|ne \w+ pas|ne \w+ aucun|aucune
 _VARIABLE_VALUE = re.compile(r"\"[^\"]*\"|<[^>]+>|\b\d+\b")
 
 
+_COUNT_COLUMN = re.compile(r"(?i)^(x|n|nb\w*|nombre\w*|count\w*|total\w*)$")
+
+
 def is_negative(scenario: dict) -> bool:
-    """Le titre ou un contrôle (Then) du scénario vérifie l'absence d'une action."""
+    """
+    Un contrôle (Then) du scénario vérifie l'absence d'une action : formulation négative du step, ou nombre 0 dans
+    une colonne de comptage de sa table (« X », « nombre »…). Le titre ne compte que sans aucun Then : un témoin
+    intitulé « … document non exclu … » n'est pas négatif.
+    """
     checks = [s for s in scenario["steps"] if s["phase"] == "then"]
-    return bool(_NEGATIVE.search(scenario["titre"]) or any(
-        _NEGATIVE.search(" ".join([s["texte"], *s["table"]])) for s in checks))
+    if not checks:
+        return bool(_NEGATIVE.search(scenario["titre"]))
+    for step in checks:
+        if _NEGATIVE.search(step["texte"]):
+            return True
+        rows = [[c.strip() for c in row.strip().strip("|").split("|")] for row in step["table"]]
+        if rows and any(cell == "0" and n < len(rows[0]) and _COUNT_COLUMN.match(rows[0][n])
+                        for row in rows[1:] for n, cell in enumerate(row)):
+            return True
+    return False
 
 
 def action_keys(scenario: dict) -> set:
@@ -380,13 +395,13 @@ def check_positive_witness(worktree: str, features: list) -> list:
     """
     Règle du témoin positif : un scénario négatif (l'action N'A PAS lieu) est accompagné, dans la même feature, d'un
     scénario non négatif qui partage un de ses steps d'action (valeurs retirées) et où l'action A lieu. Sans témoin,
-    le test passerait aussi si le mécanisme ne fonctionnait jamais. Une erreur par scénario négatif sans témoin
-    (plans de scénario ignorés : leurs exemples peuvent porter les deux cas).
+    le test passerait aussi si le mécanisme ne fonctionnait jamais. Une erreur par scénario négatif sans témoin ;
+    un plan de scénario dont le comptage vient de ses exemples (« <X> ») n'est pas jugé négatif.
     """
     errors = []
     for rel in features:
         scenarios = [s for s in parse_scenarios(_read_text_file(os.path.join(worktree, *rel.split("/"))))
-                     if not s["outline"] and not is_setup_scenario(s["titre"], s["tags"])]
+                     if not is_setup_scenario(s["titre"], s["tags"])]
         positives = [s for s in scenarios if not is_negative(s)]
         for scenario in (s for s in scenarios if is_negative(s)):
             keys = action_keys(scenario)
