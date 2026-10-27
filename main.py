@@ -1485,6 +1485,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         # complément : rapprochement refait (synonymes, CUCUMBER_STD_MATCH_MIN à jour)
         if complete_state or any("tests_std" not in s for s in inventory["specifiques"]):
             cucumber_tools.attach_std_tests(inventory, local_cucumber_std_repo, odatio_version)
+        # Versions Standard des fichiers overridés (inventaire antérieur : complétées si la référence est connue)
+        cucumber_tools.export_sources(inventory)
         if any("endpoints_std" not in s for s in inventory["specifiques"]):
             cucumber_tools.attach_endpoints(inventory, local_std_repo, cucumber_tools.standard_endpoints(
                 local_cucumber_std_repo, odatio_version))

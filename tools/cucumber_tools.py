@@ -432,6 +432,8 @@ def build_inventory(client_name: str, client_root: str, std_root: str, max_files
         reference = entry.pop("_diff", None)
         directory = entry.pop("_dir")
         if reference:
+            # Version Standard du fichier overridé (dépôt, blob) : exportée par export_sources pour l'agent
+            entry["ref_standard"] = {"dir": reference[0], "blob": reference[1]}
             entry["diff"] = diff_summary(texts[reference[0]].get(reference[1], ""),
                                          texts[directory].get(entry["blob"], ""), entry["path"])
 
@@ -463,19 +465,35 @@ def build_inventory(client_name: str, client_root: str, std_root: str, max_files
 
 
 def export_sources(inventory: dict) -> None:
-    """Copie, à la version de référence, le contenu des fichiers spécifiques dans .tmp/cucumber/<client>/sources/."""
+    """
+    Copie, à la version de référence, le contenu des fichiers spécifiques dans .tmp/cucumber/<client>/sources/ et,
+    pour un override, celui de sa version Standard (dépôt BITBUCKET_STD_REPO_PATH, ou original.* d'un processus
+    Studio) dans .tmp/cucumber/<client>/standard/ (f["local_standard"]) : le clone du socle Standard est hors de
+    l'accès de l'agent, qui doit pourtant savoir ce que faisait le Standard pour tester ce que l'override change.
+    """
     root = os.path.join(cache_dir(inventory["client"]), "sources")
+    std_root = os.path.join(cache_dir(inventory["client"]), "standard")
     repos = git_repos(inventory["depot_client"])
-    missing = {}
+    missing, missing_std = {}, {}
     for spec in inventory["specifiques"]:
         for f in spec["fichiers"]:
             f["local"] = os.path.join(root, f["repo"], *f["path"].split("/"))
             if not os.path.exists(f["local"]):
                 missing.setdefault(f["repo"], []).append(f)
+            reference = f.get("ref_standard")
+            if reference and os.path.isdir(reference.get("dir", "")):
+                # Blob dans le chemin : une nouvelle version du Standard n'est jamais confondue avec l'ancienne
+                f["local_standard"] = os.path.join(std_root, f["repo"], reference["blob"][:10], *f["path"].split("/"))
+                if not os.path.exists(f["local_standard"]):
+                    missing_std.setdefault(reference["dir"], []).append(f)
     for repo, entries in missing.items():
         texts = blob_texts(repos[repo], [f["blob"] for f in entries])
         for f in entries:
             _write_text(f["local"], texts.get(f["blob"], ""))
+    for directory, entries in missing_std.items():
+        texts = blob_texts(directory, [f["ref_standard"]["blob"] for f in entries])
+        for f in entries:
+            _write_text(f["local_standard"], texts.get(f["ref_standard"]["blob"], ""))
 
 
 # ---------------------------------------------------------------------------
@@ -2809,6 +2827,9 @@ def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset(), 
                 elements = ", ".join(f["diff"]["elements"]) or "—"
                 detail += f" — écart avec {f.get('standard', 'le Standard')} : {f['diff']['stat']} ; modifié : {elements}"
             lines.append(detail)
+            if f.get("local_standard"):
+                lines.append(f"    Version Standard (avant override, à comparer pour le commentaire « # Standard : … / "
+                             f"Client : … » et l'assertion qui échoue sur le Standard) : '{f['local_standard']}'")
             # Classes métier : signatures publiques données ici, le fichier n'est ouvert que si son corps est utile
             if f["path"].endswith(".java") and "src/main/java/" in f"/{f['path']}" and f.get("local"):
                 lines += [f"    {line}" for line in business_signatures(f["local"])]
