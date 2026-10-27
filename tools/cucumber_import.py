@@ -24,7 +24,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from tools import cucumber_decisions, cucumber_profile, db_tools, jenkins_tools
+from tools import cucumber_decisions, cucumber_failures, cucumber_profile, db_tools, jenkins_tools
 from tools.cucumber_diagnostic import TEMP_PREFIX
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
@@ -521,17 +521,22 @@ def proof_methods(result: dict, db_configured: bool) -> list:
     return methods
 
 
-def correction_proposals(failures: dict, state: dict, extras: dict = None, db_configured: bool = False) -> tuple:
+def correction_proposals(failures: dict, state: dict, extras: dict = None, db_configured: bool = False,
+                         candidates=None) -> tuple:
     """
     (lots de correction proposés, causes à prouver) pour les échecs « test » des scénarios de l'agent, un lot par
-    spécifique. `extras` : {id: {diagnostic, preuves, refus}} joints au scénario (sortie d'un diagnostic temporaire,
+    spécifique. `candidates` : identifiants à proposer (échecs à écrire de cucumber_failures, tagués par l'agent ou
+    non : tous les scénarios du dépôt sont les siens) ; à défaut, les échecs « test » des scénarios tagués. `extras` : {id: {diagnostic, preuves, refus}} joints au scénario (sortie d'un diagnostic temporaire,
     lignes de logs serveur, commentaires de décisions refusées). Après max_attempts() corrections infructueuses sur
     la même cause, le scénario n'est plus proposé : il rejoint les causes à prouver, avec ce qui a été essayé et les
     méthodes de preuve.
     """
     ours, by_spec, to_prove = agent_scenarios(state), {}, []
     for identifier, result in failures.items():
-        if identifier not in ours or _category(result) != "test":
+        if candidates is not None:
+            if identifier not in candidates:
+                continue
+        elif identifier not in ours or _category(result) != "test":
             continue
         tried = attempts(identifier, result.get("message", ""), state)
         if len(tried) >= max_attempts():
@@ -539,8 +544,9 @@ def correction_proposals(failures: dict, state: dict, extras: dict = None, db_co
                              "tentatives": tried, "methodes": proof_methods(result, db_configured)})
             continue
         fichier, titre = identifier.split("::", 1)
-        by_spec.setdefault(ours[identifier]["spec"], []).append(
-            {"tag": ours[identifier]["tag"], "id": identifier, "fichier": fichier, "titre": titre,
+        mine = ours.get(identifier) or {"tag": "", "spec": ""}
+        by_spec.setdefault(mine["spec"], []).append(
+            {"tag": mine["tag"], "id": identifier, "fichier": fichier, "titre": titre,
              "step": result.get("step", ""), "message": result.get("message", ""), "tentatives": len(tried),
              **((extras or {}).get(identifier) or {})})
     return [{"spec": spec, "scenarios": items} for spec, items in sorted(by_spec.items())], to_prove
@@ -633,13 +639,40 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
                                         ("preuves", evidence.get(i, [])),
                                         ("refus", cucumber_decisions.refused_comments(client_name, i))) if v}
                   for i in failures}
+        # Un résultat explicite par échec (cucumber_failures) ; ceux déjà traités par une correction sont gardés
+        out["echecs"] = failure_results(client_name, numero, results, out["init_en_echec"], state, worktree)
         if not out["init_en_echec"]:
-            out["propositions"], out["a_prouver"] = correction_proposals(failures, state, extras,
-                                                                         db_tools.is_db_configured())
+            out["propositions"], out["a_prouver"] = correction_proposals(
+                failures, state, extras, db_tools.is_db_configured(),
+                {e["id"] for e in cucumber_failures.pending(out)})
     folder = os.path.join(imports_dir(client_name), str(numero))
     _write_json(os.path.join(folder, "analyse.json"), out)
     _write_text(os.path.join(folder, "analyse.md"), analysis_markdown(out))
     return out
+
+
+def failure_results(client_name: str, numero: int, results: dict, init: dict, state: dict, worktree: str) -> list:
+    """
+    Résultat explicite de chaque échec du run (cucumber_failures.failure_results) : propriétaire jugé sur le
+    worktree et la branche de base, désactivation proposée (patch) pour un défaut du produit, résultats déjà
+    traités d'une analyse précédente du même import conservés.
+    """
+    base = state.get("base", "")
+    is_owned = (lambda rel: cucumber_failures.owned(worktree, base, rel)) if worktree and os.path.isdir(worktree) \
+        else None
+    items = cucumber_failures.failure_results(results, init, is_owned)
+    previous = {e["id"]: e for e in (_read_json(cucumber_failures.analysis_path(imports_dir(client_name), numero),
+                                                {}) or {}).get("echecs") or [] if e.get("statut") == "traite"}
+    folder = os.path.join(imports_dir(client_name), str(numero))
+    for index, item in enumerate(items, 1):
+        if item["id"] in previous:
+            item.update(previous[item["id"]])
+        elif item["categorie"] == "produit" and worktree:
+            patch = cucumber_failures.disable_patch(worktree, item["fichier"], item["titre"], a_revoir_tag())
+            if patch:
+                item["patch"] = os.path.join(folder, f"desactivation-{index}.patch")
+                _write_text(item["patch"], patch)
+    return items
 
 
 def analysis_markdown(analysis: dict) -> str:

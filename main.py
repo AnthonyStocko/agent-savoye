@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -2355,6 +2355,17 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     RÈGLE 3 suivent comme pour un lot généré. Renvoie les fichiers du lot.
     """
     files = sorted({s["fichier"] for s in lot["corrections"]})
+    lot["avant"] = cucumber_tools.rev_parse(worktree, "HEAD")
+    # Scénarios écrits hors de l'agent (sans tag) : pris en charge, tag du lot de correction ajouté
+    untagged = [s for s in lot["corrections"] if not s.get("tag")]
+    if untagged:
+        tagged = cucumber_verify.tag_scenarios(worktree, [{**s, "tags": []} for s in untagged],
+                                               values.get("client_name", ""), lot["numero"])
+        by_id = {identifier: tag for tag, identifier in tagged.items()}
+        for s in untagged:
+            s["tag"] = by_id.get(s["id"], "")
+        lot["tags"] = {**(lot.get("tags") or {}), **tagged}
+        print(f"[LOT {label}] {len(tagged)} scénario(s) écrit(s) hors de l'agent pris en charge (tag ajouté).")
     lines = []
     for s in lot["corrections"]:
         lines.append(f"- {s['id']} [tag {s['tag']}] : en échec dans le run importé n° {lot['import']} — {s['step']} "
@@ -2694,6 +2705,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     except RuntimeError as e:
         print(f"❌ {e}")
         return 2
+    if args.from_import:
+        # Correction d'un run : sur la branche réelle lue par Jenkins (scénarios écrits hors de l'agent compris)
+        problem = cucumber_failures.sync_with_branch(worktree, state["base"])
+        print(f"[CUCUMBER] ⚠️ Espace de travail non synchronisé avec {state['base']} : {problem}" if problem else
+              f"[CUCUMBER] Espace de travail synchronisé avec {state['base']} (branche lue par Jenkins).")
     cucumber_tools.save_state(client, state)
 
     catalogue = inventory["catalogue_standard"]
@@ -2957,6 +2973,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                    else None)
         # Résultat obligatoire de la génération de chaque tâche du lot (carte de la tâche)
         cucumber_results.record_lot(state, lot)
+        if lot.get("type") == "correction":
+            # Résultat explicite de chaque échec corrigé : correction (diff, patch) ou diagnostic nécessaire
+            for item in cucumber_failures.record_correction(cucumber_import.imports_dir(client), lot, worktree):
+                print(f"[LOT {label}] {cucumber_failures.CATEGORIES[item['categorie']]} — {item['titre']} : "
+                      f"{item['cause']}")
         if not check["ok"] and not check.get("environnement"):
             lot.update(statut="erreur_compilation", erreur=f"{check['etape']} : {check['erreurs'][0]}"[:300])
             cucumber_tools.save_state(client, state)
