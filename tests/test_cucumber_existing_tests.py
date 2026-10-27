@@ -128,14 +128,17 @@ def test_screen_shows_tests_as_covered_and_not_measured(project):
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     buttons = [b.label for b in at.button]
-    assert "2 ont un test (aucun run importé : couverture réelle non mesurée)." in buttons
-    assert "2 restent à couvrir." in buttons
+    # Zone « Où en est-on » : sans résultat importé, « pas encore vérifié », jamais 0 %
+    assert "2 ont un test, pas encore vérifié." in buttons and "2 restent à tester." in buttons
+    assert "Importer un résultat Jenkins" in [p.proto.popover.label for p in at.get("popover")]
     text = " ".join(m.value for m in at.markdown)
-    assert "Importer un log Jenkins" in text and "Couverture réelle** : 0 %" not in text
-    assert "Couverture réelle** : non mesurée" in text
+    assert "4 fonctionnalités spécifiques." in text and "0 %" not in " ".join(buttons) + text
+    # Liste : les tests écrits à la main apparaissent « test écrit »
+    assert text.count("✍ test écrit") == 2
     # Un nombre cliquable filtre la liste
     [b for b in at.button if b.label.startswith("2 ont un test")][0].click().run()
-    assert any("Liste filtrée : tâches qui ont un test." in c.value for c in at.caption)
+    assert "Fonctionnalités qui ont un test — afficher tout" in [b.label for b in at.button]
+    assert " ".join(m.value for m in at.markdown).count("⚪ à tester") == 0
     # Test non rattaché : proposition, confirmation en un clic
     assert any("Proposition : « Etiquette » — mots-clés communs" in c.value for c in at.caption)
     [b for b in at.button if b.label == "Confirmer" and "cucumber_link_ok_" in (b.key or "")][0].click().run()

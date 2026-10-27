@@ -702,6 +702,76 @@ def summary_sentence(rows: list, run: dict) -> list:
     return parts
 
 
+# Filtres de la liste « À tester », un par nombre du résumé « Où en est-on »
+FILTERS = {"test": "ont un test", "vert": "vérifiées vertes", "echec": "en échec",
+           "indirect": "couvertes par une autre", "a_tester": "restent à tester", "reponses": "attendent une réponse",
+           "non_testable": "ne sont pas testables aujourd'hui", "sans_objet": "sont sans objet"}
+# État d'une fonctionnalité en une icône et un ou deux mots (liste « À tester »)
+SHORT_STATES = {"vert": "✅ vérifié, vert", "echec": "❌ en échec", "desactive": "⏸ désactivé",
+                "non_execute": "✍ test écrit", "partiel": "🟣 partiel", "non_couvert": "⚪ à tester",
+                "a_confirmer": "⚪ à tester", "en_attente": "🔗 couvert par une autre", "non_testable": "⛔ bloqué",
+                "sans_objet": "— sans objet"}
+
+
+def short_state(row: dict) -> str:
+    """« ✅ vérifié, vert », « 🟡 réponse attendue », « 🔗 couvert par une autre »…"""
+    if (row.get("evaluation") or {}).get("attendues") and row["etat"] == "a_confirmer":
+        return "🟡 réponse attendue"
+    if row.get("relance_inutile"):
+        return "— pas de test"
+    if row.get("couvert_par") and not row["scenarios"] and row["etat"] in WRITTEN_STATES:
+        return "🔗 couvert par une autre"
+    return SHORT_STATES.get(row["etat"], row["etat"])
+
+
+def in_filter(row: dict, key: str) -> bool:
+    """La fonctionnalité appartient-elle au filtre `key` (nombre cliqué du résumé) ?"""
+    group = group_of(row)
+    return {"test": group == "test", "vert": group == "test" and row["etat"] == "vert",
+            "echec": group == "test" and row["etat"] == "echec", "indirect": group == "indirect",
+            "a_tester": group in ("a_couvrir", "partiel"),
+            "reponses": bool((row.get("evaluation") or {}).get("attendues")) and row["etat"] == "a_confirmer",
+            "non_testable": group == "non_testable", "sans_objet": group == "sans_objet"}.get(key, True)
+
+
+def status_sentences(rows: list, run: dict) -> list:
+    """
+    Résumé « Où en est-on », en phrases : [(texte, filtre ou '')]. Ex. : « 133 fonctionnalités spécifiques. » « 38 ont
+    un test, » « dont 35 vérifiées vertes le 26/10 » « et 3 en échec. » « 12 sont couvertes par une autre. » « 83
+    restent à tester. » Sans résultat importé : « pas encore vérifié », jamais 0 %. Mêmes groupes que summary_groups :
+    la somme fait toujours le total.
+    """
+    groups = summary_groups(rows)
+    by_id = {r["id"]: r for r in rows}
+    tested = [by_id[i] for i in groups["test"]]
+    green = sum(1 for r in tested if r["etat"] == "vert")
+    failed = sum(1 for r in tested if r["etat"] == "echec")
+    plural = lambda n, word: f"{n} {word}{'s' if n > 1 else ''}"
+    parts = [(f"{plural(len(rows), 'fonctionnalité')} spécifique{'s' if len(rows) > 1 else ''}.", "")]
+    if not tested:
+        parts.append(("Aucune n'a encore de test.", ""))
+    elif not run:
+        parts.append((f"{len(tested)} {'ont' if len(tested) > 1 else 'a'} un test, pas encore vérifié.", "test"))
+    else:
+        parts.append((f"{len(tested)} {'ont' if len(tested) > 1 else 'a'} un test,", "test"))
+        date = f"{run['date'][8:10]}/{run['date'][5:7]}"
+        parts.append((f"dont {green} vérifié{'s' if green > 1 else ''} vert{'s' if green > 1 else ''} le {date}"
+                      + ("" if failed else "."), "vert"))
+        if failed:
+            parts.append((f"et {failed} en échec.", "echec"))
+    if groups["indirect"]:
+        parts.append((f"{len(groups['indirect'])} {'sont couvertes' if len(groups['indirect']) > 1 else 'est couverte'}"
+                      f" par une autre.", "indirect"))
+    remaining = len(groups["a_couvrir"]) + len(groups["partiel"])
+    parts.append((f"{remaining} {'restent' if remaining > 1 else 'reste'} à tester.", "a_tester"))
+    if groups["non_testable"]:
+        parts.append((f"{len(groups['non_testable'])} ne {'sont' if len(groups['non_testable']) > 1 else 'est'} pas "
+                      f"testable{'s' if len(groups['non_testable']) > 1 else ''} aujourd'hui.", "non_testable"))
+    if groups["sans_objet"]:
+        parts.append((f"{len(groups['sans_objet'])} sans objet.", "sans_objet"))
+    return parts
+
+
 def rates(rows: list) -> dict:
     """Couverture RÉELLE (actifs et verts) et ÉCRITE (actifs et désactivés), en % des tâches, et partielles."""
     total = len(rows)

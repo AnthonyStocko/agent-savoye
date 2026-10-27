@@ -146,7 +146,7 @@ def test_a_task_with_logic_test_written_diff_and_patch(project):
     assert rows["sp-a"]["etat"] == "non_execute" and rows["sp-a"]["generation"]["type"] == "test_ecrit"
     at = app_at("sp-a")
     assert "Test écrit" in text_of(at) and "1 scénario(s) dans 1 feature(s)" in text_of(at)
-    downloads = [b for b in at.get("download_button") if "Télécharger le patch de la tâche" in str(b.proto.label)]
+    downloads = [b for b in at.get("download_button") if str(b.proto.label) == "Télécharger"]
     assert downloads
     [t for t in at.toggle if t.label == "Voir les modifications"][0].set_value(True).run()
     diff = [c.value for c in at.code if FEATURE_A in c.value]
@@ -164,7 +164,7 @@ def test_b_covered_by_another_task_never_not_covered(project):
     assert rows["sp-b"]["generation"]["type"] == "couverte_par"
     assert rows["sp-b"]["etat"] == "en_attente" and rows["sp-b"]["couvert_par"] == "sp-c"
     at = app_at("sp-b")
-    assert "Pas de test : couverte par une autre tâche" in text_of(at)
+    assert "Pas de test : couverte par une autre fonctionnalité" in text_of(at)
     # Une seule action sur une carte en attente : ouvrir la tâche qui la couvre
     opener = [b for b in at.button if (b.key or "").startswith(("cucumber_card_open_", "cucumber_result_open_"))]
     assert len(opener) == 1 and opener[0].label.startswith("Ouvrir « ")
@@ -187,8 +187,17 @@ def test_c_declaration_without_logic_without_claude_lot(project):
 # d. Maven indisponible : génération interrompue, aucun lot lancé, état inchangé
 # ---------------------------------------------------------------------------
 
+REAL_POPEN = subprocess.Popen
+
+
 class FakePopen:
-    """main.py simulé : contrôle d'environnement en échec (Maven indisponible), aucun lot, code 3."""
+    """main.py simulé : contrôle d'environnement en échec (Maven indisponible), aucun lot, code 3. Les autres
+    commandes (git) restent réelles."""
+    def __new__(cls, cmd, **kwargs):
+        if "main.py" not in cmd:
+            return REAL_POPEN(cmd, **kwargs)
+        return super().__new__(cls)
+
     def __init__(self, cmd, **kwargs):
         problem = cpf.maven_problem("commande-maven-introuvable -q test-compile")
         self.stdout = iter([f"[CUCUMBER ENVIRONNEMENT] ❌ {problem}\n",
@@ -207,7 +216,7 @@ def test_d_maven_unavailable_interrupts_without_lot(project, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", FakePopen)
     at = app_at("sp-e")
     [b for b in at.button if (b.key or "").startswith("cucumber_card_generate_")][0].click().run()
-    assert any("Génération interrompue avant tout lot" in e.value and "Maven indisponible" in e.value
+    assert any("L'écriture des tests n'a pas pu commencer" in e.value and "Maven indisponible" in e.value
                for e in at.error)
     state = ct.load_state(CLIENT)
     assert state["lots"] == before                                    # aucun lot lancé
@@ -216,7 +225,7 @@ def test_d_maven_unavailable_interrupts_without_lot(project, monkeypatch):
     rows = {r["id"]: r for r in cov.coverage_rows(CLIENT, ct.load_inventory(CLIENT))}
     assert {i: r["etat"] for i, r in rows.items()} == etat_before     # état des tâches inchangé
     at = app_at("sp-e")
-    assert any("Génération interrompue" in w.value and "L'état de la tâche n'a pas changé" in w.value
+    assert any("Interrompu" in w.value and "L'état de la fonctionnalité n'a pas changé" in w.value
                for w in at.warning)
     no_raw_output(at)
     # Aucune génération ne se termine sans résultat enregistré
@@ -295,8 +304,9 @@ def test_f_old_scenarios_without_client_tag(project, main_module):
     assert main_module.check_cucumber_selection(CLIENT, worktree, "", profile, state, "")
     assert len(ct.load_state(CLIENT)["selection"]["retroactif"]) == 1
     at = app_at()
-    assert [b for b in at.button if b.label == f"Ajouter le tag {CLIENT_TAG} automatiquement"]
-    assert any("1 scénario(s) écrit(s) avant la règle « tag client »" in m.value for m in at.markdown)
+    # Bandeau « À faire » : une phrase et un bouton
+    assert [b for b in at.button if b.label == "Corriger automatiquement"]
+    assert any("1 ancien test ne porte pas le tag du client" in m.value for m in at.markdown)
     # Le clic lance --fix-client-tags : ajout déterministe (scénario désactivé exclu), commit, nouveau contrôle
     assert main_module.fix_client_tags(CLIENT, "") == 0
     text = open(os.path.join(worktree, *OLD_FEATURE.split("/")), encoding="utf-8").read()
@@ -320,8 +330,8 @@ def test_generation_section_with_init_patch_and_patch_renders_once(project):
     write(ct.init_patch_path(CLIENT), "diff --git a/x b/x\n")
     write(ct.patch_path(CLIENT), "diff --git a/y b/y\n")
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
-    at.session_state[f"cucumber_section_generation_{CLIENT}"] = True
-    at.session_state[f"cucumber_section_generation_{CLIENT}_vu"] = True
+    at.session_state[f"cucumber_section_expert_{CLIENT}"] = True
+    at.session_state[f"cucumber_section_expert_{CLIENT}_vu"] = True
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     labels = [str(b.proto.label) for b in at.get("download_button")]

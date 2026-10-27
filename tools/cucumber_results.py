@@ -18,9 +18,11 @@ from datetime import datetime
 from tools import cucumber_testability
 from tools.cucumber_tools import TECHNICAL_REASON, _git, load_state, save_state
 
-KINDS = {"test_ecrit": "Test écrit", "couverte_par": "Pas de test : couverte par une autre tâche",
+KINDS = {"test_ecrit": "Test écrit", "couverte_par": "Pas de test : couverte par une autre fonctionnalité",
          "sans_logique": "Pas de test : sans logique propre", "blocage": "Pas de test : blocage prouvé",
-         "a_confirmer": "Pas de test : informations à confirmer", "interrompue": "Génération interrompue"}
+         "a_confirmer": "Pas de test : réponse attendue", "interrompue": "Interrompu"}
+ICONS = {"test_ecrit": "✍", "couverte_par": "🔗", "sans_logique": "—", "blocage": "⛔", "a_confirmer": "🟡",
+         "interrompue": "⛔"}
 
 
 def _now() -> str:
@@ -101,6 +103,20 @@ def task_files(state: dict, spec_id: str) -> tuple:
         generation = generation.get("precedent") or {}
     lot = next((l for l in state.get("lots") or [] if l.get("numero") == generation.get("lot")), {})
     return list(generation.get("fichiers") or []), lot
+
+
+def modifications(state: dict, spec_id: str, worktree: str) -> dict:
+    """
+    Modifications d'une fonctionnalité (dernier « test écrit ») : {"diff", "fichiers", "commits", "partage"} ; si les
+    fichiers de la fonctionnalité ne donnent rien, ceux écrits en même temps qu'elle (« partage » vrai).
+    """
+    base = state.get("base", "")
+    files, lot = task_files(state, spec_id)
+    diff, shared = task_diff(worktree, base, files), False
+    if not diff and lot.get("fichiers"):
+        files, shared = list(lot["fichiers"]), True
+        diff = task_diff(worktree, base, files)
+    return {"diff": diff, "fichiers": files, "commits": task_commits(worktree, base, files), "partage": shared}
 
 
 def task_diff(worktree: str, base: str, files: list) -> str:
