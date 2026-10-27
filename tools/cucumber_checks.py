@@ -260,6 +260,49 @@ def check_tags(worktree: str, features: list, convention: str) -> list:
     return errors
 
 
+MISSING_CLIENT_TAG = "scénario actif sans le tag client"
+
+
+def add_client_tag(text: str, client: str, disabled: str = "") -> tuple:
+    """
+    Texte d'une feature où chaque scénario actif sans le tag client (ni sur la ligne Feature) le reçoit juste
+    au-dessus de lui (ligne de tags existante complétée, sinon nouvelle ligne) ; scénarios désactivés exclus.
+    Renvoie (texte, nombre de scénarios corrigés).
+    """
+    disabled = disabled or a_revoir_tag()
+    lines = text.splitlines(keepends=True)
+    targets = [u["ligne"] for u in scenario_units(text) if disabled not in u["tags"] and client not in u["tags"]]
+    for number in sorted(targets, reverse=True):
+        index = number - 1
+        indent = lines[index][:len(lines[index]) - len(lines[index].lstrip())]
+        eol = "\r\n" if lines[index].endswith("\r\n") else "\n"
+        previous = index - 1
+        while previous >= 0 and lines[previous].strip().startswith("#"):
+            previous -= 1
+        if previous >= 0 and lines[previous].strip().startswith("@"):
+            lines[previous] = lines[previous].rstrip("\r\n") + f" {client}" + eol
+        else:
+            lines.insert(index, f"{indent}{client}{eol}")
+    return "".join(lines), len(targets)
+
+
+def add_missing_client_tags(worktree: str, features_root: str, client: str, disabled: str = "") -> list:
+    """Règle rétroactive « tag client » appliquée aux features du client du worktree ; renvoie les fichiers modifiés."""
+    changed = []
+    root = os.path.join(worktree, *features_root.strip("/").split("/"))
+    for folder, _, names in os.walk(root) if os.path.isdir(root) else []:
+        for name in sorted(n for n in names if n.endswith(".feature")):
+            path = os.path.join(folder, name)
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                text = f.read()
+            fixed, count = add_client_tag(text, client, disabled)
+            if count:
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(fixed)
+                changed.append(os.path.relpath(path, worktree).replace(os.sep, "/"))
+    return changed
+
+
 def check_client_tags(texts: dict, client: str, disabled: str = "") -> list:
     """
     Tag client des scénarios ({feature: texte}) : chaque scénario actif le porte, directement ou par sa ligne
@@ -272,7 +315,7 @@ def check_client_tags(texts: dict, client: str, disabled: str = "") -> list:
         for unit in scenario_units(text):
             where = f"{rel}:{unit['ligne']} « {unit['titre']} »"
             if disabled not in unit["tags"] and client not in unit["tags"]:
-                errors.append(f"{where} : scénario actif sans le tag client {client} (ni sur la ligne Feature) : il "
+                errors.append(f"{where} : {MISSING_CLIENT_TAG} {client} (ni sur la ligne Feature) : il "
                               f"ne serait pas exécuté par un job filtré sur {client} ; ajoute-le au-dessus du scénario")
             elif disabled in unit["tags"] and client in unit["feature"]:
                 errors.append(f"{where} : scénario désactivé ({disabled}) qui hérite du tag client {client} par sa "

@@ -222,7 +222,7 @@ def test_coverage_rows_use_assessment_and_warning_shows_proof(cache, monkeypatch
          "blocage": {"type": "non_deploye", "preuve": "run n° 2 : processus introuvable"}},
         {"id": "sp-3", "statut": "non_couvert", "raison": "DTO.", "sans_objet": {"preuve": "A.java:1"}}]}]}
     rows = {r["id"]: r for r in cov.coverage_rows(CLIENT, inventory, state)}
-    assert rows["sp-1"]["etat"] == "non_couvert" and rows["sp-1"]["testabilite"] == "testable"
+    assert rows["sp-1"]["etat"] == "a_confirmer" and rows["sp-1"]["testabilite"] == "testable"
     assert rows["sp-2"]["etat"] == "non_testable" and rows["sp-2"]["testabilite"] == "non testable"
     assert rows["sp-3"]["etat"] == "sans_objet"
     warnings = cov.selection_warnings(list(rows.values()), ["sp-1", "sp-2"])

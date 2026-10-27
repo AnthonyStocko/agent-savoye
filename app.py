@@ -8,12 +8,15 @@ import subprocess
 import sys
 import time
 import streamlit as st
-from dotenv import dotenv_values, load_dotenv, set_key
+import logging
 
+from dotenv import dotenv_values, load_dotenv
+
+from tools import env_tools
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_import,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
-                   cucumber_studio, cucumber_testability, cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
+                   cucumber_results, cucumber_studio, cucumber_testability, cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -95,25 +98,83 @@ def show_release_note(ticket: str, since: float) -> None:
         st.markdown(note or "_Fichier vide._")
 
 
-def run_main_step(cmd: list, on_line=None) -> int:
-    """Lance main.py en affichant ses logs au fil de l'eau (`on_line` : appelé à chaque ligne). Renvoie le code retour."""
+# Préfixe des problèmes d'environnement rédigés par main.py (contrôle avant tout lot)
+CUCUMBER_ENV_PREFIX = "[CUCUMBER ENVIRONNEMENT] ❌"
+JOURNAL_PATH = os.path.join(".tmp", "journal_technique.log")
+JOURNAL_MAX_BYTES = 5_000_000
+
+
+def run_main_step(cmd: list, on_line=None, quiet: bool = True) -> int:
+    """
+    Lance main.py (`on_line` : appelé à chaque ligne). Toute la sortie va dans le journal technique
+    (.tmp/journal_technique.log, panneau « Journal technique » replié de l'en-tête) ; par défaut (`quiet`), rien de
+    brut n'est affiché : seul un indicateur d'avancement, et la dernière exécution est gardée pour en tirer des
+    phrases (journal_phrases). `quiet=False` réservé au diagnostic. Renvoie le code retour.
+    """
+    os.makedirs(os.path.dirname(JOURNAL_PATH), exist_ok=True)
+    if os.path.exists(JOURNAL_PATH) and os.path.getsize(JOURNAL_PATH) > JOURNAL_MAX_BYTES:
+        os.replace(JOURNAL_PATH, JOURNAL_PATH + ".1")
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
-        errors="replace"
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
-    output_container = st.empty()
-    logs = ""
-    for line in process.stdout:
-        logs += line
-        output_container.code(logs, language="text")
-        if on_line:
-            on_line(line)
-    process.wait()
+    output_container = st.empty() if not quiet else None
+    spinner = st.spinner("Traitement en cours… (sortie détaillée : « Journal technique », en haut de la page)") \
+        if quiet else None
+    if spinner:
+        spinner.__enter__()
+    logs, lines = "", []
+    with open(JOURNAL_PATH, "a", encoding="utf-8") as journal:
+        journal.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} — {' '.join(cmd[1:])[:300]}\n")
+        for line in process.stdout:
+            journal.write(line)
+            lines.append(line.rstrip("\n"))
+            if output_container is not None:
+                logs += line
+                output_container.code(logs, language="text")
+            if on_line:
+                on_line(line)
+        process.wait()
+        journal.write(f"===== code retour {process.returncode}\n")
+    if spinner:
+        spinner.__exit__(None, None, None)
+    st.session_state["last_run_lines"] = lines
     return process.returncode
+
+
+def journal_phrases(prefix: str) -> list:
+    """Phrases rédigées par main.py dans la dernière exécution, sous un préfixe (ex. problèmes d'environnement)."""
+    return [line.split(prefix, 1)[1].strip() for line in st.session_state.get("last_run_lines") or []
+            if prefix in line]
+
+
+def interruption_cause(returncode: int) -> str:
+    """Cause d'une interruption, en une phrase : problème d'environnement, sinon dernière erreur signalée."""
+    environment = journal_phrases(CUCUMBER_ENV_PREFIX)
+    if environment:
+        return environment[0]
+    errors = [re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", line).replace("❌", "").replace("⛔", "").strip()
+              for line in st.session_state.get("last_run_lines") or [] if "❌" in line or "⛔" in line]
+    errors = [e for e in errors if e and not e.startswith(("Traceback", "File "))]
+    return (errors[-1][:240] if errors else
+            f"le traitement s'est arrêté avant la fin (code retour {returncode}), voir le journal technique")
+
+
+def render_technical_journal() -> None:
+    """Panneau « Journal technique », replié : sortie brute des traitements (jamais dans une carte)."""
+    with st.expander("Journal technique", icon=":material/terminal:"):
+        if not os.path.exists(JOURNAL_PATH):
+            st.caption("Aucun traitement lancé pour l'instant.")
+            return
+        with open(JOURNAL_PATH, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-400:]
+        st.caption(f"Sortie brute des derniers traitements (400 dernières lignes) — {JOURNAL_PATH}")
+        st.code("".join(tail), language="text")
 
 
 def run_epic_patches(epic_key: str, project: str, client_repo: str, db_schema: str) -> bool:
@@ -225,11 +286,24 @@ if not os.path.exists(ENV_PATH):
 # configuration enregistrée (onglet ⚙️) au lieu de garder les valeurs du démarrage.
 # CLAUDE_CONFIG_DIR vide dans le .env : on garde celui du shell de lancement (mémorisé au premier passage).
 os.environ.setdefault("AGENT_SHELL_CLAUDE_CONFIG_DIR", os.environ.get("CLAUDE_CONFIG_DIR", ""))
+# Lignes du .env en défaut : un message clair au démarrage (numéros de ligne) au lieu des avertissements bruts
+logging.getLogger("dotenv.main").setLevel(logging.ERROR)
 load_dotenv(ENV_PATH, override=True)
 if not os.getenv("CLAUDE_CONFIG_DIR", "").strip():
     os.environ["CLAUDE_CONFIG_DIR"] = os.environ["AGENT_SHELL_CLAUDE_CONFIG_DIR"]
 
 st.title("🤖 Tableau de bord - Agent Scrum Master")
+
+render_technical_journal()
+env_problems = env_tools.check_env(ENV_PATH)
+if env_problems:
+    with st.container(border=True):
+        st.warning(env_tools.check_line(env_problems), icon=":material/warning:")
+        if st.button("Neutraliser les lignes invalides", icon=":material/comment:", key="env_neutralize",
+                     help="Met ces lignes en commentaire (rien n'est supprimé) ; copie de l'ancien fichier : .env.bak"):
+            st.success(f"{env_tools.neutralize_invalid_lines(ENV_PATH)} ligne(s) mise(s) en commentaire ; copie : "
+                       f".env.bak.")
+            st.rerun()
 
 tab_integration, tab_execution, tab_cucumber, tab_merges, tab_knowledge, tab_config = st.tabs(
     ["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🔔 Écoute des merges", "📚 Connaissances partagées",
@@ -434,7 +508,7 @@ with tab_execution:
                     st.session_state["current_client_repo"] = client_repo_path.strip()
                     st.rerun()
                 else:
-                    st.error("Une erreur est survenue lors de l'analyse de l'épopée : consultez les logs ci-dessus "
+                    st.error("Une erreur est survenue lors de l'analyse de l'épopée : consultez le journal technique (en haut de la page) "
                              "(les tâches déjà créées sont conservées et réutilisées à la relance).")
             run_cadrage_btn = run_direct_patch_btn = False
 
@@ -453,23 +527,9 @@ with tab_execution:
                     "--db-schema", db_schema_input
                 ]
 
-                process = subprocess.Popen(
-                    cmd_cadrage,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace"
-                )
-                output_container = st.empty()
-                logs = ""
-                for line in process.stdout:
-                    logs += line
-                    output_container.code(logs, language="text")
+                returncode = run_main_step(cmd_cadrage)
 
-                process.wait()
-
-                if process.returncode == 0:
+                if returncode == 0:
                     st.success("Analyse terminée et sauvegardée.")
                     st.session_state["workflow_step"] = "REVIEW_ANALYSIS"
                     st.session_state["current_ticket"] = selected_ticket
@@ -494,23 +554,9 @@ with tab_execution:
                 ]
                 patch_started_at = time.time()
 
-                process = subprocess.Popen(
-                    cmd_patch,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace"
-                )
-                output_container = st.empty()
-                logs = ""
-                for line in process.stdout:
-                    logs += line
-                    output_container.code(logs, language="text")
+                returncode = run_main_step(cmd_patch)
 
-                process.wait()
-
-                if process.returncode == 0:
+                if returncode == 0:
                     st.success(f"🎉 Patch généré et attaché avec succès au ticket Jira {selected_ticket} !")
                     show_release_note(selected_ticket, patch_started_at)
                     st.session_state["workflow_step"] = "FINISHED"
@@ -567,29 +613,14 @@ with tab_execution:
                     "--db-schema", st.session_state.get("db_schema_input", "").strip()
                 ]
 
-                process = subprocess.Popen(
-                    cmd_refine,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace"
-                )
+                returncode = run_main_step(cmd_refine)
 
-                output_container = st.empty()
-                logs = ""
-                for line in process.stdout:
-                    logs += line
-                    output_container.code(logs, language="text")
-
-                process.wait()
-
-                if process.returncode == 0:
+                if returncode == 0:
                     st.toast("Analyse révisée et mise à jour !", icon=":material/check_circle:")
                     st.rerun()
                 else:
                     # Pas de rerun : les logs restent affichés pour diagnostiquer l'échec
-                    st.error(f"La révision a échoué (code {process.returncode}). Rien n'a été enregistré en mémoire : consultez les logs ci-dessus.")
+                    st.error(f"La révision a échoué (code {returncode}). Rien n'a été enregistré en mémoire : consultez le journal technique (en haut de la page).")
 
         with col_validate:
             if st.button("✅ Valider l'analyse & Générer le Patch", type="primary", use_container_width=True):
@@ -611,24 +642,9 @@ with tab_execution:
                 ]
                 patch_started_at = time.time()
 
-                process = subprocess.Popen(
-                    cmd_val_patch,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace"
-                )
+                returncode = run_main_step(cmd_val_patch)
 
-                output_container = st.empty()
-                logs = ""
-                for line in process.stdout:
-                    logs += line
-                    output_container.code(logs, language="text")
-
-                process.wait()
-
-                if process.returncode == 0:
+                if returncode == 0:
                     st.success(f"🎉 Traitement terminé avec succès ! Le patch est attaché au ticket {active_ticket}.")
                     show_release_note(active_ticket, patch_started_at)
                     st.session_state["workflow_step"] = "FINISHED"
@@ -702,7 +718,7 @@ with tab_execution:
                     st.toast("Analyses révisées et tâches Jira mises à jour !", icon=":material/check_circle:")
                     st.rerun()
                 else:
-                    st.error(f"La révision a échoué (code {returncode}) : consultez les logs ci-dessus.")
+                    st.error(f"La révision a échoué (code {returncode}) : consultez le journal technique (en haut de la page).")
 
         with col_epic_validate:
             if st.button("✅ Valider les analyses & Générer les Patchs", type="primary", use_container_width=True,
@@ -789,7 +805,7 @@ def render_cucumber_run(ctx: dict, state: dict) -> None:
             code = run_main_step(ctx["cmd"] + ["--run-jenkins", "--run-tags", tags.strip()])
             (st.success if code in (0, 1) else st.error)(
                 "Run importé : voir le résultat ci-dessous et le bilan." if code in (0, 1) else
-                "Run non lancé ou non abouti : voir le journal ci-dessus.")
+                "Run non lancé ou non abouti : voir le journal technique (en haut de la page).")
             state.update(cucumber_tools.load_state(client))
         last = cucumber_run.last_run(state)
         if last:
@@ -1121,7 +1137,7 @@ with tab_integration:
                                          f"(code {returncode}). Relancez la rédaction ci-dessus.")
                             else:
                                 st.error(f"Besoin complété, mais le cadrage {integ_ticket}-cadrage.md n'a pas pu être "
-                                         "complété avec les réponses : voir le journal ci-dessus.")
+                                         "complété avec les réponses : voir le journal technique (en haut de la page).")
                 st.caption("Les réponses déjà envoyées restent dans la description Jira, sous leur question.")
             completed = st.session_state.get("integ_completed")
             if completed and completed[0] == integ_ticket:
@@ -1445,7 +1461,7 @@ def render_cucumber_health(ctx: dict) -> None:
                 st.warning("Le dépôt client a des défauts : voir le rapport. Les échecs qu'ils provoquent à "
                            "l'exécution ne viendront pas des tests générés.", icon=":material/warning:")
             else:
-                st.error("Le bilan de santé a échoué : voir le journal ci-dessus.")
+                st.error("Le bilan de santé a échoué : voir le journal technique (en haut de la page).")
             st.rerun()
         if health:
             st.markdown(health)
@@ -1605,6 +1621,85 @@ def render_card_details(ctx: dict, row: dict) -> None:
     render_coverage_knowledge(client, row)
 
 
+def render_generation_result(ctx: dict, row: dict) -> None:
+    """
+    Résultat de la dernière génération de la tâche, en phrases : test écrit (fichiers, commit, « Voir les
+    modifications », « Télécharger le patch »), couverte par une autre tâche, sans logique propre, blocage prouvé,
+    informations à confirmer, ou génération interrompue (cause et action ; l'état de la tâche n'a pas changé).
+    """
+    client, generation = ctx["client"], row.get("generation") or {}
+    if not generation:
+        return
+    kind, date = generation.get("type", ""), (generation.get("date") or "").replace("T", " ")[:16]
+    label = cucumber_results.KINDS.get(kind, kind)
+    if kind == "interrompue":
+        st.warning(f"**{label}** ({date}) : {generation.get('message', '')}"
+                   + (f" Action : {generation['action']}." if generation.get("action") else "")
+                   + " L'état de la tâche n'a pas changé.", icon=":material/block:")
+        return
+    st.markdown(f"**{label}** :gray[({date}, lot {generation.get('lot') or '?'})] — {generation.get('message', '')}")
+    if generation.get("couvert_par") and row["etat"] != "en_attente":
+        st.button("Ouvrir la tâche qui la couvre", icon=":material/arrow_forward:", type="tertiary",
+                  key=f"cucumber_result_open_{client}_{row['id']}", on_click=st.session_state.update,
+                  kwargs={f"cucumber_card_{client}": generation["couvert_par"]})
+    if kind != "test_ecrit":
+        return
+    state = cucumber_tools.load_state(client)
+    worktree, base = cucumber_tools.worktree_dir(client), state.get("base", "")
+    files, lot = cucumber_results.task_files(state, row["id"])
+    diff = cucumber_results.task_diff(worktree, base, files)
+    scope = "de la tâche"
+    if not diff and lot.get("fichiers"):
+        files, scope = lot["fichiers"], f"du lot {lot.get('numero')} qui la contient"
+        diff = cucumber_results.task_diff(worktree, base, files)
+    commits = cucumber_results.task_commits(worktree, base, files)
+    st.caption("Fichiers : " + ", ".join(f"`{f}`" for f in files[:8]) + (f" (+{len(files) - 8})" if len(files) > 8
+                                                                          else "")
+               + (f" · commit(s) : {', '.join(c.split(' ', 1)[0] for c in commits[:3])}" if commits else ""))
+    if not diff:
+        st.caption("Modifications non disponibles : le worktree de la génération est absent ou déjà réinitialisé.")
+        return
+    with st.container(horizontal=True):
+        show = st.toggle("Voir les modifications", key=f"cucumber_diff_{client}_{row['id']}")
+        st.download_button(f"Télécharger le patch {scope}", diff, icon=":material/download:",
+                           file_name=f"{client}-{row['id']}.patch", mime="text/x-diff",
+                           key=f"cucumber_patch_{client}_{row['id']}")
+    if show:
+        lines = diff.splitlines()
+        st.code("\n".join(lines[:600]) + (f"\n… {len(lines) - 600} ligne(s) de plus dans le patch"
+                                          if len(lines) > 600 else ""), language="diff")
+
+
+def render_delivery_header(ctx: dict) -> None:
+    """En-tête de la vue : patch global de la livraison, règles rétroactives à corriger en un clic."""
+    client = ctx["client"]
+    state = cucumber_tools.load_state(client)
+    retroactive = (state.get("selection") or {}).get("retroactif") or []
+    patch = cucumber_tools.patch_path(client)
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if os.path.exists(patch):
+            with open(patch, "rb") as f:
+                st.download_button("Patch global de la livraison", f.read(), file_name=os.path.basename(patch),
+                                   mime="text/x-diff", icon=":material/download:", key=f"cucumber_global_patch_{client}")
+            st.caption(f"généré le {time.strftime('%d/%m/%Y %H:%M', time.localtime(os.path.getmtime(patch)))}")
+    if retroactive:
+        tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client)).get("tag_client", "")
+        with st.container(border=True):
+            st.markdown(f":orange[:material/rule:] **{len(retroactive)} scénario(s) écrit(s) avant la règle « tag "
+                        f"client » n'ont pas le tag {tag}** : un job filtré sur ce tag ne les exécuterait pas. La "
+                        f"livraison n'est pas bloquée.")
+            if st.button(f"Ajouter le tag {tag} automatiquement", icon=":material/auto_fix_high:",
+                         disabled=not ctx["ready"], key=f"cucumber_fix_tags_{client}",
+                         help="Ajoute le tag au-dessus de chaque scénario actif qui ne l'a pas (scénarios désactivés "
+                              "exclus), commite, contrôle de nouveau et régénère le patch. Aucun appel à Claude."):
+                code = run_main_step(ctx["cmd"] + ["--fix-client-tags"])
+                remaining = len((cucumber_tools.load_state(client).get("selection") or {}).get("retroactif") or [])
+                (st.success if code == 0 else st.error)(
+                    f"Tag {tag} ajouté ; {remaining} scénario(s) encore sans tag." if code in (0, 1) else
+                    f"Correction impossible : {interruption_cause(code)}.")
+                st.rerun()
+
+
 def render_task_card(ctx: dict, row: dict) -> None:
     """
     Carte d'une tâche, même gabarit pour tous les états : titre métier et badge, une phrase métier, réponses
@@ -1617,6 +1712,7 @@ def render_task_card(ctx: dict, row: dict) -> None:
     with st.container(border=True):
         st.markdown(f"#### {row['titre']}  \n{badge} {label}")
         st.markdown(row["phrase"])
+        render_generation_result(ctx, row)
         if row["etat"] == "a_confirmer":
             for proposal in evaluation.get("proposees") or []:
                 render_proposal(client, row, proposal)
@@ -1686,6 +1782,7 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
     st.caption(f"{rates['total']} tâche(s) de l'inventaire du {inventory['genere_le'].replace('T', ' ')[:16]} · "
                + cucumber_coverage.legend())
     client = ctx["client"]
+    render_delivery_header(ctx)
     retro = cucumber_tools._read_json(cucumber_testability.retro_path(client), {}) if client else {}
     if retro.get("taches"):
         st.caption(f":material/published_with_changes: Rétro-analyse de la testabilité du "
@@ -1795,7 +1892,17 @@ def current_selection(candidates: list, key: str) -> list:
 
 
 def run_cucumber_generation(ctx: dict, extra: list) -> int:
-    """Lance une génération (nouvelle, reprise, complément) avec la progression des lots."""
+    """
+    Lance une génération (nouvelle, reprise, complément) avec la progression des lots, sans aucun journal brut.
+    Chaque tâche demandée finit avec un résultat enregistré : celui de son lot, sinon « Génération interrompue »
+    (cause en une phrase) ; son état ne change pas.
+    """
+    client = ctx["client"]
+    state = cucumber_tools.load_state(client)
+    requested = (extra[extra.index("--specifics") + 1].split(",") if "--specifics" in extra else
+                 [i for lot in cucumber_tools.pending_lots(state) for i in lot["ids"]] if "--resume" in extra else
+                 cucumber_tools.completable_specifics(state) if "--complete" in extra else [])
+    started = time.strftime("%Y-%m-%dT%H:%M:%S")
     progress = st.progress(0.0, text="Préparation (inventaire, catalogues, worktree)...")
 
     def show_lot_progress(line: str) -> None:
@@ -1806,10 +1913,20 @@ def run_cucumber_generation(ctx: dict, extra: list) -> int:
             progress.progress(min((current - 1) / total_lots, 1.0), text=f"Lot {current}/{total_lots} en cours")
     returncode = run_main_step(ctx["cmd"] + extra, on_line=show_lot_progress)
     progress.progress(1.0, text="Terminé" if returncode == 0 else "Interrompu")
-    if returncode == 0:
-        st.success(f"Tests Cucumber des spécifiques {ctx['client']} générés.")
+    missing = cucumber_results.missing_results(cucumber_tools.load_state(client), requested, started)
+    if missing:
+        cucumber_results.record_interruption(client, missing, interruption_cause(returncode),
+                                             "corriger la cause indiquée, puis relancer la génération", started)
+    environment = journal_phrases(CUCUMBER_ENV_PREFIX)
+    if environment:
+        st.error("**Génération interrompue avant tout lot** : l'état des tâches est inchangé.\n\n"
+                 + "\n".join(f"- {p}" for p in environment), icon=":material/block:")
+    elif missing:
+        st.error(f"Génération interrompue pour {len(missing)} tâche(s) : {interruption_cause(returncode)}. L'état "
+                 f"de ces tâches est inchangé ; le résultat est sur leur carte.", icon=":material/block:")
     else:
-        st.error(f"Génération interrompue (code {returncode}) : utilisez « Reprendre » (étape Génération).")
+        st.success(f"Génération terminée : le résultat de chaque tâche est sur sa carte (vue Couverture).",
+                   icon=":material/task_alt:")
     return returncode
 
 
@@ -1820,7 +1937,7 @@ def run_cucumber_init_lot(ctx: dict, lot: dict) -> int:
     if returncode == 0:
         st.success(f"{lot['titre']} : terminé (voir le journal et le patch d'initialisation).")
     else:
-        st.error(f"{lot['titre']} en échec (code {returncode}) : voir le journal ci-dessus.")
+        st.error(f"{lot['titre']} en échec (code {returncode}) : voir le journal technique (en haut de la page).")
     return returncode
 
 
@@ -2332,8 +2449,8 @@ with tab_merges:
         if not projects_value:
             st.error("Renseignez au moins un projet Bitbucket.")
         else:
-            set_key(ENV_PATH, "POLL_REPOSITORIES", projects_value)
-            set_key(ENV_PATH, "POLL_INTERVAL_SECONDS", str(int(listen_interval) * 60))
+            env_tools.write_env(ENV_PATH, {"POLL_REPOSITORIES": projects_value,
+                                           "POLL_INTERVAL_SECONDS": str(int(listen_interval) * 60)})
             os.environ["POLL_REPOSITORIES"] = projects_value
             os.environ["POLL_INTERVAL_SECONDS"] = str(int(listen_interval) * 60)
             with st.spinner("Démarrage de l'écoute…"):
@@ -2964,13 +3081,17 @@ with tab_config:
         submit_save = st.form_submit_button("💾 Enregistrer la configuration complète", type="primary", use_container_width=True)
 
         if submit_save:
-            # Les secrets sont enregistrés tels quels ; les autres valeurs sans espaces superflus
-            for env_name, env_value in env_values.items():
-                is_secret = env_name.endswith(("_TOKEN", "_SECRET", "_PASSWORD", "_API_KEY"))
-                set_key(ENV_PATH, env_name, env_value if is_secret else env_value.strip())
-
-            st.success("Toute la configuration a été enregistrée avec succès dans le fichier .env !")
-            st.rerun()
+            # Les secrets sont enregistrés tels quels ; les autres valeurs sans espaces superflus. Écriture unique
+            # (une ligne par valeur, échappements, relecture contrôlée)
+            try:
+                env_tools.write_env(ENV_PATH, {
+                    name: value if name.endswith(("_TOKEN", "_SECRET", "_PASSWORD", "_API_KEY")) else value.strip()
+                    for name, value in env_values.items()})
+            except ValueError as e:
+                st.error(f"Configuration non enregistrée correctement : {e}.")
+            else:
+                st.success("Toute la configuration a été enregistrée avec succès dans le fichier .env !")
+                st.rerun()
 
     # Hors formulaire : teste la configuration base déjà enregistrée dans le .env
     with st.container(horizontal=True, vertical_alignment="center"):

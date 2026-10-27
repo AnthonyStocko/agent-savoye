@@ -248,6 +248,12 @@ def _globs(env_name: str, default: str) -> list:
     return [g.strip().lower() for g in value.split(",") if g.strip()]
 
 
+def outside_inventory(repo_name: str) -> bool:
+    """Dépôt du client que l'inventaire ignore : dépôts Cucumber et dépôts exclus (CUCUMBER_EXCLUDE_REPOS)."""
+    return "cucumber" in repo_name.lower() or _matches(repo_name,
+                                                       _globs("CUCUMBER_EXCLUDE_REPOS", DEFAULT_EXCLUDE_REPOS))
+
+
 def _matches(path: str, globs: list) -> bool:
     lowered = path.lower()
     name = lowered.rsplit("/", 1)[-1]

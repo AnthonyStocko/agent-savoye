@@ -125,8 +125,9 @@ def test_coverage_states_rates_and_order(client):
     assert rows["sp-a"]["etat"] == "vert" and rows["sp-a"]["derniere"].startswith("import n° 2")   # dernier import
     assert rows["sp-b"]["etat"] == "echec" and rows["sp-b"]["cause"] == "attendu 3"
     assert rows["sp-c"]["etat"] == "desactive" and rows["sp-c"]["cause"] == "donnée de référence absente"
-    # Raison libre sans blocage prouvé ni valeur à demander : testable, non couverte (jamais « non testable »)
-    assert rows["sp-d"]["etat"] == "non_couvert" and rows["sp-d"]["evaluation"]["questions"] == []
+    # Raison libre sans blocage prouvé ni valeur à demander : jamais « non testable », ni « non couverte » après
+    # une génération (le résumé du lot devient l'information à confirmer)
+    assert rows["sp-d"]["etat"] == "a_confirmer" and rows["sp-d"]["evaluation"]["questions"] == []
     assert rows["sp-e"]["etat"] == "partiel" and rows["sp-f"]["etat"] == "partiel"   # rapprochement / faibles
     assert rows["sp-g"]["etat"] == "vert" and "indirectement" in rows["sp-g"]["cause"]
     assert rows["sp-h"]["etat"] == "non_execute"

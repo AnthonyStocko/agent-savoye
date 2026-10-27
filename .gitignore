@@ -1,5 +1,6 @@
 # Configuration personnelle (identifiants, jetons) : partir de .env.example
 .env
+.env.bak
 
 # Environnements Python et caches
 venv/

@@ -466,6 +466,9 @@ def spec_state(spec: dict, result: dict, scenarios: list, testable: dict) -> tup
             return "sans_objet", evaluation["preuve"]
         if evaluation.get("etat") == "a_confirmer":
             return "a_confirmer", evaluation["resume"]
+        # Une tâche ne repasse jamais « non couverte » après une génération : le lot n'a rien écrit, son résumé
+        # devient l'information à confirmer (relance inutile tant que ses entrées ne changent pas)
+        return "a_confirmer", evaluation.get("resume") or cucumber_testability.summary(result.get("raison") or "")
     if testable["testabilite"] == "non testable":
         return "non_testable", " ; ".join(r for r in testable["raisons"] if ": non" in r)
     if spec.get("couverture") == "partiel":
@@ -531,7 +534,8 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
             "scenarios": scenarios, "effort": effort(spec), "constats": result.get("constats") or [],
             "studio": cucumber_studio.spec_behaviours(spec), "studio_total": cucumber_studio.behaviour_counts(spec),
             "studio_a_calculer": studio_pending(spec),
-            "couvert_par": "", "chaine": [], "chaine_titre": ""}
+            "couvert_par": "", "chaine": [], "chaine_titre": "",
+            "generation": (state.get("generations") or {}).get(spec["id"]) or {}}
     propagate(rows, coverage_links(specifics, results))
     return selection_order(list(rows.values()))
 

@@ -2,6 +2,7 @@ import argparse
 import csv
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -15,7 +16,8 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import env_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -36,7 +38,11 @@ if hasattr(sys.stdout, "buffer"):
 if hasattr(sys.stderr, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
+# Lignes du .env en défaut : une phrase avec leurs numéros au lieu des avertissements bruts de python-dotenv
+logging.getLogger("dotenv.main").setLevel(logging.ERROR)
 load_dotenv()
+if env_tools.check_env(".env"):
+    print(f"[CONFIGURATION] ⚠️ {env_tools.check_line(env_tools.check_env('.env'))}")
 
 
 def _safe_memory(action, *args, **kwargs) -> bool:
@@ -892,6 +898,7 @@ def main():
     parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : lot d'initialisation des données, en patch séparé, selon l'état détecté de l'init : absente, copie des Init_<MODULE> du Cucumber Standard pour ses modules ; incomplète, compléments seuls dans une nouvelle feature (jamais de réécriture ni de fichier protégé modifié) ; complète, rien. Sans appel à Claude, sauf steps du projet à écrire")
     parser.add_argument("--profile-only", action="store_true", help="generate-cucumber-client : détecte le profil client (racine et tag des features, init, clear, fichiers du module spécifique, runner, codes de référence, version de la bibliothèque) dans le dépôt <client>-cucumber, sans appel à Claude")
     parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
+    parser.add_argument("--fix-client-tags", action="store_true", help="generate-cucumber-client : règle rétroactive « tag client » : ajoute le tag client au-dessus des scénarios actifs qui ne l'ont pas (scénarios désactivés exclus), commite dans le worktree, contrôle de nouveau et régénère le patch, sans appel à Claude")
     parser.add_argument("--detect-force", action="store_true", help="generate-cucumber-client --detect-only : détection refaite même si l'empreinte des commits n'a pas changé (profil corrigé)")
     parser.add_argument("--health-only", action="store_true", help="generate-cucumber-client : bilan de santé du dépôt <client>-cucumber avant génération (emplacement et tags des features, fichiers de données manquants, compilation et dry-run de toutes ses features), sans appel à Claude")
     parser.add_argument("--import-run", nargs="*", default=None, help="generate-cucumber-client : import d'un rapport d'exécution (console Jenkins, rapport Cucumber JSON, exports de logs serveur CSV), secrets masqués avant stockage, analysé sans appel à Claude")
@@ -1708,6 +1715,35 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             lot_specs, set(result["classes_executees"]))
 
 
+CUCUMBER_ENV_PREFIX = "[CUCUMBER ENVIRONNEMENT] ❌"
+
+
+def fix_client_tags(client: str, local_cucumber_std_repo: str) -> int:
+    """
+    Règle rétroactive « tag client » : ajoute le tag client au-dessus des scénarios actifs qui ne l'ont pas
+    (scénarios désactivés exclus), commite dans le worktree, contrôle de nouveau et régénère le patch. 0 token.
+    """
+    worktree = cucumber_tools.worktree_dir(client)
+    state = cucumber_tools.load_state(client)
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    if not os.path.isdir(worktree) or not profile.get("tag_client"):
+        print("[CUCUMBER] Correction impossible : aucune génération (worktree) ou tag client absent du profil.")
+        return 2
+    changed = cucumber_checks.add_missing_client_tags(worktree, profile["features_root"], profile["tag_client"],
+                                                      cucumber_a_revoir.a_revoir_tag())
+    if changed:
+        cucumber_tools._git(worktree, "add", "--", *changed)
+        cucumber_tools._git(worktree, "commit", "-m", f"Cucumber: client tag {profile['tag_client']} on scenarios "
+                                                      f"written before the rule")
+    check_cucumber_selection(client, worktree, local_cucumber_std_repo, profile, state, "")
+    remaining = len((state.get("selection") or {}).get("retroactif") or [])
+    if cucumber_tools.write_patch(worktree, state["base"], cucumber_tools.patch_path(client), client):
+        print(f"[CUCUMBER] Patch régénéré : {cucumber_tools.patch_path(client)}")
+    print(f"[CUCUMBER] Tag client {profile['tag_client']} ajouté dans {len(changed)} feature(s) ; "
+          f"{remaining} scénario(s) encore sans tag.")
+    return 0 if not remaining else 1
+
+
 def check_cucumber_selection(client: str, worktree: str, cucumber_std_dir: str, profile: dict, state: dict,
                              dry_run_cmd: str) -> bool:
     """
@@ -1726,9 +1762,15 @@ def check_cucumber_selection(client: str, worktree: str, cucumber_std_dir: str, 
                                           "*.feature").stdout.splitlines()
              if os.path.exists(os.path.join(worktree, *p.split("/")))
              and (p.startswith(root) or p in profile["init_features"])}
-    errors = cucumber_checks.check_client_tags(texts, client_tag)
+    # Règle « tag client » postérieure à certains scénarios : tag absent = correction proposée, pas un échec
+    tag_errors = cucumber_checks.check_client_tags(texts, client_tag)
+    retroactive = [e for e in tag_errors if cucumber_checks.MISSING_CLIENT_TAG in e]
+    errors = [e for e in tag_errors if e not in retroactive]
     selection = {"attendu": cucumber_verify.expected_count(texts.values(), "", cucumber_a_revoir.a_revoir_tag()),
-                 "nombre_attendu": 0, "environnement": False}
+                 "nombre_attendu": 0, "environnement": False, "retroactif": retroactive}
+    if retroactive:
+        print(f"[CUCUMBER] ⚠️ {len(retroactive)} scénario(s) écrit(s) avant la règle « tag client » sans le tag "
+              f"{client_tag} : correction automatique proposée (onglet Cucumber).")
     if dry_run_cmd and texts:
         try:
             dry = cucumber_checks.selection_check(cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
@@ -2409,6 +2451,27 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     if args.resume and not args.complete and not cucumber_tools.pending_lots(resume_state):
         print("[CUCUMBER] Aucun lot à reprendre.")
         return 0
+    if args.fix_client_tags:
+        return fix_client_tags(client, local_cucumber_std_repo)
+    if not (args.inventory_only or args.detect_only):
+        # Environnement de l'agent contrôlé avant tout lot, sans rien modifier : un problème = aucun lot lancé
+        compile_cmd = os.getenv("CUCUMBER_COMPILE_CMD")
+        compile_cmd = cucumber_tools.DEFAULT_COMPILE_CMD if compile_cmd is None else compile_cmd.strip()
+        problems = cucumber_preflight.check(local_client_repo, compile_cmd, local_cucumber_std_repo,
+                                            cucumber_tools.outside_inventory)
+        if problems:
+            for problem in problems:
+                print(f"{CUCUMBER_ENV_PREFIX} {problem}")
+            requested = ([i.strip() for i in args.specifics.split(",") if i.strip()] if args.specifics else
+                         [i for lot in cucumber_tools.pending_lots(resume_state) for i in lot["ids"]] if resume_state
+                         else cucumber_tools.completable_specifics(complete_state) if complete_state else [])
+            cucumber_results.record_interruption(client, requested, problems[0], "corriger l'environnement puis "
+                                                 "relancer" if len(problems) == 1 else
+                                                 f"corriger les {len(problems)} problèmes d'environnement signalés, "
+                                                 f"puis relancer")
+            print(f"[CUCUMBER] ⛔ Génération interrompue avant tout lot : {len(problems)} problème(s) "
+                  f"d'environnement ; aucun lot lancé, l'état des tâches est inchangé.")
+            return 3
 
     # 1. Pré-calculs (0 token). Reprise ou sélection faite sur un inventaire : celui-ci est réutilisé tel quel
     subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
@@ -2520,6 +2583,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         wanted, sorted_out = cucumber_tools.presort(wanted, specifics)
         if sorted_out:
             sorted_lot = cucumber_tools.add_sorted_lot(state, sorted_out)
+            cucumber_results.record_lot(state, sorted_lot)
             print(f"[CUCUMBER] Tri sans appel Claude (lot {sorted_lot['numero']}) : " + " ; ".join(
                 f"{r['id']} — {r['raison']}" for r in sorted_out))
         if not wanted:
@@ -2558,6 +2622,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             lots.append(cucumber_tools.presort_lot(sorted_out, len(lots) + 1))
         state = {"client": client, "debut": datetime.now().isoformat(timespec="seconds"), "base": base,
                  "lots": lots}
+        for sorted_lot in (lot for lot in lots if lot.get("tri")):
+            cucumber_results.record_lot(state, sorted_lot)
         if cucumber_tools.load_state(client).get("lots"):
             print("⚠️ Nouvelle génération : les lots précédents (worktree, commits, etat.json) sont écrasés.")
     state["partiels"] = sorted(set(state.get("partiels") or []) | {i for lot in cucumber_tools.pending_lots(state)
@@ -2824,6 +2890,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                    fin=datetime.now().isoformat(timespec="seconds"),
                    verification={k: check.get(k) for k in ("ok", "etape", "erreurs", "environnement")} if files
                    else None)
+        # Résultat obligatoire de la génération de chaque tâche du lot (carte de la tâche)
+        cucumber_results.record_lot(state, lot)
         if not check["ok"] and not check.get("environnement"):
             lot.update(statut="erreur_compilation", erreur=f"{check['etape']} : {check['erreurs'][0]}"[:300])
             cucumber_tools.save_state(client, state)

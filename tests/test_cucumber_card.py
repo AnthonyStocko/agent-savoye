@@ -117,7 +117,8 @@ def test_no_input_for_detectable_factors(project):
 
 
 def test_testable_card_shows_only_title_sentence_and_generate(project):
-    cte.save_index(CLIENT, {v: [{"source": "init", "ou": "init.feature:3"}] for v in (*DOC_KEYS, "DOC_FICTIF_Z")})
+    # Tâche jamais générée : testable, carte réduite au titre, à la phrase et à « Générer le test »
+    ct.save_state(CLIENT, {"lots": []})
     at = open_card(project)
     assert not card_keys(at, "text_input")
     assert not [b for b in at.button if b.label in ("Confirmer", "Corriger")]
