@@ -125,12 +125,12 @@ def test_coverage_states_rates_and_order(client):
     assert rows["sp-a"]["etat"] == "vert" and rows["sp-a"]["derniere"].startswith("import n° 2")   # dernier import
     assert rows["sp-b"]["etat"] == "echec" and rows["sp-b"]["cause"] == "attendu 3"
     assert rows["sp-c"]["etat"] == "desactive" and rows["sp-c"]["cause"] == "donnée de référence absente"
-    # Raison libre sans blocage prouvé : testable, informations à confirmer (jamais « non testable »)
-    assert rows["sp-d"]["etat"] == "a_confirmer" and "aucun step" in rows["sp-d"]["cause"]
+    # Raison libre sans blocage prouvé ni valeur à demander : testable, non couverte (jamais « non testable »)
+    assert rows["sp-d"]["etat"] == "non_couvert" and rows["sp-d"]["evaluation"]["questions"] == []
     assert rows["sp-e"]["etat"] == "partiel" and rows["sp-f"]["etat"] == "partiel"   # rapprochement / faibles
     assert rows["sp-g"]["etat"] == "vert" and "indirectement" in rows["sp-g"]["cause"]
     assert rows["sp-h"]["etat"] == "non_execute"
-    assert rows["sp-d"]["testabilite"] == "à confirmer" and rows["sp-a"]["criteres"]["donnees"][0] == "oui"
+    assert rows["sp-d"]["testabilite"] == "testable" and rows["sp-a"]["criteres"]["donnees"][0] == "oui"
     rates = cov.rates(list(rows.values()))
     assert (rates["reelle"], rates["ecrite"], rates["partielles"]) == (25, 62, 2)   # 2/8 verts, 5/8 écrites
     assert "réelle 25 %, écrite 62 %" in cov.summary_line(list(rows.values()))
@@ -141,13 +141,16 @@ def test_coverage_states_rates_and_order(client):
     assert cov.failing_test_causes(ordered) == 1
 
 
-def test_overrides_change_risk_and_testability(client):
+def test_risk_override_and_detected_factors_never_entered(client):
     inventory = {"specifiques": [_spec("sp-a", fichiers=[{"path": "p/customized.xml", "kind": "extension",
                                                           "nb_comportements_studio": {"écran": 2}}])]}
     cov.save_override(client, "sp-a", {"risque": "faible", "testabilite": {"studio": "non"}})
     row = cov.coverage_rows(client, inventory, {"lots": []})[0]
     assert row["risque"] == "faible" and row["risque_propose"] == "moyen"
-    assert row["criteres"]["studio"] == ("non", "saisi") and row["etat"] == "non_testable"
+    # Facteurs détectés : une ancienne saisie est ignorée ; non détecté = « non déterminé », sans blocage
+    assert row["criteres"]["studio"] == (cov.UNDETERMINED, "aucun scénario lié exécuté")
+    assert row["etat"] == "non_couvert" and row["testabilite"] == "testable"
+    assert row["titre"] and row["phrase"].startswith("Vérifier le comportement propre au client (2 écran(s))")
     assert row["point_entree"] == "processus interactif (2 écran(s))"
     cov.save_override(client, "sp-a", {})
     assert cov.load_overrides(client) == {}

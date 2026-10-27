@@ -46,26 +46,55 @@ def missing_docs(**extra) -> dict:
                       f"disponibles, clés de document non vérifiées.", **extra}
 
 
-def test_data_only_in_project_init_makes_task_testable(cache, worktree):
+def test_data_in_project_init_becomes_proposed_answer(cache, worktree):
     profile = {**cp.empty_profile(), "init_features": [INIT_REL]}
     index = cte.known_values(CLIENT, profile, {}, worktree)
     assert index[DOC_KEYS[0]][0]["source"] == "init" and index[DOC_KEYS[0]][0]["ou"].startswith(INIT_REL)
     assert index[DOC_KEYS[1]][0]["source"] == "depot"
-    evaluation = cte.assess(missing_docs(recherches=ALL_SOURCES[:1]), index, profile)
-    assert evaluation["etat"] == "testable" and set(evaluation["trouvees"]) == set(DOC_KEYS)
-    assert any("trouvée(s)" in r for r in evaluation["rejets"])
-    # Raison au format ancien (texte libre) : à confirmer, valeurs trouvées jointes
-    legacy = cte.assess(missing_docs(), index, profile)
-    assert legacy["etat"] == "a_confirmer" and set(legacy["trouvees"]) == set(DOC_KEYS) and legacy["questions"]
+    # Toutes les valeurs dites manquantes sont trouvées : directement testable, réponses proposées avec leur source
+    evaluation = cte.assess(missing_docs(), index, profile, "Rendu d'un document")
+    assert evaluation["etat"] == "testable" and evaluation["attendues"] == 0 and evaluation["questions"] == []
+    proposed = {v: p for p in evaluation["proposees"] for v in p["valeurs"]}
+    assert set(proposed) == set(DOC_KEYS)
+    assert proposed[DOC_KEYS[0]]["source"].startswith(f"init du projet ({INIT_REL}:")
+    # Une valeur introuvable : une seule question précise, avec la donnée, le scénario et les candidats proches
+    result = missing_docs(raison=f"Documents {DOC_KEYS[0]} et DOC_FICTIF_Z exclus du rendu, clés non vérifiées.")
+    evaluation = cte.assess(result, index, profile, "Rendu d'un document")
+    assert evaluation["etat"] == "a_confirmer" and evaluation["attendues"] == 1
+    assert [v for p in evaluation["proposees"] for v in p["valeurs"]] == [DOC_KEYS[0]]
+    question = evaluation["questions"][0]
+    assert question["texte"].startswith("Pour tester « Rendu d'un document » : DOC_FICTIF_Z est cité mais "
+                                        "introuvable dans le profil, l'init")
+    assert set(question["candidats"]) == set(DOC_KEYS)
 
 
-def test_data_only_in_initializer_makes_task_testable(cache):
+def test_data_in_initializer_becomes_proposed_answer_grouped_by_entity(cache):
     inventory = {"initialiseurs": [{"depot": "app", "chemin": "x/DocInit.java", "classe": "DocInit",
                                     "creations": [{"entite": "RefReportDoc", "code": DOC_KEYS[0], "expression": "C"},
                                                   {"entite": "RefReportDoc", "code": DOC_KEYS[1], "expression": "D"}]}]}
     index = cte.known_values(CLIENT, cp.empty_profile(), inventory)
-    assert index[DOC_KEYS[0]] == [{"source": "initializers", "ou": "app/x/DocInit.java"}]
-    assert cte.assess(missing_docs(resume="Clés des documents à vérifier."), index)["etat"] == "testable"
+    assert index[DOC_KEYS[0]] == [{"source": "initializers", "ou": "app/x/DocInit.java", "entite": "RefReportDoc"}]
+    evaluation = cte.assess(missing_docs(), index)
+    assert evaluation["etat"] == "testable"
+    assert evaluation["proposees"] == [{"cle": cte.question_key("proposition " + " ".join(sorted(DOC_KEYS))),
+                                        "libelle": "RefReportDoc présent(s) sur l'environnement",
+                                        "valeurs": list(DOC_KEYS), "source": "initializer (app/x/DocInit.java)",
+                                        "reponse": None}]
+
+
+def test_no_generic_question_nor_copy_of_the_reason(cache):
+    reason = "Les documents sont produits par d'autres processus, ce qui demande des fixtures non disponibles."
+    generic = ["Quelle donnée, clé ou valeur faut-il pour tester cette tâche ?",
+               "Les documents sont produits par d'autres processus, ce qui demande des fixtures non disponibles ?"]
+    evaluation = cte.assess({"statut": "non_couvert", "raison": reason, "questions": generic}, {})
+    assert evaluation["questions"] == [] and evaluation["etat"] == "testable"
+    # Raison sans aucune valeur identifiable : rien de précis à demander, jamais de question générique
+    assert cte.assess({"statut": "non_couvert", "raison": reason}, {})["questions"] == []
+    # Références de tickets ou de scénarios : pas des données
+    assert cte.assess({"statut": "non_couvert", "raison": "Voir CLE-2021 et TOW-1037-4."}, {})["questions"] == []
+    precise = "Quel est le code du paramétrage d'impression du document DOC_FICTIF_A pour le scénario de rendu ?"
+    kept = cte.assess({"statut": "non_couvert", "raison": reason, "questions": [precise]}, {})
+    assert [q["texte"] for q in kept["questions"]] == [precise] and kept["etat"] == "a_confirmer"
 
 
 def test_initializer_and_configuration_values_extracted(cache, tmp_path):
@@ -92,41 +121,49 @@ def test_not_testable_requires_proven_blocker(cache):
     # Type de blocage sans preuve : rejeté
     no_proof = missing_docs(blocage={"type": "non_deploye", "preuve": ""}, recherches=ALL_SOURCES)
     assert cte.assess(no_proof, {})["etat"] == "a_confirmer"
-    # Blocage prouvé, 6 sources citées, aucune valeur dite manquante connue : non testable
+    # Blocage prouvé, 6 sources citées, aucune valeur dite manquante dans le projet : non testable
     proven = missing_docs(blocage={"type": "non_deploye", "preuve": "run n° 4 : échec « déploiement »"},
                           recherches=ALL_SOURCES, resume="Le processus n'est pas déployé.")
     evaluation = cte.assess(proven, {})
     assert evaluation["etat"] == "non_testable" and evaluation["resume"] == "Le processus n'est pas déployé."
     assert cte.blocker_line(evaluation) == "code ou personnalisation non déployé — preuve : run n° 4 : échec « déploiement »"
-    # Même blocage, mais une valeur dite manquante est connue : rejeté
-    assert cte.assess(proven, {DOC_KEYS[0]: [{"source": "init", "ou": "x"}]})["etat"] == "testable"
+    # Même blocage, mais les valeurs dites manquantes sont dans le projet : rejeté, testable
+    known = {v: [{"source": "init", "ou": "x"}] for v in DOC_KEYS}
+    assert cte.assess(proven, known)["etat"] == "testable"
+    # Trouvées seulement dans le Standard : exemples d'usage, le blocage prouvé tient
+    assert cte.assess(proven, {v: [{"source": "standard", "ou": "x"}] for v in DOC_KEYS})["etat"] == "non_testable"
 
 
 def test_without_own_behaviour_requires_proof(cache):
     assert cte.assess({"statut": "non_couvert", "raison": "DTO", "sans_objet": {"preuve": "A.java:3 class A {}"}},
                       {})["etat"] == "sans_objet"
-    assert cte.assess({"statut": "non_couvert", "raison": "DTO", "sans_objet": {"preuve": ""}}, {})["etat"] == \
-        "a_confirmer"
+    assert cte.assess({"statut": "non_couvert", "raison": "DTO", "sans_objet": {"preuve": ""}}, {})["etat"] != \
+        "sans_objet"
     assert cte.assess({"statut": "non_couvert", "raison": ct.TECHNICAL_REASON}, {})["etat"] == "sans_objet"
 
 
-def test_user_answer_reused_without_new_question(cache):
-    question = f"Quelle est la clé du document {DOC_KEYS[0]} ?"
-    result = missing_docs(questions=[question, "Quel paramétrage d'impression utiliser ?"])
+def test_answers_saved_automatically_and_reused_without_new_question(cache):
+    question = f"Quelle est la clé du paramétrage du document {DOC_KEYS[0]} pour le scénario de rendu ?"
+    result = missing_docs(questions=[question])
     first = cte.assess(result, {})
-    assert first["etat"] == "a_confirmer" and question in first["questions"]
+    assert first["etat"] == "a_confirmer" and question in [q["texte"] for q in first["questions"]]
     cte.save_answer(CLIENT, question, f"{DOC_KEYS[0]}-KEY", "sp-1")
     cte.save_answer(CLIENT, question, f"{DOC_KEYS[0]}-KEY2", "sp-1")
     profile = cp.effective_profile(cp.load_profile(CLIENT))
     assert len(profile["reponses"]) == 1 and profile["reponses"][0]["reponse"] == f"{DOC_KEYS[0]}-KEY2"
-    # Même question (casse, ponctuation) pour une autre tâche : jamais reposée
+    # Même question (casse, ponctuation) pour une autre tâche : déjà répondue, jamais reposée
     other = {**result, "id": "sp-2", "questions": [question.upper().rstrip(" ?") + " ?"]}
-    assert cte.question_key(other["questions"][0]) == cte.question_key(question)
-    reused = cte.assess(other, {}, profile)
-    assert reused["questions"] == [] and reused["etat"] == "testable"
-    assert question not in cte.assess(result, {}, profile)["questions"]
+    known = {v: [{"source": "init", "ou": "x"}] for v in DOC_KEYS}
+    reused = cte.assess(other, known, profile)
+    assert reused["attendues"] == 0 and reused["etat"] == "testable"
     block = cte.answers_block(profile)
     assert "ne repose jamais ces questions" in block and f"→ {DOC_KEYS[0]}-KEY2" in block
+    # Réponse proposée confirmée ou corrigée : enregistrée sous sa clé, avec son statut
+    proposal = {"cle": "proposition x", "libelle": "RefReportDoc présent(s) sur l'environnement"}
+    cte.save_answer(CLIENT, proposal["libelle"], DOC_KEYS[0], "sp-1", key=proposal["cle"], status="confirmee")
+    cte.save_answer(CLIENT, proposal["libelle"], DOC_KEYS[1], "sp-1", key=proposal["cle"], status="corrigee")
+    saved = cte.answers(cp.effective_profile(cp.load_profile(CLIENT)))
+    assert saved["proposition x"]["reponse"] == DOC_KEYS[1] and saved["proposition x"]["statut"] == "corrigee"
     # La réponse rejoint l'index des valeurs connues (source profil)
     assert cte.known_values(CLIENT, profile, {})[f"{DOC_KEYS[0]}-KEY2"][0]["source"] == "profil"
 
@@ -166,9 +203,10 @@ def test_retro_analysis_reclassifies_and_counts(cache, worktree):
         {"id": "sp-3", "statut": "non_couvert", "raison": ct.TECHNICAL_REASON},
         {"id": "sp-4", "statut": "couvert"}]}]}
     document = cte.retro(CLIENT, state, index, profile)
-    assert document["taches"] == {"sp-1": "a_confirmer", "sp-2": "a_confirmer", "sp-3": "sans_objet"}
+    # Valeurs trouvées dans le projet, rien de précis à demander : testables, jamais de question générique
+    assert document["taches"] == {"sp-1": "testable", "sp-2": "testable", "sp-3": "sans_objet"}
     assert document["reclassees"] == 3
-    assert cte.retro_line(document) == ("3 tâche(s) reclassée(s) : 0 testable(s), 2 à confirmer, 1 sans objet ; "
+    assert cte.retro_line(document) == ("3 tâche(s) reclassée(s) : 2 testable(s), 0 à confirmer, 1 sans objet ; "
                                         "0 reste(nt) non testable(s) (blocage prouvé)")
 
 
@@ -177,7 +215,7 @@ def test_coverage_rows_use_assessment_and_warning_shows_proof(cache, monkeypatch
     inventory = {"specifiques": [{"id": i, "libelle": i, "type": "processus", "nature": "", "depot": "d",
                                   "fichiers": [{"path": "a/A.java", "kind": "extension"}]}
                                  for i in ("sp-1", "sp-2", "sp-3")]}
-    cte.save_index(CLIENT, {DOC_KEYS[0]: [{"source": "init", "ou": INIT_REL}]})
+    cte.save_index(CLIENT, {v: [{"source": "init", "ou": INIT_REL}] for v in DOC_KEYS})
     state = {"lots": [{"numero": 1, "ids": ["sp-1", "sp-2", "sp-3"], "resultats": [
         missing_docs(recherches=ALL_SOURCES),
         {**missing_docs(), "id": "sp-2", "raison": "Processus absent.", "recherches": ALL_SOURCES,

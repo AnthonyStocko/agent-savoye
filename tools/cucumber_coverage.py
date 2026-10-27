@@ -13,10 +13,11 @@ Une ligne par spécifique de l'inventaire (tickets Jira en colonne), croisée av
 non couvert, testable avec informations à confirmer (questions), non testable aujourd'hui (blocage prouvé et sa
 preuve), sans objet (aucun comportement propre, avec sa preuve). Un spécifique couvert indirectement prend l'état de
 celui qui le couvre. Le résultat « non_couvert » d'un lot est jugé par cucumber_testability.assess (6 sources).
-TESTABILITÉ (testable, à confirmer, non testable) : code spécifique déployé, personnalisation Studio déployée,
-données recréables, steps disponibles ; « inconnu » par défaut, « non » sur preuve d'exécution ou blocage prouvé,
-« oui » si un scénario lié est vert. Le risque métier est
-proposé (nature et type du spécifique), le risque et la testabilité sont modifiables (surcharges enregistrées dans
+TESTABILITÉ (testable, à confirmer, non testable) : facteurs DÉTECTÉS, jamais saisis (code et personnalisation
+Studio déployés, données recréables, steps disponibles), chacun oui / non / non déterminé avec sa preuve (dernier
+run, init détectée, steps candidats, blocage prouvé) ; un facteur non déterminé ne bloque pas. Chaque tâche a un
+titre métier (ticket Jira, sinon nom du processus traduit) et une phrase métier sur ce qu'il faut tester. Le risque
+métier est proposé (nature et type du spécifique) et seul modifiable (surcharges enregistrées dans
 .tmp/cucumber/<client>/couverture.json).
 """
 import os
@@ -44,12 +45,9 @@ STATES = {
 }
 WRITTEN_STATES = ("vert", "echec", "desactive", "non_execute")
 SELECTABLE_STATES = ("non_couvert", "partiel", "a_confirmer", "non_testable", "sans_objet")
-# Tâches cochées par défaut à la sélection : générées
-DEFAULT_SELECTED = ("non_couvert", "partiel", "a_confirmer")
 RISKS = ("élevé", "moyen", "faible")
 CRITERIA = {"code": "code spécifique déployé", "studio": "personnalisation Studio déployée",
             "donnees": "données recréables par l'init", "steps": "steps disponibles dans la bibliothèque"}
-ANSWERS = ("oui", "non", "inconnu")
 TESTABILITY = ("testable", "à confirmer", "non testable")
 # Statuts de vérification des lots : vert, en échec, jamais exécuté
 _GREEN = ("pertinent", "faible")
@@ -235,43 +233,147 @@ def linked_scenarios(spec: dict, result: dict, sources: dict) -> list:
     return [scenario_status(i, sources) for i in ids]
 
 
-def testability(spec: dict, result: dict, scenarios: list, override: dict = None, index: dict = None,
-                profile: dict = None) -> dict:
+UNDETERMINED = "non déterminé"
+ANSWERS = ("oui", "non", UNDETERMINED)
+# Vocabulaire générique Odatio des noms de processus Studio et de classes (aucun nom propre à un client)
+GLOSSARY = {"render": "rendu", "rendering": "rendu", "request": "demande", "reportdoc": "document", "report": "document",
+            "doc": "document", "document": "document", "label": "étiquette", "print": "impression", "printing":
+            "impression", "goodsin": "réception", "folder": "dossier", "controlandvalidate": "contrôle et validation",
+            "control": "contrôle", "check": "contrôle", "validate": "validation", "validation": "validation",
+            "identify": "identification", "identification": "identification", "repack": "reconditionnement",
+            "repackhandlingunit": "reconditionnement d'UM", "repackcontent": "reconditionnement du contenu",
+            "repackidentifiedcontent": "reconditionnement du contenu identifié", "handlingunit": "UM",
+            "selectslot": "choix d'alvéole", "slot": "alvéole", "product": "produit", "create": "création",
+            "createorupdate": "création ou mise à jour", "update": "mise à jour", "feedback": "retour",
+            "logisticunitsite": "UL du site", "qty": "quantité", "preparation": "préparation", "dispatch": "expédition",
+            "shipping": "expédition", "order": "ordre", "location": "emplacement", "stock": "stock",
+            "replenishment": "réapprovisionnement", "inventory": "inventaire", "stocktaking": "inventaire",
+            "packaging": "emballage", "cubing": "colisage", "message": "message", "partner": "partenaire",
+            "production": "production", "cartography": "cartographie", "unit": "unité", "content": "contenu",
+            "operationalorder": "ordre logistique", "destination": "destination", "merge": "fusion",
+            "advice": "avis", "activity": "activité", "line": "ligne", "reintegration": "réintégration",
+            "estimation": "estimation", "assembly": "assemblage", "transport": "transport", "rejection": "rejet",
+            "invoice": "facture", "route": "routage", "routing": "routage", "rooting": "routage", "status": "statut",
+            "type": "type", "custom": "personnalisé", "clearance": "dédouanement", "need": "besoin", "full": "complet",
+            "pick": "prélèvement", "movement": "mouvement", "pack": "colis", "list": "liste", "public": "public",
+            "api": "API", "identifier": "identifiant", "tray": "bac", "number": "numéro", "miniload": "miniload"}
+# Segments techniques sans sens métier
+_TECHNICAL_WORDS = {"ref", "spec", "wms", "tms", "oms", "exc", "listener", "event", "process", "interactive",
+                    "studio", "by", "with", "to", "on", "of", "the", "impl", "service", "action", "actions", "core",
+                    "java", "manager", "helper", "util", "utils", "from", "for", "and", "any"}
+# Actions (début du titre) parmi les mots traduits
+_ACTIONS = ("rendu", "création", "création ou mise à jour", "mise à jour", "contrôle", "validation",
+            "contrôle et validation", "identification", "reconditionnement", "reconditionnement d'UM",
+            "reconditionnement du contenu", "reconditionnement du contenu identifié", "impression", "choix d'alvéole",
+            "réapprovisionnement", "inventaire", "fusion", "expédition", "préparation", "réception", "retour")
+
+
+def ticket_titles(spec: dict) -> list:
+    """Titres des tickets Jira du spécifique (extrait Jira : « ## CLE-1 — Titre »)."""
+    path = spec.get("jira") or ""
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [m.group(2).strip() for m in re.finditer(r"^##\s+([A-Z][A-Z0-9]+-\d+)\s*[—–-]\s*(.+)$", f.read(), re.M)]
+
+
+def split_words(token: str) -> list:
+    """Mots accolés d'un nom (« dispatchadvice » → dispatch, advice) d'après le vocabulaire ; [token] sinon."""
+    vocabulary = sorted(set(GLOSSARY) | _TECHNICAL_WORDS, key=len, reverse=True)
+    if token in GLOSSARY:
+        return [token]
+    words, rest = [], token
+    while rest:
+        word = next((w for w in vocabulary if len(w) > 2 and rest.startswith(w)), "")
+        if not word:
+            return [token]
+        words.append(word)
+        rest = rest[len(word):]
+    return words
+
+
+def business_title(spec: dict) -> str:
     """
-    {critère: (réponse, raison)} pour les critères applicables, la synthèse « testabilite » (testable, à confirmer,
-    non testable), « raisons » et « evaluation » (cucumber_testability.assess du résultat du lot). Un « non » ne
-    vient que d'une preuve (exécution, blocage prouvé) ou d'une saisie ; les réponses saisies (override) l'emportent.
+    Titre métier d'une tâche : titre de son premier ticket Jira, sinon déduit du nom du processus ou du dossier
+    (vocabulaire générique : « render-reportdoc-request » → « Rendu : document, demande »).
     """
-    evaluation = cucumber_testability.assess(result, index or {}, profile or {})
+    titles = ticket_titles(spec)
+    if titles:
+        return titles[0]
+    name = (spec.get("libelle") or spec.get("id") or "").split("·")[-1].strip()
+    words = []
+    for token in (w for t in re.split(r"[-_./\s]+", name.lower()) if t for w in split_words(t)):
+        if token and token not in _TECHNICAL_WORDS:
+            word = GLOSSARY.get(token, token)
+            if word not in words:
+                words.append(word)
+    if not words:
+        return name
+    action = next((w for w in words if w in _ACTIONS), "")
+    others = [w for w in words if w != action]
+    text = f"{action} : {', '.join(others)}" if action and others else action or ", ".join(others)
+    return text[:1].upper() + text[1:]
+
+
+def business_sentence(spec: dict, state_key: str, evaluation: dict, cause: str = "") -> str:
+    """
+    Une phrase métier sur ce qu'il faut tester (résumé du lot, sinon déduite du type et des comportements Studio),
+    ou sur ce qui bloque (non testable, sans objet). Jamais la raison technique recopiée.
+    """
+    if state_key == "non_testable":
+        return (f"{cucumber_testability.BLOCKERS.get(evaluation.get('blocage'), 'Blocage prouvé')}. "
+                f"Preuve : {evaluation.get('preuve') or cause or '—'}")
+    if state_key == "sans_objet":
+        return f"Aucun comportement propre au client à tester. Preuve : {evaluation.get('preuve') or cause or '—'}"
+    if evaluation.get("resume"):
+        return evaluation["resume"]
+    title = business_title(spec).lower()
+    counts = cucumber_studio.behaviour_counts(spec)
+    if counts:
+        return (f"Vérifier le comportement propre au client ({cucumber_studio.counts_line(counts)}) de la "
+                f"personnalisation « {title} ».")
+    if spec.get("type") == "override":
+        return f"Vérifier ce que le client fait autrement que le Standard pour « {title} »."
+    return f"Vérifier l'effet propre au client de « {title} » (statut, donnée enregistrée, message ou document)."
+
+
+def testability(spec: dict, result: dict, scenarios: list, index: dict = None, profile: dict = None,
+                init_state: str = "") -> dict:
+    """
+    Facteurs de testabilité DÉTECTÉS (jamais saisis), chacun (réponse, preuve) parmi oui / non / non déterminé :
+    code et personnalisation Studio déployés (dernier run, blocage prouvé), données recréables (init détectée,
+    dernier run), steps disponibles (steps candidats, scénario vert, blocage prouvé). Un facteur non déterminé ne
+    bloque pas. Synthèse « testabilite » (testable, à confirmer, non testable), « raisons » et « evaluation »
+    (cucumber_testability.assess, réponses proposées et questions précises).
+    """
+    evaluation = cucumber_testability.assess(result, index or {}, profile or {}, business_title(spec))
     green = any(s["etat"] == "vert" for s in scenarios)
     natures = {s["nature"] for s in scenarios}
-    has_studio = bool(studio_files(spec))
-    has_code = any(f["path"].endswith(".java") for f in spec.get("fichiers") or [])
-    criteria = {}
-    for key, applies in (("code", has_code), ("studio", has_studio)):
-        if applies:
-            criteria[key] = (("non", "échec « déploiement » d'un scénario lié") if "deploiement" in natures else
-                             ("oui", "scénario lié vert") if green else ("inconnu", ""))
-    criteria["donnees"] = (("inconnu", "donnée de référence absente à l'exécution : à créer dans le Background")
-                           if "donnee_reference" in natures else ("oui", "scénario lié vert") if green else
-                           ("inconnu", ""))
     blocked = evaluation["etat"] == "non_testable"
-    if blocked and evaluation["blocage"] == "non_deploye":
-        for key in ("code", "studio"):
-            if key in criteria:
-                criteria[key] = ("non", evaluation["preuve"])
-    if blocked and evaluation["blocage"] == "donnee_impossible":
-        criteria["donnees"] = ("non", evaluation["preuve"])
+    criteria = {}
+    for key, applies in (("code", any(f["path"].endswith(".java") for f in spec.get("fichiers") or [])),
+                         ("studio", bool(studio_files(spec)))):
+        if applies:
+            criteria[key] = (("non", evaluation["preuve"]) if blocked and evaluation["blocage"] == "non_deploye" else
+                             ("non", "échec « déploiement » d'un scénario lié au dernier run")
+                             if "deploiement" in natures else ("oui", "scénario lié vert au dernier run") if green else
+                             (UNDETERMINED, "aucun scénario lié exécuté"))
+    criteria["donnees"] = (("non", evaluation["preuve"]) if blocked and evaluation["blocage"] == "donnee_impossible"
+                           else ("oui", "scénario lié vert au dernier run") if green else
+                           (UNDETERMINED, "donnée de référence absente au dernier run : à créer dans le Background")
+                           if "donnee_reference" in natures else
+                           ("oui", "init du projet complète (détection)") if init_state == "complete" else
+                           (UNDETERMINED, {"absente": "init du projet absente : lot d'initialisation proposé",
+                                           "incomplete": "init du projet incomplète : compléments proposés"}.get(
+                               init_state, "init du projet non encore détectée")))
+    candidates = len(spec.get("steps_candidats") or []) + len(spec.get("tests_std") or [])
     criteria["steps"] = (("non", evaluation["preuve"]) if blocked and evaluation["blocage"] == "step_impossible" else
-                         ("oui", "scénario lié vert") if green else
-                         ("oui", "steps Standard candidats") if spec.get("steps_candidats") or spec.get("tests_std")
-                         else ("inconnu", ""))
-    for key, answer in ((override or {}).get("testabilite") or {}).items():
-        if key in criteria and answer in ANSWERS:
-            criteria[key] = (answer, "saisi")
+                         ("oui", "scénario lié vert au dernier run") if green else
+                         ("oui", f"{candidates} step(s) ou test(s) Standard candidat(s)") if candidates else
+                         (UNDETERMINED, "aucun step Standard candidat trouvé : steps à écrire dans le projet"))
     answers = [a for a, _ in criteria.values()]
-    summary = ("non testable" if "non" in answers or blocked else
-               "à confirmer" if evaluation["etat"] == "a_confirmer" or "donnee_reference" in natures else "testable")
+    summary = ("non testable" if blocked or "non" in answers else
+               "à confirmer" if evaluation["etat"] == "a_confirmer" else "testable")
     reasons = [f"{CRITERIA[k]} : {a}" + (f" ({r})" if r else "") for k, (a, r) in criteria.items() if a != "oui"]
     return {"criteres": criteria, "testabilite": summary, "raisons": reasons, "evaluation": evaluation}
 
@@ -327,6 +429,14 @@ def coverage_sources(client_name: str, state: dict) -> dict:
             "audit": cucumber_audit.load_audit(client_name).get("scenarios") or {}}
 
 
+def init_state_of(client_name: str, profile: dict) -> str:
+    """État détecté de l'init du projet (absente, incomplete, complete) ; '' sans détection."""
+    from tools import cucumber_detection, cucumber_journey
+    facts = cucumber_detection.load_detection(client_name).get("faits") or {}
+    return cucumber_detection.init_status(facts, profile, client_name, cucumber_journey.last_analysis(client_name),
+                                          cucumber_import.imports_dir(client_name))["etat"] if facts else ""
+
+
 def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources: dict = None) -> list:
     """Lignes de la vue Couverture, triées dans l'ordre de sélection proposé (selection_order)."""
     state = load_state(client_name) if state is None else state
@@ -334,11 +444,12 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
     overrides, results = load_overrides(client_name), latest_results(state)
     index = cucumber_testability.load_index(client_name) if client_name else {}
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name)) if client_name else {}
+    init_state = init_state_of(client_name, profile) if client_name else ""
     rows = {}
     for spec in inventory.get("specifiques") or []:
         result, override = results.get(spec["id"], {}), overrides.get(spec["id"], {})
         scenarios = linked_scenarios(spec, result, sources)
-        testable = testability(spec, result, scenarios, override, index, profile)
+        testable = testability(spec, result, scenarios, index, profile, init_state)
         state_key, cause = spec_state(spec, result, scenarios, testable)
         rows[spec["id"]] = {
             "id": spec["id"], "tache": spec["libelle"], "module": module_of(spec), "point_entree": entry_point(spec),
@@ -346,7 +457,8 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
             "risque_propose": proposed_risk(spec), "features": sorted({s["id"].split("::", 1)[0] for s in scenarios}),
             "etat": state_key, "cause": cause, "testabilite": testable["testabilite"],
             "criteres": testable["criteres"], "raisons": testable["raisons"], "derniere": last_execution(scenarios),
-            "evaluation": testable["evaluation"],
+            "evaluation": testable["evaluation"], "titre": business_title(spec),
+            "phrase": business_sentence(spec, state_key, testable["evaluation"], cause),
             "scenarios": scenarios, "effort": effort(spec), "constats": result.get("constats") or [],
             "studio": cucumber_studio.spec_behaviours(spec), "studio_total": cucumber_studio.behaviour_counts(spec),
             "studio_a_calculer": studio_pending(spec),

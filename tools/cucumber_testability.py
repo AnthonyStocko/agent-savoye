@@ -13,11 +13,15 @@ A_REVOIR.md / COUVERTURE.md / connaissances partagées. L'index des valeurs conn
 .tmp/cucumber/<client>/valeurs_connues.json, écrit par la détection, et valeurs_connues.md pour les lots.
 
 CONTRÔLE (assess) d'un résultat de lot « non_couvert » : un « non testable » sans blocage autorisé prouvé, sans
-recherche citée dans chacune des 6 sources, ou dont une valeur dite manquante figure dans l'index, est rejeté ;
-la tâche repasse en « à confirmer » (ou « testable » si toutes les valeurs dites manquantes ont été trouvées).
+recherche citée dans chacune des 6 sources, ou dont une valeur dite manquante figure dans le projet, est rejeté.
+La recherche tourne alors AVANT toute question (requests) : une valeur citée et trouvée dans le projet devient une
+RÉPONSE PROPOSÉE avec sa source (à confirmer en un clic) ; une seule question précise porte sur ce qui reste
+introuvable (donnée, scénario, candidats proches). Jamais de question générique ni de copie de la raison technique.
+« à confirmer » tant qu'une question reste sans réponse, sinon « testable » (les réponses proposées se confirment
+ou se corrigent en un clic, sans bloquer la génération).
 
-RÉPONSES : la réponse de l'utilisateur à une question est enregistrée dans le profil client (champ « reponses ») et
-déposée dans les connaissances partagées ; elle est injectée dans tous les lots, et la même question (clé normalisée)
+RÉPONSES : chaque confirmation, correction ou réponse est enregistrée aussitôt dans le profil client (champ
+« reponses », clé de la proposition ou de la question) ; elle est injectée dans tous les lots, et la même question
 n'est jamais reposée.
 """
 import json
@@ -45,8 +49,6 @@ CODE = re.compile(r"\b[A-Z][A-Z0-9]*(?:[_-][A-Z0-9]+)+\b")
 _STRING = re.compile(r"\"([^\"\n]{2,80})\"")
 _BOOLEAN = re.compile(r"\b(\w+)\s*=\s*(true|false)\b")
 _CONFIG_FILE = re.compile(r"(Initiali[sz]er|Config|Constant|Param|Settings)\w*\.java$", re.I)
-# Champs du format de résultat structuré ; un résultat sans aucun d'eux est au format ancien (raison libre)
-STRUCTURED_KEYS = ("recherches", "blocage", "questions", "sans_objet", "resume")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 MAX_PLACES = 3
 
@@ -63,13 +65,13 @@ def retro_path(client_name: str) -> str:
 # Index des valeurs connues (6 sources)
 # ---------------------------------------------------------------------------
 
-def _add(index: dict, value: str, source: str, where: str) -> None:
+def _add(index: dict, value: str, source: str, where: str, entity: str = "") -> None:
     value = (value or "").strip()
     if len(value) < 2:
         return
     places = index.setdefault(value, [])
     if len(places) < MAX_PLACES and not any(p["source"] == source and p["ou"] == where for p in places):
-        places.append({"source": source, "ou": where})
+        places.append({"source": source, "ou": where, **({"entite": entity} if entity else {})})
 
 
 def _scan_text(index: dict, text: str, source: str, rel: str, strings: bool = False) -> None:
@@ -111,7 +113,8 @@ def known_values(client_name: str, profile: dict, inventory: dict, worktree: str
             _add(index, code, "profil", f"codes de référence ({category})")
     for item in profile.get("server_initialized_data") or []:
         for key in ("code", "expression"):
-            _add(index, item.get(key, ""), "profil", f"données initialisées par le serveur ({item.get('classe', '?')})")
+            _add(index, item.get(key, ""), "profil", f"données initialisées par le serveur ({item.get('classe', '?')})",
+                 item.get("entite", ""))
     for item in profile.get("environment_checks") or []:
         _add(index, item.get("code", ""), "profil", "dépendances d'environnement")
     for answer in profile.get("reponses") or []:
@@ -136,7 +139,7 @@ def known_values(client_name: str, profile: dict, inventory: dict, worktree: str
         for creation in initializer.get("creations") or []:
             for key in ("code", "expression"):
                 _add(index, creation.get(key, ""), "initializers",
-                     f"{initializer.get('depot', '?')}/{initializer.get('chemin', '?')}")
+                     f"{initializer.get('depot', '?')}/{initializer.get('chemin', '?')}", creation.get("entite", ""))
     for spec in inventory.get("specifiques") or []:
         for item in spec.get("fichiers") or []:
             local = item.get("local") or ""
@@ -200,17 +203,23 @@ def question_key(question: str) -> str:
 
 
 def answers(profile: dict) -> dict:
-    """{clé: réponse} des réponses enregistrées dans le profil."""
-    return {question_key(a.get("question", "")): a for a in profile.get("reponses") or [] if a.get("reponse")}
+    """{clé: réponse} des réponses enregistrées dans le profil (clé fournie, sinon clé de la question)."""
+    return {a.get("cle") or question_key(a.get("question", "")): a for a in profile.get("reponses") or []
+            if a.get("reponse")}
 
 
-def save_answer(client_name: str, question: str, answer: str, task: str = "") -> dict:
-    """Réponse enregistrée dans le profil client (saisie), sans doublon de question. Renvoie la réponse."""
+def save_answer(client_name: str, question: str, answer: str, task: str = "", key: str = "",
+                status: str = "saisie") -> dict:
+    """
+    Réponse enregistrée dans le profil client (saisie), sans doublon de clé : `key` (réponse proposée) sinon la clé
+    de la question. `status` : saisie, confirmee (réponse proposée confirmée), corrigee. Renvoie la réponse.
+    """
     document = cucumber_profile.load_profile(client_name)
     saved = (document.setdefault("saisi", {}).get("reponses") or [])
-    entry = {"question": question.strip(), "reponse": answer.strip(), "tache": task,
+    key = key or question_key(question)
+    entry = {"cle": key, "question": question.strip(), "reponse": answer.strip(), "statut": status, "tache": task,
              "date": datetime.now().isoformat(timespec="seconds")}
-    saved = [a for a in saved if question_key(a.get("question", "")) != question_key(question)] + [entry]
+    saved = [a for a in saved if (a.get("cle") or question_key(a.get("question", ""))) != key] + [entry]
     document["saisi"]["reponses"] = saved
     _write_json(cucumber_profile.profile_path(client_name), document)
     return entry
@@ -223,6 +232,106 @@ def answers_block(profile: dict) -> str:
         return ""
     return ("=== RÉPONSES DE L'UTILISATEUR (à appliquer ; ne repose jamais ces questions) ===\n"
             + "\n".join(f"- {a['question']} → {a['reponse']}" for a in saved))
+
+
+# ---------------------------------------------------------------------------
+# Réponses proposées et questions précises (recherche AVANT toute question)
+# ---------------------------------------------------------------------------
+
+# Sources propres au projet : une valeur trouvée seulement dans le Standard n'est qu'un exemple d'usage
+PROJECT_SOURCES = ("profil", "init", "initializers", "depot", "documents")
+SOURCE_LABELS = {"profil": "profil client", "init": "init du projet", "initializers": "initializer",
+                 "depot": "dépôt client", "standard": "Cucumber Standard", "documents": "documents du projet"}
+_GENERIC_QUESTION = re.compile(r"(?i)\b(quelle?s?|quoi)\b.{0,40}\b(donn[ée]es?|cl[ée]s?|valeurs?|informations?)\b"
+                               r".{0,40}\b(faut|manque|n[ée]cessaire|tester cette t[âa]che)")
+_WORD = re.compile(r"\w{4,}")
+# Référence à un ticket ou à un scénario (CLE-123, TOW-1037-4) : pas une donnée
+_REFERENCE = re.compile(r"^[A-Z][A-Z0-9]*-\d+(?:-\d+)*$")
+MAX_CANDIDATES = 5
+
+
+def source_line(places: list) -> str:
+    """« init du projet (fichier:67), initializer (dépôt/Classe.java) »."""
+    return ", ".join(dict.fromkeys(f"{SOURCE_LABELS.get(p['source'], p['source'])} ({p['ou']})" for p in places))
+
+
+def candidates(value: str, index: dict, limit: int = MAX_CANDIDATES) -> list:
+    """Valeurs connues du projet proches de `value` : mêmes deux premiers segments, à défaut le même premier."""
+    parts = re.split(r"[_-]", value)
+    for size in (2, 1):
+        prefix = "_".join(parts[:size])
+        if len(parts) <= size or len(prefix) < 3:
+            continue
+        found = [v for v, places in index.items() if v != value and re.split(r"[_-]", v)[:size] == parts[:size]
+                 and any(p["source"] in PROJECT_SOURCES for p in places)]
+        if found:
+            return sorted(found)[:limit]
+    return []
+
+
+def copies_reason(question: str, reason: str) -> bool:
+    """Question générique, ou qui recopie la raison technique (70 % de ses mots s'y trouvent)."""
+    if _GENERIC_QUESTION.search(question or ""):
+        return True
+    words = {w.lower() for w in _WORD.findall(question or "")}
+    reason_words = {w.lower() for w in _WORD.findall(reason or "")}
+    return len(words) >= 6 and len(words & reason_words) / len(words) >= 0.7
+
+
+def requests(result: dict, index: dict, profile: dict = None, title: str = "") -> tuple:
+    """
+    Recherche dans les 6 sources AVANT toute question. (réponses proposées, questions) :
+    - chaque valeur citée par la tâche et trouvée dans une source du projet devient une RÉPONSE PROPOSÉE avec sa
+      source, regroupée par entité : {"cle", "libelle", "valeurs", "source", "reponse" (réponse enregistrée)} ;
+    - une seule question précise pour les valeurs introuvables partout (donnée, scénario, candidats proches),
+      plus les questions de l'agent qui ne sont ni génériques ni une copie de la raison :
+      {"cle", "texte", "candidats", "reponse"}.
+    Une valeur trouvée seulement dans le Standard est un exemple d'usage : ni proposée ni demandée.
+    """
+    known = answers(profile or {})
+    reason = result.get("raison") or ""
+    blocker = result.get("blocage") if isinstance(result.get("blocage"), dict) else {}
+    asked = [q for q in result.get("questions") or [] if isinstance(q, str) and q.strip()]
+    cited = [v for v in dict.fromkeys(CODE.findall(" ".join([reason, blocker.get("preuve") or "", *asked])))
+             if not _REFERENCE.match(v)]
+    groups = {}
+    for value in cited:
+        places = [p for p in index.get(value) or [] if p["source"] in PROJECT_SOURCES]
+        if places:
+            entity = next((p["entite"] for p in places if p.get("entite")), "")
+            group = groups.setdefault(entity or places[0]["source"], {"entite": entity, "valeurs": [], "places": []})
+            group["valeurs"].append(value)
+            group["places"] += places
+    proposals = []
+    for key, group in groups.items():
+        label = (f"{group['entite']} présent(s) sur l'environnement" if group["entite"] else
+                 f"Valeur(s) connue(s) du projet ({SOURCE_LABELS.get(key, key)})")
+        cle = question_key("proposition " + " ".join(sorted(group["valeurs"])))
+        proposals.append({"cle": cle, "libelle": label, "valeurs": group["valeurs"],
+                          "source": source_line(group["places"]), "reponse": known.get(cle)})
+    questions = [{"cle": question_key(q), "texte": q, "candidats": [], "reponse": known.get(question_key(q))}
+                 for q in asked if not copies_reason(q, reason)]
+    # Valeur introuvable déjà visée par une question précise de l'agent : pas de seconde question
+    unknown = [v for v in cited if v not in index and not any(v in q["texte"] for q in questions)]
+    if unknown:
+        shown = ", ".join(unknown[:5]) + (f" (+{len(unknown) - 5})" if len(unknown) > 5 else "")
+        text = (f"Pour tester « {title or 'cette tâche'} » : {shown} "
+                + ("est cité mais introuvable" if len(unknown) == 1 else "sont cités mais introuvables")
+                + " dans le profil, l'init, les initializers, le dépôt client, le Standard et les documents du "
+                  "projet. Quelle valeur utiliser sur l'environnement, ou faut-il créer la donnée dans le test ?")
+        cle = question_key("introuvable " + " ".join(sorted(unknown)))
+        questions.append({"cle": cle, "texte": text, "reponse": known.get(cle),
+                          "candidats": list(dict.fromkeys(c for v in unknown for c in candidates(v, index)))
+                          [:MAX_CANDIDATES]})
+    return proposals, questions
+
+
+def pending(evaluation: dict) -> int:
+    """
+    Réponses encore attendues : questions sans réponse. Une réponse proposée vaut réponse (sa source est connue) :
+    elle se confirme ou se corrige, sans bloquer la génération.
+    """
+    return sum(1 for item in evaluation.get("questions") or [] if not item.get("reponse"))
 
 
 # ---------------------------------------------------------------------------
@@ -248,18 +357,18 @@ def found_values(text: str, index: dict) -> dict:
     return {v: index[v] for v in dict.fromkeys(CODE.findall(text or "")) if v in index}
 
 
-def assess(result: dict, index: dict, profile: dict = None) -> dict:
+def assess(result: dict, index: dict, profile: dict = None, title: str = "") -> dict:
     """
-    Testabilité d'un résultat de lot : {"etat", "resume", "blocage", "preuve", "questions", "trouvees",
-    "recherches", "rejets"}. Un « non testable » n'est retenu qu'avec un blocage autorisé prouvé, les 6 sources
-    citées et aucune valeur dite manquante présente dans l'index ; sinon « à confirmer », ou « testable » si les
-    valeurs dites manquantes ont toutes été trouvées. Questions déjà répondues retirées. Une raison au format ancien
-    (texte libre, aucun champ de STRUCTURED_KEYS) est toujours « à confirmer », valeurs trouvées jointes.
+    Testabilité d'un résultat de lot : {"etat", "resume", "blocage", "preuve", "proposees", "questions",
+    "attendues", "trouvees", "recherches", "rejets", "raison"}. Un « non testable » n'est retenu qu'avec un blocage
+    autorisé prouvé, les 6 sources citées et aucune valeur dite manquante présente dans l'index. Sinon la recherche
+    dans les 6 sources donne des réponses proposées et des questions précises (requests) : « à confirmer » tant
+    qu'une question reste sans réponse (pending), « testable » sinon. Jamais de question générique.
     """
     reason = result.get("raison") or ""
-    out = {"etat": "testable", "resume": result.get("resume") or summary(reason), "blocage": "", "preuve": "",
-           "questions": [], "trouvees": {}, "recherches": result.get("recherches") or [], "rejets": [],
-           "raison": reason}
+    out = {"etat": "testable", "resume": result.get("resume") or "", "blocage": "", "preuve": "", "proposees": [],
+           "questions": [], "attendues": 0, "trouvees": {}, "recherches": result.get("recherches") or [],
+           "rejets": [], "raison": reason}
     if result.get("statut") != "non_couvert":
         return out
     if result.get("tri") or reason == TECHNICAL_REASON:
@@ -267,13 +376,11 @@ def assess(result: dict, index: dict, profile: dict = None) -> dict:
     sans_objet = result.get("sans_objet") or {}
     if isinstance(sans_objet, dict) and (sans_objet.get("preuve") or "").strip():
         return {**out, "etat": "sans_objet", "preuve": sans_objet["preuve"].strip()}
-    known = answers(profile or {})
-    asked = [q for q in result.get("questions") or [] if isinstance(q, str) and q.strip()]
-    questions = [q for q in asked if question_key(q) not in known]
     blocker = result.get("blocage") or {}
     kind = blocker.get("type", "") if isinstance(blocker, dict) else ""
     proof = (blocker.get("preuve") or "").strip() if isinstance(blocker, dict) else ""
-    found = found_values(" ".join([reason, proof, *questions]), index)
+    asked = [q for q in result.get("questions") or [] if isinstance(q, str)]
+    found = found_values(" ".join([reason, proof, *asked]), index)
     rejections = []
     if kind not in BLOCKERS or not proof:
         rejections.append("aucun blocage prouvé (non déployé, défaut produit, donnée impossible à créer et absente, "
@@ -281,21 +388,16 @@ def assess(result: dict, index: dict, profile: dict = None) -> dict:
     missing = [label for key, label in SOURCES if key not in cited_sources(out["recherches"])]
     if missing:
         rejections.append(f"sources non citées : {', '.join(missing)}")
-    if found:
-        rejections.append(f"{len(found)} valeur(s) dite(s) manquante(s) trouvée(s) : {', '.join(list(found)[:6])}")
+    project = {v: p for v, p in found.items() if any(x["source"] in PROJECT_SOURCES for x in p)}
+    if project:
+        rejections.append(f"{len(project)} valeur(s) dite(s) manquante(s) trouvée(s) dans le projet : "
+                          f"{', '.join(list(project)[:6])}")
     if not rejections:
-        return {**out, "etat": "non_testable", "blocage": kind, "preuve": proof, "questions": questions}
-    # Rejet : la tâche est testable ; à confirmer s'il reste des questions (déjà répondues : retirées) ou si rien
-    # n'a été trouvé ni demandé
-    legacy = not any(result.get(k) for k in STRUCTURED_KEYS)
-    if (found or asked) and not questions and not legacy:
-        return {**out, "etat": "testable", "trouvees": found, "rejets": rejections}
-    if not questions:
-        questions = [f"Quelle donnée, clé ou valeur faut-il pour tester cette tâche ? (l'agent indiquait : "
-                     f"{summary(reason, 1, 200)})"]
-        questions = [q for q in questions if question_key(q) not in known]
-    return {**out, "etat": "a_confirmer" if questions else "testable", "questions": questions, "trouvees": found,
-            "rejets": rejections}
+        return {**out, "etat": "non_testable", "blocage": kind, "preuve": proof}
+    proposals, questions = requests(result, index, profile, title)
+    evaluation = {**out, "proposees": proposals, "questions": questions, "trouvees": found, "rejets": rejections}
+    evaluation["attendues"] = pending(evaluation)
+    return {**evaluation, "etat": "a_confirmer" if evaluation["attendues"] else "testable"}
 
 
 def blocker_line(assessment: dict) -> str:

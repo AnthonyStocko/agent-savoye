@@ -1466,115 +1466,163 @@ def render_init_patch(client: str) -> None:
 
 
 COVERAGE_COLUMNS = {
+    "Générer": st.column_config.CheckboxColumn("Générer", width="small",
+                                               help="Tâches à générer ensemble (testables, réponses données)"),
     "Tâche": st.column_config.TextColumn("Tâche", width="large"),
-    "Risque": st.column_config.TextColumn("Risque", width="small", help="Risque métier proposé (nature et type du "
-                                                                        "spécifique), modifiable dans le détail"),
-    "Testabilité": st.column_config.TextColumn(
-        "Testabilité", width="small", help="Aujourd'hui : code spécifique et personnalisation Studio déployés, données "
-                                           "recréables par l'init, steps disponibles dans la bibliothèque"),
-    "Features": st.column_config.NumberColumn("Features", width="small", help="Features liées à la tâche"),
+    "Risque": st.column_config.TextColumn("Risque", width="small", help="Risque métier proposé (module, type de "
+                                                                        "règle), modifiable dans les détails"),
+    "Réponses attendues": st.column_config.NumberColumn("Réponses attendues", width="small"),
 }
+# États dont la tâche se génère
+GENERABLE_STATES = ("non_couvert", "partiel", "a_confirmer")
 
 
-def coverage_table(rows: list) -> list:
-    """Lignes affichées de la vue Couverture (libellés métier)."""
-    return [{"État": cucumber_coverage.state_label(r), "Tâche": r["tache"], "Module": r["module"],
-             "Point d'entrée": r["point_entree"], "Risque": r["risque"], "Features": len(r["features"]),
-             "Testabilité": r["testabilite"], "Dernière exécution": r["derniere"],
-             "Tickets": ", ".join(r["tickets"])} for r in rows]
+def generable(row: dict) -> bool:
+    """Tâche à générer : non couverte, partielle ou à confirmer, sans réponse attendue."""
+    return row["etat"] in GENERABLE_STATES and not (row.get("evaluation") or {}).get("attendues")
 
 
-def render_testability(ctx: dict, row: dict) -> None:
+def coverage_table(rows: list, key: str) -> list:
+    """Lignes de la liste : case « Générer » (cochée pour les tâches générables), titre métier, état, risque."""
+    edits = (st.session_state.get(key) or {}).get("edited_rows") or {}
+    table = []
+    for index, r in enumerate(rows):
+        checked = (edits.get(index) or edits.get(str(index)) or {}).get("Générer", generable(r))
+        table.append({"Générer": checked, "Tâche": r["titre"], "État": cucumber_coverage.state_label(r).split(" (")[0],
+                      "Réponses attendues": (r.get("evaluation") or {}).get("attendues") or None,
+                      "Module": r["module"], "Risque": r["risque"], "Tickets": ", ".join(r["tickets"])})
+    return table
+
+
+def generate_tasks(ctx: dict, ids: list) -> None:
+    """Génère les tests des tâches `ids` : ajoutées à la génération en cours, sinon première génération."""
+    existing = bool(cucumber_tools.load_state(ctx["client"]).get("lots")) and os.path.isdir(
+        cucumber_tools.worktree_dir(ctx["client"]))
+    run_cucumber_generation(ctx, (["--complete"] if existing else []) + ["--specifics", ",".join(ids)])
+
+
+def record_answer(client: str, row: dict, question: str, answer: str, key: str, status: str) -> None:
+    """Enregistrement automatique d'une confirmation, correction ou réponse : profil client, connaissances partagées."""
+    if not (answer or "").strip():
+        return
+    cucumber_testability.save_answer(client, question, answer, row["id"], key=key, status=status)
+    if knowledge_tools.enabled():
+        knowledge_tools.publish_knowledge(f"- {question} → {answer.strip()}", client.upper(), "cucumber-reponses",
+                                          f"Réponse de l'utilisateur ({row['titre']})", client=client,
+                                          tags=["cucumber"])
+
+
+def render_proposal(client: str, row: dict, proposal: dict) -> None:
+    """Réponse proposée avec sa source : « Confirmer » / « Corriger » (champ de saisie seulement après « Corriger »)."""
+    values = ", ".join(proposal["valeurs"])
+    question = f"{proposal['libelle']} : {values}"
+    editing = f"cucumber_fix_{client}_{row['id']}_{proposal['cle']}"
+    answer = proposal.get("reponse") or {}
+    st.markdown(f"**Réponse proposée** — {proposal['libelle']} : `{values}`")
+    st.caption(f"Source : {proposal['source']}")
+    if answer and not st.session_state.get(editing):
+        st.caption(f":green[:material/check_circle: {'Confirmée' if answer.get('statut') == 'confirmee' else 'Corrigée'}"
+                   f" : {answer['reponse']}]")
+    if st.session_state.get(editing):
+        def save_correction() -> None:
+            record_answer(client, row, question, st.session_state[f"{editing}_texte"], proposal["cle"], "corrigee")
+            st.session_state[editing] = False
+        st.text_input("Valeur correcte", value=(answer or {}).get("reponse") or values, key=f"{editing}_texte",
+                      on_change=save_correction, help="Enregistrée dès la validation (Entrée).")
+        return
+    with st.container(horizontal=True):
+        if not answer:
+            st.button("Confirmer", icon=":material/check:", key=f"{editing}_ok", on_click=record_answer,
+                      args=(client, row, question, values, proposal["cle"], "confirmee"))
+        st.button("Corriger", icon=":material/edit:", type="tertiary", key=f"{editing}_edit",
+                  on_click=lambda: st.session_state.update({editing: True}))
+
+
+def render_question(client: str, row: dict, question: dict) -> None:
+    """Question précise sans réponse proposée : champ de saisie, enregistré dès la validation."""
+    key = f"cucumber_answer_{client}_{row['id']}_{question['cle']}"
+    st.markdown(f"**À renseigner** — {question['texte']}")
+    if question.get("candidats"):
+        st.caption("Candidats proches trouvés : " + ", ".join(f"`{c}`" for c in question["candidats"]))
+    answer = question.get("reponse") or {}
+
+    def save() -> None:
+        record_answer(client, row, question["texte"], st.session_state[key], question["cle"], "saisie")
+    st.text_input("Réponse", value=answer.get("reponse", ""), key=key, on_change=save, label_visibility="collapsed",
+                  placeholder="Valeur à utiliser, ou « créer dans le test »", help="Enregistrée dès la validation (Entrée).")
+
+
+def render_card_details(ctx: dict, row: dict) -> None:
+    """Volet « Détails » : identifiant, raison et recherches, facteurs détectés, risque, Studio, scénarios, documents."""
+    client, evaluation = ctx["client"], row.get("evaluation") or {}
+    st.caption(f"Identifiant : {row['id']} · {row['tache']} · point d'entrée : {row['point_entree']}"
+               + (f" · tickets : {', '.join(row['tickets'])}" if row["tickets"] else ""))
+    if evaluation.get("raison"):
+        st.caption(f"Raison technique de l'agent : {evaluation['raison']}")
+    for search in evaluation.get("recherches") or []:
+        st.caption(f"- {dict(cucumber_testability.SOURCES).get(search.get('source'), search.get('source'))} : "
+                   f"« {search.get('cherche', '')} » → {search.get('trouve') or 'rien'}")
+    for value, places in (evaluation.get("trouvees") or {}).items():
+        st.caption(f"- {value} trouvé : {cucumber_testability.source_line(places)}")
+    for rejection in evaluation.get("rejets") or []:
+        st.caption(f":orange[Contrôle : {rejection}]")
+    st.markdown("**Facteurs de testabilité** (détectés)\n" + "\n".join(
+        f"- {cucumber_coverage.CRITERIA[k].capitalize()} : **{answer}** — {proof or '—'}"
+        for k, (answer, proof) in row["criteres"].items()))
+
+    def save_risk() -> None:
+        risk = st.session_state.get(f"cucumber_risk_{client}_{row['id']}")
+        previous = cucumber_coverage.load_overrides(client).get(row["id"], {})
+        cucumber_coverage.save_override(client, row["id"], {
+            **previous, "risque": risk if risk and risk != row["risque_propose"] else ""})
+    st.segmented_control(f"Risque métier (proposé : {row['risque_propose']})", cucumber_coverage.RISKS,
+                         default=row["risque"], key=f"cucumber_risk_{client}_{row['id']}", on_change=save_risk)
+    if row["studio_a_calculer"]:
+        st.caption("Personnalisation Studio : ses comportements à couvrir seront listés à la prochaine analyse "
+                   "du projet.")
+    elif row["studio_total"]:
+        st.markdown(f"**Comportements Studio à couvrir** : {cucumber_studio.counts_line(row['studio_total'])}\n"
+                    + "\n".join(f"- {cucumber_studio.behaviour_line(b)}" for b in row["studio"]))
+    if row["scenarios"]:
+        st.dataframe([{"Scénario": s["id"].split("::", 1)[-1], "Feature": s["id"].split("::", 1)[0],
+                       "État": cucumber_coverage.STATES[s["etat"]][1] + " " + cucumber_coverage.STATES[s["etat"]][0]
+                       + (" (faible)" if s["faible"] else ""),
+                       "Cause": s["cause"], "Dernière exécution": s["derniere"],
+                       "Audit": cucumber_audit.VERDICTS.get(s.get("audit"), "—"),
+                       "Constats de l'audit": " ; ".join(s.get("audit_motifs") or [])} for s in row["scenarios"]],
+                     hide_index=True, width="stretch")
+    if row["constats"]:
+        st.markdown("**Défauts et constats de l'agent**\n" + "\n".join(
+            f"- {cucumber_tools.constat_line(c)}" for c in row["constats"]))
+    render_coverage_knowledge(client, row)
+
+
+def render_task_card(ctx: dict, row: dict) -> None:
     """
-    Testabilité d'une tâche non couverte : raison métier courte, détail technique replié (recherches, valeurs
-    trouvées, rejet du contrôle), questions à confirmer avec un champ de réponse ; les réponses sont enregistrées
-    dans le profil client et les connaissances partagées, puis la tâche est régénérée.
+    Carte d'une tâche, même gabarit pour tous les états : titre métier et badge, une phrase métier, réponses
+    proposées (Confirmer / Corriger) et questions sans réponse proposée (champ de saisie), UNE action « Générer le
+    test » (désactivée tant qu'une réponse est attendue), puis le volet « Détails » replié.
     """
     client, evaluation = ctx["client"], row.get("evaluation") or {}
-    if row["etat"] not in ("a_confirmer", "non_testable", "sans_objet") and not evaluation.get("trouvees"):
-        return
-    if evaluation.get("resume"):
-        st.markdown(evaluation["resume"])
-    with st.expander("Détails", icon=":material/manage_search:"):
-        if evaluation.get("raison"):
-            st.caption(f"Raison de l'agent : {evaluation['raison']}")
-        for search in evaluation.get("recherches") or []:
-            st.caption(f"- {dict(cucumber_testability.SOURCES).get(search.get('source'), search.get('source'))} : "
-                       f"« {search.get('cherche', '')} » → {search.get('trouve') or 'rien'}")
-        for value, places in (evaluation.get("trouvees") or {}).items():
-            st.caption(f"- {value} trouvé : " + " ; ".join(
-                f"{dict(cucumber_testability.SOURCES)[p['source']]} ({p['ou']})" for p in places))
-        for rejection in evaluation.get("rejets") or []:
-            st.caption(f":orange[Contrôle : {rejection}]")
-    questions = evaluation.get("questions") or []
-    if row["etat"] != "a_confirmer" or not questions:
-        return
-    with st.form(f"cucumber_questions_{client}_{row['id']}"):
-        st.markdown("**Informations à confirmer**")
-        replies = {q: st.text_input(q, key=f"cucumber_answer_{client}_{row['id']}_{n}") for n, q in
-                   enumerate(questions)}
-        if st.form_submit_button("Enregistrer et régénérer la tâche", icon=":material/refresh:",
-                                 disabled=not ctx["ready"]):
-            answered = {q: a.strip() for q, a in replies.items() if a.strip()}
-            for question, answer in answered.items():
-                cucumber_testability.save_answer(client, question, answer, row["id"])
-            if answered and knowledge_tools.enabled():
-                shared = knowledge_tools.publish_knowledge(
-                    "\n".join(f"- {q} → {a}" for q, a in answered.items()), client.upper(), "cucumber-reponses",
-                    f"Réponses de l'utilisateur ({row['tache']})", client=client, tags=["cucumber"])
-                st.caption(knowledge_tools.publish_line(shared))
-            if answered:
-                existing = bool(cucumber_tools.load_state(client).get("lots"))
-                run_cucumber_generation(ctx, (["--complete"] if existing else []) + ["--specifics", row["id"]])
-
-
-def render_coverage_detail(ctx: dict, row: dict) -> None:
-    """Détail d'une tâche : scénarios et dernier résultat, causes, défauts, comportements Studio, testabilité."""
-    client = ctx["client"]
+    label, badge, _ = cucumber_coverage.STATES[row["etat"]]
+    expected = evaluation.get("attendues") or 0
     with st.container(border=True):
-        st.markdown(f"**{row['tache']}** :gray[({row['id']})] — {cucumber_coverage.state_label(row)}")
-        if row["cause"] and row["etat"] not in ("a_confirmer",):
-            st.caption(f"Cause : {row['cause']}")
-        render_testability(ctx, row)
-        if row["scenarios"]:
-            st.dataframe([{"Scénario": s["id"].split("::", 1)[-1], "Feature": s["id"].split("::", 1)[0],
-                           "État": cucumber_coverage.STATES[s["etat"]][1] + " " + cucumber_coverage.STATES[s["etat"]][0]
-                           + (" (faible)" if s["faible"] else ""),
-                           "Cause": s["cause"], "Dernière exécution": s["derniere"],
-                           "Audit": cucumber_audit.VERDICTS.get(s.get("audit"), "—"),
-                           "Constats de l'audit": " ; ".join(s.get("audit_motifs") or [])} for s in row["scenarios"]],
-                         hide_index=True, width="stretch")
-        else:
-            st.caption("Aucun scénario lié.")
-        if row["constats"]:
-            st.markdown("**Défauts et constats de l'agent**\n" + "\n".join(
-                f"- {cucumber_tools.constat_line(c)}" for c in row["constats"]))
-        if row["studio_a_calculer"]:
-            st.caption("Personnalisation Studio : ses comportements à couvrir seront listés à la prochaine analyse "
-                       "du projet.")
-        elif row["studio_total"]:
-            with st.expander(f"Comportements Studio à couvrir : "
-                             f"{cucumber_studio.counts_line(row['studio_total'])}"):
-                st.markdown("\n".join(f"- {cucumber_studio.behaviour_line(b)}" for b in row["studio"]))
-                shown = len(row["studio"])
-                if shown < sum(row["studio_total"].values()):
-                    st.caption(f"{shown} premiers affichés (écrans d'abord).")
-        with st.form(f"cucumber_coverage_override_{client}_{row['id']}", border=False):
-            with st.container(horizontal=True):
-                risk = st.segmented_control("Risque métier", cucumber_coverage.RISKS, default=row["risque"],
-                                            help=f"Proposé : {row['risque_propose']}")
-                answers = {key: st.selectbox(cucumber_coverage.CRITERIA[key].capitalize(), cucumber_coverage.ANSWERS,
-                                             index=cucumber_coverage.ANSWERS.index(answer),
-                                             help=reason or None)
-                           for key, (answer, reason) in row["criteres"].items()}
-            if st.form_submit_button("Enregistrer", icon=":material/save:"):
-                changed = {k: v for k, v in answers.items() if v != row["criteres"][k][0]}
-                previous = cucumber_coverage.load_overrides(client).get(row["id"], {})
-                cucumber_coverage.save_override(client, row["id"], {
-                    "risque": risk if risk and risk != row["risque_propose"] else "",
-                    "testabilite": {**(previous.get("testabilite") or {}), **changed}})
-                st.rerun()
-        render_coverage_knowledge(client, row)
+        st.markdown(f"#### {row['titre']}  \n{badge} {label}")
+        st.markdown(row["phrase"])
+        if row["etat"] == "a_confirmer":
+            for proposal in evaluation.get("proposees") or []:
+                render_proposal(client, row, proposal)
+            for question in evaluation.get("questions") or []:
+                render_question(client, row, question)
+        with st.container(horizontal=True, vertical_alignment="center"):
+            if st.button("Générer le test", type="primary", icon=":material/science:",
+                         key=f"cucumber_card_generate_{client}_{row['id']}",
+                         disabled=not (ctx["ready"] and generable(row))):
+                generate_tasks(ctx, [row["id"]])
+            if expected:
+                st.caption(f"{expected} réponse(s) attendue(s)")
+        with st.expander("Détails", icon=":material/info:"):
+            render_card_details(ctx, row)
 
 
 def render_coverage_knowledge(client: str, row: dict) -> None:
@@ -1634,16 +1682,29 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
         risks = st.pills("Risque", cucumber_coverage.RISKS, selection_mode="multi", key=f"cucumber_cov_risks_{client}")
     shown = [r for r in rows if (not states or r["etat"] in states) and (not modules or r["module"] in modules)
              and (not risks or r["risque"] in risks)
-             and (not ticket or ticket in (r["tache"] + " " + " ".join(r["tickets"])).casefold())]
-    selection = st.dataframe(coverage_table(shown), hide_index=True, width="stretch", height=380,
-                             column_config=COVERAGE_COLUMNS, on_select="rerun", selection_mode="single-row",
-                             key=f"cucumber_coverage_{client}_{len(shown)}")
-    picked = selection.selection.rows
-    if picked:
-        render_coverage_detail(ctx, shown[picked[0]])
-    else:
-        st.caption(f"{len(shown)} tâche(s) affichée(s) · sélectionnez une ligne pour son détail (scénarios, causes, "
-                   "défauts, comportements Studio, testabilité, documents partagés).")
+             and (not ticket or ticket in (r["titre"] + " " + r["tache"] + " " + " ".join(r["tickets"])).casefold())]
+    # Liste : cases « Générer » pour générer plusieurs tâches sans ouvrir les cartes
+    list_key = f"cucumber_coverage_list_{client}_{len(shown)}"
+    table = coverage_table(shown, list_key)
+    st.data_editor(table, key=list_key, hide_index=True, width="stretch", height=380,
+                   disabled=[c for c in (table[0] if table else {}) if c != "Générer"],
+                   column_config=COVERAGE_COLUMNS)
+    checked = [r for r, line in zip(shown, coverage_table(shown, list_key)) if line["Générer"]]
+    ready_ids = [r["id"] for r in checked if generable(r)]
+    waiting = len(checked) - len(ready_ids)
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if st.button(f"Générer les tests sélectionnés ({len(ready_ids)})", type="primary", icon=":material/science:",
+                     disabled=not (ctx["ready"] and ready_ids), key=f"cucumber_generate_checked_{client}"):
+            generate_tasks(ctx, ready_ids)
+        if waiting:
+            st.caption(f"{waiting} tâche(s) cochée(s) ignorée(s) : réponses attendues, déjà couvertes, non testables "
+                       f"ou sans objet.")
+    by_id = {r["id"]: r for r in shown}
+    card = st.selectbox("Ouvrir la carte d'une tâche", [""] + list(by_id), key=f"cucumber_card_{client}",
+                        format_func=lambda i: "—" if not i else f"{by_id[i]['titre']} "
+                                                              f"({cucumber_coverage.STATES[by_id[i]['etat']][0]})")
+    if card:
+        render_task_card(ctx, by_id[card])
     specs = inventory.get("specifiques") or []
     linked = sum(1 for s in specs if s.get("tests_std"))
     unresolved_steps = (inventory.get("catalogue_standard") or {}).get("nb_steps_non_resolus")
@@ -1700,7 +1761,7 @@ def current_selection(candidates: list, key: str) -> list:
     edits = (st.session_state.get(key) or {}).get("edited_rows") or {}
     selected = []
     for index, row in enumerate(candidates):
-        checked = row["etat"] in cucumber_coverage.DEFAULT_SELECTED
+        checked = generable(row)
         checked = (edits.get(index) or edits.get(str(index)) or {}).get("Couvrir", checked)
         if checked:
             selected.append(row["id"])
@@ -1778,13 +1839,13 @@ def render_cucumber_selection(ctx: dict, inventory: dict, state: dict, rows: lis
         st.info("Aucune tâche non couverte, partielle ou non testable.", icon=":material/task_alt:")
     else:
         st.caption("Ordre proposé : risque métier, puis testabilité, puis effort. Les tâches « à confirmer » sont "
-                   "cochées (générées, questions listées dans leur détail) ; les tâches « non testables aujourd'hui » "
+                   "cochées dès que leurs réponses sont données (carte de la tâche, vue Couverture) ; les tâches « non testables aujourd'hui » "
                    "(blocage prouvé) et « sans objet » ne le sont pas : sélectionnez-les en connaissance de cause. "
                    "Pour une tâche "
                    "partielle, le lot teste l'EFFET (document généré, message envoyé, statut, champ enregistré), pas "
                    "la configuration.")
         key = selection_key(client, inventory)
-        table = [{"Couvrir": r["etat"] in cucumber_coverage.DEFAULT_SELECTED, "État": cucumber_coverage.state_label(r),
+        table = [{"Couvrir": generable(r), "État": cucumber_coverage.state_label(r),
                   "Tâche": r["tache"], "Module": r["module"], "Risque": r["risque"], "Testabilité": r["testabilite"],
                   "Effort": r["effort"], "Tickets": ", ".join(r["tickets"])} for r in candidates]
         st.data_editor(table, key=key, hide_index=True, width="stretch", height=360,
