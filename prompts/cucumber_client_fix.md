@@ -9,9 +9,10 @@ ${fichiers}
 
 === RÈGLES ===
 1. Corrige uniquement ces erreurs, dans les fichiers du worktree (en priorité ceux du lot) : lis chaque fichier en cause autour de la ligne indiquée (offset / limit), pas en entier.
-2. Classe, méthode, constante ou POJO introuvable : cherche son nom exact par Grep dans '${java_std}' (signatures du Cucumber Standard, jamais en entier) puis dans '${java_client}', et corrige l'appel ou l'import d'après la signature trouvée.
+2. Classe, méthode, constante ou POJO introuvable : cherche son nom exact par Grep dans '${java_std}' (signatures du Cucumber Standard, jamais en entier) puis dans '${java_client}', et corrige l'appel ou l'import d'après la signature trouvée ; pour voir comment le Standard l'utilise, lis le code dans '${sources_std}' (copie en lecture seule de ses sources de test, Grep puis offset / limit).
 3. Step non défini : ajoute sa méthode dans la classe Step Definitions du domaine (package ${package_steps}), sur le modèle des steps voisins, ou corrige le texte du step dans le .feature s'il s'agit d'un step existant mal recopié.
-4. Aucune méthode vide, aucun `throw new PendingException()`, aucune dépendance Maven nouvelle ; ne modifie aucun fichier du Standard ni hors du worktree. N'utilise ni git ni Maven : la vérification est relancée automatiquement.
+4. Aucune méthode vide, aucun `throw new PendingException()`, aucune dépendance Maven nouvelle ; ne modifie aucun fichier du Standard ni hors du worktree. N'utilise ni git ni Maven directement : la vérification est relancée automatiquement ; seule la commande de compilation ci-dessous, si elle est donnée, est autorisée, pour vérifier tes corrections avant de répondre.
+${compilation_agent}
 5. Pour compléter une classe ou une feature existante, utilise Edit, jamais une réécriture complète.
 6. Si une erreur ne peut pas être corrigée sans supprimer le test, supprime le scénario et ses steps devenus inutiles, et signale-le.
 7. Vérification par exécution (scénarios identifiés par leur tag @agent_…, à conserver) :

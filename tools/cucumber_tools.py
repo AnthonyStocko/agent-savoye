@@ -1314,7 +1314,8 @@ def candidate_steps(spec: dict, steps: list, groups: list = None, client_name: s
         if score > 0:
             scored.append((-score, n, step))
     scored.sort(key=lambda s: s[:2])
-    return [{"expr": s["expr"], "classe": s["classe"], "endpoints": s["endpoints"][:2]} for _, _, s in scored[:limit]]
+    return [{"expr": s["expr"], "classe": s["classe"], "fichier": s["fichier"], "endpoints": s["endpoints"][:2]}
+            for _, _, s in scored[:limit]]
 
 
 def attach_candidate_steps(inventory: dict, steps_md: str, std_endpoints: dict) -> int:
@@ -1797,7 +1798,8 @@ def _java_methods(text: str, class_constants=lambda cls: {}) -> list:
         before = text[previous_end:match.start()]
         steps, unresolved = step_expressions(before, class_constants, constants)
         methods.append({"name": match.group(1), "body": text[start:end], "masked": masked[start:end], "steps": steps,
-                        "steps_non_resolus": unresolved})
+                        "steps_non_resolus": unresolved, "signature": " ".join(text[match.start():close].split()),
+                        "debut": text.count("\n", 0, match.start()) + 1})
         pos = previous_end = end
 
 
@@ -1944,6 +1946,84 @@ def standard_endpoints(cucumber_std_dir: str, odatio_version: str) -> dict:
             "endpoints": endpoints, "appelants": callers}
     _write_json(meta_file, meta)
     return meta
+
+
+# Code des steps du Standard injecté dans les lots : sans lui, l'agent ne connaît que l'expression d'un step et
+# devine les colonnes de ses tables de données, les clés de contexte qu'il lit ou écrit et les helpers qu'il appelle
+STEP_CODE_FORMAT = 1
+MAX_STEP_CODE_LINES = 40
+DEFAULT_INLINE_STEP_CODE_CHARS = 16_000
+STEP_CODE_PER_SPEC = 8
+SOURCE_SUFFIXES = (".java", ".feature", ".properties")
+
+
+def _step_code(method: dict, path: str, max_lines: int = MAX_STEP_CODE_LINES) -> str:
+    """Signature et corps d'une méthode de step, indentation retirée, borné à `max_lines` lignes."""
+    lines = f"{method['signature']} {method['body']}".splitlines()
+    tail = [line for line in lines[1:] if line.strip()]
+    indent = min((len(line) - len(line.lstrip()) for line in tail), default=0)
+    lines = [lines[0]] + [line[indent:] if len(line) >= indent else line.lstrip() for line in lines[1:]]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"// … {len(lines) - max_lines} ligne(s) de plus : '{path}'"]
+    return "\n".join(lines)
+
+
+def std_step_code(cucumber_std_dir: str, odatio_version: str) -> dict:
+    """
+    Code des Step Definitions du Cucumber Standard, en cache par version Odatio et HEAD : {"steps": {expression:
+    {"fichier", "ligne", "code"}}, "sources": dossier}. Copie aussi les sources de test du Standard (src/test : .java,
+    .feature, .properties) dans .tmp/cucumber/_standard/sources_<version>/, seul endroit où l'agent d'un lot peut
+    lire le corps d'une classe d'appui ou d'un step non injecté (le clone du Standard est hors de son accès).
+    """
+    version = re.sub(r"[^\w.-]", "_", odatio_version or "inconnue")
+    head = rev_parse(cucumber_std_dir, "HEAD")
+    meta_file = os.path.join(STD_CACHE_DIR, f"step_code_{version}.json")
+    sources = os.path.join(STD_CACHE_DIR, f"sources_{version}")
+    meta = _read_json(meta_file, {}) or {}
+    if meta.get("head") == head and meta.get("format") == STEP_CODE_FORMAT and os.path.isdir(sources):
+        return meta
+    tree = {p: b for p, b in ls_tree(cucumber_std_dir, "HEAD").items()
+            if "src/test/" in f"/{p}" and p.endswith(SOURCE_SUFFIXES)}
+    texts = blob_texts(cucumber_std_dir, tree.values())
+    shutil.rmtree(sources, ignore_errors=True)
+    for path, blob in tree.items():
+        _write_text(os.path.join(sources, *path.split("/")), texts.get(blob, ""))
+    files = {p: texts.get(b, "") for p, b in tree.items() if p.endswith(".java") and "src/test/java/" in f"/{p}"}
+    constants = {p: _string_constants(t) for p, t in files.items()}
+    classes = {p.rsplit("/", 1)[-1][:-5]: p for p in files}
+    steps = {}
+    for path, text in sorted(files.items()):
+        if not re.search(r"@(?:Given|When|Then|And|But|Soit|Quand|Alors|Et|Mais)\s*\(", text):
+            continue
+        for method in _java_methods(text, lambda cls: constants.get(classes.get(cls, ""), {})):
+            for expr in method["steps"]:
+                steps.setdefault(expr, {"fichier": path, "ligne": method["debut"], "code": _step_code(method, path)})
+    meta = {"head": head, "format": STEP_CODE_FORMAT, "version": odatio_version, "sources": sources, "steps": steps}
+    _write_json(meta_file, meta)
+    return meta
+
+
+def step_code_block(specifics: list, step_code: dict, max_chars: int = DEFAULT_INLINE_STEP_CODE_CHARS,
+                    per_spec: int = STEP_CODE_PER_SPEC) -> tuple:
+    """
+    Code des steps candidats du lot (les `per_spec` premiers de chaque spécifique, pris à tour de rôle, sans
+    doublon), dans la limite de `max_chars`. Renvoie (texte, expressions injectées).
+    """
+    known = (step_code or {}).get("steps") or {}
+    queue = [[c["expr"] for c in (spec.get("steps_candidats") or [])[:per_spec]] for spec in specifics]
+    parts, done, used = [], set(), 0
+    for rank in range(per_spec):
+        for exprs in queue:
+            if rank >= len(exprs) or exprs[rank] in done or exprs[rank] not in known:
+                continue
+            entry = known[exprs[rank]]
+            text = f"`{exprs[rank]}` — {entry['fichier']}:{entry['ligne']}\n```java\n{entry['code']}\n```"
+            if used + len(text) > max_chars:
+                continue
+            parts.append(text)
+            done.add(exprs[rank])
+            used += len(text)
+    return "\n".join(parts), done
 
 
 def rest_endpoints(text: str) -> list:
@@ -2647,7 +2727,8 @@ def lot_example(specifics: list) -> str:
     return max(tests, key=lambda t: t["score"])["extrait"] if tests else ""
 
 
-def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) -> str:
+def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset(), step_code: dict = None,
+              step_code_max: int = DEFAULT_INLINE_STEP_CODE_CHARS) -> str:
     """
     Partie variable du prompt : recettes applicables (une fois chacune), puis les spécifiques du lot (steps
     candidats compris). `inline_max` > 0 : contenu des extraits Standard et des extraits Jira du lot injecté à la
@@ -2665,6 +2746,9 @@ def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) 
                       and spec["tests_std"][rank].get("extrait")]
     documents += [(spec["jira"], f"extraits Jira de {spec['id']}") for spec in specifics if spec.get("jira")]
     injected, here, _ = _inline_documents(documents, inline_max) if inline_max > 0 else ("", set(), [])
+    # Code des steps candidats (table de données, clés de contexte, helpers) : step_code de std_step_code
+    code_text, with_code = step_code_block(specifics, step_code, step_code_max) if step_code and step_code_max > 0 \
+        else ("", set())
 
     def ref(path: str) -> str:
         return (f"'{path}' (injecté plus bas)" if path in here else
@@ -2707,7 +2791,8 @@ def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) 
         if spec.get("steps_candidats"):
             lines.append("- Steps candidats (Standard, les plus proches, à réutiliser tels quels) :")
             lines += [f"  - `{s['expr']}` — {s['classe']}" + (f" — {' ; '.join(s['endpoints'])}" if s["endpoints"]
-                                                               else "") for s in spec["steps_candidats"]]
+                                                               else "")
+                      + (" (code injecté plus bas)" if s["expr"] in with_code else "") for s in spec["steps_candidats"]]
         if spec.get("endpoints_std"):
             lines.append("- Endpoints Standard liés (déjà appelés par ces steps / classes du Standard : à réutiliser) :")
             lines += [f"  - {e['methode']} {e['chemin']} — {', '.join(e['java'])}"
@@ -2733,6 +2818,10 @@ def lot_block(specifics: list, inline_max: int = 0, inlined: set = frozenset()) 
     if studio_text:
         lines += ["### Parties modifiées des processus Studio du lot (le reste du fichier : à lire si nécessaire)",
                   studio_text]
+    if code_text:
+        lines += ["### Code des steps candidats (Standard : colonnes des tables de données, clés de contexte, helpers et "
+                  "endpoints appelés — à respecter à l'identique dans les .feature, et modèle des nouveaux steps)",
+                  code_text]
     if injected:
         lines += ["### Contenu injecté du lot (extraits Standard et Jira : NE RELIS PAS ces fichiers)", injected]
     return "\n".join(lines).rstrip()

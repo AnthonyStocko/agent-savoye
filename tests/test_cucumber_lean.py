@@ -146,6 +146,7 @@ def test_candidate_steps(tmp_path):
     assert "PREP- Valider l'unité de préparation {string}" not in exprs
     assert found[exprs.index("REC- Contrôle dossier d'arrivage {string}")] == {
         "expr": "REC- Contrôle dossier d'arrivage {string}", "classe": "GoodsInFolderStep",
+        "fichier": "src/test/java/cucumber/features/goodsin/GoodsInFolderStep.java",
         "endpoints": ["POST /wms/goodsinfolders"]}
     assert len(ct.candidate_steps(spec, steps, client_name="apparel", limit=2)) == 2
 
@@ -287,7 +288,7 @@ def test_system_prompt_asks_to_write_early(main_module):
     assert main_module.warning_turn(40) == 30 and main_module.warning_turn(25) == 19
     names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
              "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
-             "class_suffix").split()
+             "class_suffix sources_std compilation_agent").split()
     text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
                                      tour_alerte=main_module.warning_turn(40))
     assert "=== ÉCRIRE TÔT ===" in text and "au plus 40 tours" in text and "au tour 30 (75 %)" in text

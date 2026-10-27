@@ -15,8 +15,9 @@ Des contrôles automatiques ont signalé les scénarios ci-dessous (chemins rela
 
 === RÈGLES ===
 1. Lis chaque scénario autour de la ligne indiquée (offset / limit), et le test Standard lié seulement si tu dois les comparer. Ne parcours aucun dépôt.
-2. Steps : réutilise d'abord ceux du Standard (Grep dans '${steps_std}'), endpoints dans '${endpoints_std}'.
-3. Ne modifie que les scénarios signalés et leurs Step Definitions ; aucun code applicatif, aucun fichier du Standard ni hors du worktree. N'utilise ni git ni Maven : la compilation et le commit sont faits automatiquement ensuite.
+2. Steps : réutilise d'abord ceux du Standard (Grep dans '${steps_std}'), endpoints dans '${endpoints_std}' ; avant d'utiliser un step ou un helper, lis son code dans '${sources_std}' (copie en lecture seule, Grep puis offset / limit) : colonnes de table, clés de contexte, valeurs attendues.
+3. Ne modifie que les scénarios signalés et leurs Step Definitions ; aucun code applicatif, aucun fichier du Standard ni hors du worktree. N'utilise ni git ni Maven directement : la compilation et le commit sont faits automatiquement ensuite ; seule la commande de compilation ci-dessous, si elle est donnée, est autorisée.
+${compilation_agent}
 
 === SCÉNARIOS SIGNALÉS ===
 ${scenarios_signales}

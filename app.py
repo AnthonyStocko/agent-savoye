@@ -1468,6 +1468,12 @@ with tab_config:
             value=env_int("CUCUMBER_INLINE_STUDIO_LINES", cucumber_tools.DEFAULT_INLINE_STUDIO_LINES),
             help="Lignes au plus, par customized.xml, des parties modifiées (nœuds modifiés et leur contexte) "
                  "injectées dans le prompt du lot. Le reste du fichier est lu à la demande. 0 = rien d'injecté.")))
+        env_values["CUCUMBER_INLINE_STEP_CODE_CHARS"] = str(int(st.number_input(
+            "CUCUMBER_INLINE_STEP_CODE_CHARS", min_value=0, step=2000,
+            value=env_int("CUCUMBER_INLINE_STEP_CODE_CHARS", cucumber_tools.DEFAULT_INLINE_STEP_CODE_CHARS),
+            help="Taille maximale (caractères) du code des steps Standard candidats injecté dans le prompt d'un lot "
+                 "(signature et corps : colonnes des tables, clés de contexte, helpers appelés), 8 steps au plus "
+                 "par spécifique. 0 = rien d'injecté (l'agent lit le code dans la copie des sources du Standard).")))
         lean = st.checkbox(
             "CLAUDE_LEAN_SESSION", value=os.getenv("CLAUDE_LEAN_SESSION", "1").strip() != "0",
             help="Sessions Cucumber allégées : seules les définitions des outils autorisés sont envoyées (--tools), "
@@ -1532,6 +1538,12 @@ with tab_config:
             help="Après une compilation réussie, dry-run Cucumber des features du lot : vérifie que chaque step a "
                  "une définition (mvn test -Dcucumber.execution.dry-run=true), sans rien exécuter.")
         env_values["CUCUMBER_DRY_RUN"] = "1" if dry_run else "0"
+        agent_compile = st.checkbox(
+            "CUCUMBER_AGENT_COMPILE", value=os.getenv("CUCUMBER_AGENT_COMPILE", "1").strip() != "0",
+            help="L'agent d'un lot (et de la revue / des corrections) compile lui-même le worktree pendant qu'il "
+                 "écrit (CUCUMBER_COMPILE_CMD, test-compile : rien n'est exécuté) et corrige ses erreurs avec tout le "
+                 "contexte du lot. Décoché = compilation après le lot seulement, corrigée par CLAUDE_MODEL_CUCUMBER_FIX.")
+        env_values["CUCUMBER_AGENT_COMPILE"] = "1" if agent_compile else "0"
         st.markdown("##### Vérification de la pertinence par exécution")
         st.caption("Sans job ni commande locale, la génération s'arrête au contrôle statique et affiche « pertinence "
                    "non vérifiée par exécution ».")
