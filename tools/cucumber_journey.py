@@ -56,7 +56,8 @@ def project_step(client_name: str, inventory: dict, profile_doc: dict, state: di
 def coverage_step(rows: list, client_name: str = "") -> dict:
     """Taux réel et écrit, partielles ; action : choisir les tâches à couvrir, sinon exécuter les tests écrits."""
     if not rows:
-        return _step("couverture", "vide", "aucune tâche inventoriée", "Lancer l'inventaire (étape Projet)")
+        return _step("couverture", "vide", "aucune tâche inventoriée",
+                     "Attendre la fin de l'analyse du projet")
     count = cucumber_coverage.rates(rows)["par_etat"]
     to_cover = count["non_couvert"] + count["partiel"]
     audited = cucumber_audit.summary_line(cucumber_audit.load_audit(client_name)) if client_name else ""
@@ -223,6 +224,28 @@ def next_step(steps: list) -> str:
         if found:
             return found
     return "couverture"
+
+
+def overview_line(client_name: str, init_label: str, rows: list, analysis: dict) -> str:
+    """
+    Ligne d'état du projet en tête de l'onglet : « <Client> · init incomplète (3 éléments) · 12 tâches couvertes sur
+    67 · dernier run : 37 verts / 2 échecs ».
+    """
+    rates = cucumber_coverage.rates(rows)
+    parts = [client_name.capitalize(), init_label,
+             f"{rates['couvertes']} tâche{'s' if rates['couvertes'] > 1 else ''} couverte"
+             f"{'s' if rates['couvertes'] > 1 else ''} sur {rates['total']}" if rates["total"] else
+             "aucune tâche inventoriée"]
+    if not analysis:
+        parts.append("aucun run importé")
+    elif analysis.get("non_analyse"):
+        parts.append("dernier run non analysé")
+    elif analysis.get("init_en_echec"):
+        parts.append("dernier run : init en échec")
+    else:
+        green, failed = run_counts(analysis)
+        parts.append(f"dernier run : {green} vert{'s' if green > 1 else ''} / {failed} échec{'s' if failed > 1 else ''}")
+    return " · ".join(parts)
 
 
 def step_line(step: dict) -> str:

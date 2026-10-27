@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -889,8 +889,10 @@ def main():
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
     parser.add_argument("--max-lots", type=int, default=0, help="generate-cucumber-client : nombre maximal de lots traités par cette exécution (0 = tous), les suivants restent à reprendre")
     parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
-    parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : patch d'initialisation du client (copie des Init_<MODULE> du Cucumber Standard pour ses modules), sans appel à Claude")
+    parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : lot d'initialisation des données, en patch séparé, selon l'état détecté de l'init : absente, copie des Init_<MODULE> du Cucumber Standard pour ses modules ; incomplète, compléments seuls dans une nouvelle feature (jamais de réécriture ni de fichier protégé modifié) ; complète, rien. Sans appel à Claude, sauf steps du projet à écrire")
     parser.add_argument("--profile-only", action="store_true", help="generate-cucumber-client : détecte le profil client (racine et tag des features, init, clear, fichiers du module spécifique, runner, codes de référence, version de la bibliothèque) dans le dépôt <client>-cucumber, sans appel à Claude")
+    parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
+    parser.add_argument("--detect-force", action="store_true", help="generate-cucumber-client --detect-only : détection refaite même si l'empreinte des commits n'a pas changé (profil corrigé)")
     parser.add_argument("--health-only", action="store_true", help="generate-cucumber-client : bilan de santé du dépôt <client>-cucumber avant génération (emplacement et tags des features, fichiers de données manquants, compilation et dry-run de toutes ses features), sans appel à Claude")
     parser.add_argument("--import-run", nargs="*", default=None, help="generate-cucumber-client : import d'un rapport d'exécution (console Jenkins, rapport Cucumber JSON, exports de logs serveur CSV), secrets masqués avant stockage, analysé sans appel à Claude")
     parser.add_argument("--import-url", default="", help="generate-cucumber-client : import d'un build Jenkins (console et rapports Cucumber JSON lus en mémoire), analysé sans appel à Claude")
@@ -1881,6 +1883,39 @@ def detect_cucumber_profile(client: str, cucumber_repo_dir: str, base: str, loca
     return profile
 
 
+def detect_init_facts(client: str, cucumber_repo_dir: str, base: str, local_cucumber_std_repo: str,
+                      odatio_version: str) -> dict:
+    """
+    Profil client puis faits de l'initialisation des données, relevés dans le worktree détaché du dépôt client à
+    `base` (lecture seule). Lève RuntimeError si le profil ne peut pas être détecté.
+    """
+    if not detect_cucumber_profile(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version):
+        raise RuntimeError("profil client non détecté (worktree du dépôt client impossible à créer)")
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    return cucumber_detection.init_facts(cucumber_profile.base_worktree_dir(client), client, profile,
+                                         cucumber_tools.load_inventory(client))
+
+
+def current_init_status(client: str, facts: dict) -> dict:
+    """État de l'init d'après les faits, le profil appliqué et le dernier run importé."""
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    index = cucumber_import.load_index(client)
+    numero = max((e["numero"] for e in index.get("imports") or []), default=0)
+    analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
+                                                      "analyse.json"), {}) if numero else {}
+    return cucumber_detection.init_status(facts, profile, client, analysis or {}, cucumber_import.imports_dir(client))
+
+
+def print_init_status(client: str, facts: dict) -> dict:
+    status = current_init_status(client, facts)
+    print(f"[CUCUMBER DÉTECTION] Initialisation des données : {cucumber_detection.state_label(status)}")
+    for finding in status["constats"]:
+        print(f"  - {finding['libelle']} : {finding['message']}")
+        for proof in finding["preuves"][:3]:
+            print(f"      {cucumber_detection.proof_line(proof)}")
+    return status
+
+
 def initializer_sources(client_root: str, items: list, target_dir: str) -> dict:
     """Sources des initializers des données à recréer, copiées dans `target_dir` pour être lues : {classe: copie}."""
     repos, out = cucumber_tools.git_repos(client_root), {}
@@ -1996,14 +2031,31 @@ def write_environment_steps(client: str, worktree: str, checks: list, recreation
 
 
 def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str, cucumber_repo_dir: str,
-                      base: str) -> int:
+                      base: str, odatio_version: str = "") -> int:
     """
-    Patch d'initialisation du client : Init_<MODULE> du Cucumber Standard copiées pour les modules --init-modules, à
-    défaut ceux détectés dans les dépôts et l'inventaire du client (0 token). Seule exception : les données
-    d'initializers effacées par le clear sans step du Standard reconnu, dont les steps du projet sont écrits par
-    un appel Claude borné (recreate_initializer_data). Renvoie le code de sortie.
+    Lot d'initialisation des données (patch séparé), selon l'état détecté de l'init du client : absente,
+    Init_<MODULE> du Cucumber Standard copiées pour les modules détectés dans les dépôts et l'inventaire du client
+    (ou --init-modules, qui force cette copie) ; incomplète, compléments seuls (run_cucumber_init_complements) ;
+    complète, rien (0 token). Seule exception : les steps du projet (données d'initializers effacées par le clear
+    sans step du Standard reconnu, contrôle de l'environnement), écrits par un appel Claude borné. Renvoie le code
+    de sortie.
     """
     client = args.client_name
+    if not args.init_modules.strip():
+        # Lot d'initialisation selon l'état détecté : init absente -> init complète, incomplète -> compléments seuls
+        subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
+        try:
+            facts = detect_init_facts(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version)
+        except RuntimeError as e:
+            print(f"[CUCUMBER INIT] ❌ {e}")
+            return 1
+        status = print_init_status(client, facts)
+        if status["etat"] == "complete":
+            print("[CUCUMBER INIT] Initialisation complète : aucun lot d'initialisation à générer.")
+            return 0
+        if status["etat"] == "incomplete":
+            return run_cucumber_init_complements(client, local_client_repo, local_cucumber_std_repo,
+                                                 cucumber_repo_dir, base, facts, status)
     if args.init_modules.strip():
         modules = {m.strip().upper() for m in args.init_modules.split(",") if m.strip()}
         unknown = modules - set(cucumber_init.INIT_MODULES)
@@ -2060,6 +2112,39 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     print(f"[CUCUMBER INIT] Patch : {result['patch']}")
     print(f"[CUCUMBER INIT] Une initialisation par module, chacune purge l'environnement : lancez-les séparément "
           f"({tags}).")
+    return 0
+
+
+def run_cucumber_init_complements(client: str, local_client_repo: str, local_cucumber_std_repo: str,
+                                  cucumber_repo_dir: str, base: str, facts: dict, status: dict) -> int:
+    """
+    Lot « Compléments d'initialisation » (init incomplète) : éléments manquants livrables dans une nouvelle feature,
+    patch séparé ; les autres constats sont affichés avec leur preuve, à traiter à la main. Renvoie le code de sortie.
+    """
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    try:
+        result = cucumber_init.build_init_complements(
+            cucumber_repo_dir, local_cucumber_std_repo, client, base, profile, status,
+            [f["chemin"] for f in facts.get("features") or []], cucumber_import.imports_dir(client),
+            lambda worktree, items: recreate_initializer_data(client, worktree, items, local_client_repo,
+                                                              local_cucumber_std_repo, profile),
+            lambda worktree, checks, manual: write_environment_steps(client, worktree, checks, manual,
+                                                                     local_cucumber_std_repo, profile))
+    except RuntimeError as e:
+        print(f"[CUCUMBER INIT] ❌ {e}")
+        return 1
+    for warning in result["avertissements"]:
+        print(f"[CUCUMBER INIT] ⚠️ {warning}")
+    for finding in result["manuels"]:
+        print(f"[CUCUMBER INIT] À traiter à la main (fichier protégé ou preuve de run) — {finding['libelle']} : "
+              f"{finding['message']}")
+        for proof in finding["preuves"][:3]:
+            print(f"    {cucumber_detection.proof_line(proof)}")
+    if not result["patch"]:
+        print("[CUCUMBER INIT] Aucun complément livrable : aucun patch produit.")
+        return 0
+    print(f"[CUCUMBER INIT] Compléments d'initialisation : {', '.join(result['fichiers'])}")
+    print(f"[CUCUMBER INIT] Patch : {result['patch']}")
     return 0
 
 
@@ -2274,9 +2359,21 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
     if not base:
         print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")
+        if args.detect_only:
+            cucumber_detection.save_error(client, f"branche '{args.cucumber_base_branch}' introuvable dans "
+                                                  f"{args.cucumber_repo}")
         return 2
+    if args.detect_only:
+        subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
+        base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
+        commits = cucumber_detection.repo_commits(local_client_repo, cucumber_repo_dir, base, local_cucumber_std_repo)
+        if not args.detect_force and cucumber_detection.up_to_date(client, cucumber_detection.fingerprint(commits)):
+            print(f"[CUCUMBER DÉTECTION] Commits inchangés ({cucumber_detection.fingerprint(commits)}) : détection "
+                  f"en cache conservée.")
+            return 0
     if args.init_only:
-        return run_cucumber_init(args, local_client_repo, local_cucumber_std_repo, cucumber_repo_dir, base)
+        return run_cucumber_init(args, local_client_repo, local_cucumber_std_repo, cucumber_repo_dir, base,
+                                 odatio_version)
     if args.health_only:
         return run_cucumber_health(client, local_cucumber_std_repo, cucumber_repo_dir, base, project)
     if args.profile_only:
@@ -2335,6 +2432,16 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
           + (f" ({recipes_file})" if recipes_file else " (aucun fichier de recettes)"))
     print(f"[CUCUMBER] Steps Standard candidats : {with_candidates} spécifique(s) concerné(s) ; parties modifiées "
           f"de processus Studio : {with_studio} fichier(s)")
+    if args.detect_only:
+        try:
+            facts = detect_init_facts(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version)
+        except RuntimeError as e:
+            print(f"[CUCUMBER DÉTECTION] ❌ {e}")
+            cucumber_detection.save_error(client, str(e))
+            return 1
+        cucumber_detection.save_result(client, commits, facts)
+        print_init_status(client, facts)
+        return 0
     if args.inventory_only:
         detect_cucumber_profile(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version)
         share_knowledge(inventory_markdown(client, specifics), project, "cucumber-inventaire",

@@ -20,8 +20,8 @@ from datetime import datetime
 
 from tools import cucumber_checks, cucumber_init_data, cucumber_initializers, cucumber_versions
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _runners, _test_java_files, _write_json,
-                                  add_worktree, cache_dir, depends_on_std_test_jar, java_classes,
-                                  java_package_segment, load_inventory)
+                                  cache_dir, depends_on_std_test_jar, java_classes, java_package_segment,
+                                  load_inventory, snapshot)
 
 REPO_PROFILE = ".agent-savoye.json"
 REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
@@ -59,7 +59,7 @@ def profile_path(client_name: str) -> str:
 
 
 def base_worktree_dir(client_name: str) -> str:
-    return os.path.join(cache_dir(client_name), "worktree_profil")
+    return os.path.join(cache_dir(client_name), "copie_profil")
 
 
 def empty_profile() -> dict:
@@ -240,10 +240,13 @@ def client_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
 
 def detect_in_base(client_name: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str,
                    std_runners: list = (), server_version: str = "") -> dict:
-    """Profil détecté dans un worktree du dépôt client à `base` (avant génération). Lève RuntimeError."""
-    worktree = add_worktree(cucumber_repo_dir, base_worktree_dir(client_name), f"cucumber_{client_name}_profil", base,
-                            reset=True)
-    return client_profile(client_name, worktree, base, cucumber_std_dir, std_runners, server_version)
+    """
+    Profil détecté dans une copie de lecture du dépôt client à `base` (avant génération) : rien n'est écrit dans le
+    dépôt client. Lève RuntimeError.
+    """
+    commit = snapshot(cucumber_repo_dir, base_worktree_dir(client_name), base)
+    return client_profile(client_name, base_worktree_dir(client_name), commit, cucumber_std_dir, std_runners,
+                          server_version)
 
 
 def init_view(profile: dict) -> dict:

@@ -366,6 +366,114 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     return result
 
 
+COMPLEMENTS_NAME = "99-Complements-initialisation"
+
+
+def complements_path(init_feature: str, present) -> str:
+    """
+    Nouvelle feature de compléments, à côté de la première feature d'init (même tri, même dossier de données) : jamais
+    une feature existante, protégée une fois livrée (suffixe -2, -3… si besoin).
+    """
+    folder = init_feature.rsplit("/", 1)[0]
+    candidates = [f"{folder}/{COMPLEMENTS_NAME}.feature"] + [f"{folder}/{COMPLEMENTS_NAME}-{n}.feature"
+                                                             for n in range(2, 100)]
+    return next(c for c in candidates if c not in present)
+
+
+def complements_feature(client_name: str, tags: list, items: list, checks: list, eol: str = "\n") -> str:
+    """Feature des compléments : recréation des données d'initializers, puis contrôle de l'environnement."""
+    lines = [" ".join(tags) + eol, f"Feature: {java_class_suffix(client_name)} - Compléments d'initialisation{eol}"]
+    if items:
+        lines += [eol, f"  Scenario: {java_class_suffix(client_name)} - Recréation des données des initializers{eol}"]
+        body = cucumber_recreation.feature_lines(items, "    ", eol)
+        first = next((i for i, line in enumerate(body) if line.lstrip().startswith("And ")), -1)
+        if first >= 0:
+            body[first] = body[first].replace("And ", "Given ", 1)
+        lines += body
+    lines += [line + eol for line in cucumber_environment.scenario_lines(client_name, checks, [])]
+    return "".join(lines)
+
+
+def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client_name: str, base: str,
+                           profile: dict, status: dict, init_features: list, imports_dir: str = "", recreate=None,
+                           writer=None) -> dict:
+    """
+    Lot « Compléments d'initialisation » d'une init existante incomplète : seuls les éléments manquants livrables
+    (données d'initializers effacées, contrôle des dépendances d'environnement et des champs personnalisés) sont
+    ajoutés dans UNE nouvelle feature, taguée comme l'init, à côté d'elle. Jamais de réécriture de l'init, jamais
+    de fichier protégé modifié. Les autres constats (clear, TODO-VERSION, init en échec) sont rendus avec leur
+    preuve, à traiter à la main. `imports_dir` : runs importés (dépendances relevées). Renvoie {"fichiers",
+    "patch", "manuels", "avertissements", "recreation", "environnement"} ; "patch" vaut '' s'il n'y a rien à
+    livrer. Lève RuntimeError.
+    """
+    findings = status.get("constats") or []
+    result = {"fichiers": [], "patch": "", "avertissements": [], "recreation": {}, "environnement": {},
+              "manuels": [f for f in findings if not f["livrable"]]}
+    output = init_patch_path(client_name)
+    if os.path.exists(output):
+        os.remove(output)
+    codes = {c for f in findings if f["type"] == "initializer" for c in f["codes"]}
+    checks = [{"type": "champ_personnalise", "entite": "", "code": c}
+              for f in findings if f["type"] == "champ_personnalise" for c in f["codes"]]
+    controlled = {c for f in findings if f["type"] == "controle_environnement" for c in f["codes"]}
+    checks = [d for d in cucumber_environment.dependencies(profile or {}, imports_dir)
+              if d["code"] in controlled] + checks
+    if not (codes or checks) or not init_features:
+        return result
+    worktree = add_worktree(cucumber_repo_dir, init_worktree_dir(client_name), init_branch(client_name), base,
+                            reset=True)
+    protected = set((profile or {}).get("protected_files") or [])
+    present = set(_git(worktree, "ls-files").stdout.splitlines())
+    target_rel = complements_path(init_features[0], present | protected)
+    items = [e for e in recreation_plan(cucumber_std_dir, client_name, profile) if e["donnee"]["code"] in codes]
+    first = _read_text(os.path.join(worktree, *init_features[0].split("/")))
+    tags = [t for t in (first.splitlines() or [""])[0].split() if t.startswith("@")] or [
+        f"@INIT_{java_package_segment(client_name).upper()}"]
+    target = os.path.join(worktree, *target_rel.split("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="") as f:
+        f.write(complements_feature(client_name, tags, items, checks))
+    result["fichiers"].append(target_rel)
+    result["recreation"] = _recreate_project_steps(worktree, base, client_name, items, [target_rel], recreate)
+    result["avertissements"] += result["recreation"]["avertissements"]
+    env = {"controles": len(checks), "livres": False, "avertissements": []}
+    if checks:
+        errors = writer(worktree, checks, []) if writer else ["aucun moyen d'écrire les steps du projet"]
+        env["livres"] = not errors
+        if errors:
+            lines = cucumber_environment.scenario_lines(client_name, checks, [])
+            text = _read_text(target)
+            text = text.replace("\n".join(lines) + "\n",
+                                "\n".join(cucumber_environment.commented(lines, errors[0][:150])) + "\n")
+            with open(target, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            java = cucumber_environment.java_path(client_name)
+            if _git(worktree, "cat-file", "-e", f"{base}:{java}").returncode == 0:
+                _git(worktree, "checkout", base, "--", java)
+            elif os.path.exists(os.path.join(worktree, *java.split("/"))):
+                os.remove(os.path.join(worktree, *java.split("/")))
+            env["avertissements"].append(f"contrôle de l'environnement non livré, commenté sous "
+                                         f"{cucumber_environment.TODO_MARKER} : {errors[0][:150]}")
+    result["environnement"] = env
+    result["avertissements"] += env["avertissements"]
+    extra = [p for p in (cucumber_recreation.java_path(client_name), cucumber_environment.java_path(client_name))
+             if os.path.exists(os.path.join(worktree, *p.split("/")))]
+    result["fichiers"] += [p for p in extra if p not in present]
+    _git(worktree, "add", "-A", "--", target_rel, *extra)
+    touched = set(_git(worktree, "diff", "--cached", "--name-only").stdout.splitlines())
+    if touched & protected:
+        _git(worktree, "reset", "-q", "--hard", base)
+        raise RuntimeError(f"fichier(s) protégé(s) modifié(s) par les compléments : {', '.join(sorted(touched & protected))}")
+    if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
+        return result
+    commit = _git(worktree, "commit", "-m", f"Cucumber initialisation complements of {client_name}")
+    if commit.returncode != 0:
+        raise RuntimeError(f"Commit des compléments d'initialisation impossible : {commit.stderr.strip()[:300]}")
+    if format_patch(worktree, f"{base}..HEAD", output):
+        result["patch"] = output
+    return result
+
+
 def recreation_plan(cucumber_std_dir: str, client_name: str, profile: dict) -> list:
     """Recréations des données d'initializers effacées (cucumber_recreation.plan) ; [] s'il n'y a rien à recréer."""
     if not cucumber_recreation.to_recreate(profile):

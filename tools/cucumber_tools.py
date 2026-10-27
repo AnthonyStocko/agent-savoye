@@ -2328,6 +2328,28 @@ def add_worktree(cucumber_repo_dir: str, path: str, branch: str, base: str, rese
     return path
 
 
+def snapshot(repo_dir: str, path: str, ref: str) -> str:
+    """
+    Copie de lecture du dépôt `repo_dir` à `ref` dans `path` : clone local --shared (objets lus dans le dépôt
+    d'origine) extrait en HEAD détaché sur le commit de `ref`. Rien n'est écrit dans le dépôt d'origine (ni branche,
+    ni worktree, ni index). Renvoie le commit extrait. Lève RuntimeError.
+    """
+    commit = _git(repo_dir, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}").stdout.strip()
+    if not commit:
+        raise RuntimeError(f"Référence {ref} introuvable dans {repo_dir}.")
+    if not os.path.isdir(os.path.join(path, ".git")):
+        shutil.rmtree(path, ignore_errors=True)
+        cloned = subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", repo_dir, path],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if cloned.returncode != 0:
+            raise RuntimeError(f"Copie de lecture de {repo_dir} impossible : {cloned.stderr.strip()[:300]}")
+    checkout = _git(path, "checkout", "-q", "--force", "--detach", commit)
+    if checkout.returncode != 0:
+        raise RuntimeError(f"Extraction de {ref} impossible : {checkout.stderr.strip()[:300]}")
+    _git(path, "clean", "-q", "-fdx")
+    return commit
+
+
 def commit_lot(worktree: str, client_name: str, lot_number: int, forced: list = ()) -> bool:
     """
     Commite les fichiers écrits par le lot (hors sorties Maven), plus `forced` : fichiers de test ignorés par le

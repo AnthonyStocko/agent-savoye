@@ -11,9 +11,9 @@ import streamlit as st
 from dotenv import dotenv_values, load_dotenv, set_key
 
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage,
-                   cucumber_decisions, cucumber_environment, cucumber_import, cucumber_init, cucumber_init_data,
-                   cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run, cucumber_studio,
-                   cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
+                   cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_import,
+                   cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
+                   cucumber_studio, cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -1135,18 +1135,54 @@ with tab_integration:
                                "Lancement tiendra compte des réponses présentes dans la description.")
 
 
+NEW_PROJECT = "__nouveau__"
+PROJECT_KEYS = {"client_repo": "cucumber_repo", "client_name": "cucumber_client_name",
+                "db_schema": "cucumber_db_schema", "application": "cucumber_application",
+                "std_repo": "cucumber_std_repo"}
+
+
+def load_cucumber_project() -> None:
+    """Projet choisi dans la liste : ses réglages enregistrés remplissent « Client et dépôts » (vides : nouveau)."""
+    choice = st.session_state.get("cucumber_project")
+    settings = cucumber_detection.known_projects(cucumber_tools.CACHE_ROOT).get(choice) or {}
+    if choice != NEW_PROJECT:
+        settings = {"client_name": choice, **{k: v for k, v in settings.items() if v}}
+    for key, state_key in PROJECT_KEYS.items():
+        st.session_state[state_key] = settings.get(key) or (
+            os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "") if key == "std_repo" else "")
+    # Nom saisi conservé : le nom déduit du dépôt ne le remplace pas
+    st.session_state["cucumber_client_derived"] = cucumber_tools.client_name_from_repo(
+        st.session_state["cucumber_repo"])
+
+
 def cucumber_header() -> dict:
     """
-    Client et dépôts de l'onglet Cucumber (repliés une fois renseignés). Renvoie le contexte commun des étapes :
-    client, commande main.py, prêt ou non, capture de la référence Git du Standard.
+    Projet choisi dans la liste des projets connus (ou nouveau), puis client et dépôts (repliés une fois
+    renseignés). Renvoie le contexte commun des étapes : client, commande main.py, prêt ou non, capture de la
+    référence Git du Standard.
     """
     # Valeurs par défaut du .env, puis dernières valeurs saisies (conservées dans la session)
     st.session_state.setdefault("cucumber_repo", os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""))
     st.session_state.setdefault("cucumber_db_schema", os.getenv("DB_SCHEMA", ""))
     st.session_state.setdefault("cucumber_application", "")
     st.session_state.setdefault("cucumber_std_repo", os.getenv("BITBUCKET_CUCUMBER_STD_REPO", ""))
+    projects = cucumber_detection.known_projects(cucumber_tools.CACHE_ROOT)
+    options = list(projects) + [NEW_PROJECT]
+    current = st.session_state.get("cucumber_project")
+    typed = (st.session_state.get("cucumber_client_name") or "").strip().lower()
+    if current == NEW_PROJECT and typed in projects:
+        # Nouveau projet enregistré : il rejoint la liste
+        st.session_state["cucumber_project"] = typed
+    elif current not in options:
+        env_client = cucumber_tools.client_name_from_repo(os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""))
+        st.session_state["cucumber_project"] = env_client if env_client in projects else options[0]
+        load_cucumber_project()
+    st.selectbox("Projet", options, key="cucumber_project", on_change=load_cucumber_project,
+                 format_func=lambda k: "Nouveau projet…" if k == NEW_PROJECT else k.capitalize(),
+                 help="Projets déjà travaillés (réglages enregistrés dans .tmp/cucumber/<client>/projet.json).")
     filled = bool(st.session_state.get("cucumber_repo") and st.session_state.get("cucumber_client_name"))
-    with st.expander("Client et dépôts", icon=":material/settings:", expanded=not filled):
+    with st.expander("Client et dépôts", icon=":material/settings:",
+                     expanded=not filled or st.session_state["cucumber_project"] == NEW_PROJECT):
         cucumber_repo_input = st.text_input(
             "Dépôt Bitbucket du projet client :", key="cucumber_repo",
             help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/CLIENT) ou chemin d'un clone local.",
@@ -1199,6 +1235,12 @@ def cucumber_header() -> dict:
             show_std_ref()
 
     show_std_ref()
+    ready = bool(cucumber_repo_input and cucumber_client)
+    if ready:
+        settings = {"client_repo": cucumber_repo_input, "client_name": cucumber_client, "db_schema": cucumber_schema,
+                    "application": cucumber_application, "std_repo": cucumber_std_input}
+        if projects.get(cucumber_client) != settings:
+            cucumber_detection.save_project(cucumber_client, settings)
     cucumber_cmd = [
         sys.executable, "main.py",
         "--step", "generate-cucumber-client",
@@ -1208,229 +1250,219 @@ def cucumber_header() -> dict:
         "--db-schema", cucumber_schema,
         "--cucumber-std-repo", cucumber_std_input,
     ]
-    return {"client": cucumber_client, "cmd": cucumber_cmd, "ready": bool(cucumber_repo_input and cucumber_client),
-            "capture": capture_std_ref}
+    return {"client": cucumber_client, "cmd": cucumber_cmd, "ready": ready, "capture": capture_std_ref}
 
 
-def render_cucumber_profile(ctx: dict, profile_doc: dict) -> None:
-    """Profil client : conventions détectées dans le dépôt <client>-cucumber, corrigeables (aucun token)."""
-    cucumber_client, ready = ctx["client"], ctx["ready"]
-    profile = cucumber_profile.effective_profile(profile_doc)
-    empty_fields = [cucumber_profile.LABELS[k] for k in cucumber_profile.FIELDS if cucumber_profile.is_empty(profile[k])]
-    with st.expander(("⚠️ " if empty_fields or not profile_doc else "") + "Profil client"
-                     + (f" — {len(empty_fields)} champ(s) vide(s)" if profile_doc and empty_fields else ""),
-                     expanded=bool(profile_doc) and bool(empty_fields)):
-        if st.button("Détecter le profil", icon=":material/manage_search:", disabled=not ready,
-                     help="Relit le dépôt <client>-cucumber à sa base : racine et tag des features, init, clear, "
-                          "fichiers du module spécifique, runner, codes de référence, version de la bibliothèque. "
-                          "La saisie enregistrée est conservée. Aucun appel à Claude."):
-            if run_main_step(ctx["cmd"] + ["--profile-only"], on_line=ctx["capture"]) == 0:
-                st.rerun()
-            st.error("Détection du profil impossible : voir le journal ci-dessus.")
-        if not profile_doc:
-            st.caption("Aucun profil : lancez l'inventaire ou « Détecter le profil ».")
+def render_cucumber_detection(ctx: dict) -> None:
+    """
+    Détection automatique en arrière-plan (inventaire, profil, faits de l'init ; 0 token, lecture seule) : lancée
+    quand le projet est prêt puis, à chaque contrôle périodique, si les commits des dépôts ont changé. Indicateur
+    discret pendant l'analyse ; la page est rechargée à la fin.
+    """
+    client = ctx["client"]
+    if not ctx["ready"]:
+        return
+    cucumber_detection.start(client, ctx["cmd"])
+    active = cucumber_detection.running(client)
+
+    def watch() -> None:
+        if cucumber_detection.running(client):
+            st.session_state[f"cucumber_detecting_{client}"] = True
+            st.caption(":material/progress_activity: Analyse du projet en cours…")
             return
-        st.caption(f"Détecté le {profile_doc.get('date', '?').replace('T', ' ')[:16]} · priorité : "
-                   f"{cucumber_profile.REPO_PROFILE} du dépôt > saisie > détection.")
+        if st.session_state.pop(f"cucumber_detecting_{client}", False):
+            cucumber_detection.finish(client)
+            st.rerun()
+        if cucumber_detection.start(client, ctx["cmd"]):
+            st.rerun()
+
+    st.fragment(watch, run_every="3s" if active else f"{cucumber_detection.interval()}s")()
+
+
+def render_cucumber_findings(status: dict) -> None:
+    """Constats de l'init, chacun avec ses preuves (fichier, ligne, extrait, ou résultat de run)."""
+    for finding in status.get("constats") or []:
+        st.markdown(f"- **{finding['libelle']}** : {finding['message']}"
+                    + ("" if finding["livrable"] or finding["type"] == "absente" else
+                       " :gray[(à traiter à la main : fichier protégé ou preuve de run)]"))
+        st.caption("  \n".join(cucumber_detection.proof_line(p) for p in finding["preuves"][:5])
+                   + (f"  \n… {len(finding['preuves']) - 5} autre(s)" if len(finding["preuves"]) > 5 else ""))
+
+
+PROFILE_TEXT_FIELDS = ("features_root", "tag_client", "init_tags", "clear_name", "library_version", "server_version",
+                       "verify_branch", "verify_branch_param", "run_job")
+
+
+def profile_field_inputs(client: str, fields: list, profile: dict, profile_doc: dict) -> dict:
+    """Champs du profil à corriger (ceux de `fields` seulement) ; renvoie les valeurs saisies."""
+    values = {}
+    for key in (k for k in PROFILE_TEXT_FIELDS if k in fields):
+        values[key] = st.text_input(cucumber_profile.LABELS[key], value=profile[key],
+                                    placeholder={"verify_branch_param": cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
+                                                 "run_job": "DOSSIER/JOB"}.get(key, ""))
+    for key in (k for k in ("init_features", "protected_files") if k in fields):
+        values[key] = [line.strip() for line in st.text_area(
+            f"{cucumber_profile.LABELS[key]}, un par ligne", value="\n".join(profile[key]),
+            height=100).splitlines() if line.strip()]
+    if "spec_files" in fields:
+        options = list(dict.fromkeys(profile["spec_files"] + (profile_doc.get("suggestions") or {}).get("spec_files",
+                                                                                                        [])))
+        values["spec_files"] = st.multiselect(
+            f"{cucumber_profile.LABELS['spec_files']}, dans l'ordre d'intégration", options,
+            default=profile["spec_files"], help="Intégrés par l'init après l'initialisation globale, dans l'ordre de "
+                                                "sélection. Suggestions : fichiers de données du dépôt client hors "
+                                                "initialisation Standard.")
+    if "reference_codes" in fields:
+        codes = {}
+        with st.container(horizontal=True):
+            for category in cucumber_profile.REFERENCE_CATEGORIES:
+                codes[category] = [c.strip() for c in st.text_input(
+                    cucumber_init_data.LABELS.get(category, category),
+                    value=", ".join((profile["reference_codes"] or {}).get(category) or [])).split(",") if c.strip()]
+        values["reference_codes"] = codes
+    if "initializers_survive_clear" in fields:
+        values["initializers_survive_clear"] = st.segmented_control(
+            cucumber_profile.LABELS["initializers_survive_clear"], list(cucumber_profile.SURVIVE_CLEAR),
+            format_func=cucumber_profile.SURVIVE_CLEAR.get, default=profile["initializers_survive_clear"] or "",
+            help="Réponse globale, appliquée aux données dont le statut est « inconnu ».") or ""
+    if "server_initialized_data" in fields and profile["server_initialized_data"]:
+        import pandas as pd
+        initialized = pd.DataFrame(profile["server_initialized_data"])
+        values["server_initialized_data"] = st.data_editor(
+            initialized, hide_index=True, num_rows="fixed",
+            column_order=("statut", "code", "entite", "classe", "depot", "mode", "certitude"),
+            disabled=[c for c in initialized.columns if c != "statut"],
+            column_config={"statut": st.column_config.SelectboxColumn(
+                "Statut après un clear", options=list(cucumber_initializers.STATUSES),
+                format_func=cucumber_initializers.STATUSES.get, required=True)},
+            key=f"cucumber_initialized_{client}").to_dict("records")
+    if "environment_checks" in fields:
+        import pandas as pd
+        checks = pd.DataFrame(profile["environment_checks"] or [], columns=["type", "entite", "code"])
+        edited = st.data_editor(
+            checks, hide_index=True, num_rows="dynamic",
+            column_config={"type": st.column_config.SelectboxColumn(
+                "Type", options=list(cucumber_environment.TYPES), format_func=cucumber_environment.TYPES.get,
+                required=True), "entite": st.column_config.TextColumn("Entité"),
+                "code": st.column_config.TextColumn("Code", required=True)},
+            key=f"cucumber_env_checks_{client}")
+        values["environment_checks"] = [{k: str(v or "").strip() for k, v in row.items()}
+                                        for row in edited.to_dict("records")
+                                        if row.get("type") and str(row.get("code") or "").strip()]
+    if "runner" in fields:
+        values["runner"] = st.text_area(f"{cucumber_profile.LABELS['runner']} (JSON)",
+                                        value=json.dumps(profile["runner"], ensure_ascii=False, indent=1), height=150)
+    return values
+
+
+def render_cucumber_profile(ctx: dict, profile_doc: dict, detection: dict, status: dict) -> None:
+    """
+    Profil client en lecture seule, replié : projet, racine des features, tag client, init, runner, versions. Un
+    seul indicateur (vert : complet, orange : champs manquants, rouge : détection impossible). « Corriger » ouvre
+    l'édition des seuls champs manquants (ou choisis comme faux) ; l'enregistrement relance la détection.
+    """
+    client = ctx["client"]
+    profile = cucumber_profile.effective_profile(profile_doc)
+    indicator = cucumber_detection.profile_indicator(detection, profile)
+    missing = [cucumber_profile.LABELS[k] for k in indicator["manquants"]]
+    title = {"vert": "🟢 Profil client — complet",
+             "orange": f"🟠 Profil client — {len(missing)} champ(s) manquant(s) : {', '.join(missing)}",
+             "rouge": f"🔴 Profil client — détection impossible : {indicator['cause']}",
+             "attente": "⚪ Profil client — en attente de la première détection"}[indicator["couleur"]]
+    with st.expander(title, expanded=False):
+        runner = profile["runner"]
+        st.markdown("\n".join([
+            f"- **Projet** : {client.capitalize()} (dépôt `{client}-cucumber`)",
+            f"- **Racine des features** : `{profile['features_root'] or '—'}`",
+            f"- **Tag client** : `{profile['tag_client'] or '—'}`",
+            f"- **Init** : {cucumber_detection.state_label(status)}"
+            + (f" ({', '.join(f'`{p}`' for p in profile['init_features'][:3])})" if profile["init_features"] else ""),
+            f"- **Runner** : " + (f"`{runner['classe']}`" + (" (surcouche du Standard)" if runner.get("surcouche")
+                                                              else "") if runner.get("classe") else "—"),
+            f"- **Versions** : bibliothèque de steps {profile['library_version'] or '—'}, serveur "
+            f"{profile['server_version'] or '—'}"]))
+        render_cucumber_findings(status)
         for warning in profile["avertissements"]:
-            st.markdown(f":orange[⚠️ {warning}]")
-        sources = profile["sources"]
-
-        def origin(key: str) -> str:
-            return {"depot": "fixé par le dépôt", "saisi": "saisi", "detecte": "détecté"}.get(sources.get(key),
-                                                                                              "vide")
-        with st.form(f"cucumber_profile_{cucumber_client}"):
-            values = {}
-            with st.container(horizontal=True):
-                for key in ("features_root", "tag_client", "init_tags", "clear_name", "library_version",
-                            "server_version"):
-                    values[key] = st.text_input(f"{cucumber_profile.LABELS[key]} ({origin(key)})",
-                                                value=profile[key], disabled=sources.get(key) == "depot")
-            values["init_features"] = [line.strip() for line in st.text_area(
-                f"{cucumber_profile.LABELS['init_features']} ({origin('init_features')}), une par ligne",
-                value="\n".join(profile["init_features"]), disabled=sources.get("init_features") == "depot",
-                height=80).splitlines() if line.strip()]
-            options = list(dict.fromkeys(profile["spec_files"]
-                                         + (profile_doc.get("suggestions") or {}).get("spec_files", [])))
-            values["spec_files"] = st.multiselect(
-                f"{cucumber_profile.LABELS['spec_files']} ({origin('spec_files')}), dans l'ordre d'intégration",
-                options, default=profile["spec_files"], disabled=sources.get("spec_files") == "depot",
-                help="Intégrés par l'init après l'initialisation globale, dans l'ordre de sélection. Suggestions : "
-                     "fichiers de données du dépôt client hors initialisation Standard.")
-            values["protected_files"] = [line.strip() for line in st.text_area(
-                f"{cucumber_profile.LABELS['protected_files']} ({origin('protected_files')}, "
-                f"{len(profile['protected_files'])}), un par ligne",
-                value="\n".join(profile["protected_files"]), disabled=sources.get("protected_files") == "depot",
-                height=100, help="Features d'init et fichiers qu'elles intègrent, partagés par tous les tests : "
-                                 "toute modification par la génération est une erreur bloquante (fichier "
-                                 "restauré après le lot, patch refusé).").splitlines() if line.strip()]
-            codes = {}
-            with st.container(horizontal=True):
-                for category in cucumber_profile.REFERENCE_CATEGORIES:
-                    codes[category] = [c.strip() for c in st.text_input(
-                        cucumber_init_data.LABELS.get(category, category),
-                        value=", ".join((profile["reference_codes"] or {}).get(category) or []),
-                        disabled=sources.get("reference_codes") == "depot").split(",") if c.strip()]
-            values["reference_codes"] = codes
-            # Branche lue par le job de vérification : commitée et poussée avant chaque vérification
-            with st.container(horizontal=True):
-                for key in ("verify_branch", "verify_branch_param", "run_job"):
-                    values[key] = st.text_input(
-                        f"{cucumber_profile.LABELS[key]} ({origin(key)})", value=profile[key],
-                        disabled=sources.get(key) == "depot",
-                        placeholder={"verify_branch_param": cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
-                                     "run_job": "DOSSIER/JOB"}.get(key, ""),
-                        help={"verify_branch": "Le worktree y est commité et poussé avant chaque vérification (jamais "
-                                               "de push forcé). Vide : le job reçoit le commit de base et le patch "
-                                               "du worktree.",
-                              "run_job": "Job qui exécute <client>-cucumber sur la branche ci-contre : lancé par "
-                                         "« Pousser et lancer le run » (étape Exécution). Repli : CUCUMBER_RUN_JOB."
-                              }.get(key))
-            # Données créées au démarrage par les initializers serveur : statut après un clear, saisi à la main
-            values["initializers_survive_clear"] = st.segmented_control(
-                f"{cucumber_profile.LABELS['initializers_survive_clear']} "
-                f"({origin('initializers_survive_clear')})", list(cucumber_profile.SURVIVE_CLEAR),
-                format_func=cucumber_profile.SURVIVE_CLEAR.get,
-                default=profile["initializers_survive_clear"] or "",
-                disabled=sources.get("initializers_survive_clear") == "depot",
-                help="Réponse globale, appliquée aux données dont le statut est « inconnu ».") or ""
-            initialized = profile["server_initialized_data"]
-            if initialized:
-                import pandas as pd
-                edited = st.data_editor(
-                    pd.DataFrame(initialized), hide_index=True, num_rows="fixed",
-                    column_order=("statut", "code", "entite", "classe", "depot", "mode", "certitude"),
-                    disabled=sources.get("server_initialized_data") == "depot" or [
-                        c for c in pd.DataFrame(initialized).columns if c != "statut"],
-                    column_config={"statut": st.column_config.SelectboxColumn(
-                        "Statut après un clear", options=list(cucumber_initializers.STATUSES),
-                        format_func=cucumber_initializers.STATUSES.get, required=True)},
-                    key=f"cucumber_initialized_{cucumber_client}")
-                values["server_initialized_data"] = edited.to_dict("records")
-                st.caption(f"{cucumber_profile.LABELS['server_initialized_data']} ({origin('server_initialized_data')}"
-                           f", {len(initialized)}) : codes « partiel » non résolus, jamais devinés.")
-            # Dépendances d'environnement contrôlées en lecture seule par l'init du projet (point 9g)
-            import pandas as pd
-            checks = pd.DataFrame(profile["environment_checks"] or [], columns=["type", "entite", "code"])
-            edited_checks = st.data_editor(
-                checks, hide_index=True, num_rows="dynamic", disabled=sources.get("environment_checks") == "depot",
-                column_config={"type": st.column_config.SelectboxColumn(
-                    "Type", options=list(cucumber_environment.TYPES), format_func=cucumber_environment.TYPES.get,
-                    required=True), "entite": st.column_config.TextColumn("Entité"),
-                    "code": st.column_config.TextColumn("Code", required=True)},
-                key=f"cucumber_env_checks_{cucumber_client}")
-            values["environment_checks"] = [
-                {k: str(v or "").strip() for k, v in row.items()} for row in edited_checks.to_dict("records")
-                if row.get("type") and str(row.get("code") or "").strip()]
-            st.caption(f"{cucumber_profile.LABELS['environment_checks']} ({origin('environment_checks')}) : ajoutées "
-                       f"à l'init du client par « Générer l'initialisation client », avec les champs personnalisés "
-                       f"introuvables relevés dans les runs importés ; un environnement incomplet y produit un seul "
-                       f"échec clair.")
-            if profile["workarounds"]:
-                st.caption(f"{cucumber_profile.LABELS['workarounds']} ({len(profile['workarounds'])}, lecture "
-                           f"seule) : " + " ; ".join(f"{w['fichier']}:{w['ligne']} {w['texte']}"
-                                                     for w in profile["workarounds"][:10]))
-            runner_text = st.text_area(f"{cucumber_profile.LABELS['runner']} ({origin('runner')}, JSON)",
-                                       value=json.dumps(profile["runner"], ensure_ascii=False, indent=1),
-                                       disabled=sources.get("runner") == "depot", height=150)
-            if st.form_submit_button("Enregistrer le profil", icon=":material/save:"):
-                try:
-                    values["runner"] = json.loads(runner_text)
-                except ValueError:
-                    st.error("Runner : JSON invalide, profil non enregistré.")
-                else:
-                    depot = profile_doc.get("depot") or {}
-                    cucumber_profile.save_user_fields(
-                        cucumber_client, {k: v for k, v in values.items() if k not in depot})
-                    st.success("Profil enregistré.")
-                    st.rerun()
+            st.caption(f":orange[⚠️ {warning}]")
+        if detection.get("date"):
+            st.caption(f"Détecté le {detection['date'].replace('T', ' ')[:16]} (commits {detection.get('empreinte')}),"
+                       f" contrôlé le {(detection.get('verifie_le') or '').replace('T', ' ')[:16]}.")
+        if not profile_doc:
+            return
+        editing_key = f"cucumber_profile_edit_{client}"
+        if st.button("Corriger", type="tertiary", icon=":material/edit:", key=f"cucumber_profile_fix_{client}"):
+            st.session_state[editing_key] = not st.session_state.get(editing_key, False)
+        if not st.session_state.get(editing_key):
+            return
+        depot = profile_doc.get("depot") or {}
+        editable = [k for k in cucumber_profile.FIELDS if k not in depot and k != "workarounds"]
+        extra = st.multiselect("Autres champs faux à corriger", [k for k in editable if k not in indicator["manquants"]],
+                               format_func=cucumber_profile.LABELS.get, key=f"cucumber_profile_extra_{client}")
+        fields = [k for k in editable if k in indicator["manquants"] or k in extra]
+        if not fields:
+            st.caption("Aucun champ manquant : choisissez ci-dessus les champs à corriger.")
+            return
+        with st.form(f"cucumber_profile_{client}"):
+            values = profile_field_inputs(client, fields, profile, profile_doc)
+            if st.form_submit_button("Enregistrer et relancer la détection", icon=":material/save:"):
+                if "runner" in values:
+                    try:
+                        values["runner"] = json.loads(values["runner"])
+                    except ValueError:
+                        st.error("Runner : JSON invalide, profil non enregistré.")
+                        return
+                # Saisie complète : champs non affichés repris du profil appliqué (la détection est filtrée)
+                current = {k: profile[k] for k in editable}
+                cucumber_profile.save_user_fields(client, {**current, **values})
+                cucumber_detection.start(client, ctx["cmd"], force=True)
+                st.session_state[editing_key] = False
+                st.rerun()
 
 
-def render_cucumber_project(ctx: dict, inventory: dict, profile_doc: dict, state: dict) -> None:
-    """Étape 1 : inventaire, bilan de santé, profil client, initialisation et dernier résultat de l'init."""
-    cucumber_client, ready, capture = ctx["client"], ctx["ready"], ctx["capture"]
-    with st.container(horizontal=True):
-        # Inventaire des spécifiques (calculs Python, aucun token)
-        if st.button("Inventaire des spécifiques", icon=":material/inventory_2:", disabled=not ready,
-                     help="Prépare les dépôts, puis inventorie les spécifiques du client, les catalogues Cucumber, "
-                          "les personnalisations Studio et les extraits Jira. Aucun appel à Claude."):
-            st.info(f"Inventaire des spécifiques {cucumber_client} en cours...")
-            if run_main_step(ctx["cmd"] + ["--inventory-only"], on_line=capture) == 0:
-                st.success("Inventaire terminé.")
-            else:
-                st.error("L'inventaire a échoué : voir le journal ci-dessus.")
-        # Bilan de santé du dépôt client avant génération (aucun token)
-        if st.button("Bilan de santé du dépôt client", icon=":material/health_and_safety:", disabled=not ready,
+def render_cucumber_health(ctx: dict) -> None:
+    """Bilan de santé du dépôt client (compilation et dry-run : plusieurs minutes), à la demande, replié."""
+    client, capture = ctx["client"], ctx["capture"]
+    health_file = cucumber_checks.health_path(client) if client else ""
+    health = ""
+    if health_file and os.path.exists(health_file):
+        with open(health_file, "r", encoding="utf-8", errors="replace") as f:
+            health = f.read()
+    drifted = "décalé de sa bibliothèque" in health or "⚠️ le client utilise la bibliothèque" in health
+    verdict = cucumber_journey.health_verdict(client) if client else ""
+    with st.expander(("⚠️ Projet client décalé de sa bibliothèque — " if drifted else "") + "Bilan de santé du dépôt "
+                     "client" + (f" : {verdict} " + time.strftime("(%d/%m/%Y %H:%M)", time.localtime(
+                         os.path.getmtime(health_file))) if health else " : non lancé"),
+                     icon=":material/health_and_safety:"):
+        if st.button("Lancer le bilan de santé", icon=":material/play_arrow:", disabled=not ctx["ready"],
                      help="Contrôle le dépôt <client>-cucumber tel quel : emplacement et casse du tag client de ses "
                           "features, fichiers de données manquants (le dépôt client n'a pas ceux du Standard à "
                           "l'exécution), puis compilation et dry-run de toutes ses features (steps non définis ou "
-                          "ambigus). Aucun appel à Claude."):
-            st.info(f"Bilan de santé de {cucumber_client}-cucumber en cours...")
+                          "ambigus). Plusieurs minutes. Aucun appel à Claude."):
             code = run_main_step(ctx["cmd"] + ["--health-only"], on_line=capture)
             if code == 0:
                 st.success("Dépôt client sain.")
             elif code == 1:
-                st.warning("Le dépôt client a des défauts : voir le rapport ci-dessous. Les échecs qu'ils provoquent "
-                           "à l'exécution ne viendront pas des tests générés.", icon=":material/warning:")
+                st.warning("Le dépôt client a des défauts : voir le rapport. Les échecs qu'ils provoquent à "
+                           "l'exécution ne viendront pas des tests générés.", icon=":material/warning:")
             else:
                 st.error("Le bilan de santé a échoué : voir le journal ci-dessus.")
-    health_file = cucumber_checks.health_path(cucumber_client) if cucumber_client else ""
-    if health_file and os.path.exists(health_file):
-        with open(health_file, "r", encoding="utf-8", errors="replace") as f:
-            health = f.read()
-        drifted = "décalé de sa bibliothèque" in health or "⚠️ le client utilise la bibliothèque" in health
-        with st.expander(("⚠️ Projet client décalé de sa bibliothèque — " if drifted else "") + "Bilan de santé du "
-                         "dépôt client " + time.strftime("(%d/%m/%Y %H:%M)",
-                                                         time.localtime(os.path.getmtime(health_file))),
-                         expanded=drifted):
+            st.rerun()
+        if health:
             st.markdown(health)
 
-    render_cucumber_profile(ctx, profile_doc)
 
-    # Initialisation du client : Init_<MODULE> du Standard copiées pour ses modules (aucun token, sauf steps de
-    # recréation des données d'initializers effacées par le clear)
-    st.markdown("##### :material/restart_alt: Initialisation du client")
-    detected_modules = cucumber_init.client_modules(inventory.get("depot_client", ""), inventory) if inventory else set()
-    with st.container(horizontal=True, vertical_alignment="center"):
-        init_modules = [m for m in cucumber_init.INIT_MODULES
-                        if st.checkbox(m, value=m in detected_modules, disabled=not ready,
-                                       key=f"cucumber_init_{m}_{cucumber_client}_{inventory.get('genere_le', '')}")]
-        st.caption(f"Modules détectés : {', '.join(sorted(detected_modules))}" if detected_modules else
-                   "Aucun module détecté : lancez l'inventaire ou cochez les modules du client.")
-    if st.button("Générer l'initialisation client", icon=":material/play_circle:", disabled=not ready,
-                 help="Copie, dans <client>-cucumber, l'initialisation du Cucumber Standard (features/<MODULE>/"
-                      "01-Contexte et ses fichiers de données) de chaque module coché, au nom du client (tag "
-                      "@INIT_<CLIENT>_<MODULE>), sous features/<client>/01-Contexte/<MODULE>/ pour s'exécuter avant "
-                      "ses autres features. Purge par le clear CUCUMBER_CLEAR_NAME (step client ajouté). Une "
-                      "initialisation par module : chacune purge l'environnement, à lancer séparément. Après "
-                      "l'initialisation globale : recréation des données d'initializers serveur « effacées » par le "
-                      "clear (profil), par un step du Standard reconnu, sinon par des steps du projet écrits par un "
-                      "appel Claude borné et contrôlés ; une recréation non livrable reste commentée "
-                      "(TODO-INITIALIZER). Aucun appel à Claude sans donnée à recréer."):
-        if not init_modules:
-            st.error("Aucun module WMS, TMS ou OMS coché : pas de patch d'initialisation.")
-        else:
-            st.info(f"Initialisation {cucumber_client} ({', '.join(init_modules)}) en cours...")
-            if run_main_step(ctx["cmd"] + ["--init-only", "--init-modules", ",".join(init_modules)],
-                             on_line=capture) == 0:
-                st.success("Initialisation générée : voir le journal ci-dessus et les derniers livrables.")
-            else:
-                st.error("La génération de l'initialisation a échoué : voir le journal ci-dessus.")
-    init = state.get("init") or {}
-    if init:
-        (st.success if init.get("ok") else st.error)(
-            f"Dernier lancement de l'initialisation ({init.get('date', '?').replace('T', ' ')[:16]}) : "
-            f"{init.get('message', '')}", icon=":material/check_circle:" if init.get("ok") else ":material/block:")
-    if cucumber_client and os.path.exists(cucumber_tools.init_patch_path(cucumber_client)):
-        init_patch = cucumber_tools.init_patch_path(cucumber_client)
-        generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(init_patch)))
-        with st.container(border=True):
-            st.markdown(f"**:material/description: Patch d'initialisation** `{init_patch}` "
-                        f":gray[(généré le {generated_at})]")
-            with open(init_patch, "rb") as f:
-                st.download_button("Télécharger le patch d'initialisation", f.read(),
-                                   file_name=os.path.basename(init_patch), mime="text/x-diff",
-                                   icon=":material/download:")
+def render_init_patch(client: str) -> None:
+    """Patch du lot d'initialisation (séparé des tests), téléchargeable."""
+    init_patch = cucumber_tools.init_patch_path(client) if client else ""
+    if not (init_patch and os.path.exists(init_patch)):
+        return
+    generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(init_patch)))
+    with st.container(border=True):
+        st.markdown(f"**:material/description: Patch d'initialisation** `{init_patch}` :gray[(généré le "
+                    f"{generated_at})]")
+        with open(init_patch, "rb") as f:
+            st.download_button("Télécharger le patch d'initialisation", f.read(), file_name=os.path.basename(init_patch),
+                               mime="text/x-diff", icon=":material/download:")
 
 
 COVERAGE_COLUMNS = {
@@ -1472,8 +1504,8 @@ def render_coverage_detail(client: str, row: dict) -> None:
             st.markdown("**Défauts et constats de l'agent**\n" + "\n".join(
                 f"- {cucumber_tools.constat_line(c)}" for c in row["constats"]))
         if row["studio_a_calculer"]:
-            st.caption("Personnalisation Studio : relancez l'inventaire (étape Projet) pour lister ses comportements "
-                       "à couvrir.")
+            st.caption("Personnalisation Studio : ses comportements à couvrir seront listés à la prochaine analyse "
+                       "du projet.")
         elif row["studio_total"]:
             with st.expander(f"Comportements Studio à couvrir : "
                              f"{cucumber_studio.counts_line(row['studio_total'])}"):
@@ -1522,7 +1554,8 @@ def render_coverage_knowledge(client: str, row: dict) -> None:
 def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
     """Étape 2 : tâches couvertes et non couvertes, deux taux, filtres, détail d'une ligne."""
     if not rows:
-        st.info("Aucune tâche : lancez l'inventaire des spécifiques (étape Projet).", icon=":material/inventory_2:")
+        st.info("Aucune tâche : l'inventaire des spécifiques est fait par l'analyse automatique du projet.",
+                icon=":material/inventory_2:")
         return
     rates = cucumber_coverage.rates(rows)
     with st.container(horizontal=True):
@@ -1640,51 +1673,105 @@ def run_cucumber_generation(ctx: dict, extra: list) -> int:
     return returncode
 
 
-def render_cucumber_selection(ctx: dict, inventory: dict, state: dict, rows: list) -> None:
-    """Étape 3 : choix des tâches à couvrir ou à compléter, puis génération des tests."""
+def run_cucumber_init_lot(ctx: dict, lot: dict) -> int:
+    """Lot d'initialisation (patch séparé, avant les lots de tests) : init complète ou compléments selon l'état."""
+    st.info(f"{lot['titre']} {ctx['client']} en cours...")
+    returncode = run_main_step(ctx["cmd"] + ["--init-only"], on_line=ctx["capture"])
+    if returncode == 0:
+        st.success(f"{lot['titre']} : terminé (voir le journal et le patch d'initialisation).")
+    else:
+        st.error(f"{lot['titre']} en échec (code {returncode}) : voir le journal ci-dessus.")
+    return returncode
+
+
+def generation_plan(inventory: dict, selected: list, dependencies: dict) -> list:
+    """Lots de tests prévus pour les tâches cochées (aperçu, tri sans token compris) et leur dépendance à l'init."""
+    specifics = {s["id"]: s for s in inventory.get("specifiques") or []}
+    remaining, sorted_out = cucumber_tools.presort([i for i in selected if i in specifics], specifics)
+    lots = cucumber_tools.make_lots(remaining, max(1, env_int("CUCUMBER_BATCH_SIZE", 3)), specifics)
+    plan = [{"Lot": f"Tests {n}", "Tâches": ", ".join(specifics[i]["libelle"] for i in lot["ids"]),
+             "Initialisation": cucumber_detection.lot_dependency(lot["ids"], dependencies)}
+            for n, lot in enumerate(lots, 1)]
+    if sorted_out:
+        plan.append({"Lot": "Tri sans appel Claude", "Tâches": f"{len(sorted_out)} tâche(s) (listener, technique)",
+                     "Initialisation": ""})
+    return plan
+
+
+def render_cucumber_selection(ctx: dict, inventory: dict, state: dict, rows: list, status: dict,
+                              dependencies: dict) -> None:
+    """
+    Étape 3 : plan de génération — lot d'initialisation proposé selon l'état de l'init (coché par défaut), choix
+    des tâches à couvrir ou à compléter, lots de tests et leur dépendance à l'init — puis génération.
+    """
     client, ready = ctx["client"], ctx["ready"]
+    init_lot = cucumber_detection.init_lot(status)
+    run_init = False
+    if init_lot:
+        with st.container(border=True):
+            run_init = st.checkbox(f"**Lot 0 — {init_lot['titre']}** (patch séparé, avant les lots de tests)",
+                                   value=True, key=f"cucumber_init_lot_{client}_{status['etat']}")
+            st.caption("Init absente : copie de l'initialisation du Cucumber Standard pour les modules du client "
+                       "(clear de l'environnement, intégration globale, fichiers du module spécifique, recréation des "
+                       "données d'initializers, contrôle de l'environnement)." if init_lot["mode"] == "init" else
+                       "Init incomplète : seuls les éléments manquants livrables sont ajoutés, dans une nouvelle "
+                       "feature à côté de l'init ; l'init existante et les fichiers protégés ne sont jamais "
+                       "modifiés. Les autres constats restent à traiter à la main, avec leur preuve.")
+            with st.expander(f"Éléments du lot ({len(init_lot['constats'])} constat(s))"):
+                render_cucumber_findings(status)
     candidates = selection_candidates(rows)
+    selected, accepted = [], True
     if not candidates:
         st.info("Aucune tâche non couverte, partielle ou non testable.", icon=":material/task_alt:")
-        return
-    st.caption("Ordre proposé : risque métier, puis testabilité, puis effort. Les tâches « non testables "
-               "aujourd'hui » ne sont pas cochées : sélectionnez-les en connaissance de cause. Pour une tâche "
-               "partielle, le lot teste l'EFFET (document généré, message envoyé, statut, champ enregistré), pas la "
-               "configuration.")
-    key = selection_key(client, inventory)
-    table = [{"Couvrir": r["etat"] in ("non_couvert", "partiel"), "État": cucumber_coverage.state_label(r),
-              "Tâche": r["tache"], "Module": r["module"], "Risque": r["risque"], "Testabilité": r["testabilite"],
-              "Effort": r["effort"], "Tickets": ", ".join(r["tickets"])} for r in candidates]
-    st.data_editor(table, key=key, hide_index=True, width="stretch", height=360,
-                   disabled=[c for c in table[0] if c != "Couvrir"],
-                   column_config={**COVERAGE_COLUMNS,
-                                  "Couvrir": st.column_config.CheckboxColumn("Couvrir", width="small"),
-                                  "Effort": st.column_config.NumberColumn(
-                                      "Effort", width="small", help="Estimation : fichiers, absence de test Standard "
-                                                                    "ou de step candidat, comportements Studio")})
-    selected = current_selection(candidates, key)
-    warnings = cucumber_coverage.selection_warnings(rows, selected)
-    accepted = True
-    if warnings:
-        st.warning(f"**{len(warnings)} tâche(s) non testable(s) aujourd'hui sélectionnée(s)** : leurs tests risquent "
-                   "d'échouer ou de rester partiels.\n\n" + "\n".join(f"- {w}" for w in warnings[:10]),
-                   icon=":material/warning:")
-        accepted = st.checkbox("Je génère aussi ces tâches", key=f"cucumber_untestable_{client}")
+    else:
+        st.caption("Ordre proposé : risque métier, puis testabilité, puis effort. Les tâches « non testables "
+                   "aujourd'hui » ne sont pas cochées : sélectionnez-les en connaissance de cause. Pour une tâche "
+                   "partielle, le lot teste l'EFFET (document généré, message envoyé, statut, champ enregistré), pas "
+                   "la configuration.")
+        key = selection_key(client, inventory)
+        table = [{"Couvrir": r["etat"] in ("non_couvert", "partiel"), "État": cucumber_coverage.state_label(r),
+                  "Tâche": r["tache"], "Module": r["module"], "Risque": r["risque"], "Testabilité": r["testabilite"],
+                  "Effort": r["effort"], "Tickets": ", ".join(r["tickets"])} for r in candidates]
+        st.data_editor(table, key=key, hide_index=True, width="stretch", height=360,
+                       disabled=[c for c in table[0] if c != "Couvrir"],
+                       column_config={**COVERAGE_COLUMNS,
+                                      "Couvrir": st.column_config.CheckboxColumn("Couvrir", width="small"),
+                                      "Effort": st.column_config.NumberColumn(
+                                          "Effort", width="small", help="Estimation : fichiers, absence de test "
+                                                                        "Standard ou de step candidat, comportements "
+                                                                        "Studio")})
+        selected = current_selection(candidates, key)
+        warnings = cucumber_coverage.selection_warnings(rows, selected)
+        if warnings:
+            st.warning(f"**{len(warnings)} tâche(s) non testable(s) aujourd'hui sélectionnée(s)** : leurs tests "
+                       "risquent d'échouer ou de rester partiels.\n\n" + "\n".join(f"- {w}" for w in warnings[:10]),
+                       icon=":material/warning:")
+            accepted = st.checkbox("Je génère aussi ces tâches", key=f"cucumber_untestable_{client}")
     batch_size = max(1, env_int("CUCUMBER_BATCH_SIZE", 3))
     lot_count = -(-len(selected) // batch_size)
     average = cucumber_tools.lot_cost_average(os.path.join(".tmp", "token_usage.csv"))
     estimate = (f"≈ {lot_count * average['tokens'] / 1e6:.1f} M tokens, ≈ {lot_count * average['cout_usd']:.2f} $ "
                 f"(moyenne de {average['lots']} lot(s) précédent(s))" if average["lots"] else
                 "coût inconnu (aucun lot exécuté jusqu'ici)")
-    st.caption(f"{len(selected)} tâche(s) cochée(s) → {lot_count} lot(s) de {batch_size}, regroupés par test Standard "
-               f"et par module · {estimate}")
+    if selected:
+        st.caption(f"{len(selected)} tâche(s) cochée(s) → {lot_count} lot(s) de {batch_size}, regroupés par test "
+                   f"Standard et par module · {estimate}")
+        plan = generation_plan(inventory, selected, dependencies)
+        if any(p["Initialisation"] for p in plan):
+            st.dataframe(plan, hide_index=True, width="stretch")
     existing = bool(state.get("lots")) and os.path.isdir(cucumber_tools.worktree_dir(client))
     ids = ",".join(selected)
+    tests_ok = bool(selected) and accepted
     if st.button("Générer les tests", type="primary", icon=":material/science:",
-                 disabled=not (ready and selected and accepted),
-                 help="Ajoute des lots à la génération en cours, sans rien effacer." if existing else
-                 "Crée les lots des tâches cochées."):
-        run_cucumber_generation(ctx, ["--complete", "--specifics", ids] if existing else ["--specifics", ids])
+                 disabled=not (ready and (tests_ok or run_init)),
+                 help=("Lot d'initialisation d'abord (patch séparé), puis " if run_init else "")
+                 + ("ajoute des lots à la génération en cours, sans rien effacer." if existing else
+                    "crée les lots des tâches cochées.")):
+        if run_init:
+            run_cucumber_init_lot(ctx, init_lot)
+        if tests_ok:
+            run_cucumber_generation(ctx, ["--complete", "--specifics", ids] if existing else ["--specifics", ids])
+    render_init_patch(client)
     if existing:
         with st.expander("Nouvelle génération (repart de la base)", icon=":material/restart_alt:"):
             st.warning(f"Une génération existe déjà ({len(state['lots'])} lot(s)) : une nouvelle génération repart "
@@ -1693,12 +1780,14 @@ def render_cucumber_selection(ctx: dict, inventory: dict, state: dict, rows: lis
             overwrite = st.checkbox("Je confirme : les lots précédents seront écrasés",
                                     key=f"cucumber_overwrite_{client}")
             if st.button("Nouvelle génération", icon=":material/delete_sweep:",
-                         disabled=not (ready and selected and accepted and overwrite)):
+                         disabled=not (ready and tests_ok and overwrite)):
+                if run_init:
+                    run_cucumber_init_lot(ctx, init_lot)
                 run_cucumber_generation(ctx, ["--specifics", ids])
 
 
-def lot_table(state: dict) -> list:
-    """Lignes du tableau des lots de la dernière génération."""
+def lot_table(state: dict, dependencies: dict = None) -> list:
+    """Lignes du tableau des lots de la dernière génération (dépendance au lot d'initialisation comprise)."""
     lot_rows = []
     for lot in state["lots"]:
         tokens = lot.get("tokens") or {}
@@ -1719,13 +1808,15 @@ def lot_table(state: dict) -> list:
             "Tokens": total_tokens or None,
             "Coût ($)": round(tokens["cout_usd"], 3) if isinstance(tokens.get("cout_usd"), (int, float)) else None,
             "Erreur": lot.get("erreur", "") or ("tri Python, sans appel Claude" if lot.get("tri") else ""),
+            "Initialisation": "" if lot.get("tri") or lot.get("statut") == "termine" else
+            cucumber_detection.lot_dependency(lot["ids"], dependencies or {}),
         })
     return lot_rows
 
 
-def render_cucumber_lots(state: dict, pending: list) -> None:
+def render_cucumber_lots(state: dict, pending: list, dependencies: dict = None) -> None:
     """Tableau des lots de la dernière génération et indicateurs de contrôle."""
-    lot_rows = lot_table(state)
+    lot_rows = lot_table(state, dependencies)
     with st.expander(f"Lots de la dernière génération ({sum(1 for r in lot_rows if r['Statut'] == 'termine')}"
                      f"/{len(lot_rows)} terminés)", expanded=bool(pending)):
         controlled = [c for c in (cucumber_tools.lot_indicators(lot) for lot in state["lots"]) if c]
@@ -1839,7 +1930,7 @@ def render_cucumber_verification(client: str, state: dict) -> None:
                    "dans les lots des prochaines générations.")
 
 
-def render_cucumber_generation(ctx: dict, state: dict) -> None:
+def render_cucumber_generation(ctx: dict, state: dict, dependencies: dict = None) -> None:
     """Étape 4 : lots, contrôles, vérification par exécution, reprise, complément et patch."""
     client, ready = ctx["client"], ctx["ready"]
     if not state.get("lots"):
@@ -1861,8 +1952,9 @@ def render_cucumber_generation(ctx: dict, state: dict) -> None:
         run_cucumber_generation(ctx, ["--resume"] if resume else ["--complete"])
         state = cucumber_tools.load_state(client)
         pending = cucumber_tools.pending_lots(state)
-    render_cucumber_lots(state, pending)
+    render_cucumber_lots(state, pending, dependencies)
     render_cucumber_verification(client, state)
+    render_init_patch(client)
     if os.path.exists(cucumber_tools.patch_path(client)):
         patch_file = cucumber_tools.patch_path(client)
         generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(patch_file)))
@@ -1918,38 +2010,68 @@ def render_cucumber_review(client: str, state: dict) -> None:
 # ---------------------------------------------------------
 with tab_cucumber:
     st.markdown("### Tests Cucumber des spécifiques d'un client")
-    st.caption("L'agent inventorie les spécifiques du dépôt client (écarts avec le Standard), puis écrit les .feature et "
-               "Step Definitions qui les couvrent dans le dépôt <client>-cucumber, au formalisme du Cucumber Standard. "
-               "Le résultat est un patch local : rien n'est poussé.")
+    st.caption("Choisissez le projet : l'agent détecte le reste en arrière-plan (inventaire, profil client, état de "
+               "l'initialisation des données), sans appel à Claude et sans rien modifier dans les dépôts. La "
+               "génération écrit les .feature et Step Definitions dans un patch local : rien n'est poussé.")
     cucumber_ctx = cucumber_header()
     cucumber_client = cucumber_ctx["client"]
+    render_cucumber_detection(cucumber_ctx)
     cucumber_inventory = cucumber_tools.load_inventory(cucumber_client) if cucumber_client else {}
     cucumber_profile_doc = cucumber_profile.load_profile(cucumber_client) if cucumber_client else {}
     cucumber_state = cucumber_tools.load_state(cucumber_client) if cucumber_client else {}
+    cucumber_detected = cucumber_detection.load_detection(cucumber_client) if cucumber_client else {}
+    cucumber_analysis = cucumber_journey.last_analysis(cucumber_client) if cucumber_client else {}
+    cucumber_init_status = cucumber_detection.init_status(
+        cucumber_detected.get("faits") or {}, cucumber_profile.effective_profile(cucumber_profile_doc),
+        cucumber_client, cucumber_analysis,
+        cucumber_import.imports_dir(cucumber_client) if cucumber_client else "")
+    cucumber_dependencies = cucumber_detection.init_dependencies(cucumber_init_status,
+                                                                 cucumber_detected.get("faits") or {})
     cucumber_rows = (cucumber_coverage.coverage_rows(cucumber_client, cucumber_inventory, cucumber_state)
                      if cucumber_inventory.get("specifiques") else [])
     cucumber_selected = current_selection(selection_candidates(cucumber_rows),
                                           selection_key(cucumber_client, cucumber_inventory))
-    cucumber_steps = cucumber_journey.journey(
+    if cucumber_client:
+        if cucumber_detected.get("statut") == "erreur":
+            st.caption(f":red[:material/error: Détection impossible : {cucumber_detected.get('cause')}]"
+                       + (" — dernier résultat réussi affiché." if cucumber_detected.get("faits") else ""))
+        # Ligne d'état du projet, puis actions proposées
+        st.markdown("**" + cucumber_journey.overview_line(
+            cucumber_client, cucumber_detection.state_label(cucumber_init_status), cucumber_rows,
+            cucumber_analysis) + "**")
+    step_key = f"cucumber_step_{cucumber_client}"
+
+    def open_step(key: str) -> None:
+        st.session_state[step_key] = key
+
+    with st.container(horizontal=True):
+        st.button("Générer les tests", type="primary", icon=":material/science:", disabled=not cucumber_ctx["ready"],
+                  on_click=open_step, args=("selection",), key="cucumber_action_generate")
+        st.button("Importer des logs Jenkins", icon=":material/upload_file:", disabled=not cucumber_client,
+                  on_click=open_step, args=("execution",), key="cucumber_action_import")
+    if cucumber_client:
+        render_cucumber_profile(cucumber_ctx, cucumber_profile_doc, cucumber_detected, cucumber_init_status)
+        render_cucumber_health(cucumber_ctx)
+    cucumber_steps = [s for s in cucumber_journey.journey(
         cucumber_client, cucumber_inventory, cucumber_profile_doc, cucumber_state, cucumber_rows,
         len(cucumber_selected), -(-len(cucumber_selected) // max(1, env_int("CUCUMBER_BATCH_SIZE", 3))))
-    with st.container(border=True):
-        st.markdown("  \n".join(f"{n}. " + cucumber_journey.step_line(s) for n, s in enumerate(cucumber_steps, 1)))
+        if s["cle"] != "projet"]
     steps_by_key = {s["cle"]: s for s in cucumber_steps}
+    # Sections détaillées repliées par défaut : aucune étape ouverte tant qu'aucune n'est choisie
     cucumber_step = st.segmented_control(
-        "Étape", list(steps_by_key), required=True, key=f"cucumber_step_{cucumber_client}",
-        default=cucumber_journey.next_step(cucumber_steps), label_visibility="collapsed",
+        "Étape", list(steps_by_key), key=step_key, label_visibility="collapsed",
         format_func=lambda k: f"{cucumber_journey.STATUSES[steps_by_key[k]['etat']][0]} {steps_by_key[k]['titre']}")
-    if steps_by_key[cucumber_step]["action"]:
-        st.info(f"Action suivante : {steps_by_key[cucumber_step]['action']}", icon=":material/arrow_forward:")
-    if cucumber_step == "projet":
-        render_cucumber_project(cucumber_ctx, cucumber_inventory, cucumber_profile_doc, cucumber_state)
-    elif cucumber_step == "couverture":
+    if cucumber_step:
+        st.caption(steps_by_key[cucumber_step]["resume"])
+        if steps_by_key[cucumber_step]["action"]:
+            st.info(f"Action suivante : {steps_by_key[cucumber_step]['action']}", icon=":material/arrow_forward:")
+    if cucumber_step == "couverture":
         render_cucumber_coverage(cucumber_ctx, cucumber_inventory, cucumber_rows)
     elif cucumber_step == "selection":
-        render_cucumber_selection(cucumber_ctx, cucumber_inventory, cucumber_state, cucumber_rows)
+        render_cucumber_selection(cucumber_ctx, cucumber_inventory, cucumber_state, cucumber_rows,
+                                  cucumber_init_status, cucumber_dependencies)
     elif cucumber_step == "generation":
-        render_cucumber_generation(cucumber_ctx, cucumber_state)
+        render_cucumber_generation(cucumber_ctx, cucumber_state, cucumber_dependencies)
     elif cucumber_step == "execution":
         if cucumber_client:
             render_cucumber_run(cucumber_ctx, cucumber_state)
@@ -2491,6 +2613,10 @@ with tab_config:
             "CUCUMBER_CLEAR_NAME", value=os.getenv("CUCUMBER_CLEAR_NAME", ""),
             help="Repli si le profil client n'a pas de clear : seul clear autorisé pour purger l'environnement, "
                  "propre à chaque environnement (aucune valeur par défaut). Le profil client (onglet Cucumber) prime.")
+        env_values["CUCUMBER_DETECTION_INTERVAL"] = st.text_input(
+            "CUCUMBER_DETECTION_INTERVAL", value=os.getenv("CUCUMBER_DETECTION_INTERVAL", ""), placeholder="300",
+            help="Onglet Cucumber : délai en secondes entre deux contrôles des commits des dépôts du projet ; la "
+                 "détection automatique (inventaire, profil, état de l'init) n'est refaite que s'ils ont changé.")
         env_values["CUCUMBER_RUN_JOB"] = st.text_input(
             "CUCUMBER_RUN_JOB", value=os.getenv("CUCUMBER_RUN_JOB", ""), placeholder="DOSSIER/JOB",
             help="Run Jenkins automatique (onglet Cucumber, étape Exécution) : job qui exécute <client>-cucumber, si "
