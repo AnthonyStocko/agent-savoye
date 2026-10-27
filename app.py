@@ -1711,6 +1711,14 @@ def render_todo_banner(ctx: dict, rows: list, links: dict, init_status: dict, de
         items.append(("relier", f"{unlinked} test{'s' if unlinked > 1 else ''} existant{'s' if unlinked > 1 else ''} "
                                 f"ne {'sont' if unlinked > 1 else 'est'} relié{'s' if unlinked > 1 else ''} à aucune "
                                 f"fonctionnalité.", None))
+    numero, analysis = latest_import_analysis(client)
+    # Corrections déjà lancées pour cet import : plus proposées (un nouvel import dira si elles ont suffi)
+    launched = {str(lot.get("import")) for lot in state.get("lots") or [] if lot.get("type") == "correction"}
+    fixable = 0 if str(numero) in launched else sum(len(p["scenarios"]) for p in analysis.get("propositions") or [])
+    if fixable and not analysis.get("non_analyse"):
+        items.append(("corriger", f"{fixable} test{'s' if fixable > 1 else ''} en échec au dernier résultat "
+                                  f"importé {'peuvent' if fixable > 1 else 'peut'} être corrigé{'s' if fixable > 1 else ''}"
+                                  f" automatiquement.", (numero, [p["spec"] for p in analysis["propositions"]])))
     decisions = len(cucumber_decisions.pending(client))
     if decisions:
         items.append(("decider", f"{decisions} décision{'s' if decisions > 1 else ''} attend"
@@ -1739,6 +1747,10 @@ def render_todo_banner(ctx: dict, rows: list, links: dict, init_status: dict, de
                 elif kind == "relier":
                     with st.popover("Les relier"):
                         render_unlinked_tests(ctx, rows, links)
+                elif kind == "corriger":
+                    if st.button("Corriger", type="primary", key=f"cucumber_todo_corriger_{client}",
+                                 disabled=not ctx["ready"]):
+                        run_cucumber_generation(ctx, ["--complete", "--from-import", str(extra[0])], extra[1])
                 elif kind == "decider":
                     # Décisions : dans le mode expert (corrections), ouvert par ce bouton
                     st.button("Décider", key=f"cucumber_todo_decider_{client}", on_click=st.session_state.update,
@@ -1774,9 +1786,11 @@ def render_simple_import(client: str) -> None:
     analysis = cucumber_import.analyse(client, imported["numero"], state, cucumber_tools.worktree_dir(client))
     cucumber_bilan.after_import(client, analysis, state, cucumber_tools.worktree_dir(client))
     failures = sum(len(g["scenarios"]) for g in analysis.get("groupes") or [])
+    fixable = sum(len(p["scenarios"]) for p in analysis.get("propositions") or [])
     st.session_state[f"cucumber_import_message_{client}"] = (
         f"Résultat non exploitable : {analysis['non_analyse']}" if analysis.get("non_analyse") else
-        f"Résultat importé : {analysis.get('tests', 0)} test(s), {failures} en échec.")
+        f"Résultat importé : {analysis.get('tests', 0)} test(s), {failures} en échec"
+        + (f" ; {fixable} peut être corrigé automatiquement (voir « À faire »)." if fixable else "."))
     st.rerun()
 
 
@@ -2249,7 +2263,7 @@ def current_selection(candidates: list, key: str) -> list:
     return selected
 
 
-def run_cucumber_generation(ctx: dict, extra: list) -> int:
+def run_cucumber_generation(ctx: dict, extra: list, requested: list = None) -> int:
     """
     Lance une génération (nouvelle, reprise, complément) avec la progression des lots, sans aucun journal brut.
     Chaque tâche demandée finit avec un résultat enregistré : celui de son lot, sinon « Génération interrompue »
@@ -2257,7 +2271,7 @@ def run_cucumber_generation(ctx: dict, extra: list) -> int:
     """
     client = ctx["client"]
     state = cucumber_tools.load_state(client)
-    requested = (extra[extra.index("--specifics") + 1].split(",") if "--specifics" in extra else
+    requested = requested or (extra[extra.index("--specifics") + 1].split(",") if "--specifics" in extra else
                  [i for lot in cucumber_tools.pending_lots(state) for i in lot["ids"]] if "--resume" in extra else
                  cucumber_tools.completable_specifics(state) if "--complete" in extra else [])
     started = time.strftime("%Y-%m-%dT%H:%M:%S")

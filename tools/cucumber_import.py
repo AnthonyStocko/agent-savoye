@@ -30,9 +30,16 @@ from tools.cucumber_diagnostic import TEMP_PREFIX
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
 from tools.cucumber_tools import _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag, cache_dir
 from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _duration, _step_outputs, _timestamp, expected_count,
-                                   failure_category, feature_texts, log_coverage, log_request, parse_cucumber_report,
-                                   report_rel, report_test_count, scenario_id, selection_gap)
+                                   failure_category, failure_kind, feature_texts, log_coverage, log_request,
+                                   parse_cucumber_report, report_rel, report_test_count, scenario_id, selection_gap)
 
+_JENKINS_STAMP = re.compile(r"^\[\d{4}-\d\d-\d\dT[\d:.]+Z\]\s?")
+_CONSOLE_MARK = re.compile(r"\[INFO\] (Scanning for projects|BUILD|Building )|Launching Cucumber|Tests run:|"
+                           r"^\s*(\[[^\]]+\]\s*)?Scenario:", re.M)
+_PRETTY_SCENARIO = re.compile(r"^\s*(?:Scenario Outline|Scenario|Scénario|Plan du scénario|Example)\s*:\s*(.+?)\s+#\s+"
+                              r"(src/\S+?\.feature):\d+\s*$")
+_SUREFIRE_FAILURE = re.compile(r"\[ERROR\]\s+(.+?)\s+--\s+Time elapsed:.*<<<\s*(?:FAILURE|ERROR)!")
+_STEP_AT = re.compile(r"at ✽\.(.+?)\(file:.*?/(src/test/resources/cucumber/features/.+?\.feature):\d+\)")
 _TESTS_RUN = re.compile(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)")
 # Valeur entre guillemets, sinon jusqu'à un guillemet, une option suivante (« -X ») ou la fin de la ligne
 _FILTER_TAGS = re.compile(r"cucumber\.filter\.tags=(?:\"([^\"]+)\"|'([^']+)'|([^\"'\n]+?)(?=[\"']|\s+-|\s*$))", re.M)
@@ -56,9 +63,58 @@ def file_kind(name: str, text: str) -> str:
             pass
     lines = [line for line in text.splitlines()[:50] if line.strip()]
     stamped = sum(1 for line in lines if _LOG_STAMP.search(line))
-    if name.lower().endswith(".csv") or (lines and stamped >= 0.8 * len(lines) and "[Pipeline]" not in text):
+    if name.lower().endswith(".csv"):
+        return "logs"
+    # Console Jenkins horodatée ligne à ligne : reconnue à ses marques Maven / Cucumber, pas à ses horodatages
+    if _CONSOLE_MARK.search(text):
+        return "console"
+    if lines and stamped >= 0.8 * len(lines) and "[Pipeline]" not in text:
         return "logs"
     return "console"
+
+
+def _unstamped(line: str) -> str:
+    """Ligne de console sans l'horodatage du plugin Jenkins « timestamps »."""
+    return _JENKINS_STAMP.sub("", line, count=1)
+
+
+def console_results(text: str) -> dict:
+    """
+    Résultats lus dans la console Jenkins quand le rapport Cucumber JSON manque : scénarios de la sortie lisible de
+    Cucumber (« Scenario: <titre> # <feature>:<ligne> »), échecs du résumé Maven Surefire (« [ERROR] <feature>.<titre>
+    -- … <<< FAILURE! », exception, « at ✽.<step>(…<feature>:<ligne>) »). {(feature, titre): résultat au format de
+    parse_cucumber_report} ; {} si la console ne montre pas les scénarios.
+    """
+    lines = [_unstamped(line) for line in text.splitlines()]
+    scenarios = {}
+    for line in lines:
+        match = _PRETTY_SCENARIO.match(line)
+        if match:
+            scenarios.setdefault((match.group(2), match.group(1).strip()), {
+                "statut": "passe", "step": "", "phase": "", "message": ""})
+    for index, line in enumerate(lines):
+        failure = _SUREFIRE_FAILURE.search(line)
+        if not failure:
+            continue
+        name = failure.group(1)
+        block = []
+        for following in lines[index + 1:index + 40]:
+            if _SUREFIRE_FAILURE.search(following) or following.startswith("[INFO]"):
+                break
+            block.append(following)
+        error = "\n".join(b for b in block if b.strip())
+        step_match = next((m for m in map(_STEP_AT.search, block) if m), None)
+        path = step_match.group(2) if step_match else ""
+        candidates = [key for key in scenarios if name.endswith("." + key[1]) or name == key[1]]
+        key = next((k for k in candidates if k[0] == path), candidates[0] if candidates else None)
+        if key is None:
+            continue
+        nature, exception = failure_kind(error)
+        message = next((b.strip() for b in block if b.strip() and not b.strip().startswith("at ")), "")
+        scenarios[key] = {"statut": "echoue", "step": step_match.group(1) if step_match else "", "phase": "",
+                          "message": " ".join(message.split())[:300], "nature": nature, "exception": exception,
+                          "heure": "", "erreur": error}
+    return scenarios if any(r["statut"] == "echoue" for r in scenarios.values()) or scenarios else {}
 
 
 def console_facts(text: str) -> dict:
@@ -156,8 +212,11 @@ def build_files(build_url: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _stored(client_name: str, entry: dict) -> list:
+    """Fichiers stockés d'un import, nature recalculée (un import antérieur a pu prendre une console pour des logs)."""
     folder = os.path.join(imports_dir(client_name), str(entry["numero"]))
-    return [{**f, "texte": _read_text_file(os.path.join(folder, f["stocke"]))} for f in entry["fichiers"]]
+    files = [{**f, "texte": _read_text_file(os.path.join(folder, f["stocke"]))} for f in entry["fichiers"]]
+    return [{**f, "type": file_kind(f["nom"], f["texte"]) if f["type"] in ("logs", "console") else f["type"]}
+            for f in files]
 
 
 def merge_reports(reports: list) -> list:
@@ -360,6 +419,15 @@ def init_markers(client_name: str) -> tuple:
     return set(profile["init_features"]), set(re.findall(r"@[\w-]+", profile["init_tags"] or ""))
 
 
+def console_init_failure(results: dict, features=(), tags=()) -> dict:
+    """Init en échec d'après la console (sans rapport JSON) : premier scénario d'une feature d'init du profil."""
+    for identifier, result in results.items():
+        if identifier.split("::", 1)[0] in features and result.get("statut") not in (None, "passe"):
+            return {"id": identifier, "step": result.get("step", ""), "message": result.get("message", ""),
+                    "nature": result.get("nature", "") or result.get("statut", "")}
+    return {}
+
+
 def init_failure(report: list, results: dict, features=(), tags=()) -> dict:
     """
     Premier scénario d'initialisation en échec (feature d'init du profil, tag d'init du profil ou @INIT_*) :
@@ -519,22 +587,28 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
            "tests": report_test_count(report), "groupes": [], "logs": [], "comparaison": {}, "propositions": [],
            "resultats": {}, "init_en_echec": {}, "durees": {}, "avertissements": [], "diagnostics": {},
            "a_prouver": []}
+    from_console = console_results(console) if console and not report else {}
     if facts.get("patch_non_applicable"):
         out["non_analyse"] = "patch non applicable : le run n'a pas exécuté les tests de cette version"
-    elif not report:
-        out["non_analyse"] = "aucun rapport Cucumber JSON dans l'import"
-    else:
+    elif not report and not from_console:
+        out["non_analyse"] = ("ni rapport Cucumber JSON, ni détail des scénarios dans la console : importez le "
+                              "rapport JSON du build, ou l'adresse du build Jenkins")
+    elif report:
         out["non_analyse"] = _count_gap(report, facts, worktree, state)
     if not out["non_analyse"]:
+        parsed = parse_cucumber_report(report) if report else from_console
         results = {scenario_id(_rel(rel), title): {k: v for k, v in r.items() if k not in ("journal", "sorties")}
-                   for (rel, title), r in parse_cucumber_report(report).items()}
+                   for (rel, title), r in parsed.items()}
+        if not report:
+            out["tests"], out["source"] = len(results), "console"
         failures = {i: r for i, r in results.items() if r["statut"] != "passe"}
         out["resultats"] = results
         out["groupes"] = group_failures(failures)
         durations = scenario_durations(report, console)
         out["durees"] = {**slow_scenarios(durations, results),
                          "par_scenario": {i: round(d, 1) for i, d in durations.items()}}
-        out["init_en_echec"] = init_failure(report, results, *init_markers(client_name))
+        out["init_en_echec"] = init_failure(report, results, *init_markers(client_name)) if report else \
+            console_init_failure(results, *init_markers(client_name))
         out["avertissements"] = log_warnings([(f["nom"], f["texte"]) for f in files if f["type"] == "logs"],
                                              failures)
         for identifier, result in list(failures.items())[:30]:
