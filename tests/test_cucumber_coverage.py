@@ -125,19 +125,19 @@ def test_coverage_states_rates_and_order(client):
     assert rows["sp-a"]["etat"] == "vert" and rows["sp-a"]["derniere"].startswith("import n° 2")   # dernier import
     assert rows["sp-b"]["etat"] == "echec" and rows["sp-b"]["cause"] == "attendu 3"
     assert rows["sp-c"]["etat"] == "desactive" and rows["sp-c"]["cause"] == "donnée de référence absente"
-    assert rows["sp-d"]["etat"] == "non_testable" and "aucun step" in rows["sp-d"]["cause"]
+    # Raison libre sans blocage prouvé : testable, informations à confirmer (jamais « non testable »)
+    assert rows["sp-d"]["etat"] == "a_confirmer" and "aucun step" in rows["sp-d"]["cause"]
     assert rows["sp-e"]["etat"] == "partiel" and rows["sp-f"]["etat"] == "partiel"   # rapprochement / faibles
     assert rows["sp-g"]["etat"] == "vert" and "indirectement" in rows["sp-g"]["cause"]
     assert rows["sp-h"]["etat"] == "non_execute"
-    assert rows["sp-d"]["testabilite"] == "non" and rows["sp-a"]["criteres"]["donnees"][0] == "oui"
+    assert rows["sp-d"]["testabilite"] == "à confirmer" and rows["sp-a"]["criteres"]["donnees"][0] == "oui"
     rates = cov.rates(list(rows.values()))
     assert (rates["reelle"], rates["ecrite"], rates["partielles"]) == (25, 62, 2)   # 2/8 verts, 5/8 écrites
     assert "réelle 25 %, écrite 62 %" in cov.summary_line(list(rows.values()))
     ordered = cov.coverage_rows(client, inventory, state)
     assert ordered[0]["risque"] == "élevé" and ordered[-1]["risque"] == "faible"
     assert cov.partial_ids(ordered) == {"sp-e", "sp-f"}
-    assert cov.selection_warnings(ordered, ["sp-d", "sp-e"]) == [
-        "depot-fictif · sp-d : non testable aujourd'hui (aucun step pour cet écran)"]
+    assert cov.selection_warnings(ordered, ["sp-d", "sp-e"]) == []
     assert cov.failing_test_causes(ordered) == 1
 
 

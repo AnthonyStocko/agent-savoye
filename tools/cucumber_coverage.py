@@ -10,10 +10,12 @@ Une ligne par spécifique de l'inventaire (tickets Jira en colonne), croisée av
 
 ÉTATS (STATES) : couvert vert, couvert en échec, couvert désactivé (cause), couvert jamais exécuté, partiel
 (vérifie seulement une configuration ou la présence d'une donnée : rapprochement partiel ou scénarios « faibles »),
-non couvert, non testable aujourd'hui (raison). Un spécifique couvert indirectement prend l'état de celui qui le
-couvre.
-TESTABILITÉ : code spécifique déployé, personnalisation Studio déployée, données recréables, steps disponibles ;
-« inconnu » par défaut, « non » sur preuve d'exécution, « oui » si un scénario lié est vert. Le risque métier est
+non couvert, testable avec informations à confirmer (questions), non testable aujourd'hui (blocage prouvé et sa
+preuve), sans objet (aucun comportement propre, avec sa preuve). Un spécifique couvert indirectement prend l'état de
+celui qui le couvre. Le résultat « non_couvert » d'un lot est jugé par cucumber_testability.assess (6 sources).
+TESTABILITÉ (testable, à confirmer, non testable) : code spécifique déployé, personnalisation Studio déployée,
+données recréables, steps disponibles ; « inconnu » par défaut, « non » sur preuve d'exécution ou blocage prouvé,
+« oui » si un scénario lié est vert. Le risque métier est
 proposé (nature et type du spécifique), le risque et la testabilité sont modifiables (surcharges enregistrées dans
 .tmp/cucumber/<client>/couverture.json).
 """
@@ -21,7 +23,7 @@ import os
 import re
 from datetime import datetime
 
-from tools import cucumber_audit, cucumber_import, cucumber_studio
+from tools import cucumber_audit, cucumber_import, cucumber_profile, cucumber_studio, cucumber_testability
 from tools.cucumber_tools import (_read_json, _write_json, a_revoir_tag, cache_dir, latest_results, load_state,
                                   worktree_dir)
 from tools.cucumber_verify import NOT_TEST_STATUSES, all_verified, failure_category, scenario_id
@@ -36,15 +38,19 @@ STATES = {
     "non_execute": ("couvert, jamais exécuté", "🔵", "blue"),
     "partiel": ("partiel", "🟣", "violet"),
     "non_couvert": ("non couvert", "⚪", "gray"),
+    "a_confirmer": ("testable, informations à confirmer", "🟡", "orange"),
     "non_testable": ("non testable aujourd'hui", "⚫", "gray"),
+    "sans_objet": ("sans objet", "▫️", "gray"),
 }
 WRITTEN_STATES = ("vert", "echec", "desactive", "non_execute")
-SELECTABLE_STATES = ("non_couvert", "partiel", "non_testable")
+SELECTABLE_STATES = ("non_couvert", "partiel", "a_confirmer", "non_testable", "sans_objet")
+# Tâches cochées par défaut à la sélection : générées
+DEFAULT_SELECTED = ("non_couvert", "partiel", "a_confirmer")
 RISKS = ("élevé", "moyen", "faible")
 CRITERIA = {"code": "code spécifique déployé", "studio": "personnalisation Studio déployée",
             "donnees": "données recréables par l'init", "steps": "steps disponibles dans la bibliothèque"}
 ANSWERS = ("oui", "non", "inconnu")
-TESTABILITY = ("oui", "à vérifier", "non")
+TESTABILITY = ("testable", "à confirmer", "non testable")
 # Statuts de vérification des lots : vert, en échec, jamais exécuté
 _GREEN = ("pertinent", "faible")
 _NOT_RUN = ("non_verifie",)
@@ -229,11 +235,14 @@ def linked_scenarios(spec: dict, result: dict, sources: dict) -> list:
     return [scenario_status(i, sources) for i in ids]
 
 
-def testability(spec: dict, result: dict, scenarios: list, override: dict = None) -> dict:
+def testability(spec: dict, result: dict, scenarios: list, override: dict = None, index: dict = None,
+                profile: dict = None) -> dict:
     """
-    {critère: (réponse, raison)} pour les critères applicables, puis la synthèse « testabilite » (oui, à vérifier,
-    non) et « raisons ». Les réponses saisies (override) l'emportent.
+    {critère: (réponse, raison)} pour les critères applicables, la synthèse « testabilite » (testable, à confirmer,
+    non testable), « raisons » et « evaluation » (cucumber_testability.assess du résultat du lot). Un « non » ne
+    vient que d'une preuve (exécution, blocage prouvé) ou d'une saisie ; les réponses saisies (override) l'emportent.
     """
+    evaluation = cucumber_testability.assess(result, index or {}, profile or {})
     green = any(s["etat"] == "vert" for s in scenarios)
     natures = {s["nature"] for s in scenarios}
     has_studio = bool(studio_files(spec))
@@ -243,19 +252,28 @@ def testability(spec: dict, result: dict, scenarios: list, override: dict = None
         if applies:
             criteria[key] = (("non", "échec « déploiement » d'un scénario lié") if "deploiement" in natures else
                              ("oui", "scénario lié vert") if green else ("inconnu", ""))
-    criteria["donnees"] = (("non", "donnée de référence absente à l'exécution") if "donnee_reference" in natures
-                           else ("oui", "scénario lié vert") if green else ("inconnu", ""))
-    reason = result.get("raison", "") if result.get("statut") == "non_couvert" else ""
-    criteria["steps"] = (("non", reason) if reason else ("oui", "scénario lié vert") if green else
+    criteria["donnees"] = (("inconnu", "donnée de référence absente à l'exécution : à créer dans le Background")
+                           if "donnee_reference" in natures else ("oui", "scénario lié vert") if green else
+                           ("inconnu", ""))
+    blocked = evaluation["etat"] == "non_testable"
+    if blocked and evaluation["blocage"] == "non_deploye":
+        for key in ("code", "studio"):
+            if key in criteria:
+                criteria[key] = ("non", evaluation["preuve"])
+    if blocked and evaluation["blocage"] == "donnee_impossible":
+        criteria["donnees"] = ("non", evaluation["preuve"])
+    criteria["steps"] = (("non", evaluation["preuve"]) if blocked and evaluation["blocage"] == "step_impossible" else
+                         ("oui", "scénario lié vert") if green else
                          ("oui", "steps Standard candidats") if spec.get("steps_candidats") or spec.get("tests_std")
                          else ("inconnu", ""))
     for key, answer in ((override or {}).get("testabilite") or {}).items():
         if key in criteria and answer in ANSWERS:
             criteria[key] = (answer, "saisi")
     answers = [a for a, _ in criteria.values()]
-    summary = "non" if "non" in answers else "oui" if all(a == "oui" for a in answers) else "à vérifier"
+    summary = ("non testable" if "non" in answers or blocked else
+               "à confirmer" if evaluation["etat"] == "a_confirmer" or "donnee_reference" in natures else "testable")
     reasons = [f"{CRITERIA[k]} : {a}" + (f" ({r})" if r else "") for k, (a, r) in criteria.items() if a != "oui"]
-    return {"criteres": criteria, "testabilite": summary, "raisons": reasons}
+    return {"criteres": criteria, "testabilite": summary, "raisons": reasons, "evaluation": evaluation}
 
 
 def spec_state(spec: dict, result: dict, scenarios: list, testable: dict) -> tuple:
@@ -275,10 +293,16 @@ def spec_state(spec: dict, result: dict, scenarios: list, testable: dict) -> tup
             motifs = [m for s in active for m in s.get("audit_motifs") or []]
             return "partiel", "audit : " + (motifs[0] if motifs else "scénarios partiels")
         return ("vert", "") if green else ("non_execute", "")
-    if result.get("statut") == "non_couvert" and result.get("raison"):
-        return "non_testable", result["raison"]
-    if testable["testabilite"] == "non":
-        return "non_testable", " ; ".join(testable["raisons"])
+    evaluation = testable.get("evaluation") or {}
+    if result.get("statut") == "non_couvert":
+        if evaluation.get("etat") == "non_testable":
+            return "non_testable", cucumber_testability.blocker_line(evaluation)
+        if evaluation.get("etat") == "sans_objet":
+            return "sans_objet", evaluation["preuve"]
+        if evaluation.get("etat") == "a_confirmer":
+            return "a_confirmer", evaluation["resume"]
+    if testable["testabilite"] == "non testable":
+        return "non_testable", " ; ".join(r for r in testable["raisons"] if ": non" in r)
     if spec.get("couverture") == "partiel":
         return "partiel", "features existantes rapprochées en partie seulement"
     if spec.get("couverture") == "deja_couvert":
@@ -308,11 +332,13 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
     state = load_state(client_name) if state is None else state
     sources = coverage_sources(client_name, state) if sources is None else sources
     overrides, results = load_overrides(client_name), latest_results(state)
+    index = cucumber_testability.load_index(client_name) if client_name else {}
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name)) if client_name else {}
     rows = {}
     for spec in inventory.get("specifiques") or []:
         result, override = results.get(spec["id"], {}), overrides.get(spec["id"], {})
         scenarios = linked_scenarios(spec, result, sources)
-        testable = testability(spec, result, scenarios, override)
+        testable = testability(spec, result, scenarios, override, index, profile)
         state_key, cause = spec_state(spec, result, scenarios, testable)
         rows[spec["id"]] = {
             "id": spec["id"], "tache": spec["libelle"], "module": module_of(spec), "point_entree": entry_point(spec),
@@ -320,6 +346,7 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
             "risque_propose": proposed_risk(spec), "features": sorted({s["id"].split("::", 1)[0] for s in scenarios}),
             "etat": state_key, "cause": cause, "testabilite": testable["testabilite"],
             "criteres": testable["criteres"], "raisons": testable["raisons"], "derniere": last_execution(scenarios),
+            "evaluation": testable["evaluation"],
             "scenarios": scenarios, "effort": effort(spec), "constats": result.get("constats") or [],
             "studio": cucumber_studio.spec_behaviours(spec), "studio_total": cucumber_studio.behaviour_counts(spec),
             "studio_a_calculer": studio_pending(spec),
@@ -367,9 +394,9 @@ def partial_ids(rows: list) -> set:
 
 
 def selection_warnings(rows: list, selected: list) -> list:
-    """Avertissements d'une sélection : tâches non testables aujourd'hui, avec leur raison."""
+    """Avertissements d'une sélection : tâches non testables aujourd'hui, avec le blocage prouvé et sa preuve."""
     by_id = {r["id"]: r for r in rows}
-    return [f"{by_id[i]['tache']} : non testable aujourd'hui ({by_id[i]['cause'] or 'raison inconnue'})"
+    return [f"{by_id[i]['tache']} : non testable aujourd'hui — {by_id[i]['cause'] or 'blocage non précisé'}"
             for i in selected if i in by_id and by_id[i]["etat"] == "non_testable"]
 
 

@@ -28,10 +28,10 @@ REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
 FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
           "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-          "environment_checks")
+          "environment_checks", "reponses")
 # Champs dont l'absence est normale : vides sans avertissement
 OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-                   "environment_checks")
+                   "environment_checks", "reponses")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
@@ -48,7 +48,8 @@ LABELS = {"features_root": "racine des features", "tag_client": "tag client", "i
           "verify_branch_param": "paramètre du job de vérification qui porte la branche",
           "run_job": "job Jenkins qui exécute le dépôt client (lancement automatique d'un run)",
           "environment_checks": "dépendances d'environnement contrôlées par l'init (champs personnalisés, "
-                                "documents, énumérations, paramétrages)"}
+                                "documents, énumérations, paramétrages)",
+          "reponses": "réponses de l'utilisateur aux questions des tâches à confirmer"}
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _GLOBAL_INIT = "Initialisation globale par fichiers"
@@ -69,7 +70,7 @@ def empty_profile() -> dict:
                        for k in RUNNER_KEYS},
             "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
             "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
-            "verify_branch_param": "", "run_job": "", "environment_checks": []}
+            "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": []}
 
 
 def is_empty(value) -> bool:
@@ -255,13 +256,15 @@ def init_view(profile: dict) -> dict:
             "codes": {k: v for k, v in (profile.get("reference_codes") or {}).items() if v}}
 
 
-def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_CODES, gap_file: str = "") -> str:
+def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_CODES, gap_file: str = "",
+                  known: dict = None) -> str:
     """
     Bloc « PROFIL CLIENT » de la partie variable du prompt de lot : seuls emplacement, tag et données autorisés,
     interdiction d'écrire purge, clear ou init et de modifier les fichiers de l'init globale, steps du projet
     marqués TODO-VERSION quand la bibliothèque du client est plus ancienne que le serveur (`gap_file` : écarts du
-    catalogue, cucumber_versions.library_gap_file), données des initializers serveur. Tout vient du profil ; un champ
-    vide est signalé comme tel.
+    catalogue, cucumber_versions.library_gap_file), données des initializers serveur (`known` : index des valeurs
+    connues, cucumber_testability ; une donnée retrouvée dans l'init ou le dépôt client est utilisable). Tout vient
+    du profil ; un champ vide est signalé comme tel.
     """
     root = profile.get("features_root") or "(non renseignée : signale-le dans « raison »)"
     tag = profile.get("tag_client") or "(non renseigné : n'ajoute aucun tag client)"
@@ -275,7 +278,9 @@ def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_
         *filter(None, [version_block(profile.get("library_version", ""), profile.get("server_version", ""),
                                      gap_file),
                        initializers_block(profile.get("server_initialized_data") or [],
-                                          profile.get("initializers_survive_clear", ""))]),
+                                          profile.get("initializers_survive_clear", ""),
+                                          present_codes={v for v, places in (known or {}).items()
+                                                         if any(p["source"] in ("init", "depot") for p in places)})]),
         "- N'utilise QUE des steps existants (catalogue du Standard, steps du client) ou définis par ce lot, avec la "
         "syntaxe de colonnes du Standard actuel ; préfère un Background à un scénario « Contexte » séparé."])
 
@@ -300,10 +305,10 @@ def version_block(library: str, server: str, gap_file: str = "") -> str:
               f"la bibliothèque partagée ; n'invente aucun autre contournement.")
 
 
-def initializers_block(data: list, survive_clear: str, max_codes: int = 20) -> str:
+def initializers_block(data: list, survive_clear: str, max_codes: int = 20, present_codes: set = frozenset()) -> str:
     """
-    Ligne du bloc profil : codes créés par les initializers serveur, utilisables (présents après un clear) ou à
-    créer dans le Background. '' sans donnée codée.
+    Ligne du bloc profil : codes créés par les initializers serveur, utilisables (présents après un clear, ou
+    retrouvés dans l'init ou le dépôt client : `present_codes`) ou à créer dans le Background. '' sans donnée codée.
     """
     coded = [d for d in data if d.get("code")]
     if not coded:
@@ -312,11 +317,11 @@ def initializers_block(data: list, survive_clear: str, max_codes: int = 20) -> s
     def codes(items):
         shown = [f"{d['code']} ({d.get('entite') or '?'}, {d.get('classe') or '?'})" for d in items[:max_codes]]
         return ", ".join(shown) + (f", … (+{len(items) - max_codes})" if len(items) > max_codes else "")
-    present = [d for d in coded if cucumber_initializers.usable(d, survive_clear)]
+    present = [d for d in coded if cucumber_initializers.usable(d, survive_clear) or d["code"] in present_codes]
     missing = [d for d in coded if d not in present]
     parts = [f"- Données créées au démarrage par les initializers serveur ({len(coded)}, hors features d'init)"]
     if present:
-        parts.append(f"présentes après le clear, utilisables : {codes(present)}")
+        parts.append(f"présentes après le clear (ou recréées par l'init du projet), utilisables : {codes(present)}")
     if missing:
         parts.append(("effacées par le clear" if survive_clear == "faux" else "présence après le clear incertaine")
                      + f" : {codes(missing)} — ne t'y fie pas, crée la donnée dans le Background ou signale un "

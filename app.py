@@ -13,7 +13,7 @@ from dotenv import dotenv_values, load_dotenv, set_key
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_import,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
-                   cucumber_studio, cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
+                   cucumber_studio, cucumber_testability, cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -1395,7 +1395,7 @@ def render_cucumber_profile(ctx: dict, profile_doc: dict, detection: dict, statu
         if not st.session_state.get(editing_key):
             return
         depot = profile_doc.get("depot") or {}
-        editable = [k for k in cucumber_profile.FIELDS if k not in depot and k != "workarounds"]
+        editable = [k for k in cucumber_profile.FIELDS if k not in depot and k not in ("workarounds", "reponses")]
         extra = st.multiselect("Autres champs faux à corriger", [k for k in editable if k not in indicator["manquants"]],
                                format_func=cucumber_profile.LABELS.get, key=f"cucumber_profile_extra_{client}")
         fields = [k for k in editable if k in indicator["manquants"] or k in extra]
@@ -1412,7 +1412,7 @@ def render_cucumber_profile(ctx: dict, profile_doc: dict, detection: dict, statu
                         st.error("Runner : JSON invalide, profil non enregistré.")
                         return
                 # Saisie complète : champs non affichés repris du profil appliqué (la détection est filtrée)
-                current = {k: profile[k] for k in editable}
+                current = {k: profile[k] for k in editable + ["reponses"]}
                 cucumber_profile.save_user_fields(client, {**current, **values})
                 cucumber_detection.start(client, ctx["cmd"], force=True)
                 st.session_state[editing_key] = False
@@ -1484,12 +1484,58 @@ def coverage_table(rows: list) -> list:
              "Tickets": ", ".join(r["tickets"])} for r in rows]
 
 
-def render_coverage_detail(client: str, row: dict) -> None:
+def render_testability(ctx: dict, row: dict) -> None:
+    """
+    Testabilité d'une tâche non couverte : raison métier courte, détail technique replié (recherches, valeurs
+    trouvées, rejet du contrôle), questions à confirmer avec un champ de réponse ; les réponses sont enregistrées
+    dans le profil client et les connaissances partagées, puis la tâche est régénérée.
+    """
+    client, evaluation = ctx["client"], row.get("evaluation") or {}
+    if row["etat"] not in ("a_confirmer", "non_testable", "sans_objet") and not evaluation.get("trouvees"):
+        return
+    if evaluation.get("resume"):
+        st.markdown(evaluation["resume"])
+    with st.expander("Détails", icon=":material/manage_search:"):
+        if evaluation.get("raison"):
+            st.caption(f"Raison de l'agent : {evaluation['raison']}")
+        for search in evaluation.get("recherches") or []:
+            st.caption(f"- {dict(cucumber_testability.SOURCES).get(search.get('source'), search.get('source'))} : "
+                       f"« {search.get('cherche', '')} » → {search.get('trouve') or 'rien'}")
+        for value, places in (evaluation.get("trouvees") or {}).items():
+            st.caption(f"- {value} trouvé : " + " ; ".join(
+                f"{dict(cucumber_testability.SOURCES)[p['source']]} ({p['ou']})" for p in places))
+        for rejection in evaluation.get("rejets") or []:
+            st.caption(f":orange[Contrôle : {rejection}]")
+    questions = evaluation.get("questions") or []
+    if row["etat"] != "a_confirmer" or not questions:
+        return
+    with st.form(f"cucumber_questions_{client}_{row['id']}"):
+        st.markdown("**Informations à confirmer**")
+        replies = {q: st.text_input(q, key=f"cucumber_answer_{client}_{row['id']}_{n}") for n, q in
+                   enumerate(questions)}
+        if st.form_submit_button("Enregistrer et régénérer la tâche", icon=":material/refresh:",
+                                 disabled=not ctx["ready"]):
+            answered = {q: a.strip() for q, a in replies.items() if a.strip()}
+            for question, answer in answered.items():
+                cucumber_testability.save_answer(client, question, answer, row["id"])
+            if answered and knowledge_tools.enabled():
+                shared = knowledge_tools.publish_knowledge(
+                    "\n".join(f"- {q} → {a}" for q, a in answered.items()), client.upper(), "cucumber-reponses",
+                    f"Réponses de l'utilisateur ({row['tache']})", client=client, tags=["cucumber"])
+                st.caption(knowledge_tools.publish_line(shared))
+            if answered:
+                existing = bool(cucumber_tools.load_state(client).get("lots"))
+                run_cucumber_generation(ctx, (["--complete"] if existing else []) + ["--specifics", row["id"]])
+
+
+def render_coverage_detail(ctx: dict, row: dict) -> None:
     """Détail d'une tâche : scénarios et dernier résultat, causes, défauts, comportements Studio, testabilité."""
+    client = ctx["client"]
     with st.container(border=True):
         st.markdown(f"**{row['tache']}** :gray[({row['id']})] — {cucumber_coverage.state_label(row)}")
-        if row["cause"]:
+        if row["cause"] and row["etat"] not in ("a_confirmer",):
             st.caption(f"Cause : {row['cause']}")
+        render_testability(ctx, row)
         if row["scenarios"]:
             st.dataframe([{"Scénario": s["id"].split("::", 1)[-1], "Feature": s["id"].split("::", 1)[0],
                            "État": cucumber_coverage.STATES[s["etat"]][1] + " " + cucumber_coverage.STATES[s["etat"]][0]
@@ -1566,10 +1612,17 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
         st.metric("Partielles", rates["partielles"], border=True,
                   help="Les tests ne vérifient qu'une configuration ou la présence d'une donnée")
         st.metric("Non couvertes", rates["par_etat"]["non_couvert"], border=True)
-        st.metric("Non testables aujourd'hui", rates["par_etat"]["non_testable"], border=True)
+        st.metric("À confirmer", rates["par_etat"]["a_confirmer"], border=True,
+                  help="Testables : il manque une donnée, une clé, une valeur ou un step à confirmer (générées)")
+        st.metric("Non testables aujourd'hui", rates["par_etat"]["non_testable"], border=True,
+                  help="Blocage prouvé hors du test (non déployé, défaut produit, donnée impossible, step impossible)")
     st.caption(f"{rates['total']} tâche(s) de l'inventaire du {inventory['genere_le'].replace('T', ' ')[:16]} · "
                + cucumber_coverage.legend())
     client = ctx["client"]
+    retro = cucumber_tools._read_json(cucumber_testability.retro_path(client), {}) if client else {}
+    if retro.get("taches"):
+        st.caption(f":material/published_with_changes: Rétro-analyse de la testabilité du "
+                   f"{retro['date'].replace('T', ' ')[:16]} : {cucumber_testability.retro_line(retro)}.")
     render_cucumber_audit(client, inventory, rows)
     with st.container(horizontal=True):
         states = st.multiselect("État", list(cucumber_coverage.STATES),
@@ -1587,7 +1640,7 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
                              key=f"cucumber_coverage_{client}_{len(shown)}")
     picked = selection.selection.rows
     if picked:
-        render_coverage_detail(client, shown[picked[0]])
+        render_coverage_detail(ctx, shown[picked[0]])
     else:
         st.caption(f"{len(shown)} tâche(s) affichée(s) · sélectionnez une ligne pour son détail (scénarios, causes, "
                    "défauts, comportements Studio, testabilité, documents partagés).")
@@ -1647,7 +1700,7 @@ def current_selection(candidates: list, key: str) -> list:
     edits = (st.session_state.get(key) or {}).get("edited_rows") or {}
     selected = []
     for index, row in enumerate(candidates):
-        checked = row["etat"] in ("non_couvert", "partiel")
+        checked = row["etat"] in cucumber_coverage.DEFAULT_SELECTED
         checked = (edits.get(index) or edits.get(str(index)) or {}).get("Couvrir", checked)
         if checked:
             selected.append(row["id"])
@@ -1724,12 +1777,14 @@ def render_cucumber_selection(ctx: dict, inventory: dict, state: dict, rows: lis
     if not candidates:
         st.info("Aucune tâche non couverte, partielle ou non testable.", icon=":material/task_alt:")
     else:
-        st.caption("Ordre proposé : risque métier, puis testabilité, puis effort. Les tâches « non testables "
-                   "aujourd'hui » ne sont pas cochées : sélectionnez-les en connaissance de cause. Pour une tâche "
+        st.caption("Ordre proposé : risque métier, puis testabilité, puis effort. Les tâches « à confirmer » sont "
+                   "cochées (générées, questions listées dans leur détail) ; les tâches « non testables aujourd'hui » "
+                   "(blocage prouvé) et « sans objet » ne le sont pas : sélectionnez-les en connaissance de cause. "
+                   "Pour une tâche "
                    "partielle, le lot teste l'EFFET (document généré, message envoyé, statut, champ enregistré), pas "
                    "la configuration.")
         key = selection_key(client, inventory)
-        table = [{"Couvrir": r["etat"] in ("non_couvert", "partiel"), "État": cucumber_coverage.state_label(r),
+        table = [{"Couvrir": r["etat"] in cucumber_coverage.DEFAULT_SELECTED, "État": cucumber_coverage.state_label(r),
                   "Tâche": r["tache"], "Module": r["module"], "Risque": r["risque"], "Testabilité": r["testabilite"],
                   "Effort": r["effort"], "Tickets": ", ".join(r["tickets"])} for r in candidates]
         st.data_editor(table, key=key, hide_index=True, width="stretch", height=360,
@@ -1743,8 +1798,8 @@ def render_cucumber_selection(ctx: dict, inventory: dict, state: dict, rows: lis
         selected = current_selection(candidates, key)
         warnings = cucumber_coverage.selection_warnings(rows, selected)
         if warnings:
-            st.warning(f"**{len(warnings)} tâche(s) non testable(s) aujourd'hui sélectionnée(s)** : leurs tests "
-                       "risquent d'échouer ou de rester partiels.\n\n" + "\n".join(f"- {w}" for w in warnings[:10]),
+            st.warning(f"**{len(warnings)} tâche(s) non testable(s) aujourd'hui sélectionnée(s)** : un blocage "
+                       "prouvé, hors du test, empêche aujourd'hui leur test.\n\n" + "\n".join(f"- {w}" for w in warnings[:10]),
                        icon=":material/warning:")
             accepted = st.checkbox("Je génère aussi ces tâches", key=f"cucumber_untestable_{client}")
     batch_size = max(1, env_int("CUCUMBER_BATCH_SIZE", 3))

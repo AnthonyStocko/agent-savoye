@@ -59,12 +59,14 @@ def coverage_step(rows: list, client_name: str = "") -> dict:
         return _step("couverture", "vide", "aucune tâche inventoriée",
                      "Attendre la fin de l'analyse du projet")
     count = cucumber_coverage.rates(rows)["par_etat"]
-    to_cover = count["non_couvert"] + count["partiel"]
+    to_cover = count["non_couvert"] + count["partiel"] + count["a_confirmer"]
     audited = cucumber_audit.summary_line(cucumber_audit.load_audit(client_name)) if client_name else ""
     summary = cucumber_coverage.summary_line(rows) + "".join(
         f", {count[key]} {label}" for key, label in (("echec", "en échec"), ("desactive", "désactivée(s)"),
                                                      ("non_execute", "jamais exécutée(s)"),
-                                                     ("non_testable", "non testable(s) aujourd'hui")) if count[key])
+                                                     ("a_confirmer", "à confirmer"),
+                                                     ("non_testable", "non testable(s) aujourd'hui"),
+                                                     ("sans_objet", "sans objet")) if count[key])
     summary += f" · {audited}" if audited else ""
     if to_cover:
         return _step("couverture", "a_faire", summary, f"Choisir parmi les {to_cover} tâche(s) non couvertes ou "

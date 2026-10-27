@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1779,6 +1779,9 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
             errors += cucumber_rules.check_code_lengths(worktree, sorted(new), context["longueurs"])
         errors += cucumber_verify.check_scenario_dependencies(worktree, sorted(
             f for f in new if os.path.exists(os.path.join(worktree, *f.split("/")))))
+        # Règle du témoin positif : un scénario négatif sans scénario où l'action a lieu est une erreur de lot
+        errors += cucumber_verify.check_positive_witness(worktree, sorted(
+            f for f in new if os.path.exists(os.path.join(worktree, *f.split("/")))))
         errors += cucumber_verify.check_table_columns(worktree, base, [f for f in files if f.endswith(".feature")
                                                      and os.path.exists(os.path.join(worktree, *f.split("/")))],
                                                      context.get("reference"))
@@ -1881,6 +1884,24 @@ def detect_cucumber_profile(client: str, cucumber_repo_dir: str, base: str, loca
     print_profile(profile)
     print(f"[CUCUMBER PROFIL] Profil : {cucumber_profile.profile_path(client)}")
     return profile
+
+
+def std_features_dir(local_cucumber_std_repo: str) -> str:
+    return os.path.join(local_cucumber_std_repo, *cucumber_init.RESOURCES_DIR.split("/"), "features") \
+        if local_cucumber_std_repo else ""
+
+
+def write_known_values(client: str, profile: dict, inventory: dict, worktree: str, local_cucumber_std_repo: str) -> str:
+    """valeurs_connues.md des lots (index des 6 sources recalculé sur le worktree), chemin renvoyé."""
+    index = cucumber_testability.known_values(client, profile, inventory, worktree,
+                                              std_features_dir(local_cucumber_std_repo),
+                                              cucumber_testability.document_paths(client))
+    cucumber_testability.save_index(client, index)
+    path = os.path.join(cucumber_tools.cache_dir(client), "valeurs_connues.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(cucumber_testability.index_markdown(index))
+    print(f"[CUCUMBER] Valeurs connues (6 sources) : {len(index)} valeur(s) — {path}")
+    return path
 
 
 def detect_init_facts(client: str, cucumber_repo_dir: str, base: str, local_cucumber_std_repo: str,
@@ -2441,6 +2462,15 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             return 1
         cucumber_detection.save_result(client, commits, facts)
         print_init_status(client, facts)
+        # Valeurs connues des 6 sources, puis rétro-analyse de la testabilité des tâches « non couvertes »
+        profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+        index = cucumber_testability.known_values(
+            client, profile, cucumber_tools.load_inventory(client), cucumber_profile.base_worktree_dir(client),
+            std_features_dir(local_cucumber_std_repo), cucumber_testability.document_paths(client))
+        cucumber_testability.save_index(client, index)
+        if cucumber_tools.load_state(client).get("lots"):
+            retro = cucumber_testability.retro(client, index=index, profile=profile)
+            print(f"[CUCUMBER TESTABILITÉ] {cucumber_testability.retro_line(retro)}")
         return 0
     if args.inventory_only:
         detect_cucumber_profile(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version)
@@ -2597,6 +2627,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "tag_a_revoir": cucumber_a_revoir.a_revoir_tag(),
         # Seul clear autorisé pour purger l'environnement (profil client)
         "clear_name": cucumber_init.clear_name(profile) or "(non renseigné dans le profil client)",
+        # Valeurs connues des 6 sources (profil, init, initializers, dépôt client, Standard, documents) : Grep avant
+        # de déclarer une donnée manquante
+        "valeurs_connues": write_known_values(client, profile, inventory, worktree, local_cucumber_std_repo),
     }
     # Initialisation du client vue par les lots : features d'init et codes de référence du profil
     client_init = cucumber_profile.init_view(profile)
@@ -2688,7 +2721,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                    runner_block=cucumber_tools.runner_block(std_java["runner_example"],
                                                                             java["runner_status"], inline_max),
                                    lot_block=cucumber_tools.lot_block(lot_specs, inline_max, inlined),
-                                   profil_block=cucumber_profile.profile_block(profile, gap_file=gap_file),
+                                   profil_block="\n".join(filter(None, [
+                                       cucumber_profile.profile_block(profile, gap_file=gap_file,
+                                                                      known=cucumber_testability.load_index(client)),
+                                       cucumber_testability.answers_block(profile)])),
                                    lot_label=label)
             # Accès limité au dossier de travail du client (worktree, sources, extraits Jira) et aux catalogues
             returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, lot_tools(fixed_values),

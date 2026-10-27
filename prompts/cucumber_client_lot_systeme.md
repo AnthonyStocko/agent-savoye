@@ -53,10 +53,28 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 - Mise à jour par brouillon : repars du brouillon complet lu, ne modifie que les champs visés et renvoie tous les attributs requis (sinon « La propriété … est requise »).
 - Processus interactifs Studio : l'enchaînement des écrans se lit dans le customized.xml DÉPLOYÉ (comportements Studio du lot) ; un bouton se désigne par son identifiant ou par son libellé selon ce qu'attend le step (les deux peuvent différer) ; les libellés sont ceux de la langue réellement affichée ; chaque scénario vérifie au moins un élément qui n'existe que dans la personnalisation.
 
+=== TÉMOIN POSITIF ===
+- Tout scénario qui vérifie qu'une action N'A PAS lieu (exclusion, filtre, refus silencieux, « 0 instance », « aucun ») est accompagné, dans la même feature, d'un scénario témoin dans les mêmes conditions (même step d'action) où l'action A lieu. Sans témoin, le test passerait aussi si le mécanisme ne fonctionnait jamais : contrôlé après le lot, un scénario négatif sans témoin est une erreur.
+
+=== CRÉER PLUTÔT QUE RENONCER ===
+- Une donnée nécessaire qui n'existe pas mais peut être créée par l'API ou par un fichier propre à la feature (document de test, client, paramétrage) est créée dans le Background du scénario. « Fixture non disponible » n'est une raison que si la création est impossible, preuve à l'appui.
+
 === AVANT DE CONCLURE « non_couvert » ===
 - Lis d'abord ce que le spécifique change (parties modifiées injectées, puis les fichiers du spécifique si nécessaire) : une conclusion sans avoir examiné le comportement modifié n'est pas acceptée.
 - Applique les recettes du lot (en particulier : un champ ou une entité modifiés se vérifient en relisant l'objet par un endpoint REST Standard, avec un nouveau step si besoin), examine ses « Steps candidats », puis fais AU MOINS 3 recherches dans '${steps_std}' / '${endpoints_std}' avec des formulations différentes : synonymes, anglais / français (repack / reconditionnement, slot / emplacement, screen / écran / interaction…), nom de l'objet métier, chemin REST.
-- Cite dans « raison » les recherches faites (motifs Grep, fichier et résultat) : une raison sans au moins 3 recherches citées n'est pas acceptée.
+- Pour CHAQUE donnée, clé, valeur ou fixture que tu crois manquante, cherche dans cet ordre et cite dans « recherches » ce que tu as trouvé ou non dans chaque source (Grep de la valeur d'abord dans '${valeurs_connues}', qui les réunit toutes) :
+  1. « profil » : le bloc PROFIL CLIENT du lot (codes de référence, données initialisées par le serveur, données recréées, réponses de l'utilisateur) ;
+  2. « init » : les features d'init du dépôt client (données intégrées, steps de recréation et leurs tables) ;
+  3. « initializers » : le code des initializers et des configurations du client (codes, clés, booléens) ;
+  4. « depot » : les fichiers de données et features existantes du dépôt client ('${worktree}') ;
+  5. « standard » : le Cucumber Standard aligné ('${features_std}' : tous les exemples d'usage des steps candidats, toutes valeurs confondues) ;
+  6. « documents » : A_REVOIR.md, le récapitulatif de couverture et les connaissances partagées du projet.
+- Une absence d'information n'est JAMAIS un blocage. Trois issues seulement :
+  - la tâche est testable (au besoin en créant la donnée) : écris le scénario ; s'il reste une donnée, une clé, une valeur ou un step à confirmer, écris quand même ce que tu peux et liste les « questions » précises ;
+  - « non_couvert » avec « blocage » : SEULEMENT un blocage prouvé hors du test — "non_deploye" (code ou personnalisation non déployé : preuve d'exécution ou de date de déploiement), "defaut_produit" (défaut du produit prouvé), "donnee_impossible" (donnée impossible à créer par l'API ET absente de l'environnement), "step_impossible" (step indispensable inexistant dans la version de bibliothèque ET impossible à écrire dans le projet), avec sa « preuve » ;
+  - « non_couvert » avec « sans_objet » : le spécifique n'a aucun comportement propre à tester (listener sans filtre, DTO, technique, comportement identique au Standard), avec sa « preuve » (fichier et extrait).
+  Un « non_couvert » sans blocage prouvé, sans les 6 sources citées, ou dont une valeur dite manquante figure dans '${valeurs_connues}' est rejeté par un contrôle automatique : la tâche est régénérée.
+- « resume » : une ou deux phrases en langage métier pour l'utilisateur (ex. « La règle exclut 4 documents du rendu. Il faut confirmer la clé de ces documents. ») ; le détail technique va dans « recherches ».
 - Un listener ou un événement qui ne fait que déclencher un process n'est pas « non_couvert » : réponds « couvert_indirectement » avec « couvert_par » (id du spécifique du process, Grep dans '${inventaire}').
 
 === FICHIERS ET CODE ===
@@ -93,7 +111,10 @@ Aucun texte hors du JSON final. Ta réponse finale est UNIQUEMENT ce bloc JSON (
   {"id": "<id du spécifique>", "statut": "couvert|couvert_indirectement|non_couvert", "couvert_par": "<id du spécifique qui le couvre, si couvert_indirectement>",
    "scenarios": [{"nom": "<Feature> / <Scenario>", "fichier": "<chemin relatif au worktree du .feature>", "difference_standard": "<une phrase : ce qui diffère du Standard>", "source": "<fichier du spécifique, ticket Jira, paramètre>"}],
    "fichiers": ["<chemin relatif au worktree>"], "classes_java": ["<chemin relatif au worktree>"], "inspire_de": ["<chemin Standard> / <scénario>"], "raison": "<si non couvert>",
+   "resume": "<une ou deux phrases métier : ce qui est testé ou ce qui manque>", "questions": ["<question précise : donnée, clé, valeur ou step à confirmer>"],
+   "recherches": [{"source": "profil|init|initializers|depot|standard|documents", "cherche": "<valeur ou motif Grep>", "trouve": "<fichier:ligne ou « rien »>"}],
+   "blocage": {"type": "non_deploye|defaut_produit|donnee_impossible|step_impossible", "preuve": "<preuve du blocage>"}, "sans_objet": {"preuve": "<fichier et extrait>"},
    "constats": [{"type": "donnee_introuvable|ecart_spec_code|defaut_code|comportement_surprenant|tautologique", "detail": "<une phrase>", "fichier": "<chemin, si utile>", "ligne": "<n°>", "extrait": "<code copié>", "effet": "<effet>", "correction": "<correction suggérée>", "certitude": "prouvé|probable|à vérifier", "preuve": "<extrait exact du journal>"}]}
 ]
 ```
-Un objet par spécifique du lot, dans l'ordre. « fichiers » : les .feature ; « classes_java » : les classes Java créées ou complétées pour ce spécifique ; « inspire_de » : les scénarios Standard dont tu es parti (vide si aucun). « difference_standard » et « source » sont obligatoires pour chaque scénario. « couvert_par » : seulement pour « couvert_indirectement » (pas de scénario propre).
+Un objet par spécifique du lot, dans l'ordre. « questions », « recherches », « blocage » et « sans_objet » : seulement quand ils s'appliquent (« blocage » et « sans_objet » : jamais pour une tâche couverte). « fichiers » : les .feature ; « classes_java » : les classes Java créées ou complétées pour ce spécifique ; « inspire_de » : les scénarios Standard dont tu es parti (vide si aucun). « difference_standard » et « source » sont obligatoires pour chaque scénario. « couvert_par » : seulement pour « couvert_indirectement » (pas de scénario propre).

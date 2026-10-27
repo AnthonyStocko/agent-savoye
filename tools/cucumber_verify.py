@@ -355,6 +355,49 @@ def check_scenario_dependencies(worktree: str, features: list) -> list:
     return errors
 
 
+# Scénario « négatif » : il vérifie qu'une action N'A PAS lieu (exclusion, filtre, refus silencieux, 0 instance)
+_NEGATIVE = re.compile(r"(?i)\b(n'est pas|n'a pas|ne \w+ pas|ne \w+ aucun|aucune?|exclue?s?|refus[ée]e?s?|jamais|"
+                       r"pas de|pas d'|z[ée]ro|non (?:g[ée]n[ée]r|cr[ée]|envoy|d[ée]clench|rendu|imprim)\w*|not|"
+                       r"never|none|excluded)\b|\"0\"|\b0 (?:instance|document|message|ligne|[ée]l[ée]ment)")
+_VARIABLE_VALUE = re.compile(r"\"[^\"]*\"|<[^>]+>|\b\d+\b")
+
+
+def is_negative(scenario: dict) -> bool:
+    """Le titre ou un contrôle (Then) du scénario vérifie l'absence d'une action."""
+    checks = [s for s in scenario["steps"] if s["phase"] == "then"]
+    return bool(_NEGATIVE.search(scenario["titre"]) or any(
+        _NEGATIVE.search(" ".join([s["texte"], *s["table"]])) for s in checks))
+
+
+def action_keys(scenario: dict) -> set:
+    """Steps d'action du scénario (When, à défaut Given), valeurs retirées : « mêmes conditions »."""
+    steps = [s for s in scenario["steps"] if s["phase"] == "when"] or [
+        s for s in scenario["steps"] if s["phase"] == "given"]
+    return {" ".join(_VARIABLE_VALUE.sub("_", s["texte"]).lower().split()) for s in steps}
+
+
+def check_positive_witness(worktree: str, features: list) -> list:
+    """
+    Règle du témoin positif : un scénario négatif (l'action N'A PAS lieu) est accompagné, dans la même feature, d'un
+    scénario non négatif qui partage un de ses steps d'action (valeurs retirées) et où l'action A lieu. Sans témoin,
+    le test passerait aussi si le mécanisme ne fonctionnait jamais. Une erreur par scénario négatif sans témoin
+    (plans de scénario ignorés : leurs exemples peuvent porter les deux cas).
+    """
+    errors = []
+    for rel in features:
+        scenarios = [s for s in parse_scenarios(_read_text_file(os.path.join(worktree, *rel.split("/"))))
+                     if not s["outline"] and not is_setup_scenario(s["titre"], s["tags"])]
+        positives = [s for s in scenarios if not is_negative(s)]
+        for scenario in (s for s in scenarios if is_negative(s)):
+            keys = action_keys(scenario)
+            if not any(keys & action_keys(p) for p in positives):
+                errors.append(f"{rel}:{scenario['ligne']} scénario négatif « {scenario['titre']} » sans témoin "
+                              f"positif : ajoute dans cette feature un scénario dans les mêmes conditions (même step "
+                              f"d'action) où l'action A lieu, sinon le test passerait aussi si le mécanisme ne "
+                              f"fonctionnait jamais")
+    return errors
+
+
 def _step_key(step: dict) -> str:
     return " ".join([step["texte"].lower()] + [row.lower() for row in step["table"]])
 
