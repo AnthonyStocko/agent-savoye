@@ -24,7 +24,7 @@ import os
 import re
 from datetime import datetime
 
-from tools import cucumber_audit, cucumber_import, cucumber_profile, cucumber_studio, cucumber_testability
+from tools import cucumber_audit, cucumber_import, cucumber_links, cucumber_profile, cucumber_studio, cucumber_testability
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _write_json, a_revoir_tag, cache_dir,
                                   git_repos, latest_results, load_state, studio_dependencies, worktree_dir)
 from tools.cucumber_verify import NOT_TEST_STATUSES, all_verified, failure_category, scenario_id
@@ -224,10 +224,20 @@ def scenario_status(identifier: str, sources: dict) -> dict:
 
 
 def linked_scenarios(spec: dict, result: dict, sources: dict) -> list:
-    """Scénarios liés au spécifique : écrits par l'agent, puis scénarios importés des features existantes liées."""
+    """
+    Scénarios liés au spécifique : écrits par l'agent, puis TOUS les scénarios actifs des features du dépôt client
+    rattachées à la tâche (cucumber_links, écrits ou non par l'agent), et leurs résultats importés. Sans cache des
+    tests existants : rapprochement par mots-clés de l'inventaire (scénarios importés seulement).
+    """
     ids = [scenario_id(s.get("fichier", ""), str(s.get("nom", "")).rsplit(" / ", 1)[-1])
            for s in result.get("scenarios") or [] if isinstance(s, dict) and s.get("fichier")]
-    features = [entry.rsplit(" (", 1)[0] for entry in spec.get("scenarios_existants") or []]
+    existing = sources.get("existants") or {}
+    if existing:
+        features = existing["par_tache"].get(spec["id"]) or []
+        titles = {f["chemin"]: f.get("titres") or [] for f in existing["document"].get("features") or []}
+        ids += [i for path in features for i in (scenario_id(path, t) for t in titles.get(path, [])) if i not in ids]
+    else:
+        features = [entry.rsplit(" (", 1)[0] for entry in spec.get("scenarios_existants") or []]
     for identifier in list(sources["imports"]) + list(sources["desactives"]):
         if identifier.split("::", 1)[0] in features and identifier not in ids:
             ids.append(identifier)
@@ -492,7 +502,8 @@ def coverage_sources(client_name: str, state: dict) -> dict:
     """Résultats croisés une fois pour toutes les lignes : imports, vérifications, scénarios désactivés."""
     return {"imports": import_results(client_name), "verifies": verified_results(state),
             "desactives": disabled_scenarios(worktree_dir(client_name)),
-            "audit": cucumber_audit.load_audit(client_name).get("scenarios") or {}}
+            "audit": cucumber_audit.load_audit(client_name).get("scenarios") or {},
+            "existants": cucumber_links.current_links(client_name) if client_name else {}}
 
 
 def init_state_of(client_name: str, profile: dict) -> str:
@@ -520,7 +531,9 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
         scenarios = linked_scenarios(spec, result, sources)
         title = business_title(spec, links.get(spec["id"]))
         testable = testability(spec, result, scenarios, index, profile, init_state, title)
-        state_key, cause = spec_state(spec, result, scenarios, testable)
+        # Tests existants rattachés (cache présent) : le rapprochement par mots-clés de l'inventaire ne décide plus
+        judged = {**spec, "couverture": "non_couvert"} if sources.get("existants") else spec
+        state_key, cause = spec_state(judged, result, scenarios, testable)
         rows[spec["id"]] = {
             "id": spec["id"], "tache": spec["libelle"], "module": module_of(spec), "point_entree": entry_point(spec),
             "tickets": spec_tickets(spec), "risque": override.get("risque") or proposed_risk(spec),
@@ -634,6 +647,59 @@ def selection_order(rows: list) -> list:
     """Ordre proposé : risque métier, puis testabilité, puis effort."""
     return sorted(rows, key=lambda r: (RISKS.index(r["risque"]) if r["risque"] in RISKS else 1,
                                        TESTABILITY.index(r["testabilite"]), r["effort"], r["tache"]))
+
+
+GROUPS = {"test": "ont un test", "partiel": "sont partielles", "indirect": "sont couvertes par une autre tâche",
+          "a_couvrir": "restent à couvrir", "non_testable": "ne sont pas testables aujourd'hui",
+          "sans_objet": "sont sans objet"}
+
+
+def group_of(row: dict) -> str:
+    """Groupe du résumé, un seul par tâche : test propre, partielle, couverte par une autre, à couvrir, etc."""
+    if row["etat"] == "partiel":
+        return "partiel"
+    if row["etat"] in ("non_testable", "sans_objet"):
+        return row["etat"]
+    if row["scenarios"] and row["etat"] in WRITTEN_STATES:
+        return "test"
+    if row.get("couvert_par"):
+        return "indirect"
+    return "a_couvrir"
+
+
+def summary_groups(rows: list) -> dict:
+    """{groupe: [ids]} dans l'ordre de GROUPS ; la somme des groupes est toujours le nombre de tâches."""
+    groups = {key: [] for key in GROUPS}
+    for row in rows:
+        groups[group_of(row)].append(row["id"])
+    return groups
+
+
+def last_run(client_name: str) -> dict:
+    """Dernier import de rapport analysé : {numero, date} ; {} sans import (couverture réelle non mesurée)."""
+    index = cucumber_import.load_index(client_name) if client_name else {"imports": []}
+    analysed = [e for e in index.get("imports") or [] if not (_read_json(os.path.join(
+        cucumber_import.imports_dir(client_name), str(e["numero"]), "analyse.json"), {}) or {}).get("non_analyse")]
+    return max(analysed, key=lambda e: e["numero"]) if analysed else {}
+
+
+def summary_sentence(rows: list, run: dict) -> list:
+    """
+    Résumé en phrases : [(texte, groupe ou '')], chaque nombre associé à son groupe (filtre de la liste). Ex. :
+    « 133 tâches. 38 ont un test (dont 35 verts au run du 26/10). 12 sont couvertes par une autre tâche. 83 restent
+    à couvrir. »
+    """
+    groups = summary_groups(rows)
+    parts = [(f"{len(rows)} tâche{'s' if len(rows) > 1 else ''}.", "")]
+    tested = [r for r in rows if r["id"] in set(groups["test"])]
+    green = sum(1 for r in tested if r["etat"] == "vert")
+    detail = (f" (dont {green} vert{'s' if green > 1 else ''} au run du {run['date'][8:10]}/{run['date'][5:7]})"
+              if run else " (aucun run importé : couverture réelle non mesurée)")
+    for key, label in GROUPS.items():
+        count = len(groups[key])
+        if count or key in ("test", "a_couvrir"):
+            parts.append((f"{count} {label}" + (detail if key == "test" and count else "") + ".", key))
+    return parts
 
 
 def rates(rows: list) -> dict:

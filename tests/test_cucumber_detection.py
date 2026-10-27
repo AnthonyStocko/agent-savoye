@@ -262,12 +262,14 @@ def test_known_projects_and_overview_line(cache):
     cd.save_project(CLIENT, {"client_repo": "https://git/projects/X", "client_name": CLIENT})
     os.makedirs(os.path.join(ct.CACHE_ROOT, "_standard"))
     assert list(cd.known_projects(ct.CACHE_ROOT)) == [CLIENT]
-    rows = [{"etat": "vert"}, {"etat": "non_couvert"}, {"etat": "vert"}]
+    rows = [{"id": "a", "etat": "vert", "scenarios": [{}]}, {"id": "b", "etat": "non_couvert", "scenarios": []},
+            {"id": "c", "etat": "vert", "scenarios": [{}]}]
     analysis = {"numero": 1, "resultats": {"a": {"statut": "passe"}, "b": {"statut": "echoue"}}}
     line = cj.overview_line(CLIENT, "init incomplète (3 éléments)", rows, analysis)
-    assert line == f"{CLIENT.capitalize()} · init incomplète (3 éléments) · 2 tâches couvertes sur 3 · dernier run : " \
-                   f"1 vert / 1 échec"
-    assert cj.overview_line(CLIENT, "init complète", [], {}).endswith("aucune tâche inventoriée · aucun run importé")
+    assert line == f"{CLIENT.capitalize()} · init incomplète (3 éléments) · 2 tâches avec un test sur 3 · dernier " \
+                   f"run : 1 vert / 1 échec"
+    assert cj.overview_line(CLIENT, "init complète", [], {}).endswith(
+        "aucune tâche inventoriée · aucun run importé : couverture réelle non mesurée")
     assert cj.overview_line(CLIENT, "init complète", rows, {"numero": 2, "non_analyse": "écart"}).endswith(
         "dernier run non analysé")
 

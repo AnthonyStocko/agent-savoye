@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -2536,6 +2536,15 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                                       cucumber_tools.cached_tickets(client, max_age_s=10 ** 9) or [])
         print(f"[CUCUMBER DÉTECTION] Tickets Jira liés de façon vérifiée : {sum(map(len, links.values()))} "
               f"lien(s) sur {len(links)} tâche(s)")
+        # Tous les tests du dépôt client (écrits ou non par l'agent), lus sur la branche du job, et leurs rattachements
+        tests = cucumber_links.refresh(client, cucumber_repo_dir, profile, inventory,
+                                       {i: [l["cle"] for l in ls] for i, ls in links.items()},
+                                       args.cucumber_base_branch)
+        resolved = cucumber_links.resolve(tests["features"], cucumber_links.load_confirmations(client))
+        print(f"[CUCUMBER DÉTECTION] Tests existants sur {tests['branche'] or '?'} : {len(tests['features'])} "
+              f"feature(s), {sum(f['scenarios'] for f in tests['features'])} scénario(s) actif(s) ; "
+              f"{len(resolved['rattachees'])} rattachée(s) à {len(resolved['par_tache'])} tâche(s), "
+              f"{len(resolved['non_rattachees'])} non rattachée(s)")
         if cucumber_tools.load_state(client).get("lots"):
             retro = cucumber_testability.retro(client, index=index, profile=profile)
             print(f"[CUCUMBER TESTABILITÉ] {cucumber_testability.retro_line(retro)}")

@@ -230,16 +230,16 @@ def next_step(steps: list) -> str:
 
 def overview_line(client_name: str, init_label: str, rows: list, analysis: dict) -> str:
     """
-    Ligne d'état du projet en tête de l'onglet : « <Client> · init incomplète (3 éléments) · 12 tâches couvertes sur
-    67 · dernier run : 37 verts / 2 échecs ».
+    Ligne d'état du projet en tête de l'onglet, issue du même calcul que le résumé (cucumber_coverage.summary_groups) :
+    « <Client> · init incomplète (3 éléments) · 38 tâches avec un test sur 133 · dernier run : 35 verts / 3 échecs ».
     """
-    rates = cucumber_coverage.rates(rows)
+    groups = cucumber_coverage.summary_groups(rows)
+    tested = len(groups["test"])
     parts = [client_name.capitalize(), init_label,
-             f"{rates['couvertes']} tâche{'s' if rates['couvertes'] > 1 else ''} couverte"
-             f"{'s' if rates['couvertes'] > 1 else ''} sur {rates['total']}" if rates["total"] else
+             f"{tested} tâche{'s' if tested > 1 else ''} avec un test sur {len(rows)}" if rows else
              "aucune tâche inventoriée"]
     if not analysis:
-        parts.append("aucun run importé")
+        parts.append("aucun run importé : couverture réelle non mesurée")
     elif analysis.get("non_analyse"):
         parts.append("dernier run non analysé")
     elif analysis.get("init_en_echec"):
@@ -248,6 +248,29 @@ def overview_line(client_name: str, init_label: str, rows: list, analysis: dict)
         green, failed = run_counts(analysis)
         parts.append(f"dernier run : {green} vert{'s' if green > 1 else ''} / {failed} échec{'s' if failed > 1 else ''}")
     return " · ".join(parts)
+
+
+def next_action(client_name: str, rows: list, links: dict) -> dict:
+    """
+    Action suivante, qui tient compte de l'existant : d'abord importer un log Jenkins s'il existe des tests et
+    qu'aucun run n'est importé (couverture réelle non mesurée), puis rattacher les tests existants non rattachés,
+    puis seulement générer. {"cle": import|rattacher|generer|"", "texte"}.
+    """
+    groups = cucumber_coverage.summary_groups(rows)
+    has_tests = bool(groups["test"] or groups["partiel"] or (links or {}).get("rattachees")
+                     or (links or {}).get("non_rattachees"))
+    if has_tests and not cucumber_coverage.last_run(client_name):
+        return {"cle": "import", "texte": "Importer un log Jenkins : sans run importé, la couverture réelle n'est pas "
+                                          "mesurée et l'état des tests existants est inconnu."}
+    unlinked = len((links or {}).get("non_rattachees") or [])
+    if unlinked:
+        return {"cle": "rattacher", "texte": f"Rattacher {unlinked} test{'s' if unlinked > 1 else ''} existant"
+                                             f"{'s' if unlinked > 1 else ''} à une tâche (proposition à confirmer)."}
+    to_cover = len(groups["a_couvrir"]) + len(groups["partiel"])
+    if to_cover:
+        return {"cle": "generer", "texte": f"Générer les tests des {to_cover} tâche{'s' if to_cover > 1 else ''} "
+                                           f"restant à couvrir."}
+    return {"cle": "", "texte": "Rien à faire : chaque tâche a un test, est couverte par une autre ou est expliquée."}
 
 
 def step_line(step: dict) -> str:

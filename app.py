@@ -16,7 +16,8 @@ from tools import env_tools
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_import,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
-                   cucumber_results, cucumber_studio, cucumber_testability, cucumber_tools, cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
+                   cucumber_links, cucumber_results, cucumber_studio, cucumber_testability, cucumber_tools,
+                   cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
 from tools.epic_tools import load_epic_manifest
 from tools.jira_tools import (
     JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
@@ -1487,7 +1488,7 @@ COVERAGE_COLUMNS = {
     "Tâche": st.column_config.TextColumn("Tâche", width="large"),
     "Risque": st.column_config.TextColumn("Risque", width="small", help="Risque métier proposé (module, type de "
                                                                         "règle), modifiable dans les détails"),
-    "Réponses attendues": st.column_config.NumberColumn("Réponses attendues", width="small"),
+    "Réponses attendues": st.column_config.TextColumn("Réponses attendues", width="small"),
 }
 # États dont la tâche se génère
 GENERABLE_STATES = ("non_couvert", "partiel", "a_confirmer")
@@ -1509,7 +1510,7 @@ def coverage_table(rows: list, key: str) -> list:
     for index, r in enumerate(rows):
         checked = (edits.get(index) or edits.get(str(index)) or {}).get("Générer", generable(r))
         table.append({"Générer": checked, "Tâche": r["titre"], "État": cucumber_coverage.state_label(r).split(" (")[0],
-                      "Réponses attendues": (r.get("evaluation") or {}).get("attendues") or None,
+                      "Réponses attendues": str((r.get("evaluation") or {}).get("attendues") or ""),
                       "Module": r["module"], "Risque": r["risque"], "Tickets": ", ".join(r["tickets"])})
     return table
 
@@ -1760,27 +1761,109 @@ def render_coverage_knowledge(client: str, row: dict) -> None:
                     f"{', '.join(item['raisons'])})] — `{item['doc']['chemin']}`")
 
 
+def section(title: str, icon: str, key: str, expanded: bool) -> bool:
+    """
+    Section repliable de l'onglet (interrupteur dans un cadre : les volets « Détails » y restent possibles, Streamlit
+    n'imbriquant pas les volets). Ouverte par défaut seulement quand elle a quelque chose à montrer ou est demandée.
+    """
+    state_key = f"cucumber_section_{key}"
+    if expanded and not st.session_state.get(f"{state_key}_vu"):
+        st.session_state[state_key] = True
+        st.session_state[f"{state_key}_vu"] = True
+    return st.toggle(f"{icon} **{title}**", key=state_key)
+
+
+def render_coverage_summary(ctx: dict, rows: list, links: dict, action: dict) -> None:
+    """
+    Un seul bloc de résumé, en phrases, issu d'un seul calcul (cucumber_coverage.summary_groups) : chaque nombre filtre
+    la liste ; puis l'action suivante, et les indicateurs détaillés dans un volet replié, chacun expliqué.
+    """
+    client = ctx["client"]
+    run = cucumber_coverage.last_run(client)
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+            for text, group in cucumber_coverage.summary_sentence(rows, run):
+                if group:
+                    st.button(text, type="tertiary", key=f"cucumber_group_{group}_{client}",
+                              on_click=st.session_state.update, kwargs={f"cucumber_group_{client}": group},
+                              help="Filtre la liste des tâches")
+                else:
+                    st.markdown(f"**{text}**")
+        document = (links or {}).get("document") or {}
+        if document:
+            st.caption(f"Tests lus sur la branche {document.get('branche') or '?'} (commit {document.get('commit')}"
+                       + (f", {document['date'][8:10]}/{document['date'][5:7]} {document['date'][11:16]}"
+                          if document.get("date") else "") + ")"
+                       + ("" if document.get("branche_profil") else " — branche du job Jenkins non renseignée dans "
+                                                                   "le profil : branche de base lue"))
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f":material/arrow_forward: **Action suivante** : {action['texte']}")
+            if action["cle"]:
+                st.button({"import": "Importer un log Jenkins", "rattacher": "Rattacher les tests",
+                           "generer": "Générer les tests"}[action["cle"]], type="primary",
+                          key=f"cucumber_next_{client}", on_click=st.session_state.update,
+                          kwargs={f"cucumber_open_{client}": action["cle"]})
+        with st.expander("Indicateurs détaillés", icon=":material/insights:"):
+            rates = cucumber_coverage.rates(rows)
+            states = rates["par_etat"]
+            tests = document.get("features") or []
+            st.markdown("\n".join([
+                f"- **Couverture réelle** : " + (f"{rates['reelle']} %" if run else "non mesurée")
+                + " — part des tâches dont les scénarios actifs sont verts au dernier run importé"
+                + ("." if run else " ; aucun run importé et analysé."),
+                f"- **Couverture écrite** : {rates['ecrite']} % — part des tâches qui ont des scénarios écrits (actifs "
+                f"ou désactivés, exécutés ou non), y compris par une autre tâche qui les couvre.",
+                f"- **Tests existants** : {len(tests)} feature(s), {sum(f['scenarios'] for f in tests)} scénario(s) "
+                f"actif(s) dans le dépôt client, écrits ou non par l'agent ; "
+                f"{len((links or {}).get('non_rattachees') or [])} non rattaché(s) à une tâche.",
+                f"- **Partielles** : {states['partiel']} — les tests ne vérifient qu'une configuration ou la présence "
+                f"d'une donnée, pas l'effet du spécifique.",
+                f"- **À confirmer** : {states['a_confirmer']} — testables, mais une donnée, une clé ou une valeur est à "
+                f"confirmer (carte de la tâche).",
+                f"- **En attente d'une autre tâche** : {states['en_attente']} — couvertes par une tâche qui n'a pas "
+                f"encore de test.",
+                f"- **Non testables aujourd'hui** : {states['non_testable']} — blocage prouvé hors du test.",
+                f"- **Sans objet** : {states['sans_objet']} — aucun comportement propre au client à tester."]))
+            st.caption(cucumber_coverage.legend())
+
+
+def render_unlinked_tests(ctx: dict, rows: list, links: dict) -> None:
+    """Tests existants non rattachés : proposition de rattachement à confirmer, ou autre tâche, ou aucune."""
+    client = ctx["client"]
+    unlinked = (links or {}).get("non_rattachees") or []
+    if not unlinked:
+        st.caption("Tous les tests existants du dépôt client sont rattachés à une tâche.")
+        return
+    titles = {r["id"]: r["titre"] for r in rows}
+    for item in unlinked:
+        with st.container(border=True):
+            st.markdown(f"**{item['titre'] or item['feature'].rsplit('/', 1)[-1]}** :gray[({item['scenarios']} "
+                        f"scénario(s) — `{item['feature']}`)]")
+            proposal = item.get("proposition")
+            if proposal:
+                st.caption(f"Proposition : « {titles.get(proposal['spec'], proposal['spec'])} » — "
+                           + " ; ".join(proposal["raisons"][:3]))
+            with st.container(horizontal=True, vertical_alignment="center"):
+                if proposal:
+                    st.button("Confirmer", icon=":material/link:", key=f"cucumber_link_ok_{item['feature']}",
+                              on_click=cucumber_links.confirm, args=(client, item["feature"], proposal["spec"]))
+                other = st.selectbox("Autre tâche", [""] + list(titles), key=f"cucumber_link_other_{item['feature']}",
+                                     format_func=lambda i: "Rattacher à une autre tâche…" if not i else titles[i],
+                                     label_visibility="collapsed")
+                if other:
+                    cucumber_links.confirm(client, item["feature"], other)
+                    st.rerun()
+                st.button("Aucune tâche", type="tertiary", key=f"cucumber_link_none_{item['feature']}",
+                          on_click=cucumber_links.confirm, args=(client, item["feature"], ""),
+                          help="Test sans tâche de l'inventaire : il n'apparaîtra plus ici.")
+
+
 def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
     """Étape 2 : tâches couvertes et non couvertes, deux taux, filtres, détail d'une ligne."""
     if not rows:
         st.info("Aucune tâche : l'inventaire des spécifiques est fait par l'analyse automatique du projet.",
                 icon=":material/inventory_2:")
         return
-    rates = cucumber_coverage.rates(rows)
-    with st.container(horizontal=True):
-        st.metric("Couverture réelle", f"{rates['reelle']} %", border=True,
-                  help="Tâches dont les scénarios actifs sont verts au dernier résultat connu")
-        st.metric("Couverture écrite", f"{rates['ecrite']} %", border=True,
-                  help="Tâches couvertes par des scénarios écrits, actifs ou désactivés")
-        st.metric("Partielles", rates["partielles"], border=True,
-                  help="Les tests ne vérifient qu'une configuration ou la présence d'une donnée")
-        st.metric("Non couvertes", rates["par_etat"]["non_couvert"], border=True)
-        st.metric("À confirmer", rates["par_etat"]["a_confirmer"], border=True,
-                  help="Testables : il manque une donnée, une clé, une valeur ou un step à confirmer (générées)")
-        st.metric("Non testables aujourd'hui", rates["par_etat"]["non_testable"], border=True,
-                  help="Blocage prouvé hors du test (non déployé, défaut produit, donnée impossible, step impossible)")
-    st.caption(f"{rates['total']} tâche(s) de l'inventaire du {inventory['genere_le'].replace('T', ' ')[:16]} · "
-               + cucumber_coverage.legend())
     client = ctx["client"]
     render_delivery_header(ctx)
     retro = cucumber_tools._read_json(cucumber_testability.retro_path(client), {}) if client else {}
@@ -1796,8 +1879,15 @@ def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
                                  placeholder="Tous")
         ticket = st.text_input("Ticket ou mot-clé", key=f"cucumber_cov_text_{client}").strip().casefold()
         risks = st.pills("Risque", cucumber_coverage.RISKS, selection_mode="multi", key=f"cucumber_cov_risks_{client}")
+    group = st.session_state.get(f"cucumber_group_{client}")
+    if group:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.caption(f"Liste filtrée : tâches qui {cucumber_coverage.GROUPS[group]}.")
+            st.button("Afficher toutes les tâches", type="tertiary", key=f"cucumber_group_clear_{client}",
+                      on_click=st.session_state.pop, args=(f"cucumber_group_{client}", None))
+    grouped = set(cucumber_coverage.summary_groups(rows)[group]) if group else None
     shown = [r for r in rows if (not states or r["etat"] in states) and (not modules or r["module"] in modules)
-             and (not risks or r["risque"] in risks)
+             and (grouped is None or r["id"] in grouped) and (not risks or r["risque"] in risks)
              and (not ticket or ticket in (r["titre"] + " " + r["tache"] + " " + " ".join(r["tickets"])).casefold())]
     # Liste : cases « Générer » pour générer plusieurs tâches sans ouvrir les cartes
     list_key = f"cucumber_coverage_list_{client}_{len(shown)}"
@@ -2298,49 +2388,51 @@ with tab_cucumber:
         st.markdown("**" + cucumber_journey.overview_line(
             cucumber_client, cucumber_detection.state_label(cucumber_init_status), cucumber_rows,
             cucumber_analysis) + "**")
-    step_key = f"cucumber_step_{cucumber_client}"
-
-    def open_step(key: str) -> None:
-        st.session_state[step_key] = key
-
-    with st.container(horizontal=True):
-        st.button("Générer les tests", type="primary", icon=":material/science:", disabled=not cucumber_ctx["ready"],
-                  on_click=open_step, args=("selection",), key="cucumber_action_generate")
-        st.button("Importer des logs Jenkins", icon=":material/upload_file:", disabled=not cucumber_client,
-                  on_click=open_step, args=("execution",), key="cucumber_action_import")
+    cucumber_links_now = cucumber_links.current_links(cucumber_client) if cucumber_client else {}
+    cucumber_action = cucumber_journey.next_action(cucumber_client, cucumber_rows, cucumber_links_now)
+    if cucumber_client and cucumber_rows:
+        render_coverage_summary(cucumber_ctx, cucumber_rows, cucumber_links_now, cucumber_action)
     if cucumber_client:
         render_cucumber_profile(cucumber_ctx, cucumber_profile_doc, cucumber_detected, cucumber_init_status)
         render_cucumber_health(cucumber_ctx)
-    cucumber_steps = [s for s in cucumber_journey.journey(
+    cucumber_steps = {s["cle"]: s for s in cucumber_journey.journey(
         cucumber_client, cucumber_inventory, cucumber_profile_doc, cucumber_state, cucumber_rows,
-        len(cucumber_selected), -(-len(cucumber_selected) // max(1, env_int("CUCUMBER_BATCH_SIZE", 3))))
-        if s["cle"] != "projet"]
-    steps_by_key = {s["cle"]: s for s in cucumber_steps}
-    # Sections détaillées repliées par défaut : aucune étape ouverte tant qu'aucune n'est choisie
-    cucumber_step = st.segmented_control(
-        "Étape", list(steps_by_key), key=step_key, label_visibility="collapsed",
-        format_func=lambda k: f"{cucumber_journey.STATUSES[steps_by_key[k]['etat']][0]} {steps_by_key[k]['titre']}")
-    if cucumber_step:
-        st.caption(steps_by_key[cucumber_step]["resume"])
-        if steps_by_key[cucumber_step]["action"]:
-            st.info(f"Action suivante : {steps_by_key[cucumber_step]['action']}", icon=":material/arrow_forward:")
-    if cucumber_step == "couverture":
+        len(cucumber_selected), -(-len(cucumber_selected) // max(1, env_int("CUCUMBER_BATCH_SIZE", 3))))}
+    # Sections repliables, ouvertes seulement quand elles ont quelque chose à montrer (ou demandées par l'action)
+    asked = st.session_state.pop(f"cucumber_open_{cucumber_client}", "")
+    if asked:
+        # Section de l'action suivante : ouverte même si elle avait été refermée
+        opened = {"generer": "generation", "import": "execution", "rattacher": "rattacher"}[asked]
+        st.session_state[f"cucumber_section_{opened}_{cucumber_client}"] = True
+    unlinked_count = len(cucumber_links_now.get("non_rattachees") or [])
+    if section(f"Tâches ({len(cucumber_rows)})", ":material/checklist:", f"taches_{cucumber_client}", True):
         render_cucumber_coverage(cucumber_ctx, cucumber_inventory, cucumber_rows)
-    elif cucumber_step == "selection":
+    if unlinked_count or asked == "rattacher":
+        if section(f"Tests existants non rattachés ({unlinked_count})", ":material/link_off:",
+                   f"rattacher_{cucumber_client}", True):
+            render_unlinked_tests(cucumber_ctx, cucumber_rows, cucumber_links_now)
+    if section("Génération : plan et lots", ":material/science:", f"generation_{cucumber_client}",
+               asked == "generer" or cucumber_steps["generation"]["etat"] in ("a_faire", "attention")):
+        st.caption(cucumber_steps["generation"]["resume"])
         render_cucumber_selection(cucumber_ctx, cucumber_inventory, cucumber_state, cucumber_rows,
                                   cucumber_init_status, cucumber_dependencies)
-    elif cucumber_step == "generation":
         render_cucumber_generation(cucumber_ctx, cucumber_state, cucumber_dependencies)
-    elif cucumber_step == "execution":
-        if cucumber_client:
+    if cucumber_client:
+        if section("Exécution : run Jenkins et import des logs", ":material/play_circle:",
+                   f"execution_{cucumber_client}", asked == "import" or cucumber_steps["execution"]["etat"] == "attention"):
+            st.caption(cucumber_steps["execution"]["resume"])
             render_cucumber_run(cucumber_ctx, cucumber_state)
             render_cucumber_import(cucumber_client, cucumber_state)
-    elif cucumber_step == "correction":
-        if cucumber_client:
-            render_cucumber_corrections(cucumber_client, cucumber_ctx["cmd"], cucumber_rows, cucumber_state)
-    elif cucumber_step == "bilan":
-        if cucumber_client:
-            render_cucumber_review(cucumber_client, cucumber_state)
+        if cucumber_steps["correction"]["etat"] != "vide":
+            if section("Corrections et décisions", ":material/build:", f"correction_{cucumber_client}",
+                       cucumber_steps["correction"]["etat"] in ("a_faire", "attention")):
+                st.caption(cucumber_steps["correction"]["resume"])
+                render_cucumber_corrections(cucumber_client, cucumber_ctx["cmd"], cucumber_rows, cucumber_state)
+        if cucumber_steps["bilan"]["etat"] != "vide":
+            if section("Bilan du dernier run", ":material/summarize:", f"bilan_{cucumber_client}",
+                       cucumber_steps["bilan"]["etat"] == "attention"):
+                st.caption(cucumber_steps["bilan"]["resume"])
+                render_cucumber_review(cucumber_client, cucumber_state)
 
 
 def render_knowledge_outbox() -> None:
