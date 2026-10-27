@@ -350,3 +350,20 @@ def test_open_from_results_shows_detail_under_the_result(project):
     assert at.session_state[f"cucumber_card_{CLIENT}"] == "sp-a"
     [b for b in at.button if b.key == f"cucumber_close_resultat_{CLIENT}"][0].click().run()
     assert f"cucumber_card_{CLIENT}" not in at.session_state
+
+
+def test_preparation_result_stays_visible_in_results(project, tmp_path):
+    """« Les préparer » : le résultat (phrase, fichiers, points restants, patch) reste affiché dans « Résultats »."""
+    patch = str(tmp_path / f"{CLIENT}-cucumber-init.patch")
+    write(patch, "diff --git a/Init.feature b/Init.feature\n+Feature: Compléments\n")
+    cr.record_preparation(CLIENT, True, "Compléments des données de test écrits (1 fichier(s)).",
+                          [FEATURES + "01-Contexte/99-Complements.feature"], patch,
+                          ["Contrôle d'un champ personnalisé : entité inconnue", ""])
+    at = app_at()
+    shown = text_of(at)
+    assert "Préparation des données de test" in shown and "Compléments des données de test écrits" in shown
+    assert "1 point(s) non fait(s), à traiter à la main" in shown and "entité inconnue" in shown
+    assert [b for b in at.get("download_button") if str(b.proto.label) == "Télécharger le patch"]
+    [t for t in at.toggle if t.key == f"cucumber_preparation_diff_{CLIENT}"][0].set_value(True).run()
+    assert any("+Feature: Compléments" in c.value for c in at.code)
+    no_raw_output(at)

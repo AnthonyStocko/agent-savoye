@@ -90,6 +90,19 @@ def record_interruption(client_name: str, ids: list, cause: str, action: str = "
     return recorded
 
 
+def record_preparation(client_name: str, ok: bool, message: str, files: list = (), patch: str = "",
+                       remaining: list = ()) -> dict:
+    """
+    Résultat de la préparation des données de test (lot d'initialisation) : réussite, phrase, fichiers du patch,
+    chemin du patch et points restants (non faits, à traiter à la main). Remplace le précédent.
+    """
+    state = load_state(client_name)
+    state["preparation"] = {"date": _now(), "ok": ok, "message": message.strip(), "fichiers": list(files),
+                            "patch": patch, "restantes": [str(r).strip() for r in remaining if str(r).strip()][:30]}
+    save_state(client_name, state)
+    return state["preparation"]
+
+
 def missing_results(state: dict, ids: list, since: str) -> list:
     """Tâches demandées sans résultat enregistré depuis `since` : aucune génération ne finit sans résultat."""
     generations = state.get("generations") or {}

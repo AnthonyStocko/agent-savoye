@@ -1700,8 +1700,11 @@ def render_todo_banner(ctx: dict, rows: list, links: dict, init_status: dict, de
         items.append(("analyse", "L'analyse automatique du projet a échoué.", detected.get("cause", "")))
     init_lot = cucumber_detection.init_lot(init_status)
     if init_lot:
+        prepared = cucumber_tools.load_state(client).get("preparation") or {}
         items.append(("init", "Les données de test du projet sont " + ("absentes." if init_lot["mode"] == "init" else
-                                                                        "incomplètes."), init_lot))
+                                                                        "incomplètes.")
+                      + (f" Préparation faite le {prepared['date'][:16].replace('T', ' à ')} : voir « Résultats »."
+                         if prepared.get("ok") and prepared.get("patch") else ""), init_lot))
     answers = sum(1 for r in rows if cucumber_coverage.in_filter(r, "reponses"))
     if answers:
         items.append(("reponses", f"{answers} fonctionnalité{'s' if answers > 1 else ''} attend"
@@ -1739,8 +1742,8 @@ def render_todo_banner(ctx: dict, rows: list, links: dict, init_status: dict, de
                     with st.popover("Voir comment le débloquer" if kind == "repo" else "Voir le détail"):
                         st.markdown(extra or "Cause inconnue.")
                 elif kind == "init":
-                    if st.button("Les préparer", key=f"cucumber_todo_init_{client}", disabled=not ctx["ready"]):
-                        run_cucumber_init_lot(ctx, extra)
+                    st.button("Les préparer", key=f"cucumber_todo_init_{client}", disabled=not ctx["ready"],
+                              on_click=st.session_state.update, kwargs={f"cucumber_init_demande_{client}": True})
                 elif kind == "reponses":
                     st.button("Répondre", key=f"cucumber_todo_reponses_{client}", on_click=st.session_state.update,
                               kwargs={f"cucumber_filtre_{client}": "reponses"})
@@ -1762,6 +1765,10 @@ def render_todo_banner(ctx: dict, rows: list, links: dict, init_status: dict, de
                         (st.success if code == 0 else st.error)(
                             "Tag du client ajouté aux anciens tests." if code == 0 else
                             f"Correction incomplète : {interruption_cause(code)}.")
+    # Préparation demandée : lancée sous le bandeau (pleine largeur), son résultat reste affiché dans « Résultats »
+    init_item = [extra for kind, _, extra in items if kind == "init"]
+    if st.session_state.pop(f"cucumber_init_demande_{client}", False) and init_item and ctx["ready"]:
+        run_cucumber_init_lot(ctx, init_item[0])
 
 
 def render_simple_import(client: str) -> None:
@@ -1887,6 +1894,31 @@ def render_zone_tasks(ctx: dict, rows: list) -> None:
                   on_click=st.session_state.pop, args=(f"cucumber_card_{client}", None))
 
 
+def render_preparation_result(client: str, preparation: dict) -> None:
+    """Résultat de la dernière préparation des données de test : phrase, points restants, modifications, patch."""
+    if not preparation:
+        return
+    with st.container(border=True):
+        date = preparation.get("date", "")[:16].replace("T", " à ")
+        st.markdown(f"**Préparation des données de test** ({date}) — {'✅' if preparation.get('ok') else '⛔'} "
+                    f"{preparation.get('message', '')}")
+        for path in preparation.get("fichiers") or []:
+            st.caption(f"📄 `{path}`")
+        remaining = preparation.get("restantes") or []
+        if remaining:
+            st.markdown(f"**{len(remaining)} point(s) non fait(s), à traiter à la main :**")
+            st.markdown("\n".join(f"- {r}" for r in remaining))
+        patch = preparation.get("patch") or ""
+        if patch and os.path.exists(patch):
+            text = open(patch, encoding="utf-8", errors="replace").read()
+            with st.container(horizontal=True):
+                show = st.toggle("Voir les modifications", key=f"cucumber_preparation_diff_{client}")
+                st.download_button("Télécharger le patch", text, file_name=os.path.basename(patch),
+                                   icon=":material/download:", key=f"cucumber_preparation_patch_{client}")
+            if show:
+                st.code(text, language="diff")
+
+
 def render_zone_results(ctx: dict, rows: list) -> None:
     """
     Zone « Résultats » : une ligne par fonctionnalité traitée (la plus récente en tête), avec son résultat (test
@@ -1899,7 +1931,8 @@ def render_zone_results(ctx: dict, rows: list) -> None:
     waiting = [i for lot in cucumber_tools.pending_lots(state) for i in lot["ids"]
                if (generations.get(i) or {}).get("type") != "interrompue"]
     st.markdown("#### Résultats")
-    if not generations and not waiting:
+    render_preparation_result(client, state.get("preparation") or {})
+    if not generations and not waiting and not state.get("preparation"):
         st.caption("Aucune fonctionnalité traitée pour l'instant : cochez-en dans la liste et écrivez leurs tests.")
         return
     for spec_id in waiting:
@@ -2325,7 +2358,7 @@ def run_cucumber_init_lot(ctx: dict, lot: dict) -> int:
     st.info(f"{lot['titre']} {ctx['client']} en cours...")
     returncode = run_main_step(ctx["cmd"] + ["--init-only"], on_line=ctx["capture"])
     if returncode == 0:
-        st.success(f"{lot['titre']} : terminé ; les modifications sont téléchargeables dans le mode expert.")
+        st.success(f"{lot['titre']} : terminé ; le résultat est dans « Résultats » (Préparation des données de test).")
     else:
         st.error(f"{lot['titre']} en échec (code {returncode}) : voir le journal technique (en haut de l'onglet).")
     return returncode

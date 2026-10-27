@@ -2030,6 +2030,10 @@ def init_features(worktree: str) -> list:
             for n in names if n.endswith(".feature") and cucumber_init.INIT_DIR in d]
 
 
+# Points restants déclarés par Claude à la dernière écriture de steps d'init, par libellé (résultat de la préparation)
+INIT_REMAINING = {}
+
+
 def write_init_steps(client: str, worktree: str, prompt_name: str, values: dict, check, features: list,
                      cucumber_std_dir: str, label: str, usage_step: str) -> list:
     """
@@ -2046,9 +2050,10 @@ def write_init_steps(client: str, worktree: str, prompt_name: str, values: dict,
         prompt = render_prompt(prompt_name, **values,
                                erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
         effort = cucumber_fix_effort() if attempt else claude_effort("CLAUDE_EFFORT_CUCUMBER")
-        returncode, _, usage, limit_hit = run_cucumber_claude(
+        returncode, output, usage, limit_hit = run_cucumber_claude(
             prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2), run_dir, effort)
         report_token_usage(f"{client}-init", usage_step, model, usage, len(prompt), returncode, effort)
+        INIT_REMAINING[label] = cucumber_diagnostic.parse_fix_result(output).get("restantes") or []
         if limit_hit:
             return errors + [f"quota ou budget atteint pendant l'écriture ({label.lower()})"]
         errors = check()
@@ -2103,7 +2108,22 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     sans step du Standard reconnu, contrôle de l'environnement), écrits par un appel Claude borné. Renvoie le code
     de sortie.
     """
+    code = _run_cucumber_init(args, local_client_repo, local_cucumber_std_repo, cucumber_repo_dir, base,
+                              odatio_version)
+    if code and not (cucumber_tools.load_state(args.client_name).get("preparation") or {}).get("date", "") >= \
+            INIT_STARTED[0]:
+        cucumber_results.record_preparation(args.client_name, False, "La préparation a échoué : voir le journal "
+                                            "technique (mode expert).")
+    return code
+
+
+INIT_STARTED = [""]
+
+
+def _run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str, cucumber_repo_dir: str,
+                       base: str, odatio_version: str = "") -> int:
     client = args.client_name
+    INIT_STARTED[0] = datetime.now().isoformat(timespec="seconds")
     if not args.init_modules.strip():
         # Lot d'initialisation selon l'état détecté : init absente -> init complète, incomplète -> compléments seuls
         subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
@@ -2111,10 +2131,13 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
             facts = detect_init_facts(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version)
         except RuntimeError as e:
             print(f"[CUCUMBER INIT] ❌ {e}")
+            cucumber_results.record_preparation(client, False, f"La préparation a échoué : {e}")
             return 1
         status = print_init_status(client, facts)
         if status["etat"] == "complete":
             print("[CUCUMBER INIT] Initialisation complète : aucun lot d'initialisation à générer.")
+            cucumber_results.record_preparation(client, True, "Les données de test sont déjà complètes : rien à "
+                                                "préparer.")
             return 0
         if status["etat"] == "incomplete":
             return run_cucumber_init_complements(client, local_client_repo, local_cucumber_std_repo,
@@ -2170,8 +2193,15 @@ def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str
     print(f"[CUCUMBER INIT] Modules retenus : {', '.join(result['modules'])} ({len(result['fichiers'])} fichier(s))")
     if not result["patch"]:
         print(f"[CUCUMBER INIT] Le dépôt {args.cucumber_repo} contient déjà cette initialisation : aucun patch produit.")
+        cucumber_results.record_preparation(client, True, "Le dépôt contient déjà cette initialisation : rien à "
+                                            "ajouter.", remaining=result.get("avertissements") or [])
         return 0
     tags = ", ".join(f"@INIT_{cucumber_tools.java_package_segment(client).upper()}_{m}" for m in result["modules"])
+    cucumber_results.record_preparation(
+        client, True, f"Initialisation des données de test écrite pour {', '.join(result['modules'])} "
+                      f"({len(result['fichiers'])} fichier(s)) ; à appliquer au dépôt puis à lancer module par module "
+                      f"({tags}).", result["fichiers"], result["patch"],
+        (result.get("avertissements") or []) + [r for notes in INIT_REMAINING.values() for r in notes])
     print(f"[CUCUMBER INIT] Patch : {result['patch']}")
     print(f"[CUCUMBER INIT] Une initialisation par module, chacune purge l'environnement : lancez-les séparément "
           f"({tags}).")
@@ -2195,7 +2225,10 @@ def run_cucumber_init_complements(client: str, local_client_repo: str, local_cuc
                                                                      local_cucumber_std_repo, profile))
     except RuntimeError as e:
         print(f"[CUCUMBER INIT] ❌ {e}")
+        cucumber_results.record_preparation(client, False, f"La préparation a échoué : {e}")
         return 1
+    remaining = (result["avertissements"] + [r for notes in INIT_REMAINING.values() for r in notes]
+                 + [f"À traiter à la main — {f['libelle']} : {f['message']}" for f in result["manuels"]])
     for warning in result["avertissements"]:
         print(f"[CUCUMBER INIT] ⚠️ {warning}")
     for finding in result["manuels"]:
@@ -2205,7 +2238,13 @@ def run_cucumber_init_complements(client: str, local_client_repo: str, local_cuc
             print(f"    {cucumber_detection.proof_line(proof)}")
     if not result["patch"]:
         print("[CUCUMBER INIT] Aucun complément livrable : aucun patch produit.")
+        cucumber_results.record_preparation(client, True, "Aucun complément ne peut être ajouté automatiquement : "
+                                            "les points restants sont à traiter à la main.", remaining=remaining)
         return 0
+    cucumber_results.record_preparation(
+        client, True, f"Compléments des données de test écrits ({len(result['fichiers'])} fichier(s)) ; l'init "
+                      f"existante n'est pas modifiée. À appliquer au dépôt (patch).", result["fichiers"],
+        result["patch"], remaining)
     print(f"[CUCUMBER INIT] Compléments d'initialisation : {', '.join(result['fichiers'])}")
     print(f"[CUCUMBER INIT] Patch : {result['patch']}")
     return 0
