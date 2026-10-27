@@ -1479,7 +1479,7 @@ def render_init_patch(client: str) -> None:
                     f"{generated_at})]")
         with open(init_patch, "rb") as f:
             st.download_button("Télécharger le patch d'initialisation", f.read(), file_name=os.path.basename(init_patch),
-                               mime="text/x-diff", icon=":material/download:")
+                               mime="text/x-diff", icon=":material/download:", key=f"cucumber_init_patch_{client}")
 
 
 COVERAGE_COLUMNS = {
@@ -2303,7 +2303,7 @@ def render_cucumber_generation(ctx: dict, state: dict, dependencies: dict = None
         pending = cucumber_tools.pending_lots(state)
     render_cucumber_lots(state, pending, dependencies)
     render_cucumber_verification(client, state)
-    render_init_patch(client)
+    # Patch d'initialisation : affiché une seule fois, avec le plan de génération (même section)
     if os.path.exists(cucumber_tools.patch_path(client)):
         patch_file = cucumber_tools.patch_path(client)
         generated_at = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(patch_file)))
@@ -2311,7 +2311,8 @@ def render_cucumber_generation(ctx: dict, state: dict, dependencies: dict = None
             st.markdown(f"**:material/description: Patch** `{patch_file}` :gray[(généré le {generated_at})]")
             with open(patch_file, "rb") as f:
                 st.download_button("Télécharger le patch", f.read(), file_name=os.path.basename(patch_file),
-                                   mime="text/x-diff", icon=":material/download:")
+                                   mime="text/x-diff", icon=":material/download:",
+                                   key=f"cucumber_generation_patch_{client}")
 
 
 def render_manual_correction(client: str, state: dict) -> None:

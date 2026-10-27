@@ -313,3 +313,16 @@ def test_d_interruption_gives_a_single_action(project):
     assert generation["action"] == "" and generation["message"].count("Action :") == 1
     cr.record_interruption(CLIENT, ["sp-e"], "erreur de l'agent pendant le lot", "relancer la génération")
     assert ct.load_state(CLIENT)["generations"]["sp-e"]["action"] == "relancer la génération"
+
+
+def test_generation_section_with_init_patch_and_patch_renders_once(project):
+    """Patch d'initialisation et patch livré présents, section Génération ouverte : aucun élément en double."""
+    write(ct.init_patch_path(CLIENT), "diff --git a/x b/x\n")
+    write(ct.patch_path(CLIENT), "diff --git a/y b/y\n")
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_section_generation_{CLIENT}"] = True
+    at.session_state[f"cucumber_section_generation_{CLIENT}_vu"] = True
+    at.run()
+    assert not at.exception, [e.value for e in at.exception]
+    labels = [str(b.proto.label) for b in at.get("download_button")]
+    assert labels.count("Télécharger le patch d'initialisation") == 1
