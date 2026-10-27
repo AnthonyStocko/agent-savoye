@@ -408,8 +408,16 @@ DB_BLOCK_WORDING = {
 }
 
 
-def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default") -> str:
-    """Bloc de prompt de l'accès base en lecture seule ('' si non demandé ou non configuré)."""
+def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default",
+                   profile: str = "") -> str:
+    """
+    Bloc de prompt de l'accès base en lecture seule ('' si non demandé ou non configuré). `profile` « cucumber » :
+    base de l'environnement où sont joués les tests (CUCUMBER_DB_*, à défaut DB_*), passée à l'agent par --profile.
+    """
+    db_tools.set_profile(profile)
+    if not db_schema and db_tools.config_prefix() != "DB_":
+        # Base Cucumber renseignée : son schéma par défaut (CUCUMBER_DB_SCHEMA)
+        db_schema = db_tools.get_db_config()["schema"]
     if not db_schema:
         return ""
     if not db_tools.is_valid_identifier(db_schema):
@@ -422,7 +430,7 @@ def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: st
     db_type = db_tools.get_db_config()["type"]
     print(f"[BDD] Accès en lecture seule activé : {db_tools.describe_db_target()}, schéma {db_schema}.")
     db_cli = os.path.join(workspace_dir, "tools", "db_tools.py")
-    base_cmd = f'"{python_exe}" "{db_cli}" --schema {db_schema}'
+    base_cmd = f'"{python_exe}" "{db_cli}" --schema {db_schema}' + (f" --profile {profile}" if profile else "")
     if db_type == "sqlserver":
         schema_hint = f"Sous SQL Server, préfixe les tables par le schéma ({db_schema}.NOM_TABLE)."
     else:
@@ -1712,7 +1720,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             has_parameters = any(s["type"] == "parametrage" for s in lot_specs)
             all_lots = os.getenv("CUCUMBER_DB_ALL_LOTS", "1").strip() != "0"
             db_block = build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
-                                      step="generate-cucumber-client") if has_parameters or all_lots else ""
+                                      step="generate-cucumber-client", profile="cucumber") \
+                if has_parameters or all_lots else ""
             # Exemple du lot : la feature Standard la mieux classée, à défaut les exemples globaux
             example = cucumber_tools.lot_example(lot_specs)
             values = {**fixed_values, "examples": f"'{example}'"} if example else fixed_values

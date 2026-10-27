@@ -909,7 +909,7 @@ with tab_cucumber:
 
     # Valeurs par défaut du .env, puis dernières valeurs saisies (conservées dans la session)
     st.session_state.setdefault("cucumber_repo", os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""))
-    st.session_state.setdefault("cucumber_db_schema", os.getenv("DB_SCHEMA", ""))
+    st.session_state.setdefault("cucumber_db_schema", os.getenv("CUCUMBER_DB_SCHEMA", "") or os.getenv("DB_SCHEMA", ""))
     st.session_state.setdefault("cucumber_application", "")
     st.session_state.setdefault("cucumber_std_repo", os.getenv("BITBUCKET_CUCUMBER_STD_REPO", ""))
 
@@ -932,7 +932,9 @@ with tab_cucumber:
     with col_schema:
         cucumber_schema = st.text_input(
             "Schéma BDD (optionnel) :", key="cucumber_db_schema",
-            help="Schéma de la base client consultable en lecture seule. Vide = l'agent n'utilise pas la base.",
+            help="Schéma consultable en lecture seule dans la base de l'environnement de test Cucumber (CUCUMBER_DB_*, "
+                 "onglet Configuration ; à défaut la base DB_*). Vide = CUCUMBER_DB_SCHEMA si cette base est "
+                 "renseignée, sinon l'agent n'utilise pas la base.",
         ).strip()
     with col_app:
         cucumber_application = st.text_input(
@@ -1727,6 +1729,27 @@ with tab_config:
         st.caption("Utilisez de préférence un compte base en lecture seule : le mot de passe reste dans le .env "
                    "et n'est jamais transmis à l'agent.")
 
+        st.markdown("#### 🥒 Base de l'environnement de test Cucumber (lecture seule)")
+        st.caption("Base de l'environnement où Jenkins joue les tests (CUCUMBER_VERIFY_ENV) : l'agent des lots Cucumber "
+                   "y prend ses données de référence réelles. Vide = base ci-dessus (DB_*). Ne mettez pas ces "
+                   "informations dans CUCUMBER_VERIFY_ENV, transmis tel quel à Jenkins.")
+        current_cuc_type = os.getenv("CUCUMBER_DB_TYPE", "") or current_db_type
+        env_values["CUCUMBER_DB_TYPE"] = st.selectbox(
+            "CUCUMBER_DB_TYPE", DB_TYPES, index=DB_TYPES.index(current_cuc_type) if current_cuc_type in DB_TYPES else 0)
+        with st.container(horizontal=True):
+            env_values["CUCUMBER_DB_HOST"] = st.text_input("CUCUMBER_DB_HOST", value=os.getenv("CUCUMBER_DB_HOST", ""))
+            env_values["CUCUMBER_DB_PORT"] = st.text_input("CUCUMBER_DB_PORT", value=os.getenv("CUCUMBER_DB_PORT", ""),
+                                                           help="Vide = port par défaut du SGBD.")
+        env_values["CUCUMBER_DB_NAME"] = st.text_input("CUCUMBER_DB_NAME (base, ou service name Oracle)",
+                                                       value=os.getenv("CUCUMBER_DB_NAME", ""))
+        with st.container(horizontal=True):
+            env_values["CUCUMBER_DB_USER"] = st.text_input("CUCUMBER_DB_USER", value=os.getenv("CUCUMBER_DB_USER", ""))
+            env_values["CUCUMBER_DB_PASSWORD"] = st.text_input("CUCUMBER_DB_PASSWORD", type="password",
+                                                               value=os.getenv("CUCUMBER_DB_PASSWORD", ""))
+        env_values["CUCUMBER_DB_SCHEMA"] = st.text_input(
+            "CUCUMBER_DB_SCHEMA (valeur par défaut)", value=os.getenv("CUCUMBER_DB_SCHEMA", ""),
+            help="Pré-remplit le champ « Schéma BDD » de l'onglet Cucumber.")
+
         st.markdown("---")
         submit_save = st.form_submit_button("💾 Enregistrer la configuration complète", type="primary", use_container_width=True)
 
@@ -1745,11 +1768,19 @@ with tab_config:
         st.caption("Teste la connexion base enregistrée (et le schéma DB_SCHEMA s'il est renseigné).")
     if test_db_clicked:
         with st.spinner("Connexion à la base…"):
-            db_ok, db_message = test_connection(os.getenv("DB_SCHEMA", "").strip())
+            db_ok, db_message = test_connection(os.getenv("DB_SCHEMA", "").strip(), profile="")
         if db_ok:
             st.success(db_message, icon=":material/check_circle:")
         else:
             st.error(db_message, icon=":material/error:")
+    if os.getenv("CUCUMBER_DB_HOST", "").strip() or os.getenv("CUCUMBER_DB_NAME", "").strip():
+        if st.button("Tester la base Cucumber", icon=":material/lan:"):
+            with st.spinner("Connexion à la base Cucumber…"):
+                db_ok, db_message = test_connection(os.getenv("CUCUMBER_DB_SCHEMA", "").strip(), profile="cucumber")
+            if db_ok:
+                st.success(db_message, icon=":material/check_circle:")
+            else:
+                st.error(db_message, icon=":material/error:")
 
     st.divider()
     st.subheader("Mémoire de l'agent")

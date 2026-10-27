@@ -77,16 +77,40 @@ class DbError(Exception):
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Profil de connexion : "" = base du socle (DB_*) ; "cucumber" = base de l'environnement où sont joués les tests
+# Cucumber (CUCUMBER_DB_*), à défaut DB_*
+PROFILES = ("", "cucumber")
+_profile = ""
+
+
+def set_profile(profile: str) -> str:
+    """Choisit le profil de connexion ; renvoie le précédent."""
+    global _profile
+    previous, _profile = _profile, (profile or "").strip().lower()
+    if _profile not in PROFILES:
+        raise DbError(f"Profil de base inconnu : '{profile}' (attendu : cucumber ou vide).")
+    return previous
+
+
+def config_prefix(profile: str = None) -> str:
+    """Préfixe des variables du profil : CUCUMBER_DB_ si sa connexion est renseignée, sinon DB_."""
+    profile = _profile if profile is None else profile
+    if profile == "cucumber" and (os.getenv("CUCUMBER_DB_HOST", "").strip() or os.getenv("CUCUMBER_DB_NAME", "").strip()):
+        return "CUCUMBER_DB_"
+    return "DB_"
+
+
 def get_db_config() -> dict:
-    """Paramètres de connexion lus dans l'environnement (.env)."""
+    """Paramètres de connexion du profil courant, lus dans l'environnement (.env)."""
+    prefix = config_prefix()
     return {
-        "type": os.getenv("DB_TYPE", "").strip().lower(),
-        "host": os.getenv("DB_HOST", "").strip(),
-        "port": os.getenv("DB_PORT", "").strip(),
-        "name": os.getenv("DB_NAME", "").strip(),
-        "user": os.getenv("DB_USER", "").strip(),
-        "password": os.getenv("DB_PASSWORD", ""),
-        "schema": os.getenv("DB_SCHEMA", "").strip(),
+        "type": os.getenv(f"{prefix}TYPE", "").strip().lower(),
+        "host": os.getenv(f"{prefix}HOST", "").strip(),
+        "port": os.getenv(f"{prefix}PORT", "").strip(),
+        "name": os.getenv(f"{prefix}NAME", "").strip(),
+        "user": os.getenv(f"{prefix}USER", "").strip(),
+        "password": os.getenv(f"{prefix}PASSWORD", ""),
+        "schema": os.getenv(f"{prefix}SCHEMA", "").strip(),
     }
 
 
@@ -131,7 +155,7 @@ def _server_message(error) -> str:
 
 def _scrub(message) -> str:
     """Retire le mot de passe d'un message d'erreur de pilote."""
-    password = os.getenv("DB_PASSWORD", "")
+    password = get_db_config()["password"]
     text = _server_message(message) if isinstance(message, BaseException) else str(message)
     if password:
         text = text.replace(password, "***")
@@ -424,8 +448,14 @@ def describe_table(table: str, schema: str = "") -> str:
     return "\n".join(lines)
 
 
-def test_connection(schema: str = "") -> tuple:
+def test_connection(schema: str = "", profile: str = None) -> tuple:
     """Renvoie (succès, message) ; utilisé par le bouton « Tester la connexion » de l'IHM."""
+    if profile is not None:
+        previous = set_profile(profile)
+        try:
+            return test_connection(schema)
+        finally:
+            set_profile(previous)
     cfg = get_db_config()
     try:
         _import_sqlalchemy()
@@ -446,6 +476,8 @@ def test_connection(schema: str = "") -> tuple:
 def main() -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--schema", default=argparse.SUPPRESS, help="Schéma cible (défaut : DB_SCHEMA du .env)")
+    common.add_argument("--profile", default=argparse.SUPPRESS,
+                        help="cucumber = base de l'environnement de test Cucumber (CUCUMBER_DB_*, à défaut DB_*)")
 
     parser = argparse.ArgumentParser(description="Accès en lecture seule à la base de données client",
                                      parents=[common])
@@ -460,8 +492,9 @@ def main() -> int:
     query.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help=f"Lignes max (défaut {DEFAULT_LIMIT}, max {MAX_LIMIT})")
 
     args = parser.parse_args()
-    schema = (getattr(args, "schema", None) or os.getenv("DB_SCHEMA", "")).strip()
     try:
+        set_profile(getattr(args, "profile", ""))
+        schema = (getattr(args, "schema", None) or get_db_config()["schema"]).strip()
         if args.command == "test":
             ok, message = test_connection(schema)
             if not ok:
