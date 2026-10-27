@@ -320,3 +320,16 @@ def test_detection_file_is_json(cache):
     cd.save_result(CLIENT, {"cucumber": "abc"}, {"features": []})
     with open(cd.detection_path(CLIENT), encoding="utf-8") as f:
         assert json.load(f)["empreinte"] == cd.fingerprint({"cucumber": "abc"})
+
+
+def test_complements_without_verifiable_check_add_no_feature(repo, std_dir, cache):
+    """Seul complément : un champ personnalisé que l'API ne permet pas de vérifier -> aucune feature ajoutée,
+    avertissement non bloquant (jamais un contrôle qui fait échouer l'init)."""
+    commit(repo, {INIT_REL: init_text(), FEATURE_REL: FEATURE})
+    facts, status = detect(repo, std_dir)
+    profile = cp.effective_profile(cp.load_profile(CLIENT))
+    result = ci.build_init_complements(
+        repo, std_dir, CLIENT, "integration", profile, status, [f["chemin"] for f in facts["features"]],
+        writer=lambda worktree, checks, manual: {"erreurs": [], "non_verifiables": [c["code"] for c in checks]})
+    assert result["fichiers"] == [] and result["patch"] == ""
+    assert any("non vérifiable par l'API : customString4" in w for w in result["avertissements"])

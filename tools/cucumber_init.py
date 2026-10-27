@@ -438,8 +438,24 @@ def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client
     result["avertissements"] += result["recreation"]["avertissements"]
     env = {"controles": len(checks), "livres": False, "avertissements": []}
     if checks:
-        errors = writer(worktree, checks, []) if writer else ["aucun moyen d'écrire les steps du projet"]
+        errors, unverifiable = _writer_outcome(
+            writer(worktree, checks, []) if writer else ["aucun moyen d'écrire les steps du projet"])
         env["livres"] = not errors
+        kept, removed = cucumber_environment.split_unverifiable(checks, unverifiable)
+        if removed and not errors:
+            # Contrôles impossibles à vérifier par l'API : retirés du scénario, avertissement non bloquant
+            lines = cucumber_environment.scenario_lines(client_name, checks, [])
+            text = _read_text(target).replace("\n".join(lines) + "\n", "".join(
+                line + "\n" for line in cucumber_environment.scenario_lines(client_name, kept, [])))
+            with open(target, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            env["controles"] = len(kept)
+            env["avertissements"] += cucumber_environment.unverifiable_warnings(removed)
+            if not kept:
+                _drop_environment_class(worktree, base, client_name)
+            if not kept and not items:
+                os.remove(target)
+                result["fichiers"].remove(target_rel)
         if errors:
             lines = cucumber_environment.scenario_lines(client_name, checks, [])
             text = _read_text(target)
@@ -447,11 +463,7 @@ def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client
                                 "\n".join(cucumber_environment.commented(lines, errors[0][:150])) + "\n")
             with open(target, "w", encoding="utf-8", newline="") as f:
                 f.write(text)
-            java = cucumber_environment.java_path(client_name)
-            if _git(worktree, "cat-file", "-e", f"{base}:{java}").returncode == 0:
-                _git(worktree, "checkout", base, "--", java)
-            elif os.path.exists(os.path.join(worktree, *java.split("/"))):
-                os.remove(os.path.join(worktree, *java.split("/")))
+            _drop_environment_class(worktree, base, client_name)
             env["avertissements"].append(f"contrôle de l'environnement non livré, commenté sous "
                                          f"{cucumber_environment.TODO_MARKER} : {errors[0][:150]}")
     result["environnement"] = env
@@ -459,7 +471,7 @@ def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client
     extra = [p for p in (cucumber_recreation.java_path(client_name), cucumber_environment.java_path(client_name))
              if os.path.exists(os.path.join(worktree, *p.split("/")))]
     result["fichiers"] += [p for p in extra if p not in present]
-    _git(worktree, "add", "-A", "--", target_rel, *extra)
+    _git(worktree, "add", "-A", "--", *([target_rel] if target_rel in result["fichiers"] else []), *extra)
     touched = set(_git(worktree, "diff", "--cached", "--name-only").stdout.splitlines())
     if touched & protected:
         _git(worktree, "reset", "-q", "--hard", base)
@@ -515,6 +527,23 @@ def _recreate_project_steps(worktree: str, base: str, client_name: str, items: l
     return out
 
 
+def _writer_outcome(outcome) -> tuple:
+    """(erreurs, dépendances non vérifiables par l'API) : l'écriture des steps renvoie une liste d'erreurs ou
+    {"erreurs", "non_verifiables"}."""
+    if isinstance(outcome, dict):
+        return list(outcome.get("erreurs") or []), list(outcome.get("non_verifiables") or [])
+    return list(outcome or []), []
+
+
+def _drop_environment_class(worktree: str, base: str, client_name: str) -> None:
+    """Classe des steps d'environnement remise à son état de `base` (ou retirée si elle n'y existait pas)."""
+    java = cucumber_environment.java_path(client_name)
+    if _git(worktree, "cat-file", "-e", f"{base}:{java}").returncode == 0:
+        _git(worktree, "checkout", base, "--", java)
+    elif os.path.exists(os.path.join(worktree, *java.split("/"))):
+        os.remove(os.path.join(worktree, *java.split("/")))
+
+
 def _environment_steps(worktree: str, base: str, client_name: str, files: list, environment: dict) -> dict:
     """
     Contrôles d'environnement et recréations des corrections manuelles (points 9g, 9h) ajoutés à la fin de chaque
@@ -536,19 +565,27 @@ def _environment_steps(worktree: str, base: str, client_name: str, files: list, 
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(originals[path].rstrip("\r\n") + "\n" + "\n".join(lines) + "\n")
     writer = (environment or {}).get("writer")
-    errors = writer(worktree, checks, recreations) if writer else ["aucun moyen d'écrire les steps du projet"]
+    errors, unverifiable = _writer_outcome(
+        writer(worktree, checks, recreations) if writer else ["aucun moyen d'écrire les steps du projet"])
     if not errors:
         out["livres"] = True
+        kept, removed = cucumber_environment.split_unverifiable(checks, unverifiable)
+        if removed:
+            # Contrôles impossibles à vérifier par l'API : retirés des scénarios, avertissement non bloquant
+            kept_lines = cucumber_environment.scenario_lines(client_name, kept, recreations)
+            for path, text in originals.items():
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(text.rstrip("\r\n") + "\n" + "\n".join(kept_lines) + "\n" if kept_lines else text)
+            out["controles"] = len(kept)
+            out["avertissements"] += cucumber_environment.unverifiable_warnings(removed)
+            if not kept_lines:
+                _drop_environment_class(worktree, base, client_name)
         return out
     reason = errors[0][:150]
     for path, text in originals.items():
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(text.rstrip("\r\n") + "\n" + "\n".join(cucumber_environment.commented(lines, reason)) + "\n")
-    java = cucumber_environment.java_path(client_name)
-    if _git(worktree, "cat-file", "-e", f"{base}:{java}").returncode == 0:
-        _git(worktree, "checkout", base, "--", java)
-    elif os.path.exists(os.path.join(worktree, *java.split("/"))):
-        os.remove(os.path.join(worktree, *java.split("/")))
+    _drop_environment_class(worktree, base, client_name)
     out["avertissements"].append(f"contrôle de l'environnement et recréations non livrés, commentés sous "
                                  f"{cucumber_environment.TODO_MARKER} : {reason}")
     return out

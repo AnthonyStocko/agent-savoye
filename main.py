@@ -2030,8 +2030,9 @@ def init_features(worktree: str) -> list:
             for n in names if n.endswith(".feature") and cucumber_init.INIT_DIR in d]
 
 
-# Points restants déclarés par Claude à la dernière écriture de steps d'init, par libellé (résultat de la préparation)
-INIT_REMAINING = {}
+# Points restants et dépendances non vérifiables par l'API déclarés par Claude à la dernière écriture de steps
+# d'init, par libellé (résultat de la préparation)
+INIT_REMAINING, INIT_UNVERIFIABLE = {}, {}
 
 
 def write_init_steps(client: str, worktree: str, prompt_name: str, values: dict, check, features: list,
@@ -2053,7 +2054,9 @@ def write_init_steps(client: str, worktree: str, prompt_name: str, values: dict,
         returncode, output, usage, limit_hit = run_cucumber_claude(
             prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2), run_dir, effort)
         report_token_usage(f"{client}-init", usage_step, model, usage, len(prompt), returncode, effort)
-        INIT_REMAINING[label] = cucumber_diagnostic.parse_fix_result(output).get("restantes") or []
+        final = cucumber_diagnostic.parse_fix_result(output)
+        INIT_REMAINING[label] = final.get("restantes") or []
+        INIT_UNVERIFIABLE[label] = final.get("non_verifiables") or []
         if limit_hit:
             return errors + [f"quota ou budget atteint pendant l'écriture ({label.lower()})"]
         errors = check()
@@ -2091,11 +2094,15 @@ def write_environment_steps(client: str, worktree: str, checks: list, recreation
               "check_expression": cucumber_environment.check_expression(client),
               "recreation_expression": cucumber_environment.recreation_expression(client),
               "controles": controls, "recreations": manual}
-    return write_init_steps(client, worktree, "cucumber_init_environnement", values,
-                            lambda: cucumber_environment.check_steps(worktree, client, checks, recreations,
-                                                                     std_expressions),
-                            init_features(worktree), cucumber_std_dir, "Steps d'environnement",
-                            "cucumber-init-environnement")
+    label = "Steps d'environnement"
+    INIT_UNVERIFIABLE.pop(label, None)
+    errors = write_init_steps(client, worktree, "cucumber_init_environnement", values,
+                              lambda: cucumber_environment.check_steps(worktree, client, checks, recreations,
+                                                                       std_expressions)
+                              + cucumber_environment.unconfirmed_failures(worktree, client),
+                              init_features(worktree), cucumber_std_dir, label, "cucumber-init-environnement")
+    # Dépendances que l'API ne permet pas de vérifier : retirées du contrôle, avertissement non bloquant
+    return {"erreurs": errors, "non_verifiables": INIT_UNVERIFIABLE.get(label) or []}
 
 
 def run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: str, cucumber_repo_dir: str,

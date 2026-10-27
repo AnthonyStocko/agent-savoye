@@ -5,7 +5,10 @@ Environnement reconstruit par l'init du projet (points 9c, 9g, 9h), 0 token côt
   documents, valeurs d'énumération et paramétrages dont dépendent les tests. Sources : champ
   « environment_checks » du profil client, et champs personnalisés absents relevés dans les runs importés
   (« Unable to find the custom field »). Un seul step du projet les vérifie tous et échoue UNE fois, avec la
-  liste de tout ce qui manque : un environnement incomplet produit un échec clair dans l'init.
+  liste de tout ce qui manque : un environnement incomplet produit un échec clair dans l'init. Règle : il
+  n'échoue que sur une absence PROUVÉE ; une dépendance qu'il ne peut pas confirmer est un avertissement. Une
+  dépendance que l'API ne permet pas de vérifier du tout (ni directement, ni indirectement) est retirée du
+  scénario et devient un avertissement non bloquant du rapport (split_unverifiable, unverifiable_warnings).
 - Corrections manuelles de l'environnement signalées (bilan, étape Bilan) : jamais une solution durable ; elles
   deviennent une recréation dans l'init du projet (step du projet idempotent, avant le contrôle).
 Les steps du projet sont écrits par un appel Claude borné (cucumber_init_environnement.md), puis contrôlés
@@ -129,6 +132,39 @@ def check_steps(worktree: str, client_name: str, checks: list, recreations: list
                 errors.append(f"méthode {method['name']} : le contrôle de l'environnement doit être en lecture "
                               f"seule (aucune écriture)")
     return errors
+
+
+_UNCONFIRMED_FAILURE = re.compile(r"(?:fail|assert\w*|throw\s+new\s+\w+)\s*\([^;]*?(?:non\s+confirm|not\s+confirm|"
+                                  r"unconfirmed|non\s+vérifi|cannot\s+be\s+verified)", re.I | re.S)
+
+
+def unconfirmed_failures(worktree: str, client_name: str) -> list:
+    """Le contrôle échoue sur une dépendance non confirmée (au lieu d'un avertissement) : une erreur par méthode."""
+    root = os.path.join(worktree, "src", "test", "java")
+    texts = [_read_text_file(os.path.join(d, n)) for d, _, names in os.walk(root) for n in names
+             if n.endswith(".java")] if os.path.isdir(root) else []
+    return [f"méthode {m['name']} : une dépendance non confirmée doit être un avertissement, l'échec est réservé à "
+            f"une absence prouvée" for text in texts for m in _java_methods(text)
+            if check_expression(client_name) in m["steps"] and _UNCONFIRMED_FAILURE.search(m["body"])]
+
+
+def split_unverifiable(checks: list, unverifiable: list) -> tuple:
+    """(contrôles gardés, contrôles impossibles à vérifier par l'API) d'après la réponse de l'écriture des steps."""
+    codes = {(str(u.get("type") or ""), str(u.get("code") or "")) for u in unverifiable if isinstance(u, dict)}
+    codes |= {("", str(u)) for u in unverifiable if isinstance(u, str)}
+    removed = [c for c in checks if (c["type"], c["code"]) in codes or ("", c["code"]) in codes]
+    return [c for c in checks if c not in removed], removed
+
+
+def unverifiable_warnings(removed: list) -> list:
+    """Avertissements non bloquants du rapport, un par type de dépendance impossible à vérifier par l'API."""
+    out = []
+    for kind in dict.fromkeys(c["type"] for c in removed):
+        codes = ", ".join(c["code"] for c in removed if c["type"] == kind)
+        label = ("déclaration des champs personnalisés" if kind == "champ_personnalise" else TYPES.get(kind, kind))
+        out.append(f"{label} non vérifiable par l'API : {codes} (avertissement non bloquant, contrôle retiré de "
+                   f"l'init)")
+    return out
 
 
 def prompt_items(checks: list, recreations: list) -> tuple:

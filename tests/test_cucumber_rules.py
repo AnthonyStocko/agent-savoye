@@ -138,3 +138,40 @@ def test_environment_check_must_be_read_only(tmp_path):
     errors = ce.check_steps(worktree, CLIENT, [{"type": "document", "code": "BL"}], ["x"], [])
     assert any("lecture seule" in e for e in errors)
     assert any(ce.recreation_expression(CLIENT) in e and "0 fois" in e for e in errors)
+
+
+def test_unverifiable_check_becomes_a_non_blocking_warning(repo):
+    """Contrôle impossible à vérifier par l'API : ligne retirée du scénario, avertissement non bloquant ; plus aucun
+    contrôle : scénario et classe retirés."""
+    rel, other = _init_worktree(repo)
+    base = git(repo, "rev-parse", "HEAD")
+    checks = [{"type": "champ_personnalise", "entite": "", "code": "champLibre1"},
+              {"type": "document", "entite": "", "code": "DOC_FICTIF"}]
+    env = {"controles": checks, "recreations": [],
+           "writer": lambda worktree, c, m: {"erreurs": [], "non_verifiables": [
+               {"type": "champ_personnalise", "code": "champLibre1", "raison": "aucun endpoint public"}]}}
+    out = ci._environment_steps(repo, base, CLIENT, [rel, other], env)
+    text = open(os.path.join(repo, rel), encoding="utf-8").read()
+    assert out["livres"] and out["controles"] == 1
+    assert "champLibre1" not in text and "| document |  | DOC_FICTIF |" in text
+    assert out["avertissements"] == ["déclaration des champs personnalisés non vérifiable par l'API : champLibre1 "
+                                     "(avertissement non bloquant, contrôle retiré de l'init)"]
+    git(repo, "checkout", "--", ".")
+    write(os.path.join(repo, ce.java_path(CLIENT)), "class S {}\n")
+    env["writer"] = lambda worktree, c, m: {"erreurs": [], "non_verifiables": ["champLibre1", "DOC_FICTIF"]}
+    out = ci._environment_steps(repo, base, CLIENT, [rel, other], env)
+    text = open(os.path.join(repo, rel), encoding="utf-8").read()
+    assert out["controles"] == 0 and ce.check_expression(CLIENT) not in text
+    assert not os.path.exists(os.path.join(repo, ce.java_path(CLIENT)))
+
+
+def test_check_fails_only_on_proven_absence(tmp_path):
+    worktree = str(tmp_path)
+    body = ("class S {\n  @Then(\"" + ce.check_expression(CLIENT) + "\")\n  public void controle(DataTable t) {\n"
+            "    %s\n  }\n}\n")
+    write(os.path.join(worktree, ce.java_path(CLIENT)),
+          body % 'fail("Dépendances non confirmées : " + manquants);')
+    assert ce.unconfirmed_failures(worktree, CLIENT)
+    write(os.path.join(worktree, ce.java_path(CLIENT)),
+          body % 'log.warn("non confirmée : " + x); if (!absents.isEmpty()) fail("Absentes : " + absents);')
+    assert ce.unconfirmed_failures(worktree, CLIENT) == []
