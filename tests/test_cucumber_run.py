@@ -334,3 +334,35 @@ def test_run_without_push_executes_the_remote_branch_as_it_is(jenkins, tmp_path)
     calls["console"] = CONSOLE.replace("Tests run: 2", "Tests run: 0")
     run = cr.launch(CLIENT, repo, PROFILE, "@nouveau", log=lambda line: None, push=False, branch="integration")
     assert run["ok"] and calls["params"][-1]["CUCUMBER_SPEC_BRANCH"] == "integration"
+
+
+def test_autonomous_verification_uses_the_client_job_and_its_settings(jenkins, monkeypatch):
+    repo, remote, calls = jenkins
+    monkeypatch.setenv("CUCUMBER_AGENT_JENKINS", "1")
+    monkeypatch.delenv("CUCUMBER_VERIFY_JOB", raising=False)
+    monkeypatch.setenv("JENKINS_URL", "https://jenkins")
+    monkeypatch.setattr(jenkins_tools, "job_parameters", lambda job: {k: v["type"] for k, v in DEFINITIONS.items()})
+    profile = {**PROFILE, "job_params": ["COMPONENT_NAME=client-app-2"], "run_tags_target": "les_deux"}
+    mode, message = cv.execution_mode(profile, "integration")
+    assert mode == "branche" and "DOSSIER/JOB-CLIENT" in message          # job du profil, sans CUCUMBER_VERIFY_JOB
+    copy = FEATURE[:-8] + "_mut.feature"
+    run = cv.run_tags("branche", repo, "", None, "@feature_a", "", {copy: "Feature: C\n  Scenario: Copie\n"},
+                      "lot1-client", cv.branch_sources(profile, "client-cucumber"))
+    sent = calls["params"][-1]
+    assert sent["COMPONENT_NAME"] == "client-app-2" and sent["ADDITIONAL_SPEC_TAGS"] == "@feature_a"
+    assert sent["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@feature_a'")
+    assert not os.path.exists(os.path.join(repo, *copy.split("/")))    # copie retirée après le run
+    assert git(repo, "status", "--porcelain") == ""
+    assert "Copie" not in git(repo, "show", f"HEAD:{FEATURE}")
+    assert subprocess.run(["git", "-C", repo, "cat-file", "-e", f"HEAD:{copy}"], capture_output=True).returncode
+
+
+def test_merged_mutation_copies_rename_agent_tags(tmp_path):
+    rel = "src/test/resources/cucumber/features/client/p.feature"
+    write(str(tmp_path / rel), "Feature: P\n  @agent_c_1_0\n  Scenario: Mise en place\n    Given a\n\n"
+                               "  @agent_c_1 @agent_c_1_1\n  Scenario: Prix\n    Then le prix vaut \"12\"\n")
+    copies, counts, where, run = cv.mutation_copies(str(tmp_path), [rel], {"@agent_c_1_1"})
+    copy = rel[:-8] + "_mut.feature"
+    assert '"12_MUT"' in copies[copy] and "@agent_c_1_1_mut" in copies[copy] and "@agent_c_1_0_mut" in copies[copy]
+    assert counts == {"@agent_c_1_1": 1} and where == {"@agent_c_1_1": copy}
+    assert run == {"@agent_c_1_1_mut", "@agent_c_1_0_mut"}

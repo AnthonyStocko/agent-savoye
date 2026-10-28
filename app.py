@@ -3301,9 +3301,10 @@ with tab_config:
         agent_jenkins = st.checkbox(
             "CUCUMBER_AGENT_JENKINS", value=os.getenv("CUCUMBER_AGENT_JENKINS", "0").strip() == "1",
             help="Décoché (défaut) : l'agent livre un patch, ne pousse rien et ne lance aucun test ; vous appliquez le "
-                 "patch, lancez votre job complet et importez son résultat. Coché : l'agent vérifie lui-même par "
-                 "exécution pendant la génération (CUCUMBER_VERIFY_JOB, branche de travail du profil ou commande "
-                 "locale) et l'étape Exécution propose « Pousser et lancer le run ».")
+                 "patch, lancez votre job complet et importez son résultat. Coché : l'agent vérifie en autonomie "
+                 "pendant la génération — il pousse ses tests sur sa branche de travail (profil client), lance le "
+                 "job du client (profil ou CUCUMBER_VERIFY_JOB) avec les paramètres imposés du profil, un build à la "
+                 "fois, corrige et revérifie, puis livre un patch vérifié à appliquer sur votre branche.")
         env_values["CUCUMBER_AGENT_JENKINS"] = "1" if agent_jenkins else "0"
         st.markdown("##### Vérification de la pertinence par exécution")
         st.caption("Sans job ni commande locale, la génération s'arrête au contrôle statique et affiche « pertinence "

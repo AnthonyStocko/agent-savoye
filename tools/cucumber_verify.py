@@ -761,6 +761,17 @@ def job_sources(cucumber_repo: str, base_branch: str, base_commit: str, standard
             "CUCUMBER_SPEC_COMMIT": base_commit, "CUCUMBER_STANDARD_COMMIT": standard_commit}
 
 
+def verification_job(profile: dict = None) -> str:
+    """
+    Job de vérification : CUCUMBER_VERIFY_JOB, sinon (exécution sur la branche de travail) le job du client du profil
+    (« job Jenkins », repli CUCUMBER_RUN_JOB) : le même job que les runs complets, lancé sur la branche de l'agent.
+    """
+    job = os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
+    if job or profile is None:
+        return job
+    return ((profile or {}).get("run_job") or os.getenv("CUCUMBER_RUN_JOB", "")).strip()
+
+
 def agent_runs_tests() -> bool:
     """
     CUCUMBER_AGENT_JENKINS (défaut 0) : l'agent exécute-t-il lui-même des tests pendant la génération (job Jenkins,
@@ -782,7 +793,7 @@ def execution_mode(profile: dict = None, base_branch: str = "") -> tuple:
         # importe le résultat (corrections proposées ensuite)
         return "", (f"{NOT_VERIFIED} : l'agent ne pousse rien et ne lance aucun test (CUCUMBER_AGENT_JENKINS=0) — "
                     f"appliquez le patch, lancez votre job Jenkins complet, puis importez son résultat")
-    job = os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
+    job = verification_job(profile)
     reasons = []
     if job and os.getenv("JENKINS_URL", "").strip():
         parameters = jenkins_tools.job_parameters(job)
@@ -1128,28 +1139,30 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
     from tools import cucumber_checks
     from tools.cucumber_import import console_facts, console_results
     from tools.secret_tools import mask_secrets
-    profile, job = sources.get("profil") or {}, os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
+    profile = sources.get("profil") or {}
+    job = verification_job(profile)
     branch = (profile.get("verify_branch") or "").strip()
     info = cucumber_job.prepare(job, profile)
     if info["erreurs"] or not branch:
         return {"ok": False, "message": (info["erreurs"] or ["branche de travail non renseignée (profil client)"])[0],
                 "build": "", "resultats": {}}
-    originals = {rel: _read_text_file(os.path.join(worktree, *rel.split("/"))) for rel in overrides}
+    # Features exécutées : celles du worktree, avec les fichiers remplacés ou ajoutés le temps du run (mutation)
+    texts = feature_texts_with(worktree, overrides)
+    restore = _apply_overrides(worktree, overrides)
     try:
-        for rel, text in overrides.items():
-            _write_text(os.path.join(worktree, *rel.split("/")), text)
         error, _ = cucumber_checks.push_for_verification(worktree, branch, f"Cucumber verification ({label})")
         head = _git(worktree, "rev-parse", "HEAD").stdout.strip()
     finally:
         if overrides:
-            for rel, text in originals.items():
-                _write_text(os.path.join(worktree, *rel.split("/")), text)
-            _git(worktree, "add", "--", *overrides)
+            restore()
+            _git(worktree, "add", "-A", "--", *overrides)
             _git(worktree, "commit", "-q", "-m", f"Cucumber verification ({label}) : fichiers d'origine rétablis")
     if error:
         return {"ok": False, "message": f"non vérifié : {error}", "build": "", "resultats": {}}
+    fixed, _ = cucumber_job.fixed_parameters(profile, info["definitions"])
     params = cucumber_job.build_parameters(info["definitions"], info["roles"], branch, sources.get("depot", ""),
-                                           tags, head, env)
+                                           tags, head, env, fixed=fixed,
+                                           target=cucumber_job.tag_target(profile, info["roles"]))
     # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
     build = jenkins_tools.run_exclusive(job, lambda: jenkins_tools.trigger_job(job, params), _timeout())
     if build["result"] == "INDISPONIBLE" and not build["url"]:
@@ -1170,7 +1183,7 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
             data = []
         report += data if isinstance(data, list) else []
     if report:
-        gap = selection_gap(report, feature_texts(worktree), tags)
+        gap = selection_gap(report, texts, tags)
         if gap:
             return {"ok": False, "message": gap, "build": build["url"], "resultats": {}, "ecart_selection": True}
         return {"ok": True, "message": f"build {build['result']}", "build": build["url"],
@@ -1181,11 +1194,41 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
         return {"ok": False, "message": f"build {build['result']} sans rapport Cucumber JSON ni scénario lisible dans "
                                         f"la console", "build": build["url"], "resultats": {}}
     run = (console_facts(console).get("tests") or {}).get("executes")
-    gap = count_gap(run, feature_texts(worktree), tags) if run is not None else ""
+    gap = count_gap(run, texts, tags) if run is not None else ""
     if gap:
         return {"ok": False, "message": gap, "build": build["url"], "resultats": {}, "ecart_selection": True}
     return {"ok": True, "message": f"build {build['result']} (résultats lus dans la console)", "build": build["url"],
             "resultats": results}
+
+
+def _apply_overrides(root: str, overrides: dict):
+    """
+    Écrit les `overrides` {chemin relatif: texte} dans `root` (fichiers remplacés ou nouveaux) ; renvoie la fonction
+    qui rétablit `root` (contenus d'origine, fichiers nouveaux supprimés).
+    """
+    originals = {}
+    for rel, text in overrides.items():
+        path = os.path.join(root, *rel.split("/"))
+        originals[path] = _read_text_file(path) if os.path.exists(path) else None
+        _write_text(path, text)
+
+    def restore():
+        for path, text in originals.items():
+            if text is None:
+                if os.path.exists(path):
+                    os.remove(path)
+            else:
+                _write_text(path, text)
+    return restore
+
+
+def feature_texts_with(worktree: str, overrides: dict) -> list:
+    """Textes des .feature du worktree, avec les `overrides` (remplacés ou ajoutés) : ce que le run exécute."""
+    paths = _git(worktree, "ls-files", "-co", "--exclude-standard", "--", "*.feature").stdout.splitlines()
+    texts = {p: _read_text_file(os.path.join(worktree, *p.split("/"))) for p in paths
+             if os.path.exists(os.path.join(worktree, *p.split("/")))}
+    texts.update({rel: text for rel, text in (overrides or {}).items() if rel.endswith(".feature")})
+    return list(texts.values())
 
 
 def _patch_not_applicable(build: dict, patch_file: str, label: str) -> bool:
@@ -1280,6 +1323,40 @@ def mutate_feature(text: str, tags: set) -> tuple:
 # Vérification d'un lot : 3 exécutions au plus (client, Standard pour les overrides, mutation)
 # ---------------------------------------------------------------------------
 
+MUTATION_SUFFIX = "_mut"
+
+
+def merged_mutation() -> bool:
+    """
+    CUCUMBER_VERIFY_MERGE_MUTATION (défaut 0) : mutation jouée dans le même build que le client (copies
+    <feature>_mut.feature), au lieu d'un build à part. Un build de moins par lot ; mais les copies recréent les données
+    des originaux dans le même run (codes déjà existants : contre-épreuve « non concluante » possible).
+    """
+    return os.getenv("CUCUMBER_VERIFY_MERGE_MUTATION", "0").strip() == "1"
+
+
+def mutation_copies(worktree: str, rels, tags) -> tuple:
+    """
+    Copies mutées des features : <feature>_mut.feature, attendus des Then faussés (mutate_feature), tags @agent_…
+    (scénarios et mises en place) renommés <tag>_mut pour être sélectionnés à part. Renvoie ({chemin relatif: texte},
+    {tag: nombre de valeurs faussées}, {tag: chemin de la copie}, tags des copies à exécuter).
+    """
+    copies, counts, where, run = {}, {}, {}, set()
+    for rel in sorted(set(rels)):
+        text, mutations = mutate_feature(_read_text_file(os.path.join(worktree, *rel.split("/"))), set(tags))
+        if not mutations:
+            continue
+        lines = [" ".join(t + MUTATION_SUFFIX if t.startswith("@agent_") else t for t in line.split())
+                 if line.strip().startswith("@") else line for line in text.splitlines()]
+        copy = rel[:-len(".feature")] + MUTATION_SUFFIX + ".feature"
+        copies[copy] = "\n".join(lines) + "\n"
+        counts.update(mutations)
+        where.update({tag: copy for tag in mutations})
+        run |= {t + MUTATION_SUFFIX for t in mutations}
+        run |= {t + MUTATION_SUFFIX for sc in parse_scenarios(text) for t in sc["tags"] if _SETUP_TAG.match(t)}
+    return copies, counts, where, run
+
+
 PASSES_STILL = "passe encore"
 NO_VALUE_TO_MUTATE = "assertion sans valeur à vérifier en revue"
 
@@ -1363,9 +1440,14 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     def expression(selected):
         return " or ".join(sorted(set(selected) | setup_tags(worktree, files, selected)))
     builds, out = [], {}
-    client = run_tags(mode, worktree, base, build_fn, expression(scenarios),
-                      os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), {}, f"{label}-client", sources)
-    builds.append({"execution": "client", "build": client["build"], "message": client["message"]})
+    # Option : mutation dans le même build (copies <feature>_mut.feature, tags <tag>_mut) — un build de moins
+    copies, counts, copy_of, mutated_tags = mutation_copies(worktree, [k[0] for k in key_of.values()], scenarios) \
+        if merged_mutation() else ({}, {}, {}, set())
+    client = run_tags(mode, worktree, base, build_fn,
+                      " or ".join([expression(scenarios)] + sorted(mutated_tags)),
+                      os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), copies, f"{label}-client", sources)
+    builds.append({"execution": "client" + (" + mutation" if copies else ""), "build": client["build"],
+                   "message": client["message"]})
     levels = {tag: {"client": _level(client["resultats"].get(key_of.get(tag, ("", ""))), False)
                     if client["ok"] else ("nv", client["message"])} for tag in scenarios}
     passing = [t for t in scenarios if levels[t]["client"][0] == "ok"]
@@ -1383,7 +1465,12 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
         for tag in overrides:
             levels[tag]["standard"] = ("nv", "CUCUMBER_VERIFY_ENV_STD non configuré")
     # Sans environnement Standard (défaut) : un override est jugé sur le client et la mutation, comme une extension
-    if passing:
+    if passing and merged_mutation():
+        for tag in passing:
+            result = client["resultats"].get((copy_of[tag], key_of[tag][1])) if tag in copy_of and tag in key_of \
+                else None
+            levels[tag]["mutation"] = _level(result, True) if counts.get(tag) else ("nv", NO_VALUE_TO_MUTATE)
+    elif passing:
         mutated, counts = {}, {}
         for rel in {key_of[t][0] for t in passing if t in key_of}:
             text, mutations = mutate_feature(_read_text_file(os.path.join(worktree, *rel.split("/"))), set(passing))
@@ -1413,7 +1500,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
         status, reason = final_status(levels[tag])
         out[tag] = {"id": identifier, "statut": status, "motif": reason, "type": kinds.get(tag, ""),
                     "niveaux": {k: list(v) for k, v in levels[tag].items()},
-                    "build": next((b["build"] for b in builds if b["execution"] == "client"), ""),
+                    "build": next((b["build"] for b in builds if b["execution"].startswith("client")), ""),
                     "cause": (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get("cause", "")
                     if status == "cascade" else "",
                     # Step en échec et son heure (UTC) : fenêtre d'export des logs serveur
