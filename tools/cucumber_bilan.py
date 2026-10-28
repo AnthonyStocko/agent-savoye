@@ -249,7 +249,11 @@ def bilan_markdown(bilan: dict, level: int = 2) -> str:
     lines += ["", f"{section} Doutes sur le code fourni en spécification : {len(bilan['doutes'])}", ""]
     lines += [f"- {d['type']} ({d['certitude']}) : {d['detail']}" + (f" — {d['fichier']}" if d["fichier"] else "")
               + (f" — preuve : `{d['preuve']}`" if d["preuve"] else "") for d in bilan["doutes"]]
-    lines += ["", f"{section} Décisions humaines : {bilan.get('decisions_en_attente', 0)} en attente", ""]
+    if cucumber_decisions.autonomous():
+        lines += ["", f"{section} Décisions prises par l'agent (autonomie, à relire) — en attente : "
+                      f"{bilan.get('decisions_en_attente', 0)}", ""]
+    else:
+        lines += ["", f"{section} Décisions humaines : {bilan.get('decisions_en_attente', 0)} en attente", ""]
     lines += bilan.get("decisions") or []
     to_prove = bilan.get("a_prouver") or []
     if to_prove:

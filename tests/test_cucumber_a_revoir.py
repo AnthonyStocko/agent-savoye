@@ -216,6 +216,7 @@ def test_a_revoir_md_keeps_human_content_and_lists_defects_first(tmp_path):
 # --- Branchement dans main : arrêt au lieu de vider le lot ---------------------------------------------------------
 
 def test_verify_execution_lot_stops_and_keeps_scenarios(repo, main_module, monkeypatch):
+    monkeypatch.setenv("CUCUMBER_AUTONOMY", "0")
     write(os.path.join(repo, REL), FEATURE)
     failing = {"@agent_clientx_1_1": {"id": f"{REL}::Statut du contenant", "statut": "environnement",
                                       "motif": "non vérifié — environnement : 503", "niveaux": {}},

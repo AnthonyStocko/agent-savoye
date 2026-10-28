@@ -48,6 +48,10 @@ CAUSES = {
                                                                    "déployé"),
     "deploiement": ("déploiement en retard sur le dépôt", "réactiver quand le code et les personnalisations "
                                                           "déployés sont à jour"),
+    # Autonomie : échec côté test que les corrections n'ont pas résolu, désactivé par l'agent (jamais supprimé)
+    "test_persistant": ("échec côté test persistant après les corrections de l'agent",
+                        "réactiver après correction du scénario : message d'échec, base et logs du run cités dans "
+                        "A_REVOIR.md"),
 }
 _STATUS_CAUSE = {"environnement": "environnement", "donnee_reference": "donnee_reference",
                  "bug_applicatif": "bug_applicatif", "deploiement": "deploiement"}
@@ -214,7 +218,7 @@ def cause_of(item: dict) -> str:
     return _STATUS_CAUSE.get(status, "")
 
 
-def decide(scenarios: dict, spec_of: dict, max_pct: float = None) -> dict:
+def decide(scenarios: dict, spec_of: dict, max_pct: float = None, autonomous: bool = False) -> dict:
     """
     Décision sur les scénarios vérifiés d'un lot ({tag: résultat}) : {"desactiver": {tag: cause}, "faibles": [tags],
     "bloquants": [tags], "arret": bool, "motifs": [...]}. Une désactivation exige une cause hors test ET une preuve
@@ -239,9 +243,15 @@ def decide(scenarios: dict, spec_of: dict, max_pct: float = None) -> dict:
     emptied = sorted(s for s, tags in by_spec.items() if s and all(t in disable or t in blocking for t in tags))
     if disable and emptied:
         reasons.append(f"spécifique(s) sans aucun scénario actif après désactivation : {', '.join(emptied)}")
+    if autonomous:
+        # Aucun arrêt : les échecs côté test persistants sont désactivés eux aussi (cause NON PROUVÉE, listés), les
+        # seuils deviennent des alertes du bilan
+        disable.update({t: "test_persistant" for t in blocking if scenarios[t].get("motif")})
+        return {"desactiver": disable, "faibles": weak, "bloquants": blocking, "arret": False, "motifs": [],
+                "alertes": reasons}
     stop = bool(reasons)
     return {"desactiver": {} if stop else disable, "faibles": weak, "bloquants": blocking, "arret": stop,
-            "motifs": reasons}
+            "motifs": reasons, "alertes": []}
 
 
 # ---------------------------------------------------------------------------

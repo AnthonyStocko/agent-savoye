@@ -43,6 +43,7 @@ def _scenarios(worktree):
 def test_realignment_is_applied_when_the_code_wins(client, repo, monkeypatch):
     """Politique par défaut : le code fait foi, le réalignement reste actif et n'attend aucune décision."""
     monkeypatch.delenv("CUCUMBER_SPEC_CODE_POLICY", raising=False)
+    monkeypatch.setenv("CUCUMBER_AUTONOMY", "0")
     write(os.path.join(repo, REL), FEATURE)
     before = ar.snapshot(repo, [REL])
     write(os.path.join(repo, REL), FEATURE.replace(
@@ -63,6 +64,7 @@ def test_realignment_is_applied_when_the_code_wins(client, repo, monkeypatch):
 
 def test_realignment_is_held_then_validated(client, repo, monkeypatch):
     monkeypatch.setenv("CUCUMBER_SPEC_CODE_POLICY", "decision")
+    monkeypatch.setenv("CUCUMBER_AUTONOMY", "0")
     write(os.path.join(repo, REL), FEATURE)
     before = ar.snapshot(repo, [REL])
     write(os.path.join(repo, REL), FEATURE.replace(
@@ -204,3 +206,39 @@ def test_correction_step_lists_pending_decisions(client):
     assert step["action"] == "Trancher les décisions en attente"
     bilan = {"manuelles": [], "decisions_en_attente": 1}
     assert cb.next_action({"propositions": [1]}, bilan).startswith("Trancher les 1 décision(s)")
+
+
+def test_autonomy_never_asks(client, repo, monkeypatch):
+    """Autonomie (défaut) : données changées appliquées, échec persistant désactivé sans arrêt, ancienne décision
+    en attente prise par l'agent."""
+    monkeypatch.delenv("CUCUMBER_AUTONOMY", raising=False)
+    assert cd.autonomous() and "AUTONOMIE" in cd.spec_code_rule()
+    write(os.path.join(repo, REL), FEATURE)
+    before = ar.snapshot(repo, [REL])
+    write(os.path.join(repo, REL), FEATURE.replace("| C1   | 2   |", "| C1   | 5   |"))
+    held = cd.held_changes(repo, before, CLIENT_TAG)
+    assert [(h["type"], h["applique"]) for h in held] == [("donnees", True)] and "| C1   | 5   |" in _text(repo)
+    agent = cd.record_agent_decision(client, "donnees", held[0]["proposition"], scenario="s")
+    assert agent["statut"] == "validee" and agent["historique"][0]["auteur"] == "agent" and not cd.pending(client)
+    # Échec côté test persistant : désactivé (jamais supprimé), aucun arrêt ; le seuil devient une alerte
+    scenarios = {"@t1": {"id": "a::1", "statut": "invalide", "motif": "expected:<A> but was:<B>"},
+                 "@t2": {"id": "a::2", "statut": "environnement", "motif": "non vérifié — environnement : 503"}}
+    decision = ar.decide(scenarios, {"a::1": "sp", "a::2": "sp"}, max_pct=10, autonomous=True)
+    assert decision["arret"] is False and decision["desactiver"] == {"@t1": "test_persistant", "@t2": "environnement"}
+    assert decision["alertes"]
+    assert ar.decide(scenarios, {}, max_pct=10)["arret"] is True                 # sans autonomie : arrêt
+    # Décision restée en attente d'avant l'autonomie : prise par l'agent au lancement suivant
+    monkeypatch.setenv("CUCUMBER_AUTONOMY", "0")
+    write(os.path.join(repo, REL), FEATURE)
+    before = ar.snapshot(repo, [REL])
+    write(os.path.join(repo, REL), FEATURE.replace("| C1   | 2   |", "| C1   | 7   |"))
+    held = cd.held_changes(repo, before, CLIENT_TAG)
+    assert "| C1   | 7   |" not in _text(repo)                                   # gardée à part
+    cd.propose(client, "donnees", held[0]["proposition"], fichier=REL, titre="Statut du contenant",
+               scenario=f"{REL}::Statut du contenant", lot=1, avant=held[0]["avant"], apres=held[0]["apres"])
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    monkeypatch.delenv("CUCUMBER_AUTONOMY", raising=False)
+    done = cd.auto_resolve_pending(client, repo)
+    assert len(done) == 1 and done[0]["statut"] == "validee" and not cd.pending(client)
+    assert "| C1   | 7   |" in _text(repo) and "@A_REVOIR" not in _scenarios(repo)["Statut du contenant"]["tags"]

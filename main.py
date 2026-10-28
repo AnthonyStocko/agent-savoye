@@ -1611,7 +1611,19 @@ def hold_meaning_changes(client: str, worktree: str, before: dict, client_tag: s
     held = set()
     for change in cucumber_decisions.held_changes(worktree, before, client_tag):
         identifier = cucumber_verify.scenario_id(change["fichier"], change["titre"])
+        if change.get("applique") and change["type"] == "donnees":
+            # Autonomie : données de test changées par la correction, appliquées et enregistrées (à relire)
+            cucumber_decisions.record_agent_decision(
+                client, "donnees", change["proposition"], fichier=change["fichier"], titre=change["titre"],
+                scenario=identifier, lot=lot["numero"], avant=change["avant"], apres=change["apres"])
+            print(f"[LOT {label}] 🤖 Décision de l'agent ({cucumber_decisions.TYPES['donnees']}) : "
+                  f"{change['proposition']} — appliquée, à relire dans le bilan.")
+            continue
         if change.get("applique"):
+            if cucumber_decisions.autonomous():
+                cucumber_decisions.record_agent_decision(
+                    client, "realignement", change["proposition"], fichier=change["fichier"], titre=change["titre"],
+                    scenario=identifier, lot=lot["numero"], avant=change["avant"], apres=change["apres"])
             # Le code fait foi : réalignement appliqué, écart consigné (bilan « Doutes sur le code fourni »)
             lot.setdefault("correction", {}).setdefault("constats", []).append({
                 "type": "ecart_spec_code", "detail": f"{change['titre']} : attendu réaligné sur le code (le code fait "
@@ -1776,22 +1788,28 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             item["motif"] = (item.get("motif", "") + " — décision en attente").strip(" —")
     judged = {t: v for t, v in result["scenarios"].items() if v["id"] not in waiting}
     # RÈGLE 3 : désactivation des seuls blocages hors test prouvés, ou arrêt pour décision humaine
-    decision = cucumber_a_revoir.decide(judged, spec_of) if mode else {
-        "desactiver": {}, "faibles": [], "bloquants": [], "arret": False, "motifs": []}
+    autonomous = cucumber_decisions.autonomous()
+    decision = cucumber_a_revoir.decide(judged, spec_of, autonomous=autonomous) if mode else {
+        "desactiver": {}, "faibles": [], "bloquants": [], "arret": False, "motifs": [], "alertes": []}
     located = cucumber_verify.tagged_scenarios(worktree, files, result["scenarios"])
-    # D2 : chaque désactivation est proposée (désactivation provisoire, décision en attente)
+    # D2 : chaque désactivation est proposée (désactivation provisoire, décision en attente) ; autonomie : décidée
+    # par l'agent, enregistrée, à relire
     disabled = cucumber_a_revoir.apply_decision(worktree, files, result["scenarios"], decision,
-                                                conventions.get("client_tag", ""), located, pending=True)
+                                                conventions.get("client_tag", ""), located, pending=not autonomous)
     for entry in disabled:
         label_cause = cucumber_a_revoir.CAUSES[entry["cause"]][0]
-        cucumber_decisions.propose(
-            client, "desactivation", f"{entry['fichier']} / {entry['titre']} : {label_cause} ("
-            + (cucumber_a_revoir.PROVEN if entry["prouvee"] else "cause " + cucumber_a_revoir.UNPROVEN) + ")",
-            fichier=entry["fichier"], titre=entry["titre"], scenario=entry["id"], lot=lot["numero"],
-            cause=entry["cause"], preuve=entry["preuve"], reactivation=entry["reactivation"],
-            prouvee=entry["prouvee"])
-        print(f"[LOT {label}] 🔕 Désactivé, décision en attente ({label_cause}) : {entry['fichier']} / "
-              f"{entry['titre']}")
+        record = cucumber_decisions.record_agent_decision if autonomous else cucumber_decisions.propose
+        record(client, "desactivation", f"{entry['fichier']} / {entry['titre']} : {label_cause} ("
+               + (cucumber_a_revoir.PROVEN if entry["prouvee"] else "cause " + cucumber_a_revoir.UNPROVEN) + ")",
+               fichier=entry["fichier"], titre=entry["titre"], scenario=entry["id"], lot=lot["numero"],
+               cause=entry["cause"], preuve=entry["preuve"], reactivation=entry["reactivation"],
+               prouvee=entry["prouvee"])
+        print(f"[LOT {label}] 🔕 Désactivé, " + ("décision de l'agent" if autonomous else "décision en attente")
+              + f" ({label_cause}) : {entry['fichier']} / {entry['titre']}")
+    for alert in decision.get("alertes") or []:
+        print(f"[LOT {label}] ⚠️ {alert} — l'agent poursuit (autonomie), à relire dans le bilan.")
+    if decision.get("alertes"):
+        lot["alertes"] = decision["alertes"]
     if disabled and not cucumber_a_revoir.runner_excludes_a_revoir(conventions.get("runner")):
         print(f"[LOT {label}] ⚠️ Le runner n'exclut pas {cucumber_a_revoir.a_revoir_tag()} : les scénarios désactivés "
               f"restent exécutés (le filtre de tags du job peut ne pas atteindre Cucumber) ; ajoute « not "
@@ -3119,6 +3137,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                f"depuis, jamais écrasées) : {', '.join(kept)}"))
         print(f"[CUCUMBER] ⚠️ Espace de travail non synchronisé avec {state['base']} : {problem}" if problem else
               f"[CUCUMBER] Espace de travail synchronisé avec {state['base']} (branche lue par Jenkins).")
+    # Autonomie : décisions restées en attente (d'avant l'autonomie) prises par l'agent, scénarios réactivés
+    for done in cucumber_decisions.auto_resolve_pending(client, worktree, state["base"]):
+        print(f"[CUCUMBER] 🤖 Décision en attente prise par l'agent ({cucumber_decisions.TYPES[done['type']]}) : "
+              f"{done['proposition']}")
+        cucumber_decisions.sync_state(state, done)
     cucumber_tools.save_state(client, state)
 
     catalogue = inventory["catalogue_standard"]
@@ -3356,8 +3379,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                     print(f"[LOT {label}] Constat {result['id']} — {cucumber_tools.constat_line(constat)}")
                     # Test jugé tautologique (et écart spécification / code si le code ne fait pas foi) : soumis à
                     # une décision humaine ; sinon l'écart reste un constat du bilan
-                    if constat["type"] == "tautologique" or (constat["type"] == "ecart_spec_code"
-                                                             and not cucumber_decisions.code_wins()):
+                    if not cucumber_decisions.autonomous() and (
+                            constat["type"] == "tautologique" or (constat["type"] == "ecart_spec_code"
+                                                                  and not cucumber_decisions.code_wins())):
                         cucumber_decisions.propose(
                             client, constat["type"], f"{specifics.get(result['id'], {}).get('libelle', result['id'])}"
                             f" : {constat['detail']}", spec=result["id"], lot=lot["numero"],

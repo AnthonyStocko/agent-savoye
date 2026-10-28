@@ -2111,6 +2111,10 @@ def render_deliverable(client: str) -> None:
     if decisions:
         st.caption(f"✋ {decisions} décision(s) attendent ton avis (changement du sens d'un test) : mode expert, "
                    f"« Corrections ».")
+    taken = [d for d in cucumber_decisions.load_decisions(client) if d.get("auto")]
+    if taken:
+        with st.popover(f"🤖 {len(taken)} choix faits par l'agent, à relire"):
+            st.markdown("\n".join(cucumber_decisions.summary_lines(taken, limit=50)))
 
 
 def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:

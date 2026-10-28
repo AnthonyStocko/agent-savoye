@@ -31,6 +31,49 @@ TYPES = {"realignement": "réalignement d'un attendu sur le code", "donnees": "c
 HELD_TYPES = ("realignement", "donnees")
 
 
+def autonomous() -> bool:
+    """
+    Autonomie (CUCUMBER_AUTONOMY=1, défaut) : aucune décision n'est demandée à l'utilisateur. Chaque choix que
+    l'agent aurait soumis (réalignement, données de test changées, désactivation, arrêt) est appliqué et enregistré
+    comme « décision prise par l'agent » (historique, bilan), à relire et réversible plus tard. 0 : décisions
+    humaines comme avant.
+    """
+    return os.getenv("CUCUMBER_AUTONOMY", "1").strip() != "0"
+
+
+AGENT_REASON = "décision de l'agent (autonomie : aucune décision demandée à l'utilisateur)"
+
+
+def record_agent_decision(client_name: str, kind: str, proposal: str, **fields) -> dict:
+    """Décision prise par l'agent : enregistrée validée, avec son historique (bilan, revue ultérieure)."""
+    decisions = load_decisions(client_name)
+    decision = {"id": f"d-{len(decisions) + 1}", "type": kind, "proposition": " ".join(proposal.split())[:600],
+                "statut": "validee", "auto": True,
+                "historique": [_event("prise par l'agent", AGENT_REASON, author="agent")], **fields}
+    decisions.append(decision)
+    save_decisions(client_name, decisions)
+    return decision
+
+
+def auto_resolve_pending(client_name: str, worktree: str, base: str = "", client_tag: str = "") -> list:
+    """Autonomie : décisions encore en attente (d'avant l'autonomie) validées par l'agent. Renvoie celles traitées."""
+    if not autonomous():
+        return []
+    done = []
+    for decision in pending(client_name):
+        resolved = resolve(client_name, decision["id"], "valider", AGENT_REASON, worktree, base, client_tag, "agent")
+        if resolved:
+            resolved["auto"] = True
+            done.append(resolved)
+    if done:
+        decisions = load_decisions(client_name)
+        for d in decisions:
+            if d["id"] in {x["id"] for x in done}:
+                d["auto"] = True
+        save_decisions(client_name, decisions)
+    return done
+
+
 def code_wins() -> bool:
     """
     Écart spécification / code : le code fait foi (CUCUMBER_SPEC_CODE_POLICY=code, défaut). Un attendu réaligné sur
@@ -42,6 +85,11 @@ def code_wins() -> bool:
 
 def spec_code_rule() -> str:
     """Règle donnée au correcteur, selon la politique."""
+    if autonomous():
+        return ("AUTONOMIE : aucune décision n'est demandée à l'utilisateur. Le CODE FAIT FOI : un réalignement sur "
+                "le code est appliqué tel quel ; une valeur changée dans un step existant aussi. Chacun est enregistré "
+                "comme décision de l'agent, à relire plus tard : justifie-le dans « corrections » (cause prouvée, "
+                "fichier de code lu, requête en base ou ligne de log).")
     if code_wins():
         return ("Le CODE FAIT FOI : un réalignement sur le code est appliqué tel quel (pas de décision humaine) et "
                 "consigné automatiquement comme écart spécification / code, à revoir plus tard.")
@@ -169,7 +217,7 @@ def held_changes(worktree: str, before: dict, client_tag: str = "") -> list:
                               if line.strip().startswith(REALIGNED)), "")
             proposal = (f"attendu réaligné sur le code ({reference})" if kind == "realignement" else
                         "valeur d'un step existant changée par la correction")
-            applied = kind == "realignement" and code_wins()
+            applied = autonomous() or (kind == "realignement" and code_wins())
             held.append({"type": kind, "fichier": rel, "titre": scenario["titre"], "avant": block,
                          "apres": new_block, "proposition": f"{rel} / {scenario['titre']} : {proposal}",
                          "applique": applied, "code": reference})
