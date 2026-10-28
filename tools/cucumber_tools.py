@@ -2498,18 +2498,104 @@ def strip_agent_tags(text: str, client_name: str, keep: set = frozenset()) -> st
 
 def write_patch(worktree: str, base: str, output: str, client_name: str = "") -> bool:
     """
-    Patch de tous les commits de la branche depuis `base` (un par lot). Les tags @agent_<client>_<lot>[_<n>] sont
-    retirés des .feature du livrable, sur une copie : le worktree les garde pour les reprises
-    (CUCUMBER_KEEP_AGENT_TAGS=1 : patch tel quel). Renvoie False s'il n'y a aucun commit.
+    Livrable de la génération. Par défaut (CUCUMBER_PATCH_MODE=squash) : UN seul commit, construit sur l'état
+    actuel de `base` (branche d'intégration), qui ne contient que l'écart net du worktree sur les fichiers que
+    l'agent a lui-même modifiés — il s'applique sur la branche telle qu'elle est aujourd'hui, même si elle a avancé
+    ou intègre déjà une partie des tests, et ne rétablit jamais une ancienne version d'un autre fichier.
+    CUCUMBER_PATCH_MODE=commits : un commit par lot depuis `base` (ancien comportement). Les tags
+    @agent_<client>_<lot>[_<n>] sont retirés des .feature du livrable (CUCUMBER_KEEP_AGENT_TAGS=1 : gardés).
+    Renvoie False s'il n'y a rien à livrer.
     """
     head = rev_parse(worktree, "HEAD")
     commits = _git(worktree, "rev-list", "--reverse", f"{base}..HEAD").stdout.split()
     if not commits:
         return False
+    if os.getenv("CUCUMBER_PATCH_MODE", "squash").strip() != "commits":
+        return _squashed_patch(worktree, base, output, client_name)
     tip = head
     if client_name and os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() != "1":
         tip = _commits_without_agent_tags(worktree, base, commits, client_name) or head
     return format_patch(worktree, f"{base}..{tip}", output)
+
+
+def agent_paths(worktree: str, base: str) -> list:
+    """Fichiers modifiés par les commits de l'agent depuis `base` (hors fusions de synchronisation et sorties Maven)."""
+    paths = []
+    for commit in _git(worktree, "rev-list", "--no-merges", f"{base}..HEAD").stdout.split():
+        out = _git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", commit).stdout
+        paths += [p for p in out.split("\0") if p and not p.startswith("target/") and "/target/" not in p]
+    return sorted(set(paths))
+
+
+def _git_env(repo: str, env: dict, *args, data: bytes = None) -> subprocess.CompletedProcess:
+    """git avec un environnement complété (index temporaire), entrée et sortie en octets."""
+    return subprocess.run(["git", "-C", repo, *args], input=data, capture_output=True, env={**os.environ, **env})
+
+
+def _squashed_patch(worktree: str, base: str, output: str, client_name: str = "") -> bool:
+    """
+    Un commit sur `base`, construit sans espace de travail temporaire (index temporaire : robuste sous Windows, où
+    un worktree verrouillé faisait retomber sur un patch de tous les commits). Fichiers de l'agent pris dans HEAD
+    (tags @agent_ retirés) ; jamais de suppression d'un fichier présent dans `base` (un scénario n'est jamais
+    supprimé, et un fichier poussé depuis par l'utilisateur ne doit pas disparaître) ; deux chemins qui ne diffèrent
+    que par la casse (même fichier sous Windows) : un seul est livré, celui de `base` à défaut le plus récent.
+    """
+    paths = agent_paths(worktree, base)
+    if not paths:
+        return False
+    # -z : chemins non ASCII (accents) non échappés, identiques à ceux d'agent_paths
+    head_files = set(filter(None, _git(worktree, "ls-tree", "-r", "-z", "--name-only", "HEAD").stdout.split("\0")))
+    base_files = set(filter(None, _git(worktree, "ls-tree", "-r", "-z", "--name-only", base).stdout.split("\0")))
+    skipped = [p for p in paths if p not in head_files and p in base_files]
+    if skipped:
+        print(f"[CUCUMBER] Patch : {len(skipped)} suppression(s) de fichiers existants écartée(s) (jamais livrées) : "
+              + ", ".join(skipped[:5]) + (" …" if len(skipped) > 5 else ""))
+    by_case = {}
+    for rel in (p for p in paths if p in head_files):
+        by_case.setdefault(rel.lower(), []).append(rel)
+    kept = []
+    for variants in by_case.values():
+        if len(variants) > 1:
+            chosen = next((v for v in variants if v in base_files), variants[-1])
+            print(f"[CUCUMBER] Patch : chemins identiques à la casse près ({', '.join(variants)}) : seul {chosen} "
+                  f"est livré")
+            variants = [chosen]
+        kept += variants
+    if not kept:
+        return False
+    strip = client_name and os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() != "1"
+    modes = {}
+    for line in filter(None, _git(worktree, "ls-tree", "-r", "-z", "HEAD", "--", *kept).stdout.split("\0")):
+        meta, _, rel = line.partition("\t")
+        modes[rel] = meta.split()[0]
+    index = os.path.join(os.path.dirname(worktree), f"patch_index_{os.getpid()}")
+    env = {"GIT_INDEX_FILE": index}
+    try:
+        if _git_env(worktree, env, "read-tree", base).returncode != 0:
+            return False
+        for rel in kept:
+            data = subprocess.run(["git", "-C", worktree, "show", f"HEAD:{rel}"], capture_output=True).stdout
+            if strip and rel.endswith(".feature"):
+                text = data.decode("utf-8", errors="replace")
+                keep = set(re.findall(r"@agent_\w+", _git(worktree, "show", f"{base}:{rel}").stdout))
+                data = strip_agent_tags(text, client_name, keep).encode("utf-8")
+            blob = _git_env(worktree, env, "hash-object", "-w", "--stdin", data=data).stdout.decode().strip()
+            if not blob:
+                return False
+            _git_env(worktree, env, "update-index", "--add", "--cacheinfo",
+                     f"{modes.get(rel, '100644')},{blob},{rel}")
+        tree = _git_env(worktree, env, "write-tree").stdout.decode().strip()
+        if not tree or tree == _git(worktree, "rev-parse", f"{base}^{{tree}}").stdout.strip():
+            return False
+        subjects = _git(worktree, "log", "--no-merges", "--reverse", "--format=- %s", f"{base}..HEAD").stdout.strip()
+        message = (f"Cucumber : tests des spécifiques {client_name or ''} (agent)".replace("  ", " ")
+                   + f"\n\nÉcart net avec {base}, en un commit. Commits de l'agent :\n{subjects}")
+        commit = _git_env(worktree, env, "commit-tree", tree, "-p", rev_parse(worktree, base), "-m",
+                          message).stdout.decode().strip()
+        return bool(commit) and format_patch(worktree, f"{commit}~1..{commit}", output)
+    finally:
+        if os.path.exists(index):
+            os.remove(index)
 
 
 def format_patch(worktree: str, revisions: str, output: str) -> bool:

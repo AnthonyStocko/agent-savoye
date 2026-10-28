@@ -919,6 +919,7 @@ def main():
     parser.add_argument("--health-only", action="store_true", help="generate-cucumber-client : bilan de santé du dépôt <client>-cucumber avant génération (emplacement et tags des features, fichiers de données manquants, compilation et dry-run de toutes ses features), sans appel à Claude")
     parser.add_argument("--import-run", nargs="*", default=None, help="generate-cucumber-client : import d'un rapport d'exécution (console Jenkins, rapport Cucumber JSON, exports de logs serveur CSV), secrets masqués avant stockage, analysé sans appel à Claude")
     parser.add_argument("--import-url", default="", help="generate-cucumber-client : import d'un build Jenkins (console et rapports Cucumber JSON lus en mémoire), analysé sans appel à Claude")
+    parser.add_argument("--patch-only", action="store_true", help="generate-cucumber-client : régénère seulement le patch <client>-cucumber.patch depuis l'espace de travail de l'agent (un commit, écart net avec la branche d'intégration actuelle), sans appel à Claude")
     parser.add_argument("--fix-init-from-import", type=int, default=0, help="generate-cucumber-client : l'init du run importé n° N échoue dans les compléments écrits par l'agent : il corrige ces fichiers seuls (contrôlés), puis rejoue l'init si CUCUMBER_AGENT_JENKINS=1, sinon livre <client>-cucumber-init-correction.patch")
     parser.add_argument("--from-import", type=int, default=0, help="generate-cucumber-client --complete : lots « correction » des échecs « test » des scénarios de l'agent de l'import n° N")
     parser.add_argument("--run-jenkins", action="store_true", help="generate-cucumber-client : pousse le worktree sur la branche lue par le job (profil), contrôle le commit, lance le job Jenkins du client, suit le build puis importe sa console et ses rapports (bilan)")
@@ -2754,6 +2755,18 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         return check_server_log(client, args.server_log, args.log_scenario)
     if args.import_run is not None or args.import_url:
         return run_cucumber_import(client, args.import_run or [], args.import_url, project)
+    if args.patch_only:
+        worktree = cucumber_tools.worktree_dir(client)
+        base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
+        subprocess.run(["git", "-C", worktree, "fetch", "-q", "origin"], capture_output=True)
+        if not base or not os.path.exists(os.path.join(worktree, ".git")):
+            print("[CUCUMBER] Aucun espace de travail ou branche d'intégration introuvable : rien à livrer.")
+            return 2
+        if cucumber_tools.write_patch(worktree, base, cucumber_tools.patch_path(client), client):
+            print(f"[CUCUMBER] Patch régénéré (un commit, écart net avec {base}) : {cucumber_tools.patch_path(client)}")
+            return 0
+        print(f"[CUCUMBER] Rien à livrer par rapport à {base}.")
+        return 2
     if args.fix_init_from_import:
         return fix_init_from_import(args, args.fix_init_from_import, local_cucumber_std_repo, odatio_version,
                                     token_saving_rules, python_exe, workspace_dir)

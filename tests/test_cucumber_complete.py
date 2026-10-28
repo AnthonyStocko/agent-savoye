@@ -134,7 +134,8 @@ def test_complete_keeps_previous_lots(repo, tmp_path, monkeypatch):
     patch = str(tmp_path / "clientx-cucumber.patch")
     assert ct.write_patch(worktree, "integration", patch, "clientx")
     text = open(patch, encoding="utf-8").read()
-    assert text.count("Subject: [PATCH") == 3 and all(t in text for t in ("Lot un", "Lot deux", "Lot trois"))
+    # Un seul commit (écart net), qui contient les trois lots
+    assert text.count("Subject: [PATCH") == 1 and all(t in text for t in ("Lot un", "Lot deux", "Lot trois"))
     # Nouvelle génération : repart de la base
     worktree = ct.prepare_worktree(repo, "clientx", "integration", reset=True)
     assert git(worktree, "log", "-1", "--format=%s") == "base"

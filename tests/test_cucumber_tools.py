@@ -38,7 +38,7 @@ def test_final_patch_has_no_agent_tags(repo, tmp_path, monkeypatch):
     assert ct.write_patch(repo, base, patch, "clientx")
     text = open(patch, encoding="utf-8").read()
     assert "@agent_" not in text
-    assert text.count("Subject: [PATCH") == 2 and "Statut validé" in text and "Statut refusé" in text
+    assert text.count("Subject: [PATCH") == 1 and "Statut validé" in text and "Statut refusé" in text
     # Le worktree garde les tags pour les reprises
     assert "@agent_clientx_2_1" in open(os.path.join(repo, *FEATURE_REL.split("/")), encoding="utf-8").read()
     assert git(repo, "status", "--porcelain") == ""
@@ -123,3 +123,26 @@ def test_steps_declared_by_constant(repo, capsys):
     assert '^le statut vaut "([^"]*)"$' in found and "CLIENTX-le montant vaut (\\\\d+)$" in found
     methods = ct._java_methods(STEPS_JAVA, ct.disk_class_constants(root))
     assert [m["steps_non_resolus"] for m in methods if m["name"] == "absente"] == [["Inconnue.ABSENTE"]]
+
+
+def test_squashed_patch_never_deletes_existing_files_and_resolves_case(repo, tmp_path, monkeypatch):
+    monkeypatch.delenv("CUCUMBER_PATCH_MODE", raising=False)
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/WMS/Product/a.feature"), "Feature: A\n")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/existant.feature"), "Feature: E\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "rm", "-q", "src/test/resources/cucumber/features/clientx/existant.feature")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/WMS/product/a.feature"),
+          "Feature: A minuscule\n")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/WMS/Product/a.feature"), "Feature: A2\n")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/nouveau.feature"), "Feature: N\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lot 1")
+    patch = str(tmp_path / "p.patch")
+    assert ct.write_patch(repo, base, patch, "clientx")
+    text = open(patch, encoding="utf-8").read()
+    assert text.count("Subject: [PATCH") == 1 and "nouveau.feature" in text
+    assert "deleted file" not in text and "existant.feature" not in text      # jamais de suppression
+    assert "WMS/Product/a.feature" in text and "WMS/product/a.feature" not in text   # un seul chemin par casse
+    assert git(repo, "status", "--porcelain") == ""
