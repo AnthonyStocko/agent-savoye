@@ -336,3 +336,33 @@ def test_scenario_dependencies(tmp_path):
           "  Scenario: Création\n    When STOCK- je crée le contenant \"CONT-1\"\n    Then STOCK- ok\n\n"
           "  Scenario: Blocage\n    When STOCK- je bloque le contenant \"CONT-1\"\n    Then STOCK- ok\n")
     assert cv.check_scenario_dependencies(str(tmp_path), [rel]) == []
+
+
+OVERRIDE_FEATURE = """Feature: Prix
+  @agent_acme_1 @agent_acme_1_1
+  Scenario: Prix client
+    Given un article "A"
+    Then le prix de "A" vaut "12"
+"""
+
+
+def test_override_without_standard_env(monkeypatch, tmp_path):
+    from tests.conftest import write
+    rel = "src/test/resources/cucumber/features/acme/prix.feature"
+    write(str(tmp_path / rel), OVERRIDE_FEATURE)
+    monkeypatch.delenv("CUCUMBER_VERIFY_ENV_STD", raising=False)
+
+    def run_tags(mode, worktree, base, build_fn, tags, env, overrides, label, sources=None):
+        mutated = label.endswith("mutation")
+        result = ({"statut": "echoue", "step": "Then le prix", "phase": "then", "message": "expected 12_MUT",
+                   "nature": "assertion", "exception": ""} if mutated else
+                  {"statut": "passe", "step": "", "phase": "", "message": ""})
+        return {"ok": True, "message": "ok", "build": "b", "resultats": {(rel, "Prix client"): result}}
+    monkeypatch.setattr(cv, "run_tags", run_tags)
+    scenarios, kinds = {"@agent_acme_1_1": f"{rel}::Prix client"}, {"@agent_acme_1_1": "override"}
+    monkeypatch.delenv("CUCUMBER_VERIFY_REQUIRE_STD", raising=False)
+    result = cv.verify_lot("jenkins", str(tmp_path), "HEAD", None, [rel], scenarios, kinds, "lot1")
+    assert result["scenarios"]["@agent_acme_1_1"]["statut"] == "pertinent"
+    monkeypatch.setenv("CUCUMBER_VERIFY_REQUIRE_STD", "1")
+    result = cv.verify_lot("jenkins", str(tmp_path), "HEAD", None, [rel], scenarios, kinds, "lot1")
+    assert result["scenarios"]["@agent_acme_1_1"]["statut"] == "non_verifie"

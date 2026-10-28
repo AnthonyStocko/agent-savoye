@@ -1364,9 +1364,11 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
         for tag in overrides:
             levels[tag]["standard"] = _level(standard["resultats"].get(key_of.get(tag, ("", ""))), True, True) \
                 if standard["ok"] else ("nv", standard["message"])
-    elif overrides:
+    elif overrides and os.getenv("CUCUMBER_VERIFY_REQUIRE_STD", "").strip() == "1":
+        # Contre-épreuve Standard exigée mais impossible : les overrides restent non vérifiés
         for tag in overrides:
             levels[tag]["standard"] = ("nv", "CUCUMBER_VERIFY_ENV_STD non configuré")
+    # Sans environnement Standard (défaut) : un override est jugé sur le client et la mutation, comme une extension
     if passing:
         mutated, counts = {}, {}
         for rel in {key_of[t][0] for t in passing if t in key_of}:
