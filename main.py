@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1632,7 +1632,8 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     base transmis au job Jenkins (cucumber_verify.job_sources) ; sans `mode`, tous les scénarios prennent le statut
     `unverified_status` (environnement si l'initialisation a échoué). Scénarios invalides, faibles, en cascade
     d'une mise en place en échec côté test, ou sur une donnée de référence absente : au plus
-    CUCUMBER_VERIFY_FIX_ATTEMPTS (2) appels de correction (cucumber_client_fix.md), contrôlés (RÈGLE 3c : une
+    CUCUMBER_VERIFY_FIX_MAX (4) appels de correction, arrêtés pour un scénario dont l'échec revient à l'identique
+    (cucumber_fix_budget ; cucumber_client_fix.md), contrôlés (RÈGLE 3c : une
     correction interdite est annulée), recompilation, revérification de ces seuls scénarios. Puis RÈGLE 3 : rien
     n'est supprimé ; les scénarios bloqués par une cause hors test prouvée sont désactivés (cucumber_a_revoir), sauf
     seuil dépassé ou échec côté test persistant : lot["arret"] (décision humaine), rien n'est désactivé.
@@ -1677,18 +1678,22 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     tests = {s["id"]: s.get("tests_std") or [] for s in lot_specs}
     spec_of = {cucumber_verify.scenario_id(s["fichier"], s["titre"]): s["spec"]
                for s in (lot.get("indicateurs") or {}).get("scenarios", [])}
-    violations = []
-    for attempt in range(_env_int("CUCUMBER_VERIFY_FIX_ATTEMPTS", 2) if mode else 0):
+    violations, stuck = [], set()
+
+    def to_fix() -> dict:
         # Cascade d'une mise en place en échec pour une raison de test (catégorie « test ») : à corriger aussi ;
         # donnée de référence absente : à créer dans le Background avant toute désactivation
-        bad = {t: v for t, v in result["scenarios"].items()
-               if v["statut"] in ("invalide", "faible", "donnee_reference")
-               or (v["statut"] == "cascade"
-                   and cucumber_verify.failure_category(v.get("cause", "")) == "test")}
+        return {t: v for t, v in result["scenarios"].items()
+                if v["statut"] in ("invalide", "faible", "donnee_reference")
+                or (v["statut"] == "cascade" and cucumber_verify.failure_category(v.get("cause", "")) == "test")}
+    # Plafond adaptatif (cucumber_fix_budget) : on continue tant que l'échec change, scénario par scénario
+    for attempt in range(cucumber_fix_budget.max_attempts() if mode else 0):
+        bad = {t: v for t, v in to_fix().items() if t not in stuck}
         if not bad:
             break
+        sent = {t: dict(v) for t, v in bad.items()}
         print(f"[LOT {label}] Correction après exécution {attempt + 1} : {len(bad)} scénario(s) invalide(s) "
-              f"ou faible(s).")
+              f"ou faible(s)" + (f" ({len(stuck)} bloqué(s), même échec après correction)" if stuck else "") + ".")
         lines = []
         for tag, item in bad.items():
             linked = tests.get(spec_of.get(item["id"], ""), [])
@@ -1743,8 +1748,15 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             builds += again["builds"]
             result["scenarios"].update(again["scenarios"])
         # D7 : un diagnostic temporaire ne s'exécute qu'une fois, sa sortie est gardée dans le journal du scénario
-        for rel in cucumber_diagnostic.remove_temporary(worktree):
+        temporary = cucumber_diagnostic.remove_temporary(worktree)
+        for rel in temporary:
             print(f"[LOT {label}] 🧹 Diagnostic temporaire exécuté puis retiré : {rel}")
+        # Même échec qu'avant la correction : ce scénario ne repart plus (sauf diagnostic dont la sortie est nouvelle)
+        newly = set() if temporary else cucumber_fix_budget.stuck_after(sent, to_fix())
+        for tag in sorted(newly):
+            print(f"[LOT {label}] ⏹ {result['scenarios'][tag]['id']} : même échec après correction, arrêt des "
+                  f"tentatives (cause à prouver au prochain run importé).")
+        stuck |= newly
     keep_diagnostics(lot, label, worktree, mode, conventions, lambda: on_branch(base, sources)[0])
     # Scénarios dont une modification attend une décision humaine : désactivés provisoirement, hors jugement
     waiting = set(lot.get("decisions_en_attente") or [])

@@ -3510,14 +3510,17 @@ with tab_config:
                 "CUCUMBER_VERIFY_TIMEOUT", min_value=60, step=60, value=env_int("CUCUMBER_VERIFY_TIMEOUT", 3600),
                 help="Durée maximale d'une exécution (build Jenkins ou commande locale), en secondes.")
             verify_fixes = st.number_input(
-                "CUCUMBER_VERIFY_FIX_ATTEMPTS", min_value=0, step=1, value=env_int("CUCUMBER_VERIFY_FIX_ATTEMPTS", 1),
-                help="Appels de correction par lot pour les scénarios invalides ou faibles, avant leur retrait.")
+                "CUCUMBER_VERIFY_FIX_MAX", min_value=0, step=1, value=env_int("CUCUMBER_VERIFY_FIX_MAX", 4),
+                help="Corrections au plus par lot après exécution. L'agent continue tant que l'échec change et "
+                     "s'arrête pour un scénario dès que son échec revient à l'identique. 0 : aucune correction.")
             review_sample = st.number_input(
                 "CUCUMBER_REVIEW_SAMPLE", min_value=0, step=1, value=env_int("CUCUMBER_REVIEW_SAMPLE", 5),
                 help="Scénarios proposés à la revue humaine de l'onglet Cucumber : d'abord les « non vérifié », "
                      "puis des « pertinent » tirés au hasard.")
         env_values["CUCUMBER_VERIFY_TIMEOUT"] = str(int(verify_timeout))
-        env_values["CUCUMBER_VERIFY_FIX_ATTEMPTS"] = str(int(verify_fixes))
+        env_values["CUCUMBER_VERIFY_FIX_MAX"] = str(int(verify_fixes))
+        # Ancien réglage (plafond fixe) : remplacé par le plafond adaptatif, 0 conservé comme « aucune correction »
+        env_values["CUCUMBER_VERIFY_FIX_ATTEMPTS"] = "0" if int(verify_fixes) == 0 else ""
         env_values["CUCUMBER_REVIEW_SAMPLE"] = str(int(review_sample))
         with st.container(horizontal=True):
             slow_seconds = st.number_input(

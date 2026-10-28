@@ -147,3 +147,48 @@ def test_fix_loop_runs_diagnostic_once_and_accepts_verified_deployment(repo, mai
     with open(os.path.join(repo, REL), encoding="utf-8") as f:
         text = f.read()
     assert "@A_REVOIR" in text and "Scenario: Bouton de reconditionnement" in text
+
+
+def test_adaptive_budget_stops_when_the_failure_repeats_and_continues_while_it_changes(repo, main_module,
+                                                                                         monkeypatch):
+    from tools import cucumber_fix_budget as fb
+    moving, repeating = "@agent_clientx_1_1", "@agent_clientx_1_2"
+    write(os.path.join(repo, REL), f"{CLIENT_TAG}\nFeature: Stock\n\n  {moving}\n  Scenario: Mouvant\n    Then a\n\n"
+                                   f"  {repeating}\n  Scenario: Bloqué\n    Then b\n")
+    write(os.path.join(repo, STEPS_REL), STEPS + "}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    messages = iter(["expected <A> but was <B>", "expected <C> but was <D>", "OP introuvable", "liste vide"])
+    calls = []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        out = {}
+        if moving in scenarios:
+            out[moving] = {"id": f"{REL}::Mouvant", "statut": "invalide", "motif": next(messages), "niveaux": {}}
+        if repeating in scenarios:
+            # Valeur variable différente, même échec : bloqué après une correction
+            out[repeating] = {"id": f"{REL}::Bloqué", "statut": "invalide", "niveaux": {},
+                              "motif": f"Index 0 out of bounds (essai {len(calls)})"}
+        return {"scenarios": out, "builds": []}
+
+    def claude(prompt, *args, **kwargs):
+        calls.append(prompt)
+        return 0, '{"corrigees": 1}', {}, False
+    monkeypatch.setattr(main_module.cucumber_verify, "verify_lot", verify_lot)
+    monkeypatch.setattr(main_module, "run_cucumber_claude", claude)
+    monkeypatch.setattr(main_module, "render_prompt", lambda name, **values: values["erreurs"])
+    monkeypatch.setattr(main_module, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "verify_cucumber_lot", lambda *a, **k: {"ok": True})
+    monkeypatch.setenv("CUCUMBER_MAX_RETRACT_PCT", "100")
+    monkeypatch.delenv("CUCUMBER_VERIFY_FIX_ATTEMPTS", raising=False)
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_MAX", "3")
+    lot = {"numero": 1, "tags": {moving: f"{REL}::Mouvant", repeating: f"{REL}::Bloqué"},
+           "indicateurs": {"scenarios": []}}
+    main_module.verify_execution_lot(lot, [], "1/1", repo, "HEAD", [REL], [], "local", "", CLIENT, "", "", "", {},
+                                     "sonnet", "K", "/run", lambda u: None,
+                                     context={"conventions": {"client_tag": CLIENT_TAG}})
+    assert len(calls) == 3                                     # plafond : le scénario mouvant change à chaque fois
+    assert "Bloqué" in calls[0] and "Bloqué" not in calls[1] and "Bloqué" not in calls[2]
+    assert fb.max_attempts() == 3
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_ATTEMPTS", "0")
+    assert fb.max_attempts() == 0
