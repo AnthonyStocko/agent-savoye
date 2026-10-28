@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -2453,6 +2453,31 @@ def print_import(analysis: dict) -> None:
     print(f"{label} : rapport analyse.md dans le dossier de l'import.")
 
 
+def enforce_db_proofs(worktree: str, lot: dict, data: list, fixed: dict, before: dict, db_start: int,
+                      label: str) -> list:
+    """
+    Corrections d'échecs de données sans preuve en base (cucumber_db_proof.check) : features rétablies, scénario
+    gardé dans « restantes ». Preuves acceptées enregistrées dans lot["correction"]["preuves_base"] (bilan).
+    Renvoie les scénarios refusés.
+    """
+    changed = {rel for rel, text in before.items()
+               if cucumber_tools._read_text_file(os.path.join(worktree, *rel.split("/"))) != text}
+    result = cucumber_db_proof.check(data, fixed, (lot.get("base") or [])[db_start:], changed)
+    for rel in result["fichiers"]:
+        with open(os.path.join(worktree, *rel.split("/")), "w", encoding="utf-8", newline="") as f:
+            f.write(before[rel])
+    correction = lot.setdefault("correction", {})
+    correction["preuves_base"] = list(result["preuves"].values())[:30]
+    for s in result["refuses"]:
+        reason = (f"{s.get('id')} : correction refusée, échec lié aux données sans preuve en base (requête de la "
+                  f"donnée cherchée par le step, tables réellement lues) — {s.get('message', '')[:160]}")
+        correction.setdefault("restantes", []).append(reason)
+        print(f"[LOT {label}] ⛔ {reason}")
+    if result["preuves"]:
+        print(f"[LOT {label}] {len(result['preuves'])} correction(s) d'échec de données prouvée(s) en base.")
+    return result["refuses"]
+
+
 def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model: str, work_key: str,
                        run_dir: str, on_usage) -> list:
     """
@@ -2483,9 +2508,17 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
         lines += [f"  - sortie du diagnostic temporaire : {s['diagnostic']}"] if s.get("diagnostic") else []
         lines += [f"  - décision humaine refusée : « {c} »" for c in s.get("refus") or []]
     print(f"[LOT {label}] Correction de {len(lines)} scénario(s) en échec dans l'import n° {lot['import']}.")
+    # Échecs liés aux données : preuve en base exigée avant toute correction (si l'accès base est accordé)
+    data = cucumber_db_proof.data_scenarios(lot["corrections"]) if cucumber_db_proof.enabled() else []
+    db_available = bool(values.get("db_block"))
+    if data:
+        print(f"[LOT {label}] {len(data)} échec(s) lié(s) aux données : "
+              + ("preuve en base exigée." if db_available else "aucun accès base, causes NON PROUVÉES."))
     prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
-                           erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
+                           erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available),
+                           fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
+    db_start = len(lot.setdefault("base", []))
     effort = cucumber_fix_effort()
     returncode, output, usage, _ = run_cucumber_claude(prompt, model, lot_tools(values),
                                                        str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort,
@@ -2500,6 +2533,8 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
                          "realignes": [str(r) for r in fixed.get("realignes") or []][:30],
                          "constats": fixed["constats"]}
     on_usage(usage)
+    if data and db_available:
+        enforce_db_proofs(worktree, lot, data, fixed, before, db_start, label)
     for error in cucumber_a_revoir.check_corrections(worktree, before):
         print(f"[LOT {label}] ⛔ {error}")
     hold_meaning_changes(values.get("client_name", ""), worktree, before, values.get("client_tag", ""), label, lot)
@@ -2537,7 +2572,10 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
               "recreation_expression": cucumber_environment.recreation_expression(client),
               "compilation_agent": agent_compilation_block(agent_compile),
               "console": console or os.path.join(os.path.dirname(worktree), "verification", "init-console.txt"),
-              "fichiers": "\n".join(f"- {f}" for f in files), "tentatives": cucumber_init_fix.attempts()}
+              "fichiers": "\n".join(f"- {f}" for f in files), "tentatives": cucumber_init_fix.attempts(),
+              # Lecture seule de la base de test : confirmer une dépendance au lieu de la laisser « non confirmée »
+              "db_block": build_db_block("", python_exe, workspace_dir, step="generate-cucumber-client",
+                                         profile="cucumber")}
     errors, corrected = [], state.setdefault("init_corrigee", {"fichiers": [], "tentatives": []})
     for attempt in range(1, cucumber_init_fix.attempts() + 1):
         print(f"[CUCUMBER INIT] Correction des compléments d'init par l'agent, tentative {attempt} : "
@@ -2548,7 +2586,9 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
                                erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
         returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, lot_tools(values),
                                                                    str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2),
-                                                                   run_dir, effort)
+                                                                   run_dir, effort,
+                                                                   db_log=corrected.setdefault("base", []),
+                                                                   db_step="correction de l'initialisation")
         report_token_usage(work_key, "cucumber-init-fix", model, usage, len(prompt), returncode, effort)
         if limit_hit:
             print("[CUCUMBER INIT] ⛔ Quota ou budget atteint pendant la correction de l'init.")

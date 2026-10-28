@@ -30,7 +30,7 @@ ${compilation_agent}
 === RÉPONSE FINALE ===
 Aucun texte hors du JSON final. Ta réponse finale est UNIQUEMENT ce bloc JSON (cette règle remplace « Réponse finale : 10 lignes maximum ») :
 ```json
-{"corrigees": <nombre>, "restantes": ["<erreur restante : cause>"], "realignes": ["<scénario : fichier du code>"],
+{"corrigees": <nombre>, "restantes": ["<erreur restante : cause>"], "realignes": ["<scénario : fichier du code>"], "preuves_base": [{"tag": "@agent_…", "tables": ["<table>"], "requete": "<requête>", "resultat": "<réponse de la base>", "conclusion": "donnée absente|donnée présente"}],
  "constats": [{"tag": "@agent_…", "type": "deploiement|defaut_code|ecart_spec_code|comportement_surprenant", "detail": "<une phrase>", "preuve": "<extrait exact du journal>", "fichier": "<code en cause>", "ligne": "<n°>", "extrait": "<code copié>", "effet": "<effet observé>", "correction": "<correction suggérée>", "certitude": "prouvé|probable|à vérifier"}]}
 ```
 « corrigees » : décris aussi chaque correction faite dans « corrections » : [{"tag": "@agent_…", "cause": "<cause de l'échec>", "correction": "<ce que tu as changé>"}]. Un défaut du code spécifique ou du Studio, un écart entre ticket et code ou un comportement surprenant du code fourni va dans « constats » avec sa certitude (« prouvé » seulement avec une preuve d'exécution citée).

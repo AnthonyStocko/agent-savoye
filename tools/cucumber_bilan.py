@@ -117,8 +117,14 @@ def _correction_of(identifier: str, state: dict) -> dict:
         if item:
             done = next((c for c in (lot.get("correction") or {}).get("corrections", [])
                          if c.get("tag") == item.get("tag")), {})
+            proof = next((p for p in (lot.get("correction") or {}).get("preuves_base", [])
+                          if p.get("tag") == item.get("tag")), {})
+            text = done.get("correction") or f"corrigé par le lot de correction {lot['numero']}"
+            if proof:
+                text += (f" (preuve en base : {', '.join(proof.get('tables') or [])} → {proof.get('resultat', '')}"
+                         f"{' ; ' + proof['conclusion'] if proof.get('conclusion') else ''})")
             return {"lot": lot["numero"], "cause": done.get("cause") or item.get("message", ""),
-                    "correction": done.get("correction") or f"corrigé par le lot de correction {lot['numero']}",
+                    "correction": text,
                     "fichiers": lot.get("fichiers") or [item.get("fichier", "")]}
     return {}
 
