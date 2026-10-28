@@ -56,7 +56,7 @@ def jenkins(tmp_path, repo, monkeypatch):
     monkeypatch.setattr(jenkins_tools, "job_definitions", lambda job: calls["definitions"])
     monkeypatch.setattr(jenkins_tools, "trigger_job", lambda job, params: calls["params"].append(params) or "q/1")
     monkeypatch.setattr(jenkins_tools, "wait_build_result",
-                        lambda queue, timeout: {"url": "https://jenkins/job/x/7", "result": "UNSTABLE",
+                        lambda queue, timeout, *a, **k: {"url": "https://jenkins/job/x/7", "result": "UNSTABLE",
                                                 "artifacts": []})
     monkeypatch.setattr(jenkins_tools, "build_bytes", lambda url, rel: calls["console"].encode()
                         if rel == "consoleText" else b"")

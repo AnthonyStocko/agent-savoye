@@ -1137,10 +1137,11 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
         return {"ok": False, "message": f"non vérifié : {error}", "build": "", "resultats": {}}
     params = cucumber_job.build_parameters(info["definitions"], info["roles"], branch, sources.get("depot", ""),
                                            tags, head, env)
-    queue = jenkins_tools.trigger_job(job, params)
-    if not queue:
-        return {"ok": False, "message": "lancement du job Jenkins impossible", "build": "", "resultats": {}}
-    build = jenkins_tools.wait_build_result(queue, _timeout())
+    # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
+    build = jenkins_tools.run_exclusive(job, lambda: jenkins_tools.trigger_job(job, params), _timeout())
+    if build["result"] == "INDISPONIBLE" and not build["url"]:
+        return {"ok": False, "message": f"lancement du job Jenkins impossible ({build.get('message', '')})",
+                "build": "", "resultats": {}}
     if not build["url"]:
         return {"ok": False, "message": f"build non abouti : {build['result']}", "build": "", "resultats": {}}
     console = mask_secrets(jenkins_tools.build_bytes(build["url"], "consoleText").decode("utf-8", "replace"))[0]

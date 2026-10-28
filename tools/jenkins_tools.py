@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import requests
 
@@ -35,6 +36,18 @@ def _jenkins() -> tuple:
     jenkins_token = os.getenv("JENKINS_API_TOKEN", "")
     auth = (os.getenv("JENKINS_USER", ""), jenkins_token) if jenkins_token else None
     return os.getenv("JENKINS_URL", "").strip().rstrip("/"), auth
+
+
+def same_base(url: str) -> str:
+    """
+    URL renvoyée par Jenkins (en-tête Location, « url » d'un build) ramenée au schéma et à l'hôte de JENKINS_URL :
+    derrière un proxy, Jenkins annonce souvent http://hôte (port 80), injoignable ou très lent depuis le poste,
+    alors que JENKINS_URL est en https.
+    """
+    jenkins_url, _ = _jenkins()
+    match = re.match(r"^https?://[^/]+", url or "")
+    base = re.match(r"^https?://[^/]+", jenkins_url or "")
+    return (base.group(0) + url[match.end():]).rstrip("/") if match and base else (url or "").rstrip("/")
 
 
 def _job_path(job_name: str) -> str:
@@ -83,7 +96,7 @@ def trigger_job(job_name: str, parameters: dict) -> str:
                                  data=parameters, timeout=60)
         if response.status_code in (200, 201) and response.headers.get("Location"):
             print(f"[JENKINS] Job {job_name} lancé.")
-            return response.headers["Location"].rstrip("/")
+            return same_base(response.headers["Location"])
         print(f"[JENKINS] Erreur lancement job ({response.status_code}) : {response.text[:300]}")
     except requests.RequestException as e:
         print(f"[JENKINS] Impossible de lancer le job {job_name} : {e}")
@@ -110,27 +123,59 @@ def trigger_cucumber_job_with_file(job_name: str, parameters: dict, file_paramet
                                      timeout=60)
         if response.status_code in (200, 201) and response.headers.get("Location"):
             print(f"[JENKINS] Job {job_name} lancé.")
-            return response.headers["Location"].rstrip("/")
+            return same_base(response.headers["Location"])
         print(f"[JENKINS] Erreur lancement job ({response.status_code}) : {response.text[:300]}")
     except (OSError, requests.RequestException) as e:
         print(f"[JENKINS] Impossible de lancer le job {job_name} : {e}")
     return ""
 
 
-def wait_build_result(queue_url: str, timeout_s: int, poll_s: int = 30) -> dict:
+def build_from_queue(job_name: str, queue_url: str) -> str:
+    """
+    URL du build issu d'un élément de file d'attente, retrouvée parmi les derniers builds du job par son queueId :
+    Jenkins oublie l'élément de file quelques minutes après le démarrage du build (coupure réseau pendant le suivi).
+    """
+    jenkins_url, auth = _jenkins()
+    queue_id = re.search(r"/queue/item/(\d+)", queue_url or "")
+    if not (jenkins_url and job_name and queue_id):
+        return ""
+    try:
+        response = requests.get(f"{jenkins_url}/{_job_path(job_name)}/api/json", auth=auth, timeout=20,
+                                params={"tree": "builds[url,queueId]{0,20}"})
+        for build in response.json().get("builds") or []:
+            if str(build.get("queueId")) == queue_id.group(1):
+                return same_base(build.get("url", ""))
+    except (requests.RequestException, ValueError):
+        return ""
+    return ""
+
+
+def wait_build_result(queue_url: str, timeout_s: int, poll_s: int = 30, job_name: str = "") -> dict:
     """
     Attend la fin d'un build lancé (polling borné à timeout_s) : {"url", "result", "artifacts"} ; result vaut
-    SUCCESS, UNSTABLE, FAILURE, ABORTED, ou TIMEOUT / INDISPONIBLE si le build n'a pas abouti à temps.
+    SUCCESS, UNSTABLE, FAILURE, ABORTED, ou TIMEOUT / INDISPONIBLE si le build n'a pas abouti à temps. Les URL
+    annoncées par Jenkins sont ramenées à JENKINS_URL (same_base) ; avec `job_name`, un build dont l'élément de file
+    a disparu est retrouvé par son queueId.
     """
     _, auth = _jenkins()
     deadline, build_url = time.time() + timeout_s, ""
+    queue_url = same_base(queue_url)
     while time.time() < deadline:
         try:
             if not build_url:
-                item = requests.get(f"{queue_url}/api/json", auth=auth, timeout=20).json()
+                response = requests.get(f"{queue_url}/api/json", auth=auth, timeout=20)
+                if response.status_code == 404:
+                    # Élément de file oublié par Jenkins : build retrouvé par son queueId
+                    build_url = build_from_queue(job_name, queue_url)
+                    if not build_url:
+                        time.sleep(poll_s)
+                        continue
+                    item = {}
+                else:
+                    item = response.json()
                 if item.get("cancelled"):
                     return {"url": "", "result": "ABORTED", "artifacts": []}
-                build_url = ((item.get("executable") or {}).get("url") or "").rstrip("/")
+                build_url = build_url or same_base((item.get("executable") or {}).get("url") or "")
             if build_url:
                 build = requests.get(f"{build_url}/api/json", auth=auth, timeout=20,
                                      params={"tree": "result,building,artifacts[relativePath]"}).json()
@@ -303,7 +348,7 @@ def run_exclusive(job_name: str, trigger, timeout_s: int) -> dict:
         queue = trigger()
         if not queue:
             return {"url": "", "result": "INDISPONIBLE", "artifacts": [], "message": "lancement refusé par Jenkins"}
-        build = wait_build_result(queue, timeout_s)
+        build = wait_build_result(queue, timeout_s, job_name=job_name)
         if build["result"] == "TIMEOUT" and build["url"]:
             stop_build(build["url"])
             wait_until_idle([job_name], 600)

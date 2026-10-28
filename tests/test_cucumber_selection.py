@@ -188,7 +188,7 @@ def test_report_with_another_test_count_is_never_analysed(monkeypatch, repo):
     assert "41 test(s) exécuté(s) pour 1 attendu(s)" in gap
     monkeypatch.setenv("CUCUMBER_VERIFY_JOB", "QA/VERIFY")
     monkeypatch.setattr(cv.jenkins_tools, "trigger_cucumber_job_with_file", lambda *a: "https://jenkins/queue/1")
-    monkeypatch.setattr(cv.jenkins_tools, "wait_build_result", lambda queue, timeout: {
+    monkeypatch.setattr(cv.jenkins_tools, "wait_build_result", lambda queue, timeout, *a, **k: {
         "url": "https://jenkins/job/1", "result": "UNSTABLE", "artifacts": ["target/cucumber.json"]})
 
     def fetch(build, artifact, target):

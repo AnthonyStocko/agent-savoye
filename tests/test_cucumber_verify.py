@@ -128,7 +128,7 @@ def test_run_tags_sends_sources_and_detects_unapplicable_patch(monkeypatch, repo
     monkeypatch.setenv("CUCUMBER_VERIFY_JOB", "QA/VERIFY")
     monkeypatch.setattr(cv.jenkins_tools, "trigger_cucumber_job_with_file",
                         lambda job, params, name, path: sent.update(params) or "https://jenkins/queue/1")
-    monkeypatch.setattr(cv.jenkins_tools, "wait_build_result", lambda queue, timeout: {
+    monkeypatch.setattr(cv.jenkins_tools, "wait_build_result", lambda queue, timeout, *a, **k: {
         "url": "https://jenkins/job/1", "result": "FAILURE", "artifacts": [cv.PATCH_STATUS_ARTIFACT]})
 
     def fetch(build, artifact, target):
