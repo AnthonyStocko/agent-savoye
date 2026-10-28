@@ -3421,7 +3421,16 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
     lines = [f"# Couverture Cucumber des spécifiques {client_name}", "",
              f"{len(specs)} spécifique(s) inventorié(s), {len(selected)} traité(s), {len(covered)} couvert(s), "
              f"{len(indirect)} couvert(s) indirectement. "
-             f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}.", "",
+             f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}.", ""]
+    own_init = state.get("init_corrigee") or {}
+    if own_init.get("fichiers"):
+        # Compléments d'init corrigés par l'agent : en tête, à relire avant le reste du patch
+        last = (own_init.get("tentatives") or [{}])[-1]
+        lines += [f"> ⚠️ **Compléments d'initialisation corrigés par l'agent** (à relire en premier) : "
+                  f"{', '.join(own_init['fichiers'])}. Cause : {last.get('cause') or '—'}."
+                  + (f" Restant : {' ; '.join(last['restantes'])}." if last.get("restantes") else "")
+                  + f" Init après correction : {(state.get('init') or {}).get('message', '—')}.", ""]
+    lines += [
              f"- Scénarios contrôlés : {len(analysed)} ; réutilisation des steps Standard : "
              + (f"{round(100 * std_steps / all_steps)} % ({std_steps}/{all_steps} steps)" if all_steps else "—")
              + f" ; steps non définis : {sum(s['steps_non_definis'] for s in analysed)}",

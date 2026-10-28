@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -2504,6 +2504,103 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     return list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
 
 
+def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_tags: str, verify_sources: dict,
+                 profile: dict, state: dict, cucumber_std_dir: str, std_java: dict, step_code: dict,
+                 token_saving_rules: str, python_exe: str, workspace_dir: str, work_key: str) -> dict:
+    """
+    Correction autonome des compléments d'init de l'agent (cucumber_init_fix) : seulement si l'init échoue dans ses
+    propres compléments. Chaque tentative : un appel Claude borné aux fichiers autorisés, contrôles Python
+    (fichiers hors liste rétablis, aucun échec sur une dépendance non confirmée, lecture seule, aucun scénario ni
+    tag retiré, compilation), commit dédié, push sur la branche de travail, init rejouée seule. Renvoie le dernier
+    résultat de l'init ; state["init_corrigee"] : fichiers corrigés (livrés dans le patch, à relire en premier).
+    """
+    files = cucumber_init_fix.own_files(worktree, client)
+    if not (cucumber_init_fix.enabled() and cucumber_init_fix.fixable(init.get("echecs") or [], files)):
+        if init.get("echecs") and cucumber_init_fix.enabled():
+            print("[CUCUMBER INIT] Échec hors des compléments écrits par l'agent : init du client à corriger à la main.")
+        return init
+    run_dir = cucumber_tools.cache_dir(client)
+    model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
+    effort = claude_effort("CLAUDE_EFFORT_CUCUMBER")
+    compile_cmd = os.getenv("CUCUMBER_COMPILE_CMD")
+    compile_cmd = cucumber_tools.DEFAULT_COMPILE_CMD if compile_cmd is None else compile_cmd.strip()
+    agent_compile = ""
+    if compile_cmd and os.getenv("CUCUMBER_AGENT_COMPILE", "1").strip() != "0":
+        cucumber_compile.write_context(client, worktree, cucumber_std_dir, compile_cmd)
+        agent_compile = f'"{python_exe}" "{os.path.join(workspace_dir, "tools", "cucumber_compile.py")}" {client}'
+    values = {"client_name": client, "token_saving_rules": token_saving_rules, "worktree": worktree,
+              "java_std": std_java["java_std"], "sources_std": step_code["sources"],
+              "check_expression": cucumber_environment.check_expression(client),
+              "recreation_expression": cucumber_environment.recreation_expression(client),
+              "compilation_agent": agent_compilation_block(agent_compile),
+              "console": os.path.join(os.path.dirname(worktree), "verification", "init-console.txt"),
+              "fichiers": "\n".join(f"- {f}" for f in files), "tentatives": cucumber_init_fix.attempts()}
+    errors, corrected = [], state.setdefault("init_corrigee", {"fichiers": [], "tentatives": []})
+    for attempt in range(1, cucumber_init_fix.attempts() + 1):
+        print(f"[CUCUMBER INIT] Correction des compléments d'init par l'agent, tentative {attempt} : "
+              f"{', '.join(files)}")
+        before = cucumber_init_fix.snapshot(worktree, files)
+        prompt = render_prompt("cucumber_init_correction", **values, tentative=attempt,
+                               echecs=cucumber_init_fix.failure_lines(init.get("echecs") or []),
+                               erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
+        returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, lot_tools(values),
+                                                                   str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2),
+                                                                   run_dir, effort)
+        report_token_usage(work_key, "cucumber-init-fix", model, usage, len(prompt), returncode, effort)
+        if limit_hit:
+            print("[CUCUMBER INIT] ⛔ Quota ou budget atteint pendant la correction de l'init.")
+            break
+        result = cucumber_diagnostic.parse_fix_result(output)
+        errors = cucumber_init_fix.check_correction(worktree, client, files, before)
+        if not errors and compile_cmd:
+            try:
+                build = cucumber_tools.verify_build(cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
+                                                    compile_cmd)
+            except RuntimeError as e:
+                build = {"ok": False, "environnement": True, "erreurs": [str(e)]}
+            if not build["ok"] and not build.get("environnement"):
+                errors = build["erreurs"]
+        if errors:
+            print(f"[CUCUMBER INIT] Correction refusée par les contrôles : {errors[0]}")
+            # Fichiers autorisés remis à leur état d'avant l'appel : la tentative suivante repart proprement
+            for path, text in before.items():
+                with open(os.path.join(worktree, *path.split("/")), "w", encoding="utf-8", newline="") as f:
+                    f.write(text)
+            continue
+        if not cucumber_init_fix.commit(worktree, files, client, attempt):
+            print("[CUCUMBER INIT] Aucune modification proposée par l'agent : arrêt.")
+            break
+        corrected["fichiers"] = sorted(set(corrected["fichiers"]) | {
+            p for p in files if cucumber_init_fix.snapshot(worktree, [p])[p] != before.get(p)})
+        corrected["tentatives"].append({"tentative": attempt, "cause": result.get("cause", ""),
+                                        "corrections": result.get("corrections") or [],
+                                        "restantes": result.get("restantes") or []})
+        cucumber_tools.save_state(client, state)
+        push_error = cucumber_checks.push_for_verification(
+            worktree, profile["verify_branch"], f"Cucumber : correction de l'initialisation ({attempt})")[0] \
+            if profile.get("verify_branch") else ""
+        if push_error:
+            print(f"[CUCUMBER INIT] ⛔ {push_error}")
+            break
+        sources = verify_sources
+        if profile.get("verify_branch"):
+            head = cucumber_tools.rev_parse(worktree, "HEAD")
+            sources = {**verify_sources, "CUCUMBER_SPEC_COMMIT": head,
+                       profile.get("verify_branch_param") or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM:
+                           profile["verify_branch"]}
+        init = cucumber_verify.run_init(verify_mode, worktree, cucumber_tools.rev_parse(worktree, "HEAD"),
+                                        lambda: cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
+                                        init_tags, sources)
+        print(f"[CUCUMBER INIT] {'✅' if init['ok'] else '🌐'} Après correction {attempt} : {init['message']}")
+        if init["ok"]:
+            return init
+        if not cucumber_init_fix.fixable(init.get("echecs") or [], files):
+            print("[CUCUMBER INIT] L'échec restant est hors des compléments de l'agent : init à corriger à la main.")
+            break
+        errors = [f"l'init échoue encore : {init['message']}"]
+    return init
+
+
 def check_server_log(client: str, path: str, scenario: str) -> int:
     """
     Import d'un export de logs serveur (0 token) : l'export couvre-t-il l'heure du step en échec du scénario
@@ -2874,6 +2971,12 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                         init_tags, init_sources)
         print(f"[CUCUMBER] {'✅' if init['ok'] else '🌐'} {init['message']}" + (f" ({init['build']})" if init["build"]
                                                                                else ""))
+        if not init["ok"]:
+            # Init en échec dans les compléments écrits par l'agent : il les corrige lui-même (et eux seuls), puis
+            # rejoue l'init seule ; au plus CUCUMBER_INIT_FIX_ATTEMPTS tentatives
+            init = fix_own_init(client, worktree, init, verify_mode, init_tags, verify_sources, profile, state,
+                                local_cucumber_std_repo, std_java, step_code, token_saving_rules, python_exe,
+                                workspace_dir, work_key)
         # Dernier résultat connu de l'init (parcours de l'onglet, étape Projet)
         state["init"] = {**init, "date": datetime.now().isoformat(timespec="seconds")}
         cucumber_tools.save_state(client, state)
@@ -2909,6 +3012,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # Initialisation du client vue par les lots : features d'init et codes de référence du profil
     client_init = cucumber_profile.init_view(profile)
     conventions = cucumber_profile.conventions(profile)
+    # Compléments d'init corrigés par l'agent pendant cette génération : sortis des fichiers protégés (livrés)
+    own_init = set((state.get("init_corrigee") or {}).get("fichiers") or [])
+    if own_init:
+        conventions["protected_files"] = [p for p in conventions.get("protected_files") or [] if p not in own_init]
     # Longueur maximale du code de chaque entité (modèles des dépôts serveur), contrôlée après chaque lot (9b)
     code_lengths = cucumber_rules.code_length_index(client, [local_std_repo, local_client_repo])
     print(f"[CUCUMBER] Longueurs des codes : {len(code_lengths)} entité(s) trouvée(s) dans les modèles "
@@ -3150,8 +3257,13 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         exit_code = 1
     patch_file = cucumber_tools.patch_path(client)
     # Fichiers de l'init globale modifiés par la génération : erreur bloquante, aucun patch livré
-    protected = cucumber_checks.check_protected_files(worktree, state["base"], profile["protected_files"],
+    own_init = set((state.get("init_corrigee") or {}).get("fichiers") or [])
+    protected = cucumber_checks.check_protected_files(worktree, state["base"],
+                                                      [p for p in profile["protected_files"] if p not in own_init],
                                                       restore=False)
+    if own_init:
+        print(f"[CUCUMBER] ⚠️ Compléments d'initialisation corrigés par l'agent (dans le patch, à relire en premier) : "
+              f"{', '.join(sorted(own_init))}")
     state["fichiers_proteges_touches"] = [e.split(" : ", 1)[0] for e in protected["erreurs"]]
     temporary = cucumber_diagnostic.temporary_steps(worktree)
     state["steps_temporaires"] = temporary

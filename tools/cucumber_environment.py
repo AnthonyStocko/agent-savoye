@@ -138,14 +138,44 @@ _UNCONFIRMED_FAILURE = re.compile(r"(?:fail|assert\w*|throw\s+new\s+\w+)\s*\([^;
                                   r"unconfirmed|non\s+vérifi|cannot\s+be\s+verified)", re.I | re.S)
 
 
+_UNCONFIRMED_TEXT = re.compile(r"non\s+confirm|not\s+confirm|unconfirmed|non\s+vérifi|cannot\s+be\s+verified", re.I)
+_FAILURE_CALL = re.compile(r"\b(fail|assert\w*|throw\s+new\s+\w+)\s*\(", re.I)
+
+
+def unconfirmed_failure_methods(text: str, expression: str) -> list:
+    """
+    Noms des méthodes du step `expression` qui échouent sur une dépendance non confirmée : message d'échec qui le
+    dit, directement ou par une variable construite avec ce texte (affectation, StringBuilder.append).
+    """
+    out = []
+    for method in _java_methods(text):
+        if expression not in method["steps"]:
+            continue
+        body = method["body"]
+        if _UNCONFIRMED_FAILURE.search(body):
+            out.append(method["name"])
+            continue
+        names = set(re.findall(r"(\w+)\s*=\s*[^;]*?(?:" + _UNCONFIRMED_TEXT.pattern + r")", body, re.I | re.S))
+        names |= set(re.findall(r"(\w+)\s*\.\s*append\s*\([^;]*?(?:" + _UNCONFIRMED_TEXT.pattern + r")", body,
+                                re.I | re.S))
+        for call in _FAILURE_CALL.finditer(body):
+            end = body.find(";", call.end())
+            arguments = body[call.end():end if end >= 0 else len(body)]
+            if _UNCONFIRMED_TEXT.search(arguments) or any(re.search(rf"\b{re.escape(n)}\b", arguments)
+                                                          for n in names):
+                out.append(method["name"])
+                break
+    return out
+
+
 def unconfirmed_failures(worktree: str, client_name: str) -> list:
     """Le contrôle échoue sur une dépendance non confirmée (au lieu d'un avertissement) : une erreur par méthode."""
     root = os.path.join(worktree, "src", "test", "java")
     texts = [_read_text_file(os.path.join(d, n)) for d, _, names in os.walk(root) for n in names
              if n.endswith(".java")] if os.path.isdir(root) else []
-    return [f"méthode {m['name']} : une dépendance non confirmée doit être un avertissement, l'échec est réservé à "
-            f"une absence prouvée" for text in texts for m in _java_methods(text)
-            if check_expression(client_name) in m["steps"] and _UNCONFIRMED_FAILURE.search(m["body"])]
+    return [f"méthode {name} : une dépendance non confirmée doit être un avertissement, l'échec est réservé à "
+            f"une absence prouvée" for text in texts
+            for name in unconfirmed_failure_methods(text, check_expression(client_name))]
 
 
 def split_unverifiable(checks: list, unverifiable: list) -> tuple:
