@@ -214,6 +214,7 @@ def parse_claude_output(raw: str) -> tuple:
         "cout_usd": data.get("total_cost_usd", ""),
         "modeles": ",".join((data.get("modelUsage") or {}).keys()),
         "fin": data.get("subtype", ""),
+        "session_id": data.get("session_id", ""),
     })
     return text, usage
 
@@ -1391,7 +1392,8 @@ EMPTY_FIELD_MOTIFS = {"« source » vide dans le JSON", "« difference_standard 
 
 
 def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
-                        effort: str, system_file: str = "", db_log: list = None, db_step: str = "") -> tuple:
+                        effort: str, system_file: str = "", db_log: list = None, db_step: str = "",
+                        resume: str = "") -> tuple:
     """
     Appel Claude d'un lot Cucumber : session allégée (CLAUDE_LEAN_SESSION) et budget CUCUMBER_MAX_BUDGET_USD.
     `system_file` : partie fixe ajoutée au prompt système (--append-system-prompt-file), identique d'un lot à
@@ -1399,7 +1401,8 @@ def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns:
     `db_log` : liste (lot["base"]) complétée par les commandes base réellement lancées pendant l'appel (journal
     AGENT_DB_LOG de db_tools), chacune marquée de l'étape `db_step`.
     """
-    extra = ("--max-turns", max_turns) + (("--append-system-prompt-file", system_file) if system_file else ())
+    extra = ("--max-turns", max_turns) + (("--append-system-prompt-file", system_file) if system_file else ()) + (
+        ("--resume", resume) if resume else ())
     journal = os.path.join(run_dir, f"base_journal_{os.getpid()}.jsonl") if db_log is not None else ""
     if journal:
         if os.path.exists(journal):
@@ -1448,6 +1451,39 @@ def db_summary(entries: list) -> str:
             + (f", {errors} en erreur" if errors else ""))
 
 
+def resume_lot_session() -> bool:
+    """CUCUMBER_RESUME_SESSION (défaut 1) : revue et corrections reprennent la session Claude du lot (--resume)."""
+    return os.getenv("CUCUMBER_RESUME_SESSION", "1").strip() != "0"
+
+
+def cucumber_followup(lot: dict, prompt: str, model: str, effort: str, tools: list, max_turns: str, run_dir: str,
+                      db_log: list = None, db_step: str = "") -> tuple:
+    """
+    Appel de suite d'un lot (revue, correction de fichiers / compilation, correction après exécution). Si la session
+    du lot est connue (lot["session"]), elle est reprise (--resume) avec le modèle, l'effort et le prompt système du
+    lot : l'agent corrige en se souvenant du spécifique, des versions Standard et client, du code des steps et de ce
+    qu'il a déjà essayé, sans relire. Sinon, ou si la reprise échoue, appel neuf avec `model` / `effort`.
+    Renvoie (code retour, sortie, usage, quota atteint, modèle, effort).
+    """
+    session = (lot or {}).get("session", "") if resume_lot_session() else ""
+    if session:
+        lot_model, lot_effort = lot.get("modele") or model, lot.get("effort", effort)
+        system_file = lot.get("systeme", "")
+        system_file = system_file if system_file and os.path.exists(system_file) else ""
+        returncode, output, usage, limit_hit = run_cucumber_claude(prompt, lot_model, tools, max_turns, run_dir,
+                                                                   lot_effort, system_file, db_log, db_step,
+                                                                   resume=session)
+        if returncode == 0 or limit_hit or budget_hit(usage):
+            if usage and usage.get("session_id"):
+                lot["session"] = usage["session_id"]
+            return returncode, output, usage, limit_hit, lot_model, lot_effort
+        print("[CUCUMBER] Reprise de la session du lot impossible : appel neuf.")
+        lot.pop("session", None)
+    returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, tools, max_turns, run_dir, effort,
+                                                               db_log=db_log, db_step=db_step)
+    return returncode, output, usage, limit_hit, model, effort
+
+
 def cucumber_fix_effort() -> str:
     """Effort des corrections et de la revue : CLAUDE_EFFORT_CUCUMBER_FIX, défaut low."""
     return claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX") or "low"
@@ -1493,10 +1529,9 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
         before = cucumber_a_revoir.snapshot(worktree, files)
         duplicates = {cucumber_verify._title_key(s["titre"]) for s in flagged
                       if any(cucumber_verify.exact_duplicate(m) for m in s["motifs"])}
-        returncode, output, usage, _ = run_cucumber_claude(
-            prompt, model, lot_tools(values), str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8)), run_dir,
-            effort)
-        report_token_usage(work_key, "cucumber-review", model, usage, len(prompt), returncode, effort)
+        returncode, output, usage, _, used_model, effort = cucumber_followup(
+            lot, prompt, model, effort, lot_tools(values), str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8)), run_dir)
+        report_token_usage(work_key, "cucumber-review", used_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         review["decisions"] = cucumber_verify.parse_review(output)
         review["annulations"] = cucumber_a_revoir.check_corrections(worktree, before, duplicates)
@@ -1637,10 +1672,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         effort = cucumber_fix_effort()
-        returncode, output, usage, limit_hit = run_cucumber_claude(
-            prompt, model, lot_tools(values), str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort,
+        returncode, output, usage, limit_hit, used_model, effort = cucumber_followup(
+            lot, prompt, model, effort, lot_tools(values), str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir,
             db_log=lot.setdefault("base", []), db_step="correction après exécution")
-        report_token_usage(work_key, "cucumber-verify-fix", model, usage, len(prompt), returncode, effort)
+        report_token_usage(work_key, "cucumber-verify-fix", used_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
             break
@@ -1659,7 +1694,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         check = verify_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
                                     values, model, work_key, run_dir, on_usage, inspired_of(results), context,
-                                    lot.setdefault("base", []))
+                                    lot.setdefault("base", []), lot)
         if not check["ok"] and not check.get("environnement"):
             break
         bad = {t: v for t, v in bad.items() if t not in deployed and v["id"] not in held}
@@ -1884,7 +1919,8 @@ def inspired_of(results: list) -> list:
 
 def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumber_std_dir: str, files: list,
                         compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
-                        on_usage, inspired: list = (), context: dict = None, db_log: list = None) -> dict:
+                        on_usage, inspired: list = (), context: dict = None, db_log: list = None,
+                        lot: dict = None) -> dict:
     """
     Contrôles des fichiers (check_cucumber_lot, avec `context` : init du client et runner, fichiers de données du Standard copiés), puis compilation (et
     dry-run) si `compile_cmd`, en Python ; en cas d'erreurs dans les fichiers ou le code, au plus
@@ -1902,14 +1938,16 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
         if check["ok"] or check["environnement"] or attempt == attempts:
             return check
         fix_model, effort = plan[attempt]
-        print(f"[LOT {label}] Correction {attempt + 1}/{attempts} ({fix_model}, effort {effort or 'défaut'})...")
+        resumed = bool(lot and lot.get("session") and resume_lot_session())
+        print(f"[LOT {label}] Correction {attempt + 1}/{attempts} "
+              + ("(reprise de la session du lot)..." if resumed else f"({fix_model}, effort {effort or 'défaut'})..."))
         prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
-        returncode, _, usage, limit_hit = run_cucumber_claude(prompt, fix_model, lot_tools(values), fix_turns,
-                                                              run_dir, effort, db_log=db_log,
-                                                              db_step=f"correction ({check['etape']})")
+        returncode, _, usage, limit_hit, fix_model, effort = cucumber_followup(
+            lot if resumed else None, prompt, fix_model, effort, lot_tools(values), fix_turns, run_dir,
+            db_log=db_log, db_step=f"correction ({check['etape']})")
         report_token_usage(work_key, "cucumber-fix", fix_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
@@ -2911,7 +2949,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             system_prompt = render_prompt("cucumber_client_lot_systeme", **fixed_values, **java_values,
                                           references_injectees=references, max_turns=max_turns,
                                           tour_alerte=warning_turn(int(max_turns)))
-            system_file = os.path.join(run_dir, "prompt_systeme_lot.md")
+            system_file = os.path.join(run_dir, f"prompt_systeme_lot_{lot['numero']}.md")
             with open(system_file, "w", encoding="utf-8") as f:
                 f.write(system_prompt)
             prompt = render_prompt("cucumber_client_lot", **values, **java_values, runner_status=java["runner_status"],
@@ -2934,6 +2972,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                effort)
             lot["tokens"] = {}
             add_usage(lot, usage)
+            # Session du lot, reprise par la revue et les corrections (CUCUMBER_RESUME_SESSION)
+            lot.update(session=(usage or {}).get("session_id", ""), modele=model, effort=effort, systeme=system_file)
             results = cucumber_tools.parse_lot_result(output)
             if returncode != 0 or limit_hit or results is None:
                 # Rien n'est commité : le worktree revient au dernier lot, la reprise repart d'un état propre
@@ -2976,7 +3016,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             check = verify_cucumber_lot(client, label, worktree, state["base"], local_cucumber_std_repo, files,
                                         compile_cmd, dry_run_cmd, {**fixed_values, **java}, model, work_key, run_dir,
                                         lambda usage: add_usage(lot, usage), inspired_of(results), context,
-                                        lot.setdefault("base", []))
+                                        lot.setdefault("base", []), lot)
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         # Niveaux 2 et 3 : exécution sur le client, contre-épreuves, correction bornée, retrait des scénarios faibles
         if lot.get("tags") and (check["ok"] or check.get("environnement")):
