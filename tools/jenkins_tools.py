@@ -216,28 +216,51 @@ def failed_stage(build_url: str) -> str:
         return ""
 
 
-def build_info(build_url: str) -> dict:
-    """Build terminé : {"url", "numero", "resultat", "debut" (ms), "artifacts"} ; {} si introuvable."""
+def _get(url: str, timeout: int, attempts: int = 3, **kwargs):
+    """GET authentifié avec reprises (réseau instable) ; renvoie la réponse, ou lève la dernière erreur réseau."""
     _, auth = _jenkins()
+    last = None
+    for attempt in range(attempts):
+        try:
+            return requests.get(url, auth=auth, timeout=timeout, **kwargs)
+        except requests.RequestException as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise last
+
+
+def build_info(build_url: str) -> dict:
+    """Build terminé : {"url", "numero", "resultat", "debut" (ms), "artifacts"} ; {} si introuvable (cause affichée)."""
+    build_url = same_base(build_url)
     try:
-        response = requests.get(f"{build_url.rstrip('/')}/api/json", auth=auth, timeout=20,
-                                params={"tree": "number,result,timestamp,artifacts[relativePath]"})
+        response = _get(f"{build_url}/api/json", 20,
+                        params={"tree": "number,result,building,timestamp,artifacts[relativePath]"})
         if response.status_code != 200:
+            print(f"[JENKINS] Build {build_url} illisible : HTTP {response.status_code}"
+                  + (" (identifiants JENKINS_USER / JENKINS_API_TOKEN refusés ?)" if response.status_code in (401, 403)
+                     else ""))
             return {}
         build = response.json()
-        return {"url": build_url.rstrip("/"), "numero": build.get("number"), "resultat": build.get("result") or "",
+        if build.get("building"):
+            print(f"[JENKINS] Build {build_url} encore en cours : rapports pas encore archivés.")
+        return {"url": build_url, "numero": build.get("number"), "resultat": build.get("result") or "",
                 "debut": build.get("timestamp"), "artifacts": [a["relativePath"] for a in build.get("artifacts") or []]}
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as e:
+        print(f"[JENKINS] Build {build_url} injoignable : {e}")
         return {}
 
 
 def build_bytes(build_url: str, relative: str) -> bytes:
     """Contenu d'un fichier d'un build (consoleText, artifact/<chemin>), en mémoire seulement ; b'' si absent."""
-    _, auth = _jenkins()
+    build_url = same_base(build_url)
     try:
-        response = requests.get(f"{build_url.rstrip('/')}/{relative}", auth=auth, timeout=120)
-        return response.content if response.status_code == 200 else b""
-    except requests.RequestException:
+        response = _get(f"{build_url}/{relative}", 300)
+        if response.status_code != 200:
+            print(f"[JENKINS] {relative} du build {build_url} illisible : HTTP {response.status_code}")
+            return b""
+        return response.content
+    except requests.RequestException as e:
+        print(f"[JENKINS] {relative} du build {build_url} injoignable : {e}")
         return b""
 
 
