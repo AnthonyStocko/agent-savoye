@@ -194,3 +194,122 @@ def build_bytes(build_url: str, relative: str) -> bytes:
         return response.content if response.status_code == 200 else b""
     except requests.RequestException:
         return b""
+
+
+# Un seul build Cucumber à la fois (contrainte de l'environnement de test)
+# ---------------------------------------------------------------------------
+
+LOCK_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".tmp", "jenkins_cucumber.lock")
+
+
+def exclusive_jobs(job_name: str = "") -> list:
+    """
+    Jobs dont un seul build peut tourner à la fois : CUCUMBER_EXCLUSIVE_JOBS (séparés par des virgules), à défaut
+    `job_name`, CUCUMBER_VERIFY_JOB, CUCUMBER_RUN_JOB et JENKINS_CUCUMBER_JOB.
+    """
+    configured = [j.strip() for j in os.getenv("CUCUMBER_EXCLUSIVE_JOBS", "").split(",") if j.strip()]
+    jobs = configured or [job_name, os.getenv("CUCUMBER_VERIFY_JOB", ""), os.getenv("CUCUMBER_RUN_JOB", ""),
+                          os.getenv("JENKINS_CUCUMBER_JOB", "")]
+    return list(dict.fromkeys(j.strip() for j in jobs if j and j.strip()))
+
+
+def busy_builds(jobs: list) -> list:
+    """Builds en cours ou en file d'attente des `jobs` : ["<job> : <url ou 'en file d'attente'>"]."""
+    jenkins_url, auth = _jenkins()
+    busy = []
+    if not jenkins_url:
+        return busy
+    for job in jobs:
+        try:
+            response = requests.get(f"{jenkins_url}/{_job_path(job)}/api/json", auth=auth, timeout=20,
+                                    params={"tree": "inQueue,builds[url,building]{0,5}"})
+            if response.status_code != 200:
+                continue
+            data = response.json()
+            if data.get("inQueue"):
+                busy.append(f"{job} : en file d'attente")
+            busy += [f"{job} : {b['url']}" for b in data.get("builds") or [] if b.get("building")]
+        except (requests.RequestException, ValueError) as e:
+            print(f"[JENKINS] État du job {job} illisible : {e}")
+    return busy
+
+
+def wait_until_idle(jobs: list, timeout_s: int, poll_s: int = 30) -> bool:
+    """Attend qu'aucun build des `jobs` ne tourne ni n'attende (au plus timeout_s). Renvoie True si libre."""
+    deadline, announced = time.time() + timeout_s, False
+    while True:
+        busy = busy_builds(jobs)
+        if not busy:
+            return True
+        if not announced:
+            print(f"[JENKINS] Un build Cucumber est déjà en cours, attente de sa fin (un seul à la fois) : "
+                  f"{' ; '.join(busy)}")
+            announced = True
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
+def stop_build(build_url: str) -> None:
+    """Arrête un build (dépassement de délai) pour qu'il ne chevauche pas le suivant."""
+    _, auth = _jenkins()
+    try:
+        requests.post(f"{build_url}/stop", auth=auth, timeout=20)
+        print(f"[JENKINS] Build arrêté (délai dépassé) : {build_url}")
+    except requests.RequestException as e:
+        print(f"[JENKINS] Arrêt du build impossible ({build_url}) : {e}")
+
+
+def _acquire_local_lock(timeout_s: int, poll_s: int = 15) -> bool:
+    """Verrou entre processus de l'agent sur ce poste (deux générations lancées en même temps)."""
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    deadline, announced = time.time() + timeout_s, False
+    while True:
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {time.time():.0f}".encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                # Verrou abandonné (processus tué) : périmé au-delà du délai maximal d'un build
+                if time.time() - os.path.getmtime(LOCK_FILE) > timeout_s + 600:
+                    os.remove(LOCK_FILE)
+                    continue
+            except OSError:
+                continue
+        if not announced:
+            print("[JENKINS] Un autre traitement de l'agent utilise Jenkins : attente de la fin de son build.")
+            announced = True
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
+def run_exclusive(job_name: str, trigger, timeout_s: int) -> dict:
+    """
+    Lance un build par `trigger()` (renvoie l'URL de file d'attente, '' en cas d'échec) et attend son résultat en
+    garantissant qu'un seul build Cucumber tourne à la fois : verrou local entre traitements de l'agent, attente
+    qu'aucun build des exclusive_jobs ne tourne ni n'attende, puis lancement ; un build qui dépasse le délai est arrêté
+    pour ne pas chevaucher le suivant. Renvoie le résultat de wait_build_result ({"url", "result", "artifacts"}),
+    result INDISPONIBLE et "message" si rien n'a été lancé.
+    """
+    if not _acquire_local_lock(timeout_s):
+        return {"url": "", "result": "INDISPONIBLE", "artifacts": [], "message": "verrou Jenkins local non obtenu"}
+    try:
+        if not wait_until_idle(exclusive_jobs(job_name), timeout_s):
+            return {"url": "", "result": "INDISPONIBLE", "artifacts": [],
+                    "message": "un autre build Cucumber occupe Jenkins au-delà du délai"}
+        queue = trigger()
+        if not queue:
+            return {"url": "", "result": "INDISPONIBLE", "artifacts": [], "message": "lancement refusé par Jenkins"}
+        build = wait_build_result(queue, timeout_s)
+        if build["result"] == "TIMEOUT" and build["url"]:
+            stop_build(build["url"])
+            wait_until_idle([job_name], 600)
+        return build
+    finally:
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass

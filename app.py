@@ -25,6 +25,7 @@ from tools.jira_tools import (
 )
 from tools.db_tools import DB_TYPES, test_connection
 from tools.jenkins_tools import trigger_cucumber_job
+from tools import jenkins_tools
 from tools.memory_tools import (
     find_similar_tickets, get_project_lessons, load_ticket_memory, record_manual_edit,
     get_all_memories, clear_memory, delete_ticket_memory, import_existing_deliverables,
@@ -737,6 +738,12 @@ with tab_execution:
         job_name = st.text_input("Nom du Job Jenkins Cucumber :", value=os.getenv("JENKINS_CUCUMBER_JOB", ""))
         
         if st.button("🚀 Lancer les tests Cucumber sur Jenkins", use_container_width=True):
+            # Un seul build Cucumber à la fois (runs et vérifications de l'onglet Cucumber compris)
+            busy = jenkins_tools.busy_builds(jenkins_tools.exclusive_jobs(job_name))
+            if busy:
+                st.warning("Un build Cucumber est déjà en cours (un seul à la fois) : " + " ; ".join(busy)
+                           + ". Relancez une fois terminé.")
+                st.stop()
             with st.spinner("Déclenchement du build Jenkins..."):
                 build_url = trigger_cucumber_job(
                     job_name=job_name,

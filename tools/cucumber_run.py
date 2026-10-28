@@ -9,7 +9,8 @@ Lancement automatique d'un run Jenkins du dépôt <client>-cucumber (onglet Cucu
    commit poussé doit être en tête de la branche distante (cucumber_checks.push_for_verification), sinon rien n'est
    lancé.
 3. Le job est lancé avec sa configuration actuelle, la branche, le dépôt client, l'attente décochée et le filtre de
-   tags ajouté à ses arguments ; suivi jusqu'à sa fin (CUCUMBER_VERIFY_TIMEOUT). Le nombre de tests exécutés lu dans
+   tags ajouté à ses arguments, une fois qu'aucun autre build Cucumber ne tourne (un seul à la fois,
+   jenkins_tools.run_exclusive) ; suivi jusqu'à sa fin (CUCUMBER_VERIFY_TIMEOUT, au-delà le build est arrêté). Le nombre de tests exécutés lu dans
    la console est comparé à celui attendu pour les tags (une feature taguée : ses scénarios). La console et les
    rapports Cucumber JSON sont ensuite importés (cucumber_import, bilan) par l'appelant.
 4. Version testée : artefact monté (rôles « composant_* »), date de publication lue dans le dépôt Maven et comparée
@@ -147,14 +148,25 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     run["version_testee"] = tested_version(client_name, params, roles, inventory, client_root)
     if run["version_testee"]:
         log(f"[RUN JENKINS] {run['version_testee']}")
-    queue = jenkins_tools.trigger_job(check["job"], params)
-    if not queue:
-        run["message"] = f"lancement du job {check['job']} refusé par Jenkins"
+    busy = jenkins_tools.busy_builds(jenkins_tools.exclusive_jobs(check["job"]))
+    if busy:
+        log(f"[RUN JENKINS] Un build Cucumber est déjà en cours (un seul à la fois) : {' ; '.join(busy)} — attente de "
+            f"sa fin avant de lancer.")
+
+    def trigger():
+        queue = jenkins_tools.trigger_job(check["job"], params)
+        if queue:
+            log(f"[RUN JENKINS] Job {check['job']} lancé (branche {check['branche']}"
+                + (f", filtre de tags {tags}" if tags else "") + f") ; suivi jusqu'à sa fin (au plus {timeout()} s)...")
+        return queue
+    # Un seul build Cucumber à la fois : attente qu'aucun autre ne tourne, arrêt du build au-delà du délai
+    build = jenkins_tools.run_exclusive(check["job"], trigger, timeout())
+    if build["result"] == "INDISPONIBLE" and not build["url"]:
+        run["message"] = (f"lancement du job {check['job']} refusé par Jenkins"
+                          if build.get("message") == "lancement refusé par Jenkins" else
+                          f"job {check['job']} non lancé : {build.get('message', 'Jenkins indisponible')}")
         record(client_name, run)
         return run
-    log(f"[RUN JENKINS] Job {check['job']} lancé (branche {check['branche']}"
-        + (f", filtre de tags {tags}" if tags else "") + f") ; suivi jusqu'à sa fin (au plus {timeout()} s)...")
-    build = jenkins_tools.wait_build_result(queue, timeout())
     run.update(build=build["url"], resultat=build["result"])
     run["ok"] = bool(build["url"]) and build["result"] not in ("TIMEOUT", "INDISPONIBLE", "ABORTED")
     run["message"] = (f"build terminé : {build['result']}" if run["ok"] else
