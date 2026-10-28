@@ -46,6 +46,7 @@ def project(tmp_path, monkeypatch):
 
 def open_card(project) -> AppTest:
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_section_detail_{CLIENT}"] = True  # détail du projet ouvert
     at.session_state[f"cucumber_step_{CLIENT}"] = "couverture"
     at.session_state[f"cucumber_card_{CLIENT}"] = "sp-1"
     at.run()
@@ -139,6 +140,7 @@ def test_waiting_card_opens_covering_task_and_useless_relaunch_is_explained(proj
                                           "couvert_indirectement", "couvert_par": "sp-1"})
     ct.save_state(CLIENT, state)
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_section_detail_{CLIENT}"] = True  # détail du projet ouvert
     at.session_state[f"cucumber_step_{CLIENT}"] = "couverture"
     at.session_state[f"cucumber_card_{CLIENT}"] = "sp-2"
     at.run()

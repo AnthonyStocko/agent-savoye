@@ -2718,6 +2718,8 @@ def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio
                        cucumber_verify.branch_sources(profile, args.cucumber_repo), profile, state,
                        local_cucumber_std_repo, std_java, step_code, token_saving_rules, python_exe, workspace_dir,
                        cucumber_tools.work_id(client), os.path.join(folder, consoles[0]) if consoles else "")
+    # Import traité (écran minimal : la correction n'est plus proposée pour ce run)
+    state.setdefault("init_corrigee", {"fichiers": [], "tentatives": []})["import"] = numero
     cucumber_tools.save_state(client, state)
     if out.get("ok") is False and not out.get("corrige"):
         if not (state.get("init_corrigee") or {}).get("tentatives"):

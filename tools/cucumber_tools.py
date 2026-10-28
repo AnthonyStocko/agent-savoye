@@ -2685,8 +2685,8 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
         missing_file = output + ".donnees-manquantes.txt"
         if unresolved:
             with open(missing_file, "w", encoding="utf-8") as f:
-                f.write("Fichiers de données lus par les features mais absents de la branche une fois le patch "
-                        "appliqué (FileNotFoundException à l'exécution) :\n"
+                f.write("Fichiers de données lus par les features mais absents de la branche une fois les "
+                        "modifications appliquées (FileNotFoundException à l'exécution) :\n"
                         + "\n".join(f"- {feat}:{line} « {name} » attendu en {target}"
                                      for feat, line, name, target in unresolved) + "\n")
             print(f"[CUCUMBER] ⛔ Patch : {len(unresolved)} fichier(s) de données introuvable(s) (ni sur la branche, ni "

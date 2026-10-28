@@ -84,6 +84,7 @@ def test_failed_agent_test_gets_a_correction_from_the_console(project):
     assert [(p["spec"], [s["titre"] for s in p["scenarios"]]) for p in analysis["propositions"]] == [("sp-r", [KO])]
     # Bandeau « À faire » : la correction est proposée hors du mode expert
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_section_detail_{CLIENT}"] = True  # détail du projet ouvert
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     assert any("1 test en échec au dernier résultat importé peut être corrigé automatiquement" in m.value

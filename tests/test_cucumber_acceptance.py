@@ -116,6 +116,7 @@ def project(tmp_path, monkeypatch):
 
 def app_at(card: str = "", step: str = "couverture") -> AppTest:
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_section_detail_{CLIENT}"] = True  # détail du projet ouvert
     at.session_state[f"cucumber_step_{CLIENT}"] = step
     if card:
         at.session_state[f"cucumber_card_{CLIENT}"] = card
@@ -330,6 +331,7 @@ def test_generation_section_with_init_patch_and_patch_renders_once(project):
     write(ct.init_patch_path(CLIENT), "diff --git a/x b/x\n")
     write(ct.patch_path(CLIENT), "diff --git a/y b/y\n")
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_section_detail_{CLIENT}"] = True  # détail du projet ouvert
     at.session_state[f"cucumber_section_expert_{CLIENT}"] = True
     at.session_state[f"cucumber_section_expert_{CLIENT}_vu"] = True
     at.run()

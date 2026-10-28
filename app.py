@@ -1276,15 +1276,14 @@ def cucumber_header() -> dict:
     ]
     ctx = {"client": client, "cmd": cucumber_cmd, "ready": ready, "capture": capture_std_ref,
            "reglages_affiches": not ready or st.session_state["cucumber_project"] == NEW_PROJECT}
-    if ctx["reglages_affiches"]:
+    with st.expander("Données du projet", icon=":material/settings:", expanded=ctx["reglages_affiches"]):
         render_project_settings(ctx)
     return ctx
 
 
 def render_project_settings(ctx: dict) -> None:
     """Réglages du projet : dépôt du client, nom, schéma BDD, application Jira, dépôt du Cucumber Standard."""
-    with st.container(border=True):
-        st.markdown(":material/settings: **Réglages du projet**")
+    with st.container(border=False):
         st.text_input("Dépôt Bitbucket du projet client :", key="cucumber_repo",
                       help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/CLIENT) ou chemin d'un clone "
                            "local.")
@@ -1827,9 +1826,9 @@ def render_todo_banner(ctx: dict, rows: list, links: dict, init_status: dict, de
         run_cucumber_init_lot(ctx, init_item[0])
 
 
-def render_simple_import(client: str) -> None:
+def render_simple_import(client: str, place: str = "simple") -> None:
     """Import d'un résultat Jenkins (console, rapport JSON ou URL du build), sans le détail de l'analyse."""
-    with st.form(f"cucumber_simple_import_{client}", border=False):
+    with st.form(f"cucumber_{place}_import_{client}", border=False):
         uploaded = st.file_uploader("Fichiers du résultat Jenkins (console, rapport JSON, journaux)",
                                     accept_multiple_files=True, type=["txt", "log", "json", "csv"],
                                     help="Les mots de passe et jetons sont masqués avant tout enregistrement.")
@@ -1852,8 +1851,10 @@ def render_simple_import(client: str) -> None:
     fixable = sum(len(p["scenarios"]) for p in analysis.get("propositions") or [])
     st.session_state[f"cucumber_import_message_{client}"] = (
         f"Résultat non exploitable : {analysis['non_analyse']}" if analysis.get("non_analyse") else
+        "Résultat importé : l'initialisation est en échec — le bouton « Lancer » la corrige."
+        if analysis.get("init_en_echec") else
         f"Résultat importé : {analysis.get('tests', 0)} test(s), {failures} en échec"
-        + (f" ; {fixable} peut être corrigé automatiquement (voir « À faire »)." if fixable else "."))
+        + (f" ; {fixable} peut être corrigé automatiquement (bouton « Lancer »)." if fixable else "."))
     st.rerun()
 
 
@@ -2024,11 +2025,141 @@ def render_zone_results(ctx: dict, rows: list) -> None:
         st.toggle(f"Afficher les {len(ordered)} résultats", key=f"cucumber_resultats_tout_{client}")
 
 
+def main_action(ctx: dict, rows: list, init_status: dict) -> dict:
+    """
+    Ce que fait le bouton « Lancer », de la plus bloquante à la première couverture : corriger l'initialisation en
+    échec au dernier run importé, préparer l'initialisation absente ou incomplète, corriger les tests en échec au
+    dernier run importé, écrire la première couverture. {"type", "libelle", "detail", ...} ; type "" : rien à faire.
+    """
+    client = ctx["client"]
+    state = cucumber_tools.load_state(client)
+    numero, analysis = latest_import_analysis(client)
+    launched = {str(lot.get("import")) for lot in state.get("lots") or [] if lot.get("type") == "correction"}
+    init_fixed = str((state.get("init_corrigee") or {}).get("import", "")) == str(numero)
+    if analysis.get("init_en_echec") and not analysis.get("non_analyse") and not init_fixed:
+        init = analysis["init_en_echec"]
+        return {"type": "init_echec", "numero": numero, "libelle": "Corriger l'initialisation",
+                "detail": f"l'initialisation a échoué au dernier run importé (n° {numero}) : "
+                          f"{(init.get('step') or init.get('id', ''))[:120]}."}
+    init_lot = cucumber_detection.init_lot(init_status)
+    first = [r["id"] for r in rows if generable(r)] if not state.get("lots") else []
+    if init_lot:
+        return {"type": "init", "lot": init_lot, "suite": first, "libelle": "Préparer l'initialisation"
+                + (" puis écrire les tests" if first else ""),
+                "detail": "les données de test du projet sont " + ("absentes" if init_lot["mode"] == "init"
+                                                                   else "incomplètes")
+                          + (f", puis première couverture de {len(first)} tâche(s)." if first else ".")}
+    fixable = [] if str(numero) in launched or analysis.get("non_analyse") else analysis.get("propositions") or []
+    if fixable:
+        count = sum(len(p["scenarios"]) for p in fixable)
+        return {"type": "corriger", "numero": numero, "specs": [p["spec"] for p in fixable],
+                "libelle": f"Corriger les {count} test(s) en échec",
+                "detail": f"tests en échec au dernier run importé (n° {numero})."}
+    if first:
+        return {"type": "couverture", "ids": first, "libelle": f"Écrire la première couverture ({len(first)})",
+                "detail": f"{len(first)} tâche(s) sans test."}
+    return {"type": "", "libelle": "Lancer",
+            "detail": "rien à faire pour l'instant : importe le résultat du prochain run Jenkins, ou choisis des "
+                      "tâches ci-dessous."}
+
+
+def run_main_action(ctx: dict, action: dict) -> None:
+    client = ctx["client"]
+    if action["type"] == "init_echec":
+        st.info("Correction de l'initialisation en cours…", icon=":material/build:")
+        code = run_main_step(ctx["cmd"] + ["--fix-init-from-import", str(action["numero"])], on_line=ctx["capture"])
+        (st.success if code == 0 else st.error)(
+            "Initialisation corrigée : les modifications sont prêtes ci-dessous." if code == 0 else
+            f"Correction de l'initialisation incomplète : {interruption_cause(code)}.")
+    elif action["type"] == "init":
+        if run_cucumber_init_lot(ctx, action["lot"]) == 0 and action.get("suite"):
+            generate_tasks(ctx, action["suite"])
+    elif action["type"] == "corriger":
+        run_cucumber_generation(ctx, ["--complete", "--from-import", str(action["numero"])], action["specs"])
+    elif action["type"] == "couverture":
+        generate_tasks(ctx, action["ids"])
+    st.session_state.pop(f"cucumber_simple_taches_{client}", None)
+
+
+def render_deliverable(client: str) -> None:
+    """Modifications à appliquer (tests, initialisation), avec ce qui n'a pas pu y entrer."""
+    found = False
+    for path, label in ((cucumber_tools.patch_path(client), "Télécharger les tests"),
+                        (cucumber_tools.init_patch_path(client), "Télécharger l'initialisation")):
+        if not (path and os.path.exists(path)):
+            continue
+        found = True
+        when = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(path)))
+        with st.container(horizontal=True, vertical_alignment="center"):
+            with open(path, "rb") as f:
+                st.download_button(f"{label} ({when})", f.read(), file_name=os.path.basename(path),
+                                   mime="text/x-diff", icon=":material/download:",
+                                   key=f"cucumber_simple_dl_{client}_{os.path.basename(path)}")
+            for suffix, what in ((".ecarts.txt", "modification(s) écartée(s)"),
+                                 (".donnees-manquantes.txt", "fichier(s) de données introuvable(s)")):
+                if os.path.exists(path + suffix):
+                    with open(path + suffix, encoding="utf-8", errors="replace") as f:
+                        detail = f.read()
+                    count = sum(1 for line in detail.splitlines() if line.startswith("- "))
+                    with st.popover(f"⚠️ {count} {what}"):
+                        st.markdown(detail)
+    if not found:
+        st.caption("Rien à appliquer pour l'instant : les modifications apparaissent ici dès que des tests sont "
+                   "écrits ou corrigés. Applique-les dans ton dépôt (git am), relis, pousse, puis lance le job "
+                   "Jenkins.")
+    decisions = len(cucumber_decisions.pending(client))
+    if decisions:
+        st.caption(f"✋ {decisions} décision(s) attendent ton avis (changement du sens d'un test) : mode expert, "
+                   f"« Corrections ».")
+
+
+def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
+    """
+    Écran minimal : bouton « Lancer » (init, première couverture, corrections), choix de tâches non testées, import
+    du résultat Jenkins, patch à appliquer.
+    """
+    client = ctx["client"]
+    action = main_action(ctx, rows, init_status)
+    st.markdown(" ".join(text for text, _ in cucumber_coverage.status_sentences(rows, cucumber_coverage.last_run(
+        client))))
+    with st.container(border=True):
+        st.markdown("**1. Lancer**")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            clicked = st.button(action["libelle"], type="primary", icon=":material/play_arrow:",
+                                disabled=not (ctx["ready"] and action["type"]), key=f"cucumber_simple_go_{client}")
+            st.caption(action["detail"][:1].upper() + action["detail"][1:])
+        if clicked:
+            run_main_action(ctx, action)
+    with st.container(border=True):
+        st.markdown("**2. Écrire les tests de tâches choisies**")
+        candidates = sorted((r for r in rows if generable(r)), key=lambda r: (r["module"], r["titre"].casefold()))
+        titles = {r["id"]: (f"{r['module']} — " if r["module"] else "") + r["titre"] for r in candidates}
+        picked = st.multiselect("Tâches non testées", list(titles), format_func=titles.get,
+                                key=f"cucumber_simple_taches_{client}", placeholder="Choisis une ou plusieurs tâches",
+                                label_visibility="collapsed")
+        wanted, _ = cucumber_coverage.substitute_dependents(rows, picked)
+        by_id = {r["id"]: r for r in rows}
+        ready_ids = [i for i in wanted if i in by_id and generable(by_id[i])]
+        if st.button(f"Écrire les tests ({len(ready_ids)})", icon=":material/edit_note:",
+                     disabled=not (ctx["ready"] and ready_ids), key=f"cucumber_simple_write_{client}"):
+            generate_tasks(ctx, ready_ids)
+        if not candidates:
+            st.caption("Toutes les tâches testables ont un test.")
+    with st.container(border=True):
+        st.markdown("**3. Résultat du job Jenkins**")
+        st.caption("Après un run Jenkins en erreur ou en échec : dépose sa console (ou son rapport JSON), ou colle "
+                   "l'adresse du build. Le bouton « Lancer » proposera ensuite la correction.")
+        message = st.session_state.pop(f"cucumber_import_message_{client}", "")
+        if message:
+            st.info(message, icon=":material/info:")
+        render_simple_import(client, "minimal")
+    st.markdown("**Modifications à appliquer**")
+    render_deliverable(client)
+
+
 def render_expert(ctx: dict, data: dict) -> None:
     """Mode expert : réglages, profil, bilan de santé, initialisation, plan et lots, exécution, corrections, journal."""
     client = ctx["client"]
-    if not ctx["reglages_affiches"]:
-        render_project_settings(ctx)
     st.markdown("**" + cucumber_journey.overview_line(
         client, cucumber_detection.state_label(data["init_status"]), data["rows"], data["analysis"]) + "**")
     render_cucumber_profile(ctx, data["profile_doc"], data["detected"], data["init_status"])
@@ -2776,17 +2907,23 @@ with tab_cucumber:
                                           selection_key(cucumber_client, cucumber_inventory))
     cucumber_ctx["rows"] = cucumber_rows
     cucumber_links_now = cucumber_links.current_links(cucumber_client) if cucumber_client else {}
-    if cucumber_client:
-        render_todo_banner(cucumber_ctx, cucumber_rows, cucumber_links_now, cucumber_init_status, cucumber_detected)
     if cucumber_client and cucumber_rows:
-        render_zone_status(cucumber_ctx, cucumber_rows)
-        render_zone_tasks(cucumber_ctx, cucumber_rows)
-        render_zone_results(cucumber_ctx, cucumber_rows)
+        render_cucumber_simple(cucumber_ctx, cucumber_rows, cucumber_init_status)
     elif cucumber_client:
         st.info("Les fonctionnalités spécifiques du projet apparaîtront ici dès la fin de son analyse automatique.",
                 icon=":material/hourglass_top:")
     if cucumber_client:
         st.divider()
+        # Ouvert de lui-même quand une fiche, un filtre ou une préparation y est demandé
+        detail_wanted = any(st.session_state.get(f"{k}_{cucumber_client}") for k in (
+            "cucumber_card", "cucumber_filtre", "cucumber_init_demande"))
+        if section("Détail du projet", ":material/list_alt:", f"detail_{cucumber_client}", detail_wanted):
+            render_todo_banner(cucumber_ctx, cucumber_rows, cucumber_links_now, cucumber_init_status,
+                               cucumber_detected)
+            if cucumber_rows:
+                render_zone_status(cucumber_ctx, cucumber_rows)
+                render_zone_tasks(cucumber_ctx, cucumber_rows)
+                render_zone_results(cucumber_ctx, cucumber_rows)
         if section("Mode expert", ":material/engineering:", f"expert_{cucumber_client}", False):
             render_expert(cucumber_ctx, {
                 "rows": cucumber_rows, "links": cucumber_links_now, "inventory": cucumber_inventory,

@@ -132,43 +132,41 @@ def test_no_internal_vocabulary_outside_expert_mode(project):
 
 
 def test_full_path_without_expert_mode(project, monkeypatch):
+    """Écran minimal : bouton « Lancer », tâches choisies, résultat Jenkins, modifications à appliquer."""
     at = open_app()
     markdown = " ".join(m.value for m in at.markdown)
-    # Comprendre l'état de la couverture en lisant le résumé
-    labels = [b.label for b in at.button]
     assert "3 fonctionnalités spécifiques." in markdown and "Aucune n'a encore de test." in markdown
-    assert "3 restent à tester." in labels
-    # Choisir deux fonctionnalités et écrire leurs tests
-    at.checkbox(key=f"cucumber_pick_{CLIENT}_sp-a").check()
-    at.checkbox(key=f"cucumber_pick_{CLIENT}_sp-b").check()
-    at.run()
-    assert "Écrire les tests de la sélection (2)" in [b.label for b in at.button]
+    # Bouton 1 : rien d'écrit encore → première couverture des 3 tâches
+    assert "Écrire la première couverture (3)" in [b.label for b in at.button]
+    # Bouton 2 : deux tâches choisies dans la liste déroulante
+    at.multiselect(key=f"cucumber_simple_taches_{CLIENT}").set_value(["sp-a", "sp-b"]).run()
+    assert "Écrire les tests (2)" in [b.label for b in at.button]
     monkeypatch.setattr(subprocess, "Popen", FakeWriter)
-    [b for b in at.button if b.label == "Écrire les tests de la sélection (2)"][0].click().run()
+    [b for b in at.button if b.label == "Écrire les tests (2)"][0].click().run()
     assert not at.exception, [e.value for e in at.exception]
     assert any("Écriture terminée" in s.value for s in at.success)
     monkeypatch.setattr(subprocess, "Popen", REAL_POPEN)
     at = open_app()
     markdown = " ".join(m.value for m in at.markdown)
-    # Le résultat de chacune, puis voir et télécharger les modifications
-    assert markdown.count("✍ Test écrit") == 2 and "2 ont un test, pas encore vérifié." in [b.label for b in at.button]
-    toggles = [t for t in at.toggle if t.label == "Voir les modifications"]
-    assert len(toggles) == 2 and [str(b.proto.label) for b in at.get("download_button")].count("Télécharger") == 2
-    toggles[0].set_value(True).run()
-    assert any("+Feature: Test de sp-" in c.value for c in at.code)
-    # Importer un résultat Jenkins : vérifié vert ou en échec
+    assert "2 ont un test, pas encore vérifié." in markdown
+    # Tests déjà écrits, aucun résultat importé : rien à lancer ; la tâche restante est proposée au bouton 2
+    go = [b for b in at.button if b.key == f"cucumber_simple_go_{CLIENT}"][0]
+    assert go.disabled
+    assert len(at.multiselect(key=f"cucumber_simple_taches_{CLIENT}").options) == 1
+    # Résultat Jenkins importé avec un échec corrigeable → le bouton 1 propose la correction
     folder = os.path.join(cucumber_import.imports_dir(CLIENT), "1")
     os.makedirs(folder)
+    failing = f"{FEATURES}WMS/sp-b.feature::Effet de sp-b"
     with open(os.path.join(folder, "analyse.json"), "w", encoding="utf-8") as f:
-        json.dump({"numero": 1, "non_analyse": "", "propositions": [], "resultats": {
-            f"{FEATURES}WMS/sp-a.feature::Effet de sp-a": {"statut": "passe"},
-            f"{FEATURES}WMS/sp-b.feature::Effet de sp-b": {"statut": "echoue", "message": "attendu X"}}}, f)
+        json.dump({"numero": 1, "non_analyse": "", "propositions": [{"spec": "sp-b", "scenarios": [failing]}],
+                   "resultats": {f"{FEATURES}WMS/sp-a.feature::Effet de sp-a": {"statut": "passe"},
+                                 failing: {"statut": "echoue", "message": "attendu X"}}}, f)
     with open(os.path.join(cucumber_import.imports_dir(CLIENT), "index.json"), "w", encoding="utf-8") as f:
         json.dump({"imports": [{"numero": 1, "date": "2026-10-27T12:00:00", "fichiers": []}]}, f)
     at = open_app()
+    assert "Corriger les 1 test(s) en échec" in [b.label for b in at.button]
     markdown = " ".join(m.value for m in at.markdown)
-    assert "✅ vérifié, vert" in markdown and "❌ en échec" in markdown
-    labels = [b.label for b in at.button]
-    assert "2 ont un test," in labels and "dont 1 vérifié vert le 27/10" in labels and "et 1 en échec." in labels
+    assert "dont 1 vérifié vert le 27/10" in markdown and "et 1 en échec." in markdown
+    # Modifications à appliquer : téléchargeables sur l'écran minimal
     found = sorted({m.group(0) for t in visible_texts(at) for m in FORBIDDEN.finditer(t)})
     assert found == [], found

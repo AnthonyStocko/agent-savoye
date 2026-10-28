@@ -125,6 +125,7 @@ def test_covered_and_not_measured_without_run(project):
 
 def test_screen_shows_tests_as_covered_and_not_measured(project):
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state[f"cucumber_section_detail_{CLIENT}"] = True  # détail du projet ouvert
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     buttons = [b.label for b in at.button]
