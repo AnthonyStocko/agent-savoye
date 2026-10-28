@@ -119,3 +119,37 @@ def test_prompts_carry_compilation_and_sources(main_module):
             names = set(re.findall(r"\$\{(\w+)\}", f.read())) - {"compilation_agent"}
         text = main_module.render_prompt(name, **{k: k for k in names}, compilation_agent=block)
         assert "sources_std" in text and 'Commande : "py" "c.py" acme' in text
+
+
+def _git_repo(path):
+    os.makedirs(path)
+    git(path, "init", "-q", "-b", "dev")
+    git(path, "config", "user.name", "t")
+    git(path, "config", "user.email", "t@e.x")
+    git(path, "config", "core.autocrlf", "false")
+
+
+def test_override_standard_version_exported(tmp_path, monkeypatch):
+    monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(ct, "STD_CACHE_DIR", str(tmp_path / "cache" / "_standard"))
+    java = "src/main/java/com/acme/PriceService.java"
+    std, client = str(tmp_path / "std" / "wms"), str(tmp_path / "client" / "wms")
+    for repo, body in ((std, "return 10;"), (client, "return 12;")):
+        _git_repo(repo)
+        write(os.path.join(repo, java), f"public class PriceService {{ int price() {{ {body} }} }}\n")
+        write(os.path.join(repo, "src/main/java/com/acme/NewThing.java"), "class NewThing {}\n") \
+            if repo == client else None
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "init")
+    inventory = ct.build_inventory("acme", str(tmp_path / "client"), str(tmp_path / "std"))
+    ct.export_sources(inventory)
+    files = {f["path"]: f for s in inventory["specifiques"] for f in s["fichiers"]}
+    override = files[java]
+    assert override["kind"] == "override"
+    with open(override["local_standard"], encoding="utf-8") as f:
+        assert "return 10;" in f.read()
+    with open(override["local"], encoding="utf-8") as f:
+        assert "return 12;" in f.read()
+    assert "local_standard" not in files["src/main/java/com/acme/NewThing.java"]
+    spec = next(s for s in inventory["specifiques"] if any(f["path"] == java for f in s["fichiers"]))
+    assert f"Version Standard (avant override" in ct.lot_block([{**spec, "couverture": "non_couvert"}])
