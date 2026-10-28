@@ -114,6 +114,24 @@ def test_server_log_export_must_cover_failed_steps(setup):
     assert entry["couvert"] and "NullPointerException" in entry["preuves"][0]
 
 
+def test_server_log_directory_replaces_the_manual_export(setup, tmp_path, monkeypatch):
+    repo, state = setup
+    logs = tmp_path / "logs-serveur"
+    logs.mkdir()
+    (logs / "server.log").write_text("2026-10-23 07:00:00 INFO démarrage\n2026-10-23 08:00:05 ERROR NotificationService rejet du message\n"
+                                     "2026-10-23 09:00:00 INFO hors fenêtre\n", encoding="utf-8")
+    monkeypatch.setenv("CUCUMBER_SERVER_LOG_DIR", str(logs))
+    imported = cimp.import_files(CLIENT, {"cucumber.json": _report(
+        {"S0": "expected:<A> but was:<B>", "S1": "", "S2": "", "S3": ""}).encode()})
+    analysis = cimp.analyse(CLIENT, imported["numero"], state, repo)
+    entry = analysis["logs"][0]
+    assert entry["couvert"] and not entry["a_exporter"] and "rejet du message" in entry["preuves"][0]
+    extract = os.path.join(cimp.imports_dir(CLIENT), str(imported["numero"]), "logs-serveur.txt")
+    assert "hors fenêtre" not in open(extract, encoding="utf-8").read()
+    assert analysis["logs_serveur"]["lignes"] == 1
+    assert "1 ligne(s) dans la fenêtre des échecs" in cimp.analysis_markdown(analysis)
+
+
 def test_correction_lots_from_an_import(setup):
     repo, state = setup
     imported = cimp.import_files(CLIENT, {"cucumber.json": _report({

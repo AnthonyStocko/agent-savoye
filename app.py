@@ -3398,6 +3398,11 @@ with tab_config:
                 help="Corrections infructueuses sur une même cause (même message, valeurs variables masquées) avant "
                      "que l'agent arrête de deviner et propose une méthode de preuve.")
         env_values["CUCUMBER_MAX_CAUSE_ATTEMPTS"] = str(int(max_cause))
+        env_values["CUCUMBER_SERVER_LOG_DIR"] = st.text_input(
+            "CUCUMBER_SERVER_LOG_DIR", value=os.getenv("CUCUMBER_SERVER_LOG_DIR", ""),
+            help="Répertoire où sont déposés les logs applicatifs du serveur de l'environnement de test (*.log, "
+                 "rotations, .gz) : à chaque import d'un run, la fenêtre de chaque échec y est extraite (secrets "
+                 "masqués) et donnée au correcteur, sans export ni réimport manuel. Vide : non utilisé.").strip()
         env_values["CUCUMBER_SLOW_SCENARIO_SECONDS"] = str(int(slow_seconds))
         env_values["CUCUMBER_LOG_EXPORT_MAX_LINES"] = str(int(export_cap)) if export_cap else ""
         jacoco = st.checkbox(

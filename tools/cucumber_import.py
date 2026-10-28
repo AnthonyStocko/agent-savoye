@@ -24,7 +24,8 @@ import os
 import re
 from datetime import datetime, timezone
 
-from tools import cucumber_decisions, cucumber_failures, cucumber_profile, db_tools, jenkins_tools
+from tools import (cucumber_decisions, cucumber_failures, cucumber_profile, cucumber_server_logs, db_tools,
+                   jenkins_tools)
 from tools.cucumber_diagnostic import TEMP_PREFIX
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
@@ -608,6 +609,14 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         if not report:
             out["tests"], out["source"] = len(results), "console"
         failures = {i: r for i, r in results.items() if r["statut"] != "passe"}
+        # Logs applicatifs déposés dans CUCUMBER_SERVER_LOG_DIR : fenêtre de chaque échec, sans export manuel
+        server = cucumber_server_logs.extract(cucumber_server_logs.log_dir(),
+                                              [r.get("heure") for r in failures.values() if r.get("heure")])
+        if server["texte"]:
+            logs.append(server["texte"])
+            _write_text(os.path.join(imports_dir(client_name), str(numero), cucumber_server_logs.EXTRACT_NAME),
+                        server["texte"] + "\n")
+        out["logs_serveur"] = {k: server[k] for k in ("lignes", "fichiers", "tronque", "plages")}
         out["resultats"] = results
         out["groupes"] = group_failures(failures)
         durations = scenario_durations(report, console)
@@ -620,6 +629,8 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         for identifier, result in list(failures.items())[:30]:
             item = {"step": result.get("step", ""), "motif": result.get("message", ""), "heure": result.get("heure")}
             covered = [log_coverage(text, item["heure"] or "") for text in logs]
+            if cucumber_server_logs.covers(server["plages"], item["heure"] or ""):
+                covered.insert(0, (True, "couvert par les logs du répertoire CUCUMBER_SERVER_LOG_DIR"))
             out["logs"].append({"id": identifier, "heure": item["heure"] or "",
                                 "couvert": any(c[0] for c in covered),
                                 "message": next((c[1] for c in covered if c[0]), covered[0][1] if covered else ""),
@@ -690,6 +701,13 @@ def analysis_markdown(analysis: dict) -> str:
         lines += ["## ⛔ Initialisation en échec : aucun scénario n'est jugé", "", f"- Scénario : {init['id']}",
                   f"- Premier step en échec : `{init['step'] or '—'}`", f"- Cause : {init['message']}", ""]
     lines += [f"- ⚠️ {w}" for w in analysis.get("avertissements") or []]
+    server = analysis.get("logs_serveur") or {}
+    if cucumber_server_logs.log_dir() or server.get("lignes"):
+        lines += [f"- Logs applicatifs du serveur ({cucumber_server_logs.log_dir() or 'répertoire'}) : "
+                  + (f"{server['lignes']} ligne(s) dans la fenêtre des échecs ({', '.join(server['fichiers'][:5])})"
+                     + (" — plafond atteint, extrait tronqué" if server.get("tronque") else "")
+                     if server.get("lignes") else "aucune ligne dans la fenêtre des échecs (fichiers déposés pour ce "
+                                                  "run ? même fuseau horaire ?)"), ""]
     comparison = analysis.get("comparaison") or {}
     if comparison:
         lines += [f"## Comparaison avec l'import n° {comparison['import']}", "",

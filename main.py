@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -2498,6 +2498,13 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
         lot["tags"] = {**(lot.get("tags") or {}), **tagged}
         print(f"[LOT {label}] {len(tagged)} scénario(s) écrit(s) hors de l'agent pris en charge (tag ajouté).")
     lines = []
+    server_logs = os.path.join(cucumber_import.imports_dir(values.get("client_name", "")), str(lot.get("import")),
+                               cucumber_server_logs.EXTRACT_NAME)
+    if os.path.exists(server_logs):
+        lines.append(f"Logs applicatifs du serveur pendant le run (fenêtre de chaque échec, lignes « [fichier] "
+                     f"horodatage … ») : '{server_logs}' — Grep de l'heure du step en échec (HH:MM:SS) ou de la valeur "
+                     f"cherchée, puis Read offset / limit, jamais en entier. Une cause prouvée par ces logs cite la "
+                     f"ligne mot pour mot.")
     for s in lot["corrections"]:
         lines.append(f"- {s['id']} [tag {s['tag']}] : en échec dans le run importé n° {lot['import']} — {s['step']} "
                      f"— {s['message']}" + (f" (correction n° {s['tentatives'] + 1} de cette cause : change "
