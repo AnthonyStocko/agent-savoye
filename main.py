@@ -1611,6 +1611,17 @@ def hold_meaning_changes(client: str, worktree: str, before: dict, client_tag: s
     held = set()
     for change in cucumber_decisions.held_changes(worktree, before, client_tag):
         identifier = cucumber_verify.scenario_id(change["fichier"], change["titre"])
+        if change.get("applique"):
+            # Le code fait foi : réalignement appliqué, écart consigné (bilan « Doutes sur le code fourni »)
+            lot.setdefault("correction", {}).setdefault("constats", []).append({
+                "type": "ecart_spec_code", "detail": f"{change['titre']} : attendu réaligné sur le code (le code fait "
+                                                     f"foi), spécification à revoir",
+                "fichier": change.get("code") or change["fichier"], "effet": "scénario aligné sur le comportement "
+                                                                             "réel du code",
+                "certitude": "probable", "preuve": ""})
+            print(f"[LOT {label}] ↔ Réaligné sur le code (le code fait foi) : {change['proposition']} — écart "
+                  f"spécification / code consigné.")
+            continue
         cucumber_decisions.propose(client, change["type"], change["proposition"], fichier=change["fichier"],
                                    titre=change["titre"], scenario=identifier, lot=lot["numero"],
                                    avant=change["avant"], apres=change["apres"])
@@ -1704,7 +1715,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             # Sortie d'un diagnostic temporaire exécuté au tour précédent
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
-        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         effort = cucumber_fix_effort()
@@ -1984,7 +1995,7 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
         resumed = bool(lot and lot.get("session") and resume_lot_session())
         print(f"[LOT {label}] Correction {attempt + 1}/{attempts} "
               + ("(reprise de la session du lot)..." if resumed else f"({fix_model}, effort {effort or 'défaut'})..."))
-        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", **values}, lot_label=label, etape=check["etape"].upper(),
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), **values}, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
@@ -2544,7 +2555,7 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     if data:
         print(f"[LOT {label}] {len(data)} échec(s) lié(s) aux données : "
               + ("preuve en base exigée." if db_available else "aucun accès base, causes NON PROUVÉES."))
-    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
+    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
                            erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available),
                            fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
@@ -3343,8 +3354,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             for result in results:
                 for constat in result["constats"]:
                     print(f"[LOT {label}] Constat {result['id']} — {cucumber_tools.constat_line(constat)}")
-                    # Test jugé tautologique, écart spécification / code : soumis à une décision humaine
-                    if constat["type"] in ("tautologique", "ecart_spec_code"):
+                    # Test jugé tautologique (et écart spécification / code si le code ne fait pas foi) : soumis à
+                    # une décision humaine ; sinon l'écart reste un constat du bilan
+                    if constat["type"] == "tautologique" or (constat["type"] == "ecart_spec_code"
+                                                             and not cucumber_decisions.code_wins()):
                         cucumber_decisions.propose(
                             client, constat["type"], f"{specifics.get(result['id'], {}).get('libelle', result['id'])}"
                             f" : {constat['detail']}", spec=result["id"], lot=lot["numero"],

@@ -40,7 +40,29 @@ def _scenarios(worktree):
     return {s["titre"]: s for s in cv.parse_scenarios(_text(worktree))}
 
 
-def test_realignment_is_held_then_validated(client, repo):
+def test_realignment_is_applied_when_the_code_wins(client, repo, monkeypatch):
+    """Politique par défaut : le code fait foi, le réalignement reste actif et n'attend aucune décision."""
+    monkeypatch.delenv("CUCUMBER_SPEC_CODE_POLICY", raising=False)
+    write(os.path.join(repo, REL), FEATURE)
+    before = ar.snapshot(repo, [REL])
+    write(os.path.join(repo, REL), FEATURE.replace(
+        f'  {CLIENT_TAG}\n  Scenario: Statut du contenant', f'  # Réaligné sur le code : StockService.java\n'
+                                                             f'  {CLIENT_TAG}\n  Scenario: Statut du contenant')
+          .replace('Then le statut est "LIBRE"', 'Then le statut est "BLOQUE"'))
+    held = cd.held_changes(repo, before, CLIENT_TAG)
+    assert [(h["type"], h["applique"], h["code"]) for h in held] == [("realignement", True, "StockService.java")]
+    scenario = _scenarios(repo)["Statut du contenant"]
+    assert "@A_REVOIR" not in scenario["tags"] and '"BLOQUE"' in _text(repo)
+    assert cd.PENDING_COMMENT not in _text(repo)
+    # Une valeur de données changée reste soumise à décision
+    before = ar.snapshot(repo, [REL])
+    write(os.path.join(repo, REL), _text(repo).replace("| C1   | 2   |", "| C1   | 5   |"))
+    assert [(h["type"], h["applique"]) for h in cd.held_changes(repo, before, CLIENT_TAG)] == [("donnees", False)]
+    assert "CODE FAIT FOI" in cd.spec_code_rule() and "désactivé" not in cd.spec_code_rule()
+
+
+def test_realignment_is_held_then_validated(client, repo, monkeypatch):
+    monkeypatch.setenv("CUCUMBER_SPEC_CODE_POLICY", "decision")
     write(os.path.join(repo, REL), FEATURE)
     before = ar.snapshot(repo, [REL])
     write(os.path.join(repo, REL), FEATURE.replace(

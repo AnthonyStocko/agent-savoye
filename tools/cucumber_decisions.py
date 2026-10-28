@@ -29,6 +29,23 @@ TYPES = {"realignement": "réalignement d'un attendu sur le code", "donnees": "c
          "ecart_spec_code": "écart spécification / code"}
 # Décisions qui gardent une modification à part (scénario désactivé provisoirement en attendant)
 HELD_TYPES = ("realignement", "donnees")
+
+
+def code_wins() -> bool:
+    """
+    Écart spécification / code : le code fait foi (CUCUMBER_SPEC_CODE_POLICY=code, défaut). Un attendu réaligné sur
+    le code est appliqué tout de suite et consigné comme écart à revoir plus tard, au lieu d'attendre une décision.
+    « decision » : ancien comportement (réalignement gardé à part, scénario désactivé en attendant).
+    """
+    return os.getenv("CUCUMBER_SPEC_CODE_POLICY", "code").strip().lower() != "decision"
+
+
+def spec_code_rule() -> str:
+    """Règle donnée au correcteur, selon la politique."""
+    if code_wins():
+        return ("Le CODE FAIT FOI : un réalignement sur le code est appliqué tel quel (pas de décision humaine) et "
+                "consigné automatiquement comme écart spécification / code, à revoir plus tard.")
+    return "Un réalignement est soumis à une décision humaine (gardé à part, scénario désactivé provisoirement)."
 STATUSES = {"en_attente": "en attente", "validee": "validée", "refusee": "refusée"}
 PENDING_COMMENT = "# Décision en attente :"
 
@@ -152,19 +169,25 @@ def held_changes(worktree: str, before: dict, client_tag: str = "") -> list:
                               if line.strip().startswith(REALIGNED)), "")
             proposal = (f"attendu réaligné sur le code ({reference})" if kind == "realignement" else
                         "valeur d'un step existant changée par la correction")
+            applied = kind == "realignement" and code_wins()
             held.append({"type": kind, "fichier": rel, "titre": scenario["titre"], "avant": block,
-                         "apres": new_block, "proposition": f"{rel} / {scenario['titre']} : {proposal}"})
-            _replace_block(worktree, rel, scenario["titre"], _held_block(block, client_tag, TYPES[kind]))
+                         "apres": new_block, "proposition": f"{rel} / {scenario['titre']} : {proposal}",
+                         "applique": applied, "code": reference})
+            if not applied:
+                _replace_block(worktree, rel, scenario["titre"], _held_block(block, client_tag, TYPES[kind]))
     return held
 
 
 def _change_kind(old: dict, new: dict, new_block: list) -> str:
-    """« realignement », « donnees » ou '' (ajout de steps, de colonnes ou de lignes : correction ordinaire)."""
-    if any(line.strip().startswith(REALIGNED) for line in new_block):
-        return "realignement"
+    """
+    « donnees », « realignement » ou '' (ajout de steps, de colonnes ou de lignes : correction ordinaire). Une valeur
+    de step existant changée prime : elle reste soumise à décision même dans un scénario réaligné sur le code.
+    """
     given = [(s["texte"], tuple(s.get("table") or [])) for s in old["steps"] if s["phase"] != "then"]
     kept = {(s["texte"], tuple(s.get("table") or [])) for s in new["steps"] if s["phase"] != "then"}
-    return "" if all(step in kept for step in given) else "donnees"
+    if not all(step in kept for step in given):
+        return "donnees"
+    return "realignement" if any(line.strip().startswith(REALIGNED) for line in new_block) else ""
 
 
 # ---------------------------------------------------------------------------
