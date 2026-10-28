@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1367,6 +1367,22 @@ CUCUMBER_TOOLS = ["Read", "Write", "Edit", "Grep", "Glob"]
 DEFAULT_CUCUMBER_MAX_TURNS = 40
 
 
+def agent_compilation_block(command: str) -> str:
+    """Consigne de compilation par l'agent (CUCUMBER_AGENT_COMPILE), '' si désactivée."""
+    if not command:
+        return ""
+    return ("=== COMPILATION PAR TOI (seul accès autorisé à Maven) ===\n"
+            f"Commande : {command}\n"
+            "- Lance-la dès qu'une première version des .feature et Step Definitions est écrite, puis après tes "
+            "corrections : elle compile tout le worktree (test-compile, rien n'est exécuté) et liste les erreurs "
+            "« fichier:ligne:colonne message », chemins relatifs au worktree.\n"
+            "- Corrige chaque erreur d'après la signature exacte (Grep dans les catalogues Java, puis lecture ciblée des "
+            "sources du Standard) ; ne conclus pas sur un lot qui ne compile pas.\n"
+            "- Au plus 3 compilations par appel (chacune peut durer quelques minutes). « NON VÉRIFIABLE » : problème "
+            "d'environnement, ne relance pas et poursuis.\n"
+            "=== FIN COMPILATION ===")
+
+
 def warning_turn(max_turns: int) -> int:
     """Tour (75 % de CUCUMBER_MAX_TURNS, arrondi au-dessus) où l'agent d'un lot doit cesser d'explorer et finaliser."""
     return max(1, -(-3 * max_turns // 4))
@@ -1414,8 +1430,12 @@ def read_db_journal(path: str) -> list:
 
 
 def lot_tools(values: dict) -> list:
-    """Outils d'un appel Cucumber : CUCUMBER_TOOLS, plus le python de l'agent si l'accès base est accordé."""
-    return CUCUMBER_TOOLS + ([f"Bash({sys.executable}:*)"] if values.get("db_block") else [])
+    """
+    Outils d'un appel Cucumber : CUCUMBER_TOOLS, plus le python de l'agent si l'accès base est accordé ou si l'agent
+    compile lui-même (CUCUMBER_AGENT_COMPILE : tools/cucumber_compile.py).
+    """
+    return CUCUMBER_TOOLS + ([f"Bash({sys.executable}:*)"]
+                             if values.get("db_block") or values.get("compilation_agent") else [])
 
 
 def db_summary(entries: list) -> str:
@@ -1474,7 +1494,8 @@ def review_cucumber_lot(lot: dict, lot_specs: list, label: str, worktree: str, f
         duplicates = {cucumber_verify._title_key(s["titre"]) for s in flagged
                       if any(cucumber_verify.exact_duplicate(m) for m in s["motifs"])}
         returncode, output, usage, _ = run_cucumber_claude(
-            prompt, model, CUCUMBER_TOOLS, str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8)), run_dir, effort)
+            prompt, model, lot_tools(values), str(_env_int("CUCUMBER_REVIEW_MAX_TURNS", 8)), run_dir,
+            effort)
         report_token_usage(work_key, "cucumber-review", model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         review["decisions"] = cucumber_verify.parse_review(output)
@@ -2714,6 +2735,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
 
     catalogue = inventory["catalogue_standard"]
     std_java = cucumber_tools.standard_java_catalogue(local_cucumber_std_repo, odatio_version)
+    # Code des Step Definitions du Standard (injecté par step candidat) et copie lisible de ses sources de test
+    step_code = cucumber_tools.std_step_code(local_cucumber_std_repo, odatio_version)
     # Référence des contrôles de pertinence (steps, scénarios et endpoints du Standard), calculée une fois
     reference = cucumber_verify.std_reference(local_cucumber_std_repo, std_endpoints)
     # Profil client (0 token) : conventions détectées dans le worktree, surchargées par la saisie et le dépôt
@@ -2792,6 +2815,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         # Valeurs connues des 6 sources (profil, init, initializers, dépôt client, Standard, documents) : Grep avant
         # de déclarer une donnée manquante
         "valeurs_connues": write_known_values(client, profile, inventory, worktree, local_cucumber_std_repo),
+        "sources_std": step_code["sources"],
     }
     # Initialisation du client vue par les lots : features d'init et codes de référence du profil
     client_init = cucumber_profile.init_view(profile)
@@ -2826,6 +2850,15 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     compile_cmd = cucumber_tools.DEFAULT_COMPILE_CMD if compile_cmd is None else compile_cmd.strip()
     # Dry-run strict par défaut : un step non défini est une erreur de lot (CUCUMBER_DRY_RUN=0 pour le désactiver)
     dry_run_cmd = "" if os.getenv("CUCUMBER_DRY_RUN", "1").strip() == "0" else cucumber_tools.DEFAULT_DRY_RUN_CMD
+    # Compilation par l'agent lui-même pendant le lot (CUCUMBER_AGENT_COMPILE, défaut 1 dès qu'on compile)
+    agent_compile = ""
+    if compile_cmd and os.getenv("CUCUMBER_AGENT_COMPILE", "1").strip() != "0":
+        cucumber_compile.write_context(client, worktree, local_cucumber_std_repo, compile_cmd)
+        agent_compile = f'"{python_exe}" "{os.path.join(workspace_dir, "tools", "cucumber_compile.py")}" {client}'
+    fixed_values["compilation_agent"] = agent_compilation_block(agent_compile)
+    print(f"[CUCUMBER] Compilation par l'agent pendant les lots : "
+          f"{'oui' if agent_compile else 'non (CUCUMBER_AGENT_COMPILE=0 ou pas de CUCUMBER_COMPILE_CMD)'} | "
+          f"code de {len(step_code['steps'])} step(s) Standard disponible ; sources : {step_code['sources']}")
     total = {"tokens_entree": 0, "cache_ecrit": 0, "cache_lu": 0, "tokens_sortie": 0, "cout_usd": 0.0}
     lots = state["lots"]
     exit_code = 0
@@ -2882,7 +2915,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             prompt = render_prompt("cucumber_client_lot", **values, **java_values, runner_status=java["runner_status"],
                                    runner_block=cucumber_tools.runner_block(std_java["runner_example"],
                                                                             java["runner_status"], inline_max),
-                                   lot_block=cucumber_tools.lot_block(lot_specs, inline_max, inlined),
+                                   lot_block=cucumber_tools.lot_block(
+                                       lot_specs, inline_max, inlined, step_code,
+                                       _env_int("CUCUMBER_INLINE_STEP_CODE_CHARS",
+                                                cucumber_tools.DEFAULT_INLINE_STEP_CODE_CHARS)),
                                    profil_block="\n".join(filter(None, [
                                        cucumber_profile.profile_block(profile, gap_file=gap_file,
                                                                       known=cucumber_testability.load_index(client)),

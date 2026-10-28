@@ -8,6 +8,7 @@ ${references_injectees}${knowledge_block}
 - Features du Standard, une ligne par feature (à interroger par Grep, jamais en entier) : '${features_std}'
 - Endpoints appelés par le Standard, une ligne par endpoint avec la méthode Java et les steps qui l'utilisent (à interroger par Grep, jamais en entier) : '${endpoints_std}'
 - Classes Java du Standard, signatures seulement (à interroger par Grep, jamais en entier) : '${java_std}'
+- Sources de test du Standard (copie en lecture seule : Step Definitions, classes d'appui *EndPoints, POJO, contexte, features ; les chemins de '${steps_std}', '${features_std}' et '${java_std}' y sont relatifs) : '${sources_std}'
 - Classes Java du dépôt client, lots précédents compris (à interroger par Grep) : '${java_client}'
 - Package des Step Definitions du client : ${package_steps} ; package des classes d'appui : ${package_support}
 - Couverture existante du dépôt Cucumber client (à interroger par Grep) : '${couverture_existante}'
@@ -17,6 +18,7 @@ ${references_injectees}${knowledge_block}
 === LECTURE ===
 1. « Ne relis pas » ne vaut QUE pour les références injectées (bloc RÉFÉRENCES INJECTÉES ci-dessus : sommaire du catalogue Standard, Step Definitions exemplaire — injection, classe de base, contexte, appels d'endpoints —, exemples des recettes) et pour le contenu injecté du lot (extraits Standard, extraits Jira, parties modifiées des processus Studio, runner) : ne rouvre pas ces fichiers.
 2. Les fichiers du spécifique (customized.xml, classes Java, paramètres) sont à ouvrir dès que leur comportement compte pour décider ou écrire un test : les parties modifiées des processus Studio et les signatures publiques des classes Java sont données dans le lot, ouvre le fichier pour le reste (par portions offset / limit au-delà de 400 lignes). Ne parcours aucun dépôt.
+2bis. Le « Code des steps candidats » du lot donne l'implémentation des steps Standard proposés : colonnes exactes des tables de données, format des paramètres, clés de contexte lues ou écrites, helpers et endpoints appelés. Un step Standard s'utilise dans un .feature EXACTEMENT comme son code l'attend (mêmes en-têtes de table, mêmes valeurs possibles, données préparées par les steps qui alimentent les clés de contexte qu'il lit). Pour un step ou une classe d'appui dont le code n'est pas injecté, lis sa méthode dans '${sources_std}' (Grep du nom, puis Read offset / limit) avant de l'utiliser ou de l'appeler : ne devine jamais une signature, une colonne ou une clé de contexte.
 3. Pour chaque spécifique, comprends d'abord ce qui diffère du Standard : éléments modifiés (override), comportement nouveau (extension), effet du paramètre ou du libellé (paramétrage), tickets Jira.
 
 === ÉCRIRE TÔT ===
@@ -92,7 +94,8 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
    c. Aucune méthode vide ni `throw new PendingException()` : chaque step est implémenté. Si une implémentation est impossible (aucun endpoint ni moyen observable), explique-le dans « raison » et n'écris pas le scénario.
    d. Runner et glue : voir « Runner et glue » dans le lot.
 3. Pour compléter une classe ou une feature existante, utilise Edit, jamais une réécriture complète.
-4. N'écris AUCUN code applicatif, ne modifie AUCUN scénario ni classe du Standard, aucun fichier hors du worktree. N'utilise ni git ni Maven : les commits, la compilation et le patch sont faits automatiquement.
+4. N'écris AUCUN code applicatif, ne modifie AUCUN scénario ni classe du Standard, aucun fichier hors du worktree (la copie '${sources_std}' est en lecture seule). N'utilise ni git ni Maven directement : les commits, le patch et la compilation finale sont faits automatiquement ; seule la commande de compilation ci-dessous, si elle est donnée, est autorisée.
+${compilation_agent}
 
 === CONSTATS (champ « constats », facultatif) ===
 Signale ce que tu as constaté sans pouvoir le régler, plutôt que de le contourner. Un constat par fait, avec le fichier en cause s'il y en a un :
