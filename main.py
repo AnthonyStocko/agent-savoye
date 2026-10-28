@@ -922,6 +922,8 @@ def main():
     parser.add_argument("--from-import", type=int, default=0, help="generate-cucumber-client --complete : lots « correction » des échecs « test » des scénarios de l'agent de l'import n° N")
     parser.add_argument("--run-jenkins", action="store_true", help="generate-cucumber-client : pousse le worktree sur la branche lue par le job (profil), contrôle le commit, lance le job Jenkins du client, suit le build puis importe sa console et ses rapports (bilan)")
     parser.add_argument("--run-dry", action="store_true", help="generate-cucumber-client --run-jenkins : aperçu sans push ni lancement (0 token) — job, branche, rôles des paramètres, paramètres envoyés (secrets masqués) et nombre de tests attendus pour --run-tags")
+    parser.add_argument("--run-no-push", action="store_true", help="generate-cucumber-client --run-jenkins : rien n'est commité ni poussé, le job exécute la branche telle qu'elle est sur le dépôt client (--run-branch, à défaut celle du profil) ; lecture seule")
+    parser.add_argument("--run-branch", default="", help="generate-cucumber-client --run-jenkins --run-no-push : branche du dépôt client à exécuter (défaut : branche de travail du profil)")
     parser.add_argument("--run-tags", default="", help="generate-cucumber-client --run-jenkins : expression de tags ajoutée aux arguments du job (-Dcucumber.filter.tags, vide : tous les scénarios actifs)")
     parser.add_argument("--server-log", default="", help="generate-cucumber-client : export de logs serveur à contrôler (avec --log-scenario) : couvre-t-il l'heure du step en échec ? (l'outil d'export peut garder les seules lignes les plus récentes), sans appel à Claude")
     parser.add_argument("--log-scenario", default="", help="generate-cucumber-client --server-log : identifiant ou tag @agent_… du scénario en échec (dernière génération)")
@@ -2370,10 +2372,14 @@ def run_cucumber_import(client: str, paths: list, build_url: str = "", project: 
     return 1 if analysis["non_analyse"] else 0
 
 
-def preview_cucumber_jenkins(client: str, tags: str, repository: str = "", base_branch: str = "") -> int:
+def preview_cucumber_jenkins(client: str, tags: str, repository: str = "", base_branch: str = "", push: bool = True,
+                             branch: str = "") -> int:
     """Aperçu du run Jenkins (cucumber_run.preview), sans push ni lancement ; 0 si le run serait accepté, sinon 2."""
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
-    out = cucumber_run.preview(client, cucumber_tools.worktree_dir(client), profile, tags, repository, base_branch)
+    out = cucumber_run.preview(client, cucumber_tools.worktree_dir(client), profile, tags, repository, base_branch,
+                               push, branch)
+    if not push:
+        print("[RUN JENKINS — APERÇU] Sans push : la branche est exécutée telle qu'elle est sur le dépôt client.")
     print(f"[RUN JENKINS — APERÇU] Job : {out['job'] or '(non renseigné)'} | branche de travail : "
           f"{out['branche'] or '(non renseignée)'} | tags : {tags or '(aucun : tous les scénarios actifs)'}")
     if out.get("cible_tags"):
@@ -2394,7 +2400,7 @@ def preview_cucumber_jenkins(client: str, tags: str, repository: str = "", base_
 
 
 def run_cucumber_jenkins(client: str, tags: str, project: str = "", repository: str = "", base_branch: str = "",
-                         client_root: str = "") -> int:
+                         client_root: str = "", push: bool = True, branch: str = "") -> int:
     """
     Run Jenkins automatique (cucumber_run) : push du worktree sur la branche de travail lue par le job (jamais la
     branche d'intégration `base_branch`), contrôle du commit, lancement avec le dépôt client `repository` et le
@@ -2405,7 +2411,7 @@ def run_cucumber_jenkins(client: str, tags: str, project: str = "", repository: 
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
     run = cucumber_run.launch(client, cucumber_tools.worktree_dir(client), profile, tags, repository=repository,
                               base_branch=base_branch, inventory=cucumber_tools.load_inventory(client),
-                              client_root=client_root)
+                              client_root=client_root, push=push, branch=branch)
     print(f"[RUN JENKINS] {'✅' if run['ok'] else '⛔'} {run['message']}" + (f" — {run['build']}" if run["build"] else ""))
     if not run["ok"]:
         return 2
@@ -2578,10 +2584,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     if args.import_run is not None or args.import_url:
         return run_cucumber_import(client, args.import_run or [], args.import_url, project)
     if args.run_jenkins and args.run_dry:
-        return preview_cucumber_jenkins(client, args.run_tags, args.cucumber_repo, args.cucumber_base_branch)
+        return preview_cucumber_jenkins(client, args.run_tags, args.cucumber_repo, args.cucumber_base_branch,
+                                        not args.run_no_push, args.run_branch)
     if args.run_jenkins:
         return run_cucumber_jenkins(client, args.run_tags, project, args.cucumber_repo, args.cucumber_base_branch,
-                                    local_client_repo)
+                                    local_client_repo, not args.run_no_push, args.run_branch)
     base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
     if not base:
         print(f"❌ Branche '{args.cucumber_base_branch}' introuvable dans {cucumber_repo_dir}.")

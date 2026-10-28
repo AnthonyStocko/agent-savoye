@@ -22,7 +22,7 @@ import os
 from datetime import datetime
 
 from tools import cucumber_checks, cucumber_job, cucumber_profile, jenkins_tools
-from tools.cucumber_tools import load_state, rev_parse, save_state
+from tools.cucumber_tools import _git, load_state, rev_parse, save_state
 
 DEFAULT_TIMEOUT = 3600
 
@@ -37,6 +37,22 @@ def timeout() -> int:
         return int(os.getenv("CUCUMBER_VERIFY_TIMEOUT", "") or DEFAULT_TIMEOUT)
     except ValueError:
         return DEFAULT_TIMEOUT
+
+
+def remote_branch(worktree: str, branch: str) -> tuple:
+    """
+    État de `branch` sur origin, sans rien modifier dans le worktree : (commit, textes des .feature, erreur). Sert aux
+    runs sans push (--run-no-push), où le job exécute la branche telle qu'elle est sur le dépôt client.
+    """
+    fetch = _git(worktree, "fetch", "-q", "origin", f"refs/heads/{branch}")
+    if fetch.returncode != 0:
+        detail = " ".join((fetch.stderr.strip().splitlines() or ["?"])[-1].split())[:200]
+        return "", [], f"branche {branch} introuvable sur le dépôt client ({detail})"
+    commit = rev_parse(worktree, "FETCH_HEAD")
+    paths = [p for p in _git(worktree, "ls-tree", "-r", "--name-only", commit).stdout.splitlines()
+             if p.endswith(".feature")]
+    texts = [_git(worktree, "show", f"{commit}:{p}").stdout for p in paths]
+    return commit, texts, ""
 
 
 def preflight(profile: dict, worktree: str, client_name: str = "", base_branch: str = "") -> dict:
@@ -78,7 +94,7 @@ def branch_errors(branch: str, base_branch: str = "") -> list:
     return []
 
 
-def selection_check(console: str, worktree: str, tags: str) -> str:
+def selection_check(console: str, worktree: str, tags: str, texts: list = None) -> str:
     """
     Contrôle du filtre de tags par la console : '' si le nombre de tests exécutés (dernier « Tests run ») est celui
     attendu pour `tags` dans le worktree (un tag de feature : ses scénarios), sinon le constat.
@@ -88,7 +104,7 @@ def selection_check(console: str, worktree: str, tags: str) -> str:
     run = (console_facts(console).get("tests") or {}).get("executes")
     if run is None:
         return "nombre de tests exécutés introuvable dans la console : filtre de tags non contrôlé"
-    gap = count_gap(run, feature_texts(worktree), tags)
+    gap = count_gap(run, feature_texts(worktree) if texts is None else texts, tags)
     return f"{gap} (rôle « arguments » du job à vérifier)" if gap else ""
 
 
@@ -113,17 +129,22 @@ def tested_version(client_name: str, params: dict, roles: dict, inventory: dict 
 
 
 def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=print, repository: str = "",
-           base_branch: str = "", inventory: dict = None, client_root: str = "") -> dict:
+           base_branch: str = "", inventory: dict = None, client_root: str = "", push: bool = True,
+           branch: str = "") -> dict:
     """
     Push, contrôle du commit en tête de la branche distante, lancement et suivi (voir docstring du module).
     `repository` : dépôt client (rôle « depot ») ; `base_branch` : branche d'intégration, interdite ; `inventory` et
     `client_root` : tâches et dépôts dont les commits sont comparés à la publication de l'artefact testé.
     Renvoie {"ok", "message", "build", "resultat", "commit", "branche", "tags", "parametres", "selection",
     "version_testee"} ; ok faux si rien n'a été lancé ou si le build n'a pas abouti (le build terminé, même en échec
-    de tests, est importable).
+    de tests, est importable). `push` faux : rien n'est commité ni poussé, le job exécute la branche (`branch`, à
+    défaut celle du profil) telle qu'elle est sur le dépôt client — lecture seule, branche d'intégration permise.
     """
     tags = (tags or "").strip()
-    check = preflight(profile, worktree, client_name, base_branch)
+    check = preflight(profile, worktree, client_name, "" if not push else base_branch)
+    if not push and branch:
+        check["branche"] = branch.strip()
+        check["erreurs"] = [e for e in check["erreurs"] if "branche de travail" not in e]
     run = {"date": datetime.now().isoformat(timespec="seconds"), "job": check["job"], "branche": check["branche"],
            "tags": tags, "commit": "", "build": "", "resultat": "", "ok": False, "message": "", "parametres": {},
            "selection": "", "version_testee": ""}
@@ -132,15 +153,23 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     if check["erreurs"]:
         run["message"] = " ; ".join(check["erreurs"])
         return run
-    error, committed = cucumber_checks.push_for_verification(
-        worktree, check["branche"], f"Cucumber coverage of {client_name} specifics (run Jenkins)")
-    run["commit"] = rev_parse(worktree, "HEAD")
+    texts = None
+    if push:
+        error, committed = cucumber_checks.push_for_verification(
+            worktree, check["branche"], f"Cucumber coverage of {client_name} specifics (run Jenkins)")
+        run["commit"] = rev_parse(worktree, "HEAD")
+    else:
+        run["commit"], texts, error = remote_branch(worktree, check["branche"])
+        committed = False
+    run["branche"] = check["branche"]
     if error:
         run["message"] = f"rien n'est lancé : {error}"
         record(client_name, run)
         return run
     log(f"[RUN JENKINS] Worktree {'commité et ' if committed else ''}poussé sur {check['branche']} "
-        f"({run['commit'][:10]}), en tête de la branche distante.")
+        f"({run['commit'][:10]}), en tête de la branche distante." if push else
+        f"[RUN JENKINS] Sans push : le job exécute {check['branche']} telle qu'elle est sur le dépôt client "
+        f"({run['commit'][:10]}).")
     roles = check["roles"]
     fixed, fixed_warnings = cucumber_job.fixed_parameters(profile, check["definitions"])
     for warning in fixed_warnings:
@@ -177,7 +206,7 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
                       f"build non abouti : {build['result']}" + (f" ({build['url']})" if build["url"] else ""))
     if run["ok"] and tags:
         console = jenkins_tools.build_bytes(build["url"], "consoleText").decode("utf-8", "replace")
-        run["selection"] = selection_check(console, worktree, tags)
+        run["selection"] = selection_check(console, worktree, tags, texts)
         if run["selection"]:
             log(f"[RUN JENKINS] ⚠️ {run['selection']}")
     record(client_name, run)
@@ -185,7 +214,7 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
 
 
 def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repository: str = "",
-            base_branch: str = "") -> dict:
+            base_branch: str = "", push: bool = True, branch: str = "") -> dict:
     """
     Aperçu d'un run, sans push ni lancement (0 token) : contrôles préalables (preflight), correspondance des rôles,
     paramètres qui seraient envoyés au job (secrets masqués, arguments réduits au filtre de tags) et nombre de tests
@@ -194,7 +223,15 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
     """
     from tools.cucumber_verify import a_revoir_tag, expected_count, feature_texts
     tags = (tags or "").strip()
-    check = preflight(profile, worktree, client_name, base_branch)
+    check = preflight(profile, worktree, client_name, "" if not push else base_branch)
+    if not push and branch:
+        check["branche"] = branch.strip()
+        check["erreurs"] = [e for e in check["erreurs"] if "branche de travail" not in e]
+    commit, texts, remote_error = remote_branch(worktree, check["branche"]) \
+        if not push and check["branche"] and worktree and os.path.exists(os.path.join(worktree, ".git")) \
+        else ("", None, "")
+    if remote_error:
+        check["erreurs"].append(remote_error)
     out = {"ok": not check["erreurs"], "job": check["job"], "branche": check["branche"],
            "erreurs": list(check["erreurs"]), "avertissements": list(check["avertissements"]),
            "roles": {r: n for r, n in (check.get("roles") or {}).items() if n}, "parametres": {}, "attendus": None}
@@ -204,15 +241,16 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
         out["imposes"] = sorted(fixed)
         out["cible_tags"] = cucumber_job.tag_target(profile, check["roles"])
         params = cucumber_job.build_parameters(check["definitions"], check["roles"], check["branche"], repository,
-                                               tags, rev_parse(worktree, "HEAD") if worktree else "", fixed=fixed,
-                                               target=out["cible_tags"])
+                                               tags, commit or (rev_parse(worktree, "HEAD") if worktree else ""),
+                                               fixed=fixed, target=out["cible_tags"])
         out["parametres"] = cucumber_job.visible_parameters(params, check["roles"])
     if worktree and os.path.exists(os.path.join(worktree, ".git")):
-        texts = feature_texts(worktree)
+        texts = feature_texts(worktree) if texts is None else texts
         out["attendus"] = expected_count(texts, tags, a_revoir_tag())
         if tags and not out["attendus"]:
             out["ok"] = False
-            out["erreurs"].append(f"aucun scénario actif ne porte les tags « {tags} » dans le worktree : le job "
+            out["erreurs"].append(f"aucun scénario actif ne porte les tags « {tags} » "
+                                  f"{'dans le worktree' if push else 'sur la branche ' + check['branche']} : le job "
                                   f"n'exécuterait rien")
     return out
 

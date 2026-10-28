@@ -117,6 +117,7 @@ venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo ht
 venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/CLIENT --import-run console.txt cucumber.json serveur.csv   # import d'un rapport d'exécution, sans token
 venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/CLIENT --complete --from-import 3   # lots « correction » de l'import n° 3
 venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/CLIENT --run-jenkins --run-dry --run-tags "@agent_client_3_1"   # aperçu sans push ni lancement : job, rôles, paramètres envoyés, tests attendus
+venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/CLIENT --run-jenkins --run-no-push --run-branch feature/ma-branche --run-tags "@SPEC-1234"   # sans push : la branche telle qu'elle est sur le dépôt client (lecture seule)
 venv\Scripts\python.exe main.py --step generate-cucumber-client --client-repo https://git.kiscloud.io/projects/CLIENT --run-jenkins --run-tags "@agent_client_3"   # push, run Jenkins suivi, import et bilan
 venv\Scripts\python.exe webhook_server.py --poll --projects CLIENT   # écoute des merges
 ```

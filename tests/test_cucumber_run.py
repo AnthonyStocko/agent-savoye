@@ -303,3 +303,33 @@ def test_tag_filter_target(jenkins):
     assert cjob.tag_target({"run_tags_target": "parametre"}, {**roles, "tags": ""}) == "arguments"
     out = cr.preview(CLIENT, repo, {**PROFILE, "run_tags_target": "les_deux"}, "@feature_a")
     assert out["cible_tags"] == "les_deux" and out["parametres"]["ADDITIONAL_SPEC_TAGS"] == "@feature_a"
+
+
+def test_run_without_push_executes_the_remote_branch_as_it_is(jenkins, tmp_path):
+    repo, remote, calls = jenkins
+    # Tests poussés par l'utilisateur sur la branche distante, absents du worktree
+    other = str(tmp_path / "autre")
+    subprocess.run(["git", "clone", "-q", remote, other], check=True)
+    git(other, "config", "user.email", "u@example.com")
+    git(other, "config", "user.name", "u")
+    git(repo, "push", "-q", "origin", f"HEAD:refs/heads/{BRANCH}")
+    git(other, "fetch", "-q", "origin")
+    git(other, "checkout", "-q", "-b", BRANCH, f"origin/{BRANCH}")
+    write(os.path.join(other, "src/test/resources/cucumber/features/client/b.feature"),
+          "Feature: B\n\n  @nouveau\n  Scenario: Un\n    Given z\n")
+    git(other, "add", "-A")
+    git(other, "commit", "-qm", "tests poussés à la main")
+    git(other, "push", "-q", "origin", BRANCH)
+    remote_head, local_head = git(remote, "rev-parse", BRANCH), git(repo, "rev-parse", "HEAD")
+    out = cr.preview(CLIENT, repo, PROFILE, "@nouveau", push=False)
+    assert out["ok"] and out["attendus"] == 1, out                # compté sur la branche distante, pas le worktree
+    calls["console"] = CONSOLE.replace("Tests run: 2", "Tests run: 1")
+    run = cr.launch(CLIENT, repo, PROFILE, "@nouveau", log=lambda line: None, push=False)
+    assert run["ok"] and run["commit"] == remote_head and run["selection"] == ""
+    assert git(repo, "rev-parse", "HEAD") == local_head          # rien n'est commité dans le worktree
+    assert git(remote, "rev-parse", BRANCH) == remote_head       # rien n'est poussé
+    assert calls["params"][-1]["CUCUMBER_SPEC_BRANCH"] == BRANCH
+    git(repo, "push", "-q", "origin", "HEAD:refs/heads/integration")
+    calls["console"] = CONSOLE.replace("Tests run: 2", "Tests run: 0")
+    run = cr.launch(CLIENT, repo, PROFILE, "@nouveau", log=lambda line: None, push=False, branch="integration")
+    assert run["ok"] and calls["params"][-1]["CUCUMBER_SPEC_BRANCH"] == "integration"
