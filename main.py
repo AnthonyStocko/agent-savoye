@@ -492,8 +492,23 @@ DB_BLOCK_WORDING = {
 }
 
 
-def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default") -> str:
-    """Bloc de prompt de l'accès base en lecture seule ('' si non demandé ou non configuré)."""
+def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default",
+                   profile: str = "") -> str:
+    """
+    Bloc de prompt de l'accès base en lecture seule ('' si non demandé ou non configuré). `profile` « cucumber » :
+    base de l'environnement où sont joués les tests (CUCUMBER_DB_*, à défaut DB_*), passée à l'agent par --profile.
+    """
+    previous = db_tools.set_profile(profile)
+    try:
+        return _build_db_block(db_schema, python_exe, workspace_dir, step, profile)
+    finally:
+        db_tools.set_profile(previous)
+
+
+def _build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str, profile: str) -> str:
+    if not db_schema and db_tools.config_prefix() != "DB_":
+        # Base Cucumber renseignée : son schéma par défaut (CUCUMBER_DB_SCHEMA)
+        db_schema = db_tools.get_db_config()["schema"]
     if not db_schema:
         return ""
     if not db_tools.is_valid_identifier(db_schema):
@@ -506,7 +521,7 @@ def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: st
     db_type = db_tools.get_db_config()["type"]
     print(f"[BDD] Accès en lecture seule activé : {db_tools.describe_db_target()}, schéma {db_schema}.")
     db_cli = os.path.join(workspace_dir, "tools", "db_tools.py")
-    base_cmd = f'"{python_exe}" "{db_cli}" --schema {db_schema}'
+    base_cmd = f'"{python_exe}" "{db_cli}" --schema {db_schema}' + (f" --profile {profile}" if profile else "")
     if db_type == "sqlserver":
         schema_hint = f"Sous SQL Server, préfixe les tables par le schéma ({db_schema}.NOM_TABLE)."
     else:
@@ -2837,8 +2852,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "client_name": client, "token_saving_rules": token_saving_rules,
         "knowledge_block": f"\n{shared['bloc']}\n" if shared["bloc"] else "",
         # Accès base en lecture seule de tous les lots et de leurs corrections (--db-schema), journalisé par lot
+        # Base de l'environnement où Jenkins joue les tests (CUCUMBER_DB_*), à défaut la base DB_*
         "db_block": build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
-                                   step="generate-cucumber-client"),
+                                   step="generate-cucumber-client", profile="cucumber"),
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
         "features_std": catalogue["features_std"],
         "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",

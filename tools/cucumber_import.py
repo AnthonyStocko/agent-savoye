@@ -643,7 +643,7 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         out["echecs"] = failure_results(client_name, numero, results, out["init_en_echec"], state, worktree)
         if not out["init_en_echec"]:
             out["propositions"], out["a_prouver"] = correction_proposals(
-                failures, state, extras, db_tools.is_db_configured(),
+                failures, state, extras, db_tools.is_db_configured("cucumber"),
                 {e["id"] for e in cucumber_failures.pending(out)})
     folder = os.path.join(imports_dir(client_name), str(numero))
     _write_json(os.path.join(folder, "analyse.json"), out)
