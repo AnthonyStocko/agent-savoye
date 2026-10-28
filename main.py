@@ -2507,7 +2507,8 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
 
 def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_tags: str, verify_sources: dict,
                  profile: dict, state: dict, cucumber_std_dir: str, std_java: dict, step_code: dict,
-                 token_saving_rules: str, python_exe: str, workspace_dir: str, work_key: str) -> dict:
+                 token_saving_rules: str, python_exe: str, workspace_dir: str, work_key: str,
+                 console: str = "") -> dict:
     """
     Correction autonome des compléments d'init de l'agent (cucumber_init_fix) : seulement si l'init échoue dans ses
     propres compléments. Chaque tentative : un appel Claude borné aux fichiers autorisés, contrôles Python
@@ -2534,7 +2535,7 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
               "check_expression": cucumber_environment.check_expression(client),
               "recreation_expression": cucumber_environment.recreation_expression(client),
               "compilation_agent": agent_compilation_block(agent_compile),
-              "console": os.path.join(os.path.dirname(worktree), "verification", "init-console.txt"),
+              "console": console or os.path.join(os.path.dirname(worktree), "verification", "init-console.txt"),
               "fichiers": "\n".join(f"- {f}" for f in files), "tentatives": cucumber_init_fix.attempts()}
     errors, corrected = [], state.setdefault("init_corrigee", {"fichiers": [], "tentatives": []})
     for attempt in range(1, cucumber_init_fix.attempts() + 1):
@@ -2585,8 +2586,10 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
             worktree, profile["verify_branch"], f"Cucumber : correction de l'initialisation ({attempt})")[0] \
             if profile.get("verify_branch") else ""
         if push_error:
-            print(f"[CUCUMBER INIT] ⛔ {push_error}")
-            break
+            # Correction commitée mais non vérifiable sur Jenkins (réseau, droits) : livrée en patch, à vérifier
+            print(f"[CUCUMBER INIT] ⚠️ Init non rejouée : {push_error}")
+            return {"ok": None, "message": f"compléments d'init corrigés, non vérifiés ({push_error})", "build": "",
+                    "corrige": True}
         sources = verify_sources
         if profile.get("verify_branch"):
             head = cucumber_tools.rev_parse(worktree, "HEAD")
@@ -2637,11 +2640,24 @@ def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio
         mode = ""
     print(f"[CUCUMBER INIT] Import n° {numero} : init en échec dans {rel} — {init.get('step')} — "
           f"{(init.get('message') or '')[:160]}")
-    out = fix_own_init(client, worktree, {"ok": False, "message": "", "echecs": [failure]}, mode,
+    folder = os.path.join(cucumber_import.imports_dir(client), str(numero))
+    consoles = sorted(n for n in os.listdir(folder) if "console" in n.lower()) if os.path.isdir(folder) else []
+
+    def agent_commits() -> list:
+        base = state.get("base") or ""
+        log = _git_out(worktree, "log", "--format=%H %s", f"{base}..HEAD" if base else "-20")
+        return [c for c in log.splitlines() if "compléments d'initialisation" in c and "par l'agent" in c]
+    files = cucumber_init_fix.own_files(worktree, client)
+    # Correction déjà faite (tentative précédente non poussée) et conforme : patch seulement, sans nouvel appel
+    already = agent_commits() and not cucumber_init_fix.check_correction(
+        worktree, client, files, cucumber_init_fix.snapshot(worktree, files))
+    if already:
+        print("[CUCUMBER INIT] Correction déjà présente dans l'espace de travail (non poussée) : patch régénéré.")
+    out = {"ok": None, "corrige": True, "message": ""} if already else fix_own_init(client, worktree, {"ok": False, "message": "", "echecs": [failure]}, mode,
                        profile.get("init_tags") or cucumber_verify.init_tags(),
                        cucumber_verify.branch_sources(profile, args.cucumber_repo), profile, state,
                        local_cucumber_std_repo, std_java, step_code, token_saving_rules, python_exe, workspace_dir,
-                       cucumber_tools.work_id(client))
+                       cucumber_tools.work_id(client), os.path.join(folder, consoles[0]) if consoles else "")
     cucumber_tools.save_state(client, state)
     if out.get("ok") is False and not out.get("corrige"):
         if not (state.get("init_corrigee") or {}).get("tentatives"):
@@ -2649,14 +2665,13 @@ def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio
         print(f"[CUCUMBER INIT] ⛔ Init toujours en échec : {out.get('message')}")
         return 1
     patch = os.path.join(cucumber_tools.WORKSPACE_DIR, f"{client}-cucumber-init-correction.patch")
-    commits = [c for c in _git_out(worktree, "log", "--format=%H %s", "-20").splitlines()
-               if "compléments d'initialisation" in c and "par l'agent" in c]
+    commits = agent_commits()
     if commits and cucumber_tools.format_patch(worktree, f"{commits[-1].split()[0]}~1..{commits[0].split()[0]}",
                                                patch):
         print(f"[CUCUMBER INIT] Patch de la correction de l'init (à relire, appliquer et pousser) : {patch}")
     print("[CUCUMBER INIT] " + ("✅ Init vérifiée sur Jenkins après correction." if out.get("ok") else
-                                "Correction faite : appliquez le patch, poussez et relancez votre job, puis importez "
-                                "le résultat."))
+                                "Correction faite, non vérifiée sur Jenkins : relisez et appliquez le patch, poussez et "
+                                "relancez votre job, puis importez le résultat."))
     return 0
 
 

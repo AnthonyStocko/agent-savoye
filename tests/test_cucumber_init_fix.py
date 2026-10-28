@@ -157,3 +157,22 @@ def test_fix_from_an_imported_run_delivers_a_patch(main_module, monkeypatch, tmp
     patch = tmp_path / f"{CLIENT}-cucumber-init-correction.patch"
     assert patch.exists() and "scenario.log(missing.toString());" in patch.read_text(encoding="utf-8")
     assert "Assertions.fail(missing" in patch.read_text(encoding="utf-8")       # ligne retirée
+
+
+def test_unreachable_repository_still_delivers_the_correction(main_module, worktree, monkeypatch, tmp_path):
+    m = main_module
+    monkeypatch.setattr(m.cucumber_tools, "CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setenv("CUCUMBER_COMPILE_CMD", "")
+    monkeypatch.setattr(m, "report_token_usage", lambda *a, **k: None)
+
+    def claude(*a, **k):
+        write(os.path.join(worktree, *JAVA.split("/")), FIXED)
+        return 0, "{}", {}, False
+    monkeypatch.setattr(m, "run_cucumber_claude", claude)
+    monkeypatch.setattr(m.cucumber_checks, "push_for_verification",
+                        lambda *a: ("push sur agent refusé (Couldn't connect to server)", False))
+    failure = {"fichier": COMPLEMENTS, "titre": "Contrôle", "step": "s", "message": "m", "journal": ""}
+    out = m.fix_own_init(CLIENT, worktree, {"ok": False, "echecs": [failure]}, "branche", "@INIT", {},
+                         {"verify_branch": "agent"}, {}, "", {"java_std": "j"}, {"sources": "s"}, "",
+                         sys.executable, os.getcwd(), "w")
+    assert out["ok"] is None and out["corrige"] and "non vérifiés" in out["message"]
