@@ -262,3 +262,34 @@ def test_sync_keeps_the_branch_version_on_conflict(repo):
     assert os.path.exists(os.path.join(repo, "src/test/resources/cucumber/features/clientx/n.feature"))
     assert kept == [steps]
     assert cf.sync_with_branch(repo, "integration") == ""                      # déjà à jour : rien à faire
+
+
+def test_patch_delivers_or_reports_data_files_read_by_client_features(repo, tmp_path, monkeypatch):
+    """Cas réel (log 85) : fichiers lus par des features du client absents de la branche (FileNotFoundException).
+    Présent chez l'agent : ajouté au patch ; introuvable : signalé, ainsi que la règle du step de réinitialisation."""
+    monkeypatch.delenv("CUCUMBER_PATCH_MODE", raising=False)
+    feat = "src/test/resources/cucumber/features/clientx/WMS/Preparation/a.feature"
+    write(os.path.join(repo, *feat.split("/")), "Feature: A\n  Scenario: s\n    Then x\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-q", "-b", "agent")
+    data = "src/test/resources/cucumber/files/clientx/WMS/Preparation/CIN-1.xml"
+    write(os.path.join(repo, *data.split("/")), "<x/>\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lot 1")
+    git(repo, "checkout", "-q", "integration")
+    # Feature écrite à la main sur la branche, sans le fichier de l'agent ni la règle
+    write(os.path.join(repo, *feat.split("/")),
+          "Feature: A\n  Scenario: s\n    Given INIT- Intégration des fichiers GS1\n      | fileName |\n"
+          "      | CIN-1.xml |\n      | CIN-2.xml |\n    Given INIT- Réinitialisation des règles \"WMS\"\n"
+          "      | fileName |\n      | rule-Defaut |\n")
+    git(repo, "commit", "-qam", "feature manuelle")
+    git(repo, "checkout", "-q", "agent")
+    git(repo, "merge", "-q", "--no-edit", "-X", "theirs", "integration")
+    patch = str(tmp_path / "p.patch")
+    assert ct.write_patch(repo, "integration", patch, "clientx")
+    text = open(patch, encoding="utf-8").read()
+    assert "CIN-1.xml" in text and "Fichiers de données introuvables" in text
+    missing = open(patch + ".donnees-manquantes.txt", encoding="utf-8").read()
+    assert "files/clientx/WMS/Preparation/CIN-2.xml" in missing
+    assert "rules/WMS/01-Contexte/rule-Defaut.json" in missing and "CIN-1.xml" not in missing

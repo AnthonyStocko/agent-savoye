@@ -2740,6 +2740,27 @@ def run_cucumber_health(client: str, local_cucumber_std_repo: str, cucumber_repo
     return 0 if report["ok"] else 1
 
 
+def deliver_std_data(client: str, worktree: str, cucumber_std_dir: str, profile: dict) -> list:
+    """
+    Avant le patch : fichiers de données lus par TOUTES les features du client (de l'agent ou écrites à la main)
+    absents du worktree. Présents au Standard : copiés et commités (livrés) ; sinon signalés. Renvoie les copies.
+    """
+    root = profile.get("features_root") or f"{cucumber_checks.FEATURES_ROOT}{client}"
+    result = cucumber_checks.check_data_files(worktree, cucumber_checks.client_feature_files(worktree, root),
+                                              cucumber_std_dir)
+    copied = [target for target, _ in result["copies"]]
+    if copied:
+        cucumber_tools._git(worktree, "add", "-f", "--", *copied)
+        cucumber_tools._git(worktree, "commit", "-q", "-m",
+                            f"Cucumber : fichiers de données du Standard lus par les features de {client}")
+        print(f"[CUCUMBER] {len(copied)} fichier(s) de données manquant(s) copié(s) depuis le Standard : "
+              f"{', '.join(copied[:5])}")
+    if result["erreurs"]:
+        print(f"[CUCUMBER] ⚠️ {len(result['erreurs'])} fichier(s) de données introuvable(s), y compris au Standard :")
+        print("\n".join(f"    {e}" for e in result["erreurs"][:20]))
+    return copied
+
+
 def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_repo: str,
                         local_cucumber_std_repo: str, odatio_version: str, cucumber_repo_dir: str,
                         token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
@@ -2762,6 +2783,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         if not base or not os.path.exists(os.path.join(worktree, ".git")):
             print("[CUCUMBER] Aucun espace de travail ou branche d'intégration introuvable : rien à livrer.")
             return 2
+        if local_cucumber_std_repo:
+            deliver_std_data(client, worktree, local_cucumber_std_repo,
+                             cucumber_profile.effective_profile(cucumber_profile.load_profile(client)))
         if cucumber_tools.write_patch(worktree, base, cucumber_tools.patch_path(client), client):
             print(f"[CUCUMBER] Patch régénéré (un commit, écart net avec {base}) : {cucumber_tools.patch_path(client)}")
             return 0
@@ -3381,7 +3405,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
               f"modifié(s).")
         print("\n".join(f"    {e}" for e in protected["erreurs"]))
         exit_code = 1
-    elif cucumber_tools.write_patch(worktree, state["base"], patch_file, client):
+    elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile) is not None and \
+            cucumber_tools.write_patch(worktree, state["base"], patch_file, client):
         print(f"\n[CUCUMBER] Patch généré : {patch_file}")
         missing = cucumber_checks.check_patch_files(worktree, state["base"], patch_file, client)
         if missing:

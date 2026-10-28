@@ -2532,6 +2532,34 @@ def _git_env(repo: str, env: dict, *args, data: bytes = None) -> subprocess.Comp
     return subprocess.run(["git", "-C", repo, *args], input=data, capture_output=True, env={**os.environ, **env})
 
 
+def _deliver_missing_data(worktree: str, env: dict, client_name: str) -> tuple:
+    """
+    Arbre livré (index temporaire = branche + patch) : chaque fichier de données lu par une feature du client doit y
+    être. Absent de l'arbre mais présent chez l'agent (commit ou fichier du worktree) : ajouté au patch (une
+    livraison précédente l'avait perdu). Renvoie (chemins ajoutés, [(feature, ligne, nom, chemin attendu)] restants).
+    """
+    from tools import cucumber_checks
+    if not client_name:
+        return [], []
+    listing = _git_env(worktree, env, "ls-files", "-z").stdout.decode("utf-8", "replace").split("\0")
+    paths = {p for p in listing if p}
+    prefix = (cucumber_checks.FEATURES_ROOT + client_name + "/").lower()
+    texts = {rel: _git_env(worktree, env, "show", f":{rel}").stdout.decode("utf-8", "replace")
+             for rel in paths if rel.endswith(".feature") and rel.lower().startswith(prefix)}
+    recovered, unresolved = [], []
+    for feature, line, name, target in cucumber_checks.missing_data_in_tree(paths, texts):
+        blob = _git(worktree, "rev-parse", "-q", "--verify", f"HEAD:{target}").stdout.strip()
+        local = os.path.join(worktree, *target.split("/"))
+        if not blob and os.path.isfile(local):
+            blob = _git_env(worktree, env, "hash-object", "-w", "--", target).stdout.decode().strip()
+        if blob and _git_env(worktree, env, "update-index", "--add", "--cacheinfo",
+                             f"100644,{blob},{target}").returncode == 0:
+            recovered.append(target)
+        else:
+            unresolved.append((feature, line, name, target))
+    return recovered, unresolved
+
+
 def _three_way(worktree: str, env: dict, index: str, diff: bytes, target: str) -> bool:
     """
     Fusion à 3 voies d'une modification de l'agent (ancêtre : le fichier avant son commit ; d'un côté la branche,
@@ -2653,6 +2681,21 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
                 blob = _git_env(worktree, env, "hash-object", "-w", "--stdin", data=cleaned).stdout.decode().strip()
                 mode = (_git_env(worktree, env, "ls-files", "-s", "--", rel).stdout.decode().split() or ["100644"])[0]
                 _git_env(worktree, env, "update-index", "--cacheinfo", f"{mode},{blob},{rel}")
+        recovered, unresolved = _deliver_missing_data(worktree, env, client_name)
+        missing_file = output + ".donnees-manquantes.txt"
+        if unresolved:
+            with open(missing_file, "w", encoding="utf-8") as f:
+                f.write("Fichiers de données lus par les features mais absents de la branche une fois le patch "
+                        "appliqué (FileNotFoundException à l'exécution) :\n"
+                        + "\n".join(f"- {feat}:{line} « {name} » attendu en {target}"
+                                     for feat, line, name, target in unresolved) + "\n")
+            print(f"[CUCUMBER] ⛔ Patch : {len(unresolved)} fichier(s) de données introuvable(s) (ni sur la branche, ni "
+                  f"chez l'agent) — les scénarios concernés échoueront ; détail : {missing_file}")
+        elif os.path.exists(missing_file):
+            os.remove(missing_file)
+        if recovered:
+            print(f"[CUCUMBER] Patch : {len(recovered)} fichier(s) de données de l'agent absent(s) de la branche, "
+                  f"ajouté(s) au patch : {', '.join(recovered[:5])}")
         tree = _git_env(worktree, env, "write-tree").stdout.decode().strip()
         ecarts = output + ".ecarts.txt"
         if rejected:
@@ -2678,7 +2721,9 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
         message = (f"Cucumber : tests des spécifiques {client_name or ''} (agent)".replace("  ", " ")
                    + f"\n\nModifications de l'agent rejouées sur {base}, en un commit. Commits de l'agent :\n"
                    + subjects + (f"\n\nÉcartées (voir {os.path.basename(ecarts)}) : {len(set(rejected))}"
-                                 if rejected else ""))
+                                 if rejected else "")
+                   + (f"\n\nFichiers de données introuvables (voir {os.path.basename(missing_file)}) : "
+                      f"{len(unresolved)}" if unresolved else ""))
         commit = _git_env(worktree, env, "commit-tree", tree, "-p", rev_parse(worktree, base), "-m",
                           message).stdout.decode().strip()
         return bool(commit) and format_patch(worktree, f"{commit}~1..{commit}", output)

@@ -36,6 +36,10 @@ _DATA_FILE = re.compile(rf"^[\w.\-/]+\.(?:{'|'.join(DATA_EXTENSIONS)})$", re.I)
 _QUOTED = re.compile(r"\"([^\"]+)\"|'([^']+)'")
 # Step du Standard qui lit des règles : colonne fileName sans extension, dans rules/<dossier de la feature>/
 _RULE_STEP = re.compile(r"\bINIT- Intégration des règles\s*$")
+# Step du Standard qui remet des règles par défaut : colonne fileName sans extension, lue dans
+# rules/<argument>/01-Contexte/ quel que soit le dossier de la feature (QARuleStep.réinitialisationDesRègles…)
+_RULE_RESET_STEP = re.compile(r"\bINIT- Réinitialisation des règles \"([^\"]+)\"\s*$")
+RULE_RESET_DIR = "01-Contexte"
 _STEP_START = re.compile(r"^\s*(Given|When|Then|And|But|\*|Soit|Sachant que|[EÉ]tant donn[ée]e?s?|Quand|Lorsque|Alors|"
                          r"Et|Mais)\s+(.+?)\s*$")
 _TEST_JAR_DEPENDENCY = re.compile(r"<dependency>(?:(?!</dependency>).)*?<type>test-jar</type>"
@@ -90,7 +94,11 @@ def data_references(text: str) -> list:
             header = cells
             continue
         for column, value in zip(header, cells):
-            if _RULE_STEP.search(step) and column == "fileName" and value and "$" not in value:
+            reset = _RULE_RESET_STEP.search(step)
+            if reset and column == "fileName" and value and "$" not in value:
+                refs.append({"ligne": number, "nom": value, "regle": True,
+                             "dossier": f"{reset.group(1).strip()}/{RULE_RESET_DIR}"})
+            elif _RULE_STEP.search(step) and column == "fileName" and value and "$" not in value:
                 refs.append({"ligne": number, "nom": value, "regle": True})
             elif _is_data_file(value):
                 refs.append({"ligne": number, "nom": value, "regle": False})
@@ -105,7 +113,7 @@ def feature_dir(rel: str) -> str:
 
 def resolved_path(feature_rel: str, ref: dict) -> str:
     """Chemin, relatif au dépôt, du fichier lu à l'exécution pour la référence `ref` de la feature `feature_rel`."""
-    folder = feature_dir(feature_rel)
+    folder = ref.get("dossier") or feature_dir(feature_rel)
     prefix = f"{RULES_ROOT if ref['regle'] else FILES_ROOT}{folder + '/' if folder else ''}"
     path = prefix + ref["nom"] + (".json" if ref["regle"] else "")
     # Nom relatif remontant d'un dossier (../) : chemin normalisé, comme le système de fichiers à l'exécution
@@ -186,6 +194,29 @@ def check_data_files(worktree: str, features: list, cucumber_std_dir: str, copy:
                     "introuvable au Standard : crée-le (contenu propre au client) ou corrige le nom")
             errors.append(f"{rel}:{ref['ligne']} {what} « {ref['nom']} » absent : attendu en {target} ; {hint}")
     return {"copies": copies, "erreurs": errors}
+
+
+def client_feature_files(worktree: str, root: str) -> list:
+    """Toutes les features du client (racine `root` sous features/) présentes dans le worktree, écrites par
+    l'agent ou à la main."""
+    prefix = root.rstrip("/") + "/"
+    return sorted(p for p in repo_files(worktree) if p.endswith(".feature") and p.startswith(prefix)
+                  and os.path.exists(os.path.join(worktree, *p.split("/"))))
+
+
+def missing_data_in_tree(paths: set, texts: dict) -> list:
+    """
+    Références de données des features `texts` ({chemin: texte}) absentes de l'ensemble de fichiers `paths` (l'arbre
+    livré). Renvoie [(feature, ligne, nom, chemin attendu)] — ce que Jenkins lirait sans le trouver.
+    """
+    missing, seen = [], set()
+    for rel, text in sorted(texts.items()):
+        for ref in data_references(text):
+            target = resolved_path(rel, ref)
+            if target not in paths and target not in seen:
+                seen.add(target)
+                missing.append((rel, ref["ligne"], ref["nom"], target))
+    return missing
 
 
 # ---------------------------------------------------------------------------
