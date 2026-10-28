@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timezone
 
 from tools import (cucumber_decisions, cucumber_failures, cucumber_profile, cucumber_server_logs, db_tools,
-                   jenkins_tools)
+                   groundcover_tools, jenkins_tools)
 from tools.cucumber_diagnostic import TEMP_PREFIX
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
@@ -610,13 +610,19 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
             out["tests"], out["source"] = len(results), "console"
         failures = {i: r for i, r in results.items() if r["statut"] != "passe"}
         # Logs applicatifs déposés dans CUCUMBER_SERVER_LOG_DIR : fenêtre de chaque échec, sans export manuel
-        server = cucumber_server_logs.extract(cucumber_server_logs.log_dir(),
-                                              [r.get("heure") for r in failures.values() if r.get("heure")])
+        hours = [r.get("heure") for r in failures.values() if r.get("heure")]
+        server = cucumber_server_logs.extract(cucumber_server_logs.log_dir(), hours)
+        # Logs de l'environnement de test dans groundcover (GROUNDCOVER_API_KEY, CUCUMBER_GROUNDCOVER_FILTER)
+        remote = groundcover_tools.window_extract(hours)
+        server = {"texte": "\n".join(t for t in (server["texte"], remote["texte"]) if t),
+                  "lignes": server["lignes"] + remote["lignes"], "fichiers": server["fichiers"] + remote["fichiers"],
+                  "tronque": server["tronque"] or remote["tronque"], "plages": server["plages"] + remote["plages"],
+                  "erreur": remote["erreur"]}
         if server["texte"]:
             logs.append(server["texte"])
             _write_text(os.path.join(imports_dir(client_name), str(numero), cucumber_server_logs.EXTRACT_NAME),
                         server["texte"] + "\n")
-        out["logs_serveur"] = {k: server[k] for k in ("lignes", "fichiers", "tronque", "plages")}
+        out["logs_serveur"] = {k: server[k] for k in ("lignes", "fichiers", "tronque", "plages", "erreur")}
         out["resultats"] = results
         out["groupes"] = group_failures(failures)
         durations = scenario_durations(report, console)
@@ -626,6 +632,8 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
             console_init_failure(results, *init_markers(client_name))
         out["avertissements"] = log_warnings([(f["nom"], f["texte"]) for f in files if f["type"] == "logs"],
                                              failures)
+        if server["erreur"]:
+            out["avertissements"].append(f"logs groundcover non lus : {server['erreur']}")
         for identifier, result in list(failures.items())[:30]:
             item = {"step": result.get("step", ""), "motif": result.get("message", ""), "heure": result.get("heure")}
             covered = [log_coverage(text, item["heure"] or "") for text in logs]
@@ -702,8 +710,10 @@ def analysis_markdown(analysis: dict) -> str:
                   f"- Premier step en échec : `{init['step'] or '—'}`", f"- Cause : {init['message']}", ""]
     lines += [f"- ⚠️ {w}" for w in analysis.get("avertissements") or []]
     server = analysis.get("logs_serveur") or {}
-    if cucumber_server_logs.log_dir() or server.get("lignes"):
-        lines += [f"- Logs applicatifs du serveur ({cucumber_server_logs.log_dir() or 'répertoire'}) : "
+    if cucumber_server_logs.log_dir() or groundcover_tools.configured() or server.get("lignes"):
+        source = " + ".join(x for x in (cucumber_server_logs.log_dir(), "groundcover" if groundcover_tools.configured()
+                                        else "") if x) or "répertoire"
+        lines += [f"- Logs applicatifs du serveur ({source}) : "
                   + (f"{server['lignes']} ligne(s) dans la fenêtre des échecs ({', '.join(server['fichiers'][:5])})"
                      + (" — plafond atteint, extrait tronqué" if server.get("tronque") else "")
                      if server.get("lignes") else "aucune ligne dans la fenêtre des échecs (fichiers déposés pour ce "

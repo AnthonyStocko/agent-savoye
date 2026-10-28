@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -490,6 +490,16 @@ DB_BLOCK_WORDING = {
         "db_max_commands": "3",
     },
 }
+
+
+def build_logs_block(python_exe: str, workspace_dir: str) -> str:
+    """Bloc de prompt de la recherche en lecture seule dans les logs groundcover ('' si non configuré)."""
+    if not groundcover_tools.configured():
+        return ""
+    cli = f'"{python_exe}" "{os.path.join(workspace_dir, "tools", "groundcover_tools.py")}"'
+    print(f"[LOGS] Recherche dans les logs groundcover activée (filtre {groundcover_tools.config()['filter']}).")
+    return "\n" + render_prompt("logs_access", cli=cli, max_lines=groundcover_tools.MAX_LINES,
+                                 max_minutes=int(groundcover_tools.MAX_WINDOW.total_seconds() // 60))
 
 
 def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default",
@@ -1458,7 +1468,8 @@ def lot_tools(values: dict) -> list:
     compile lui-même (CUCUMBER_AGENT_COMPILE : tools/cucumber_compile.py).
     """
     return CUCUMBER_TOOLS + ([f"Bash({sys.executable}:*)"]
-                             if values.get("db_block") or values.get("compilation_agent") else [])
+                             if values.get("db_block") or values.get("logs_block") or values.get("compilation_agent")
+                             else [])
 
 
 def db_summary(entries: list) -> str:
@@ -1688,7 +1699,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             # Sortie d'un diagnostic temporaire exécuté au tour précédent
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
-        prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         effort = cucumber_fix_effort()
@@ -1961,7 +1972,7 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
         resumed = bool(lot and lot.get("session") and resume_lot_session())
         print(f"[LOT {label}] Correction {attempt + 1}/{attempts} "
               + ("(reprise de la session du lot)..." if resumed else f"({fix_model}, effort {effort or 'défaut'})..."))
-        prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape=check["etape"].upper(),
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", **values}, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
@@ -2521,7 +2532,7 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     if data:
         print(f"[LOT {label}] {len(data)} échec(s) lié(s) aux données : "
               + ("preuve en base exigée." if db_available else "aucun accès base, causes NON PROUVÉES."))
-    prompt = render_prompt("cucumber_client_fix", **values, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
+    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
                            erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available),
                            fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
@@ -2582,7 +2593,8 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
               "fichiers": "\n".join(f"- {f}" for f in files), "tentatives": cucumber_init_fix.attempts(),
               # Lecture seule de la base de test : confirmer une dépendance au lieu de la laisser « non confirmée »
               "db_block": build_db_block("", python_exe, workspace_dir, step="generate-cucumber-client",
-                                         profile="cucumber")}
+                                         profile="cucumber"),
+              "logs_block": build_logs_block(python_exe, workspace_dir)}
     errors, corrected = [], state.setdefault("init_corrigee", {"fichiers": [], "tentatives": []})
     for attempt in range(1, cucumber_init_fix.attempts() + 1):
         print(f"[CUCUMBER INIT] Correction des compléments d'init par l'agent, tentative {attempt} : "
@@ -3157,6 +3169,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         # Base de l'environnement où Jenkins joue les tests (CUCUMBER_DB_*), à défaut la base DB_*
         "db_block": build_db_block(args.db_schema.strip(), python_exe, workspace_dir,
                                    step="generate-cucumber-client", profile="cucumber"),
+        # Logs applicatifs de l'environnement de test (groundcover), en lecture seule
+        "logs_block": build_logs_block(python_exe, workspace_dir),
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
         "features_std": catalogue["features_std"],
         "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",

@@ -1,6 +1,6 @@
 TU ES UN AGENT 100 % AUTONOME : TU CORRIGES LES ERREURS DE ${etape} DES TESTS CUCUMBER DU CLIENT ${client_name} (LOT ${lot_label}).
 Tu ne dois JAMAIS poser de questions, demander de confirmation ni proposer de "suites possibles".
-${token_saving_rules}${db_block}
+${token_saving_rules}${db_block}${logs_block}
 === ERREURS (chemins relatifs au worktree '${worktree}') ===
 ${erreurs}
 

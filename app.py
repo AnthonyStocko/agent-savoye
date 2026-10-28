@@ -3403,6 +3403,44 @@ with tab_config:
             help="Répertoire où sont déposés les logs applicatifs du serveur de l'environnement de test (*.log, "
                  "rotations, .gz) : à chaque import d'un run, la fenêtre de chaque échec y est extraite (secrets "
                  "masqués) et donnée au correcteur, sans export ni réimport manuel. Vide : non utilisé.").strip()
+        st.markdown("**Logs de l'environnement de test dans groundcover** (lecture seule)")
+        with st.container(horizontal=True):
+            env_values["GROUNDCOVER_API_KEY"] = st.text_input(
+                "GROUNDCOVER_API_KEY", value=os.getenv("GROUNDCOVER_API_KEY", ""), type="password",
+                help="Clé d'API groundcover (Settings → Access → API Keys), de préférence d'un compte en lecture "
+                     "seule.").strip()
+            env_values["GROUNDCOVER_BACKEND_ID"] = st.text_input(
+                "GROUNDCOVER_BACKEND_ID", value=os.getenv("GROUNDCOVER_BACKEND_ID", ""),
+                help="Identifiant du backend (comptes multi-backend seulement, même écran que la clé).").strip()
+            env_values["GROUNDCOVER_API_URL"] = st.text_input(
+                "GROUNDCOVER_API_URL", value=os.getenv("GROUNDCOVER_API_URL", ""),
+                placeholder="https://api.groundcover.com").strip()
+        env_values["CUCUMBER_GROUNDCOVER_FILTER"] = st.text_input(
+            "CUCUMBER_GROUNDCOVER_FILTER", value=os.getenv("CUCUMBER_GROUNDCOVER_FILTER", ""),
+            placeholder="namespace:apparel-cucumber",
+            help="Filtre gcQL de l'environnement où Jenkins joue les tests (namespace, workload, cluster…), ajouté à "
+                 "toute requête : obligatoire, sans lui les logs groundcover ne sont pas lus.").strip()
+        if st.button("Tester groundcover", key="test_groundcover"):
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            from tools import groundcover_tools
+            saved = {k: os.environ.get(k) for k in ("GROUNDCOVER_API_KEY", "GROUNDCOVER_BACKEND_ID",
+                                                     "GROUNDCOVER_API_URL", "CUCUMBER_GROUNDCOVER_FILTER")}
+            os.environ.update({k: env_values[k] for k in saved})
+            try:
+                now = _dt.now(_tz.utc)
+                rows = groundcover_tools.search(now - _td(minutes=15), now, limit=3)
+                st.success(f"groundcover joignable : {len(rows)} ligne(s) sur les 15 dernières minutes avec le filtre "
+                           f"« {env_values['CUCUMBER_GROUNDCOVER_FILTER']} »."
+                           + (f" Dernière : {groundcover_tools.format_row(rows[-1])[:200]}" if rows else
+                              " Aucune ligne : filtre trop strict, ou environnement inactif."))
+            except groundcover_tools.GroundcoverError as e:
+                st.error(str(e))
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
         env_values["CUCUMBER_SLOW_SCENARIO_SECONDS"] = str(int(slow_seconds))
         env_values["CUCUMBER_LOG_EXPORT_MAX_LINES"] = str(int(export_cap)) if export_cap else ""
         jacoco = st.checkbox(
