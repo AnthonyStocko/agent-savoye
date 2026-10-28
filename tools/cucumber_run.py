@@ -180,6 +180,34 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     return run
 
 
+def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repository: str = "",
+            base_branch: str = "") -> dict:
+    """
+    Aperçu d'un run, sans push ni lancement (0 token) : contrôles préalables (preflight), correspondance des rôles,
+    paramètres qui seraient envoyés au job (secrets masqués, arguments réduits au filtre de tags) et nombre de tests
+    attendus pour `tags` dans le worktree. Renvoie {"ok", "job", "branche", "erreurs", "avertissements", "roles",
+    "parametres", "attendus"} ; ok faux si le run serait refusé.
+    """
+    from tools.cucumber_verify import a_revoir_tag, expected_count, feature_texts
+    tags = (tags or "").strip()
+    check = preflight(profile, worktree, client_name, base_branch)
+    out = {"ok": not check["erreurs"], "job": check["job"], "branche": check["branche"],
+           "erreurs": list(check["erreurs"]), "avertissements": list(check["avertissements"]),
+           "roles": {r: n for r, n in (check.get("roles") or {}).items() if n}, "parametres": {}, "attendus": None}
+    if check["definitions"]:
+        params = cucumber_job.build_parameters(check["definitions"], check["roles"], check["branche"], repository,
+                                               tags, rev_parse(worktree, "HEAD") if worktree else "")
+        out["parametres"] = cucumber_job.visible_parameters(params, check["roles"])
+    if worktree and os.path.exists(os.path.join(worktree, ".git")):
+        texts = feature_texts(worktree)
+        out["attendus"] = expected_count(texts, tags, a_revoir_tag())
+        if tags and not out["attendus"]:
+            out["ok"] = False
+            out["erreurs"].append(f"aucun scénario actif ne porte les tags « {tags} » dans le worktree : le job "
+                                  f"n'exécuterait rien")
+    return out
+
+
 def last_run(state: dict) -> dict:
     """Dernier lancement Jenkins ({} sans lancement)."""
     return (state.get("runs_jenkins") or [{}])[-1]

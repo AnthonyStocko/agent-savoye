@@ -256,3 +256,18 @@ def test_journey_proposes_the_automatic_run(tmp_path, monkeypatch):
     write(ct.patch_path(CLIENT), "diff")
     assert cj.execution_step(CLIENT, {}, {"saisi": PROFILE}, {})["action"] == "Pousser et lancer le run Jenkins"
     assert cj.execution_step(CLIENT, {}, {}, {})["action"].startswith("Lancer le job Jenkins puis importer")
+
+
+def test_preview_shows_the_parameters_without_pushing_nor_launching(jenkins):
+    repo, remote, calls = jenkins
+    head = git(repo, "rev-parse", "HEAD")
+    out = cr.preview(CLIENT, repo, PROFILE, "@feature_a", repository="client-cucumber", base_branch="integration")
+    assert out["ok"] and out["job"] == "DOSSIER/JOB-CLIENT" and out["attendus"] == 2
+    assert out["parametres"]["CUCUMBER_SPEC_BRANCH"] == BRANCH and out["parametres"]["wait"] == "false"
+    assert out["parametres"]["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@feature_a'")
+    assert out["roles"]["branche"] == "CUCUMBER_SPEC_BRANCH"
+    assert calls["params"] == []                                         # rien n'est lancé
+    assert subprocess.run(["git", "-C", remote, "rev-parse", "--verify", BRANCH], capture_output=True).returncode
+    assert git(repo, "rev-parse", "HEAD") == head                        # rien n'est commité
+    unknown = cr.preview(CLIENT, repo, PROFILE, "@inconnu")
+    assert not unknown["ok"] and "aucun scénario actif" in unknown["erreurs"][-1]

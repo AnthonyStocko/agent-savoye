@@ -921,6 +921,7 @@ def main():
     parser.add_argument("--import-url", default="", help="generate-cucumber-client : import d'un build Jenkins (console et rapports Cucumber JSON lus en mémoire), analysé sans appel à Claude")
     parser.add_argument("--from-import", type=int, default=0, help="generate-cucumber-client --complete : lots « correction » des échecs « test » des scénarios de l'agent de l'import n° N")
     parser.add_argument("--run-jenkins", action="store_true", help="generate-cucumber-client : pousse le worktree sur la branche lue par le job (profil), contrôle le commit, lance le job Jenkins du client, suit le build puis importe sa console et ses rapports (bilan)")
+    parser.add_argument("--run-dry", action="store_true", help="generate-cucumber-client --run-jenkins : aperçu sans push ni lancement (0 token) — job, branche, rôles des paramètres, paramètres envoyés (secrets masqués) et nombre de tests attendus pour --run-tags")
     parser.add_argument("--run-tags", default="", help="generate-cucumber-client --run-jenkins : expression de tags ajoutée aux arguments du job (-Dcucumber.filter.tags, vide : tous les scénarios actifs)")
     parser.add_argument("--server-log", default="", help="generate-cucumber-client : export de logs serveur à contrôler (avec --log-scenario) : couvre-t-il l'heure du step en échec ? (l'outil d'export peut garder les seules lignes les plus récentes), sans appel à Claude")
     parser.add_argument("--log-scenario", default="", help="generate-cucumber-client --server-log : identifiant ou tag @agent_… du scénario en échec (dernière génération)")
@@ -2369,6 +2370,27 @@ def run_cucumber_import(client: str, paths: list, build_url: str = "", project: 
     return 1 if analysis["non_analyse"] else 0
 
 
+def preview_cucumber_jenkins(client: str, tags: str, repository: str = "", base_branch: str = "") -> int:
+    """Aperçu du run Jenkins (cucumber_run.preview), sans push ni lancement ; 0 si le run serait accepté, sinon 2."""
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    out = cucumber_run.preview(client, cucumber_tools.worktree_dir(client), profile, tags, repository, base_branch)
+    print(f"[RUN JENKINS — APERÇU] Job : {out['job'] or '(non renseigné)'} | branche de travail : "
+          f"{out['branche'] or '(non renseignée)'} | tags : {tags or '(aucun : tous les scénarios actifs)'}")
+    print("[RUN JENKINS — APERÇU] Rôles des paramètres : "
+          + (", ".join(f"{role} → {name}" for role, name in out["roles"].items()) or "aucun détecté"))
+    for name, value in out["parametres"].items():
+        print(f"    {name} = {value}")
+    if out["attendus"] is not None:
+        print(f"[RUN JENKINS — APERÇU] Tests attendus pour ces tags dans le worktree : {out['attendus']}")
+    for warning in out["avertissements"]:
+        print(f"[RUN JENKINS — APERÇU] ⚠️ {warning}")
+    for error in out["erreurs"]:
+        print(f"[RUN JENKINS — APERÇU] ⛔ {error}")
+    print(f"[RUN JENKINS — APERÇU] {'✅ Le run serait lancé avec ces paramètres' if out['ok'] else '⛔ Le run serait refusé'}"
+          " (rien n'a été poussé ni lancé).")
+    return 0 if out["ok"] else 2
+
+
 def run_cucumber_jenkins(client: str, tags: str, project: str = "", repository: str = "", base_branch: str = "",
                          client_root: str = "") -> int:
     """
@@ -2553,6 +2575,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         return check_server_log(client, args.server_log, args.log_scenario)
     if args.import_run is not None or args.import_url:
         return run_cucumber_import(client, args.import_run or [], args.import_url, project)
+    if args.run_jenkins and args.run_dry:
+        return preview_cucumber_jenkins(client, args.run_tags, args.cucumber_repo, args.cucumber_base_branch)
     if args.run_jenkins:
         return run_cucumber_jenkins(client, args.run_tags, project, args.cucumber_repo, args.cucumber_base_branch,
                                     local_client_repo)
