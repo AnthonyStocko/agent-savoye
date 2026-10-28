@@ -2561,6 +2561,15 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
                   f"est livré")
             variants = [chosen]
         kept += variants
+    # Fichier de l'agent dont le chemin ne diffère d'un fichier de `base` que par la casse (dossier renommé entre
+    # temps, ex. WMS/product -> WMS/Product) : livré sous le chemin de `base`, jamais en doublon
+    base_by_case = {b.lower(): b for b in base_files}
+    target_of = {}
+    for rel in kept:
+        target = rel if rel in base_files else base_by_case.get(rel.lower(), rel)
+        if target != rel:
+            print(f"[CUCUMBER] Patch : {rel} livré sous le chemin existant {target} (casse différente)")
+        target_of[rel] = target
     if not kept:
         return False
     strip = client_name and os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() != "1"
@@ -2577,13 +2586,13 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
             data = subprocess.run(["git", "-C", worktree, "show", f"HEAD:{rel}"], capture_output=True).stdout
             if strip and rel.endswith(".feature"):
                 text = data.decode("utf-8", errors="replace")
-                keep = set(re.findall(r"@agent_\w+", _git(worktree, "show", f"{base}:{rel}").stdout))
+                keep = set(re.findall(r"@agent_\w+", _git(worktree, "show", f"{base}:{target_of[rel]}").stdout))
                 data = strip_agent_tags(text, client_name, keep).encode("utf-8")
             blob = _git_env(worktree, env, "hash-object", "-w", "--stdin", data=data).stdout.decode().strip()
             if not blob:
                 return False
             _git_env(worktree, env, "update-index", "--add", "--cacheinfo",
-                     f"{modes.get(rel, '100644')},{blob},{rel}")
+                     f"{modes.get(rel, '100644')},{blob},{target_of[rel]}")
         tree = _git_env(worktree, env, "write-tree").stdout.decode().strip()
         if not tree or tree == _git(worktree, "rev-parse", f"{base}^{{tree}}").stdout.strip():
             return False

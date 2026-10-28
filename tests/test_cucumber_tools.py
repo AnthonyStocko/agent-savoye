@@ -146,3 +146,20 @@ def test_squashed_patch_never_deletes_existing_files_and_resolves_case(repo, tmp
     assert "deleted file" not in text and "existant.feature" not in text      # jamais de suppression
     assert "WMS/Product/a.feature" in text and "WMS/product/a.feature" not in text   # un seul chemin par casse
     assert git(repo, "status", "--porcelain") == ""
+
+
+def test_squashed_patch_uses_the_existing_case_of_a_path(repo, tmp_path, monkeypatch):
+    monkeypatch.delenv("CUCUMBER_PATCH_MODE", raising=False)
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/WMS/product/b.feature"), "Feature: B\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "rm", "-q", "--cached", "src/test/resources/cucumber/features/clientx/WMS/product/b.feature")
+    git(repo, "commit", "-qm", "retrait")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/WMS/Product/b.feature"), "Feature: B2\n")
+    git(repo, "add", "src/test/resources/cucumber/features/clientx/WMS/Product/b.feature")
+    git(repo, "commit", "-qm", "lot")
+    patch = str(tmp_path / "p.patch")
+    assert ct.write_patch(repo, base, patch, "clientx")
+    text = open(patch, encoding="utf-8").read()
+    assert "WMS/product/b.feature" in text and "WMS/Product/b.feature" not in text and "Feature: B2" in text
