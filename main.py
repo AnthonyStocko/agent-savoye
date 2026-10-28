@@ -2376,6 +2376,8 @@ def preview_cucumber_jenkins(client: str, tags: str, repository: str = "", base_
     out = cucumber_run.preview(client, cucumber_tools.worktree_dir(client), profile, tags, repository, base_branch)
     print(f"[RUN JENKINS — APERÇU] Job : {out['job'] or '(non renseigné)'} | branche de travail : "
           f"{out['branche'] or '(non renseignée)'} | tags : {tags or '(aucun : tous les scénarios actifs)'}")
+    if out.get("cible_tags"):
+        print(f"[RUN JENKINS — APERÇU] Filtre de tags envoyé dans : {out['cible_tags']}")
     print("[RUN JENKINS — APERÇU] Rôles des paramètres : "
           + (", ".join(f"{role} → {name}" for role, name in out["roles"].items()) or "aucun détecté"))
     for name, value in out["parametres"].items():

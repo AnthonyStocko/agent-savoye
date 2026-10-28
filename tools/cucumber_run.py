@@ -146,7 +146,8 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     for warning in fixed_warnings:
         log(f"[RUN JENKINS] ⚠️ {warning}")
     params = cucumber_job.build_parameters(check["definitions"], roles, check["branche"], repository, tags,
-                                           run["commit"], fixed=fixed)
+                                           run["commit"], fixed=fixed,
+                                           target=cucumber_job.tag_target(profile, roles))
     run["parametres"] = cucumber_job.visible_parameters(params, roles)
     run["version_testee"] = tested_version(client_name, params, roles, inventory, client_root)
     if run["version_testee"]:
@@ -201,8 +202,10 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
         fixed, fixed_warnings = cucumber_job.fixed_parameters(profile, check["definitions"])
         out["avertissements"] += fixed_warnings
         out["imposes"] = sorted(fixed)
+        out["cible_tags"] = cucumber_job.tag_target(profile, check["roles"])
         params = cucumber_job.build_parameters(check["definitions"], check["roles"], check["branche"], repository,
-                                               tags, rev_parse(worktree, "HEAD") if worktree else "", fixed=fixed)
+                                               tags, rev_parse(worktree, "HEAD") if worktree else "", fixed=fixed,
+                                               target=out["cible_tags"])
         out["parametres"] = cucumber_job.visible_parameters(params, check["roles"])
     if worktree and os.path.exists(os.path.join(worktree, ".git")):
         texts = feature_texts(worktree)

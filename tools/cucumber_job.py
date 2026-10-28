@@ -30,6 +30,7 @@ from tools.cucumber_tools import _git, _read_json, _write_json, cache_dir, git_r
 ROLES = {"branche": "branche du dépôt client lue par le job (branche de travail de l'agent)",
          "depot": "dépôt client lu par le job",
          "arguments": "arguments Maven du job (reçoivent le filtre de tags Cucumber ; contiennent des identifiants)",
+         "tags": "paramètre de tags des scénarios du client (ex. ADDITIONAL_SPEC_TAGS)",
          "attente": "attente de la fin du déploiement (décochée pour les runs de l'agent)",
          "commit": "commit attendu en tête de la branche",
          "environnement": "environnement d'exécution",
@@ -43,6 +44,7 @@ _DETECTION = {
     "branche": (r"BRANCH", r"STANDARD|STD"),
     "depot": (r"REPO", r"STANDARD|STD"),
     "arguments": (r"ARGLINE|ARGS\b|ARGUMENTS?|_OPTS\b|MAVEN_OPTS", r""),
+    "tags": (r"SPEC_TAGS|^TAGS$", r"STANDARD|STD|EXCLU"),
     "attente": (r"^WAIT$|^WAIT_|_WAIT$|ATTENTE", r""),
     "commit": (r"COMMIT", r"STANDARD|STD"),
     "environnement": (r"^ENV$|ENVIRONMENT|ENVIRONNEMENT", r""),
@@ -150,8 +152,23 @@ def fixed_parameters(profile: dict, definitions: dict = None) -> tuple:
     return fixed, warnings
 
 
+# Où le filtre de tags d'un run est envoyé : arguments Maven, paramètre de tags du job (rôle « tags »), ou les deux
+TAG_TARGETS = ("arguments", "parametre", "les_deux")
+
+
+def tag_target(profile: dict, roles: dict) -> str:
+    """
+    Cible du filtre de tags : profil (« run_tags_target »), sinon les arguments (comportement établi : sur les jobs
+    observés, le paramètre de tags n'atteignait pas Cucumber). « parametre » / « les_deux » demandent le rôle « tags ».
+    """
+    chosen = ((profile or {}).get("run_tags_target") or "").strip().lower()
+    if chosen in ("parametre", "les_deux") and not (roles or {}).get("tags"):
+        return "arguments"
+    return chosen if chosen in TAG_TARGETS else "arguments"
+
+
 def build_parameters(definitions: dict, roles: dict, branch: str, repository: str = "", tags: str = "",
-                     commit: str = "", env: str = "", fixed: dict = None) -> dict:
+                     commit: str = "", env: str = "", fixed: dict = None, target: str = "arguments") -> dict:
     """
     Paramètres d'un build : configuration actuelle du job, remplacée par les paramètres imposés du profil (`fixed`),
     puis branche de travail, dépôt client, attente décochée, commit et environnement (si le job a ces rôles) et
@@ -163,8 +180,14 @@ def build_parameters(definitions: dict, roles: dict, branch: str, repository: st
             params[roles[role]] = value
     if roles.get("attente"):
         params[roles["attente"]] = "false"
+    to_parameter = target in ("parametre", "les_deux") and roles.get("tags")
+    if to_parameter:
+        params[roles["tags"]] = (tags or "").strip()
     if roles.get("arguments"):
-        params[roles["arguments"]] = with_tag_filter(params.get(roles["arguments"], ""), tags)
+        # Filtre dans les arguments sauf s'il passe seulement par le paramètre de tags (un filtre déjà présent y est
+        # retiré pour ne pas contredire ce paramètre)
+        argument_tags = "" if to_parameter and target == "parametre" else tags
+        params[roles["arguments"]] = with_tag_filter(params.get(roles["arguments"], ""), argument_tags)
     return params
 
 

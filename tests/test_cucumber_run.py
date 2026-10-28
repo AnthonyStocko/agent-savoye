@@ -67,7 +67,8 @@ def jenkins(tmp_path, repo, monkeypatch):
 def test_roles_are_detected_on_the_job_parameters():
     roles, warnings = cjob.detect_roles(DEFINITIONS)
     assert roles == {"branche": "CUCUMBER_SPEC_BRANCH", "depot": "CUCUMBER_SPEC_REPOSITORY",
-                     "arguments": "ADDITIONAL_ARGLINE", "attente": "wait", "commit": "", "environnement": "",
+                     "arguments": "ADDITIONAL_ARGLINE", "tags": "ADDITIONAL_SPEC_TAGS", "attente": "wait", "commit": "",
+                     "environnement": "",
                      "composant_proprietaire": "COMPONENT_OWNER", "composant_nom": "COMPONENT_NAME",
                      "composant_version": "COMPONENT_VERSION"}
     assert warnings == []
@@ -286,3 +287,19 @@ def test_profile_imposes_job_parameters_over_the_current_configuration(jenkins):
     run = cr.launch(CLIENT, repo, profile, "@feature_a", log=lambda line: None)
     assert calls["params"][-1]["hasSpecific"] == "true"
     assert calls["params"][-1]["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@feature_a'")
+
+
+def test_tag_filter_target(jenkins):
+    repo, remote, calls = jenkins
+    roles = cjob.detect_roles(DEFINITIONS)[0]
+    default = cjob.build_parameters(DEFINITIONS, roles, BRANCH, tags="@a", target=cjob.tag_target(PROFILE, roles))
+    assert default["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@a'") and default["ADDITIONAL_SPEC_TAGS"] == ""
+    param = cjob.build_parameters(DEFINITIONS, roles, BRANCH, tags="@a",
+                                  target=cjob.tag_target({"run_tags_target": "parametre"}, roles))
+    assert param["ADDITIONAL_SPEC_TAGS"] == "@a" and "cucumber.filter.tags" not in param["ADDITIONAL_ARGLINE"]
+    both = cjob.build_parameters(DEFINITIONS, roles, BRANCH, tags="@a",
+                                 target=cjob.tag_target({"run_tags_target": "les_deux"}, roles))
+    assert both["ADDITIONAL_SPEC_TAGS"] == "@a" and both["ADDITIONAL_ARGLINE"].endswith("tags='@a'")
+    assert cjob.tag_target({"run_tags_target": "parametre"}, {**roles, "tags": ""}) == "arguments"
+    out = cr.preview(CLIENT, repo, {**PROFILE, "run_tags_target": "les_deux"}, "@feature_a")
+    assert out["cible_tags"] == "les_deux" and out["parametres"]["ADDITIONAL_SPEC_TAGS"] == "@feature_a"

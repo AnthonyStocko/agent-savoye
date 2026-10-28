@@ -29,10 +29,10 @@ REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
 FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
           "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-          "environment_checks", "reponses", "job_roles", "job_params")
+          "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target")
 # Champs dont l'absence est normale : vides sans avertissement
 OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-                   "environment_checks", "reponses", "job_roles", "job_params")
+                   "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
@@ -52,6 +52,8 @@ LABELS = {"features_root": "racine des features", "tag_client": "tag client", "i
                                 "documents, énumérations, paramétrages)",
           "reponses": "réponses de l'utilisateur aux questions des tâches à confirmer",
           "job_roles": "correspondance paramètre du job → rôle (branche, dépôt, arguments, attente, artefact monté)",
+          "run_tags_target": "où envoyer le filtre de tags d'un run (arguments, parametre, les_deux ; vide : "
+                             "arguments)",
           "job_params": "paramètres du job imposés à chaque run de l'agent (NOM=valeur ; ex. artefact du client, "
                         "suites Standard décochées)"}
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
@@ -75,7 +77,7 @@ def empty_profile() -> dict:
             "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
             "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
             "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": [], "job_roles": {},
-            "job_params": []}
+            "job_params": [], "run_tags_target": ""}
 
 
 def is_empty(value) -> bool:
