@@ -1216,6 +1216,12 @@ def cucumber_header() -> dict:
     st.selectbox("Projet", options, key="cucumber_project", on_change=load_cucumber_project,
                  format_func=lambda k: "Nouveau projet…" if k == NEW_PROJECT else k.capitalize(),
                  help="Projets déjà travaillés (leurs réglages sont gardés).")
+    # Réglages non affichés pendant un passage (écran simplifié) : Streamlit efface l'état de leurs champs ; un
+    # projet connu dont le dépôt est vide retrouve donc ses réglages enregistrés
+    chosen = st.session_state.get("cucumber_project")
+    if chosen in projects and not (st.session_state.get("cucumber_repo") or "").strip() \
+            and (projects.get(chosen) or {}).get("client_repo"):
+        load_cucumber_project()
     # Nom du client recalculé quand le dépôt change, sauf s'il a été modifié à la main depuis
     repo_input = (st.session_state.get("cucumber_repo") or "").strip()
     derived_client = cucumber_tools.client_name_from_repo(repo_input)
