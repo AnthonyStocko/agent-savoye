@@ -209,21 +209,34 @@ def disable_patch(worktree: str, fichier: str, titre: str, tag: str) -> str:
     return f"diff --git a/{fichier} b/{fichier}\n{diff}" if diff else ""
 
 
-def sync_with_branch(worktree: str, base: str) -> str:
+def sync_with_branch(worktree: str, base: str, log=None) -> str:
     """
-    Worktree de l'agent remis sur la branche réelle lue par Jenkins (`base`, ex. origin/integration) : fusion, la
-    version de l'agent l'emportant sur un conflit (ses modifications sont plus récentes que la branche). Renvoie
-    '' si le worktree contient la branche, sinon la raison (fusion impossible, annulée).
+    Worktree de l'agent remis sur la branche réelle (`base`, ex. origin/integration) : fusion où la version de la
+    BRANCHE l'emporte sur un conflit — une correction faite à la main depuis le lot de l'agent n'est jamais écrasée
+    par sa version périmée (les runs de l'agent testent alors l'état réel). `log` : reçoit la liste des fichiers où
+    la version de la branche a été retenue sur un conflit. Renvoie '' si le worktree contient la branche, sinon la
+    raison (fusion impossible, annulée).
     """
     if not (worktree and base and os.path.isdir(worktree)):
         return ""
     if _git(worktree, "merge-base", "--is-ancestor", base, "HEAD").returncode == 0:
         return ""
-    merged = _git(worktree, "merge", "--no-edit", "-X", "ours", "-m",
-                  f"Cucumber: synchronisation avec {base} (branche lue par Jenkins)", base)
+    fork = _git(worktree, "merge-base", "HEAD", base).stdout.strip()
+    both = set()
+    if fork:
+        ours = set(_git(worktree, "diff", "--name-only", fork, "HEAD").stdout.splitlines())
+        theirs = set(_git(worktree, "diff", "--name-only", fork, base).stdout.splitlines())
+        both = ours & theirs
+    merged = _git(worktree, "merge", "--no-edit", "-X", "theirs", "-m",
+                  f"Cucumber: synchronisation avec {base} (la branche l'emporte sur un conflit)", base)
     if merged.returncode != 0:
         _git(worktree, "merge", "--abort")
         return f"fusion de {base} impossible : {(merged.stderr or merged.stdout).strip()[:200]}"
+    kept = sorted(p for p in both
+                  if _git(worktree, "rev-parse", f"HEAD:{p}").stdout.strip() == _git(
+                      worktree, "rev-parse", f"{base}:{p}").stdout.strip())
+    if kept and log:
+        log(kept)
     return ""
 
 

@@ -193,3 +193,26 @@ def test_replayed_patch_never_overwrites_a_later_manual_fix(repo, tmp_path, monk
     git(repo, "am", "-q", patch)
     assert "return all();" in open(os.path.join(repo, *steps.split("/")), encoding="utf-8").read()
     assert base_commit
+
+
+def test_sync_keeps_the_branch_version_on_conflict(repo):
+    from tools import cucumber_failures as cf
+    steps = "src/test/java/cucumber/features/clientx/Steps.java"
+    write(os.path.join(repo, *steps.split("/")), "class Steps {\n  List<JsonNode> find() {}\n}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-q", "-b", "agent")
+    write(os.path.join(repo, *steps.split("/")), "class Steps {\n  JsonNode find() {}\n}\n")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/n.feature"), "Feature: N\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lot 1")
+    git(repo, "checkout", "-q", "integration")
+    write(os.path.join(repo, *steps.split("/")), "class Steps {\n  List<JsonNode> find() { return all(); }\n}\n")
+    git(repo, "commit", "-qam", "correction manuelle")
+    git(repo, "checkout", "-q", "agent")
+    kept = []
+    assert cf.sync_with_branch(repo, "integration", kept.extend) == ""
+    assert "return all();" in open(os.path.join(repo, *steps.split("/")), encoding="utf-8").read()
+    assert os.path.exists(os.path.join(repo, "src/test/resources/cucumber/features/clientx/n.feature"))
+    assert kept == [steps]
+    assert cf.sync_with_branch(repo, "integration") == ""                      # déjà à jour : rien à faire

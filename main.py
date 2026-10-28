@@ -3001,9 +3001,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     except RuntimeError as e:
         print(f"❌ {e}")
         return 2
-    if args.from_import:
-        # Correction d'un run : sur la branche réelle lue par Jenkins (scénarios écrits hors de l'agent compris)
-        problem = cucumber_failures.sync_with_branch(worktree, state["base"])
+    if args.from_import or resume_state or complete_state:
+        # Correction d'un run, reprise ou complément : l'espace de travail est remis sur la branche réelle lue par
+        # Jenkins (scénarios écrits ou corrigés hors de l'agent compris) ; sur un conflit, la branche l'emporte
+        subprocess.run(["git", "-C", worktree, "fetch", "-q", "origin"], capture_output=True)
+        problem = cucumber_failures.sync_with_branch(
+            worktree, state["base"],
+            lambda kept: print(f"[CUCUMBER] Version de {state['base']} retenue sur conflit (corrections faites "
+                               f"depuis, jamais écrasées) : {', '.join(kept)}"))
         print(f"[CUCUMBER] ⚠️ Espace de travail non synchronisé avec {state['base']} : {problem}" if problem else
               f"[CUCUMBER] Espace de travail synchronisé avec {state['base']} (branche lue par Jenkins).")
     cucumber_tools.save_state(client, state)
