@@ -108,6 +108,7 @@ def test_review_sample_puts_unverified_first():
 
 
 def test_execution_mode_requires_spec_repository(monkeypatch):
+    monkeypatch.setenv("CUCUMBER_AGENT_JENKINS", "1")
     monkeypatch.setenv("CUCUMBER_VERIFY_JOB", "QA/VERIFY")
     monkeypatch.setenv("JENKINS_URL", "https://jenkins")
     monkeypatch.delenv("CUCUMBER_VERIFY_LOCAL_CMD", raising=False)
@@ -366,3 +367,11 @@ def test_override_without_standard_env(monkeypatch, tmp_path):
     monkeypatch.setenv("CUCUMBER_VERIFY_REQUIRE_STD", "1")
     result = cv.verify_lot("jenkins", str(tmp_path), "HEAD", None, [rel], scenarios, kinds, "lot1")
     assert result["scenarios"]["@agent_acme_1_1"]["statut"] == "non_verifie"
+
+
+def test_agent_runs_no_test_by_default(monkeypatch):
+    monkeypatch.delenv("CUCUMBER_AGENT_JENKINS", raising=False)
+    monkeypatch.setenv("CUCUMBER_VERIFY_JOB", "QA/VERIFY")
+    monkeypatch.setenv("CUCUMBER_VERIFY_LOCAL_CMD", "mvn test")
+    mode, message = cv.execution_mode({"verify_branch": "agent"}, "integration")
+    assert mode == "" and "ne lance aucun test" in message and "importez son résultat" in message

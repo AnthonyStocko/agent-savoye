@@ -204,6 +204,7 @@ def test_tested_version_is_compared_to_the_task_commits(jenkins, tmp_path, monke
 
 def test_verification_runs_on_the_work_branch_without_patch(jenkins, monkeypatch):
     repo, remote, calls = jenkins
+    monkeypatch.setenv("CUCUMBER_AGENT_JENKINS", "1")
     monkeypatch.setenv("CUCUMBER_VERIFY_JOB", "CUCUMBER-CUSTOMER")
     monkeypatch.setenv("JENKINS_URL", "https://jenkins")
     monkeypatch.setattr(jenkins_tools, "job_parameters", lambda job: {k: v["type"] for k, v in DEFINITIONS.items()})

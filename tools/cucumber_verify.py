@@ -761,6 +761,14 @@ def job_sources(cucumber_repo: str, base_branch: str, base_commit: str, standard
             "CUCUMBER_SPEC_COMMIT": base_commit, "CUCUMBER_STANDARD_COMMIT": standard_commit}
 
 
+def agent_runs_tests() -> bool:
+    """
+    CUCUMBER_AGENT_JENKINS (défaut 0) : l'agent exécute-t-il lui-même des tests pendant la génération (job Jenkins,
+    branche de travail poussée, commande locale) ? Par défaut non : il livre un patch, rien n'est poussé ni lancé.
+    """
+    return os.getenv("CUCUMBER_AGENT_JENKINS", "0").strip() == "1"
+
+
 def execution_mode(profile: dict = None, base_branch: str = "") -> tuple:
     """
     ("jenkins" | "branche" | "local" | "", message) : job CUCUMBER_VERIFY_JOB s'il accepte PATCH (fichier), TAGS, ENV
@@ -769,6 +777,11 @@ def execution_mode(profile: dict = None, base_branch: str = "") -> tuple:
     sinon commande CUCUMBER_VERIFY_LOCAL_CMD, sinon aucun moyen d'exécution (niveau 1 seulement). Job sans
     CUCUMBER_SPEC_COMMIT / CUCUMBER_STANDARD_COMMIT : utilisable, avec un avertissement.
     """
+    if not agent_runs_tests():
+        # Parcours de l'onglet : l'agent livre un patch ; l'utilisateur le pousse, lance son job complet et en
+        # importe le résultat (corrections proposées ensuite)
+        return "", (f"{NOT_VERIFIED} : l'agent ne pousse rien et ne lance aucun test (CUCUMBER_AGENT_JENKINS=0) — "
+                    f"appliquez le patch, lancez votre job Jenkins complet, puis importez son résultat")
     job = os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
     reasons = []
     if job and os.getenv("JENKINS_URL", "").strip():

@@ -126,6 +126,8 @@ Les livrables (`<TICKET>-cadrage.md`, `<TICKET>-*.patch`, `<TICKET>-release-note
 
 ### Parcours de l'onglet Cucumber
 
+**Rôle de l'onglet** : générer un patch de tests Cucumber pour un client. L'utilisateur choisit le projet et les fonctionnalités à tester, lance la génération et télécharge le patch ; il l'applique dans son propre workspace, le commite, le pousse et lance lui-même le job Jenkins complet. Par défaut (`CUCUMBER_AGENT_JENKINS=0`), l'agent ne pousse rien et ne lance aucun test : la pertinence est contrôlée sans exécution (contrôles statiques, compilation par l'agent), puis par le run complet de l'utilisateur, dont le résultat importé (URL du build) donne les corrections proposées par l'agent. `CUCUMBER_AGENT_JENKINS=1` réactive la vérification par exécution pendant la génération et le bouton « Pousser et lancer le run ».
+
 Nouveau parcours : l'utilisateur choisit le projet, l'agent détecte le reste en arrière-plan ; l'IHM ne montre que des résumés et les points qui demandent une décision. L'onglet 🥒 se lit de haut en bas :
 
 - **Projet** : liste des projets connus, ou « Nouveau projet… » ; « Client et dépôts » replié une fois renseigné.

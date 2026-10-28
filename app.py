@@ -2022,7 +2022,12 @@ def render_expert(ctx: dict, data: dict) -> None:
                               data["dependencies"])
     render_cucumber_generation(ctx, data["state"], data["dependencies"])
     st.markdown("##### Exécution détaillée")
-    render_cucumber_run(ctx, data["state"])
+    if cucumber_verify.agent_runs_tests():
+        render_cucumber_run(ctx, data["state"])
+    else:
+        st.caption("Exécution par vous : appliquez le patch dans votre workspace, commitez, poussez et lancez votre job "
+                   "Jenkins complet, puis importez son résultat ci-dessous (URL du build) : l'agent propose les "
+                   "corrections. L'agent ne pousse rien et ne lance aucun test (CUCUMBER_AGENT_JENKINS=0).")
     render_cucumber_import(client, data["state"])
     st.markdown("##### Corrections et bilan")
     render_cucumber_corrections(client, ctx["cmd"], data["rows"], data["state"])
@@ -3293,6 +3298,13 @@ with tab_config:
                  "écrit (CUCUMBER_COMPILE_CMD, test-compile : rien n'est exécuté) et corrige ses erreurs avec tout le "
                  "contexte du lot. Décoché = compilation après le lot seulement, corrigée par CLAUDE_MODEL_CUCUMBER_FIX.")
         env_values["CUCUMBER_AGENT_COMPILE"] = "1" if agent_compile else "0"
+        agent_jenkins = st.checkbox(
+            "CUCUMBER_AGENT_JENKINS", value=os.getenv("CUCUMBER_AGENT_JENKINS", "0").strip() == "1",
+            help="Décoché (défaut) : l'agent livre un patch, ne pousse rien et ne lance aucun test ; vous appliquez le "
+                 "patch, lancez votre job complet et importez son résultat. Coché : l'agent vérifie lui-même par "
+                 "exécution pendant la génération (CUCUMBER_VERIFY_JOB, branche de travail du profil ou commande "
+                 "locale) et l'étape Exécution propose « Pousser et lancer le run ».")
+        env_values["CUCUMBER_AGENT_JENKINS"] = "1" if agent_jenkins else "0"
         st.markdown("##### Vérification de la pertinence par exécution")
         st.caption("Sans job ni commande locale, la génération s'arrête au contrôle statique et affiche « pertinence "
                    "non vérifiée par exécution ».")
