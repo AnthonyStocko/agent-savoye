@@ -195,6 +195,52 @@ def test_replayed_patch_never_overwrites_a_later_manual_fix(repo, tmp_path, monk
     assert base_commit
 
 
+def test_integrated_lots_are_not_reported_and_a_later_correction_is_delivered(repo, tmp_path, monkeypatch):
+    """Cas réel (import n° 7) : lots déjà livrés puis retouchés à la main sur la branche, worktree synchronisé
+    (la branche gagne) ; seule la correction récente doit sortir, même si son contexte a bougé sur la branche."""
+    monkeypatch.delenv("CUCUMBER_PATCH_MODE", raising=False)
+    feat = "src/test/resources/cucumber/features/clientx/a.feature"
+    other = "src/test/resources/cucumber/features/clientx/b.feature"
+    lines = [f"    Then ligne {i}\n" for i in range(20)]
+    write(os.path.join(repo, *feat.split("/")), "Feature: A\n  Scenario: s\n" + "".join(lines))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-q", "-b", "agent")
+    write(os.path.join(repo, *other.split("/")), "@agent_clientx_1\nFeature: B\n  Scenario: b\n    Then x\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lot 1")
+    # Livré à la main puis retouché sur la branche, sans les tags
+    git(repo, "checkout", "-q", "integration")
+    write(os.path.join(repo, *other.split("/")), "Feature: B\n  Scenario: b\n    Then y\n")
+    edited = lines.copy()
+    edited[2] = "    Then ligne 2 retouchée\n"
+    write(os.path.join(repo, *feat.split("/")), "Feature: A\n  Scenario: s\n" + "".join(edited))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "intégration manuelle")
+    git(repo, "checkout", "-q", "agent")
+    git(repo, "merge", "-q", "--no-edit", "-X", "theirs", "integration")
+    # Correction récente de l'agent, dans un fichier dont le contexte a bougé sur la branche depuis
+    git(repo, "checkout", "-q", "integration")
+    edited[4] = "    Then ligne 4 retouchée\n"
+    write(os.path.join(repo, *feat.split("/")), "Feature: A\n  Scenario: s\n" + "".join(edited))
+    git(repo, "commit", "-qam", "autre retouche")
+    git(repo, "checkout", "-q", "agent")
+    fixed = edited.copy()
+    fixed[4] = lines[4]
+    fixed[12] = "    Then ligne 12 corrigée\n"
+    write(os.path.join(repo, *feat.split("/")), "Feature: A\n  Scenario: s\n" + "".join(fixed))
+    git(repo, "commit", "-qam", "lot de correction 54")
+    patch = str(tmp_path / "p.patch")
+    assert ct.write_patch(repo, "integration", patch, "clientx")
+    text = open(patch, encoding="utf-8").read()
+    assert "ligne 12 corrigée" in text and "b.feature" not in text
+    assert not os.path.exists(patch + ".ecarts.txt")
+    git(repo, "checkout", "-q", "integration")
+    git(repo, "am", "-q", patch)
+    content = open(os.path.join(repo, *feat.split("/")), encoding="utf-8").read()
+    assert "ligne 12 corrigée" in content and "ligne 2 retouchée" in content and "ligne 4 retouchée" in content
+
+
 def test_sync_keeps_the_branch_version_on_conflict(repo):
     from tools import cucumber_failures as cf
     steps = "src/test/java/cucumber/features/clientx/Steps.java"

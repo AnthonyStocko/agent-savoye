@@ -2532,6 +2532,25 @@ def _git_env(repo: str, env: dict, *args, data: bytes = None) -> subprocess.Comp
     return subprocess.run(["git", "-C", repo, *args], input=data, capture_output=True, env={**os.environ, **env})
 
 
+def _three_way(worktree: str, env: dict, index: str, diff: bytes, target: str) -> bool:
+    """
+    Fusion à 3 voies d'une modification de l'agent (ancêtre : le fichier avant son commit ; d'un côté la branche,
+    de l'autre l'agent) quand le contexte exact a bougé sur la branche. Gardée seulement si elle est propre (aucun
+    conflit) ; sinon l'index est rétabli et la modification sera écartée.
+    """
+    saved = index + ".sauvegarde"
+    shutil.copyfile(index, saved)
+    try:
+        result = _git_env(worktree, env, "apply", "--cached", "--3way", "-", data=diff)
+        unmerged = _git_env(worktree, env, "ls-files", "-u", "--", target).stdout.strip()
+        if result.returncode == 0 and not unmerged:
+            return True
+        shutil.copyfile(saved, index)
+        return False
+    finally:
+        os.remove(saved)
+
+
 def _squashed_patch(worktree: str, base: str, output: str, client_name: str = "") -> bool:
     """
     Un commit sur `base` (branche d'intégration actuelle) qui REJOUE les modifications de l'agent, commit par commit
@@ -2553,6 +2572,27 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
     index = os.path.join(os.path.dirname(worktree), f"patch_index_{os.getpid()}")
     env = {"GIT_INDEX_FILE": index}
     applied, already, rejected = [], [], []
+
+    def head_blob(rel):
+        return _git(worktree, "rev-parse", "-q", "--verify", f"HEAD:{rel}").stdout.strip()
+
+    def base_blob(rel):
+        return _git(worktree, "rev-parse", "-q", "--verify", f"{base}:{rel}").stdout.strip()
+
+    same = {}
+
+    def same_as_base(rel, target):
+        """Version actuelle de l'agent (HEAD) identique à celle de la branche, tags @agent_ mis à part."""
+        if (rel, target) not in same:
+            ours, theirs = head_blob(rel), base_blob(target)
+            equal = bool(ours) and ours == theirs
+            if not equal and ours and theirs and rel.endswith(".feature") and client_name:
+                text = _git(worktree, "show", f"HEAD:{rel}").stdout
+                other = _git(worktree, "show", f"{base}:{target}").stdout
+                keep = set(re.findall(r"@agent_\w+", other))
+                equal = strip_agent_tags(text, client_name, keep) == other
+            same[(rel, target)] = equal
+        return same[(rel, target)]
     try:
         if _git_env(worktree, env, "read-tree", base).returncode != 0:
             return False
@@ -2564,6 +2604,11 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
                 if not rel or rel.startswith("target/") or "/target/" in rel:
                     continue
                 target = rel if rel in base_files else base_by_case.get(rel.lower(), rel)
+                if target in base_files and same_as_base(rel, target):
+                    # Le fichier est aujourd'hui identique sur la branche et dans le worktree (synchronisé, la
+                    # branche gagnant les conflits) : rien à livrer, même si ce vieux commit ne se rejoue plus
+                    already.append(target)
+                    continue
                 if status.startswith("D") and target in base_files:
                     rejected.append(f"{target} : suppression écartée (jamais livrée) — {subject}")
                     continue
@@ -2589,6 +2634,8 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
                         f"b/{rel}".encode(), f"b/{target}".encode())
                 if _git_env(worktree, env, "apply", "--cached", "--check", "-", data=diff).returncode == 0:
                     _git_env(worktree, env, "apply", "--cached", "-", data=diff)
+                    applied.append(target)
+                elif _three_way(worktree, env, index, diff, target):
                     applied.append(target)
                 elif _git_env(worktree, env, "apply", "--cached", "--reverse", "--check", "-",
                               data=diff).returncode == 0:
@@ -2620,6 +2667,12 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
             print(f"[CUCUMBER] Patch : {len(set(already))} fichier(s) dont les modifications sont déjà sur la branche.")
         if not tree or tree == _git(worktree, "rev-parse", f"{base}^{{tree}}").stdout.strip():
             return False
+        delivered = _git_env(worktree, env, "diff-index", "--cached", "--name-only", "-z", base).stdout.decode(
+            "utf-8", "replace").split("\0")
+        if [d for d in delivered if d] == ["A_REVOIR.md"]:
+            print("[CUCUMBER] Patch : aucune modification de test nouvelle par rapport à la branche (tout ce que "
+                  "l'agent a écrit y est déjà) — seul le bilan A_REVOIR.md est livré. Lancer la correction du run "
+                  "importé (étape Correction) pour obtenir de nouveaux correctifs.")
         subjects = "\n".join(dict.fromkeys(
             f"- {_git(worktree, 'log', '-1', '--format=%s', c).stdout.strip()}" for c in commits))
         message = (f"Cucumber : tests des spécifiques {client_name or ''} (agent)".replace("  ", " ")
