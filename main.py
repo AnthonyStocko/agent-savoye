@@ -2379,7 +2379,7 @@ def preview_cucumber_jenkins(client: str, tags: str, repository: str = "", base_
     print("[RUN JENKINS — APERÇU] Rôles des paramètres : "
           + (", ".join(f"{role} → {name}" for role, name in out["roles"].items()) or "aucun détecté"))
     for name, value in out["parametres"].items():
-        print(f"    {name} = {value}")
+        print(f"    {name} = {value}" + ("   (imposé par le profil)" if name in out.get("imposes", []) else ""))
     if out["attendus"] is not None:
         print(f"[RUN JENKINS — APERÇU] Tests attendus pour ces tags dans le worktree : {out['attendus']}")
     for warning in out["avertissements"]:

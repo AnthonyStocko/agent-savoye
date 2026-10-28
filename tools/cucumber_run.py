@@ -142,8 +142,11 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     log(f"[RUN JENKINS] Worktree {'commité et ' if committed else ''}poussé sur {check['branche']} "
         f"({run['commit'][:10]}), en tête de la branche distante.")
     roles = check["roles"]
+    fixed, fixed_warnings = cucumber_job.fixed_parameters(profile, check["definitions"])
+    for warning in fixed_warnings:
+        log(f"[RUN JENKINS] ⚠️ {warning}")
     params = cucumber_job.build_parameters(check["definitions"], roles, check["branche"], repository, tags,
-                                           run["commit"])
+                                           run["commit"], fixed=fixed)
     run["parametres"] = cucumber_job.visible_parameters(params, roles)
     run["version_testee"] = tested_version(client_name, params, roles, inventory, client_root)
     if run["version_testee"]:
@@ -195,8 +198,11 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
            "erreurs": list(check["erreurs"]), "avertissements": list(check["avertissements"]),
            "roles": {r: n for r, n in (check.get("roles") or {}).items() if n}, "parametres": {}, "attendus": None}
     if check["definitions"]:
+        fixed, fixed_warnings = cucumber_job.fixed_parameters(profile, check["definitions"])
+        out["avertissements"] += fixed_warnings
+        out["imposes"] = sorted(fixed)
         params = cucumber_job.build_parameters(check["definitions"], check["roles"], check["branche"], repository,
-                                               tags, rev_parse(worktree, "HEAD") if worktree else "")
+                                               tags, rev_parse(worktree, "HEAD") if worktree else "", fixed=fixed)
         out["parametres"] = cucumber_job.visible_parameters(params, check["roles"])
     if worktree and os.path.exists(os.path.join(worktree, ".git")):
         texts = feature_texts(worktree)

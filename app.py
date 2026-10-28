@@ -1340,7 +1340,7 @@ def profile_field_inputs(client: str, fields: list, profile: dict, profile_doc: 
         values[key] = st.text_input(cucumber_profile.LABELS[key], value=profile[key],
                                     placeholder={"verify_branch_param": cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
                                                  "run_job": "DOSSIER/JOB"}.get(key, ""))
-    for key in (k for k in ("init_features", "protected_files") if k in fields):
+    for key in (k for k in ("init_features", "protected_files", "job_params") if k in fields):
         values[key] = [line.strip() for line in st.text_area(
             f"{cucumber_profile.LABELS[key]}, un par ligne", value="\n".join(profile[key]),
             height=100).splitlines() if line.strip()]

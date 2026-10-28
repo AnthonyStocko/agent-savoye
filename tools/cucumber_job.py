@@ -131,13 +131,33 @@ def current_values(definitions: dict) -> dict:
     return out
 
 
+def fixed_parameters(profile: dict, definitions: dict = None) -> tuple:
+    """
+    Paramètres imposés par le profil client (« job_params » : lignes NOM=valeur) : ({nom: valeur}, avertissements).
+    La configuration actuelle du job est celle du dernier client lancé (artefact monté, suites Standard cochées) :
+    ces valeurs la remplacent pour chaque run de l'agent. Un nom absent du job est signalé et ignoré.
+    """
+    fixed, warnings = {}, []
+    for line in (profile or {}).get("job_params") or []:
+        name, sep, value = str(line).partition("=")
+        name = name.strip()
+        if not sep or not name:
+            warnings.append(f"paramètre imposé illisible (attendu NOM=valeur) : {line}")
+        elif definitions and name not in definitions:
+            warnings.append(f"paramètre imposé {name} absent du job : ignoré")
+        else:
+            fixed[name] = value.strip()
+    return fixed, warnings
+
+
 def build_parameters(definitions: dict, roles: dict, branch: str, repository: str = "", tags: str = "",
-                     commit: str = "", env: str = "") -> dict:
+                     commit: str = "", env: str = "", fixed: dict = None) -> dict:
     """
-    Paramètres d'un build : configuration actuelle du job, puis branche de travail, dépôt client, attente
-    décochée, commit et environnement (si le job a ces rôles) et filtre de tags ajouté aux arguments.
+    Paramètres d'un build : configuration actuelle du job, remplacée par les paramètres imposés du profil (`fixed`),
+    puis branche de travail, dépôt client, attente décochée, commit et environnement (si le job a ces rôles) et
+    filtre de tags ajouté aux arguments.
     """
-    params = current_values(definitions)
+    params = {**current_values(definitions), **(fixed or {})}
     for role, value in (("branche", branch), ("depot", repository), ("commit", commit), ("environnement", env)):
         if roles.get(role) and value:
             params[roles[role]] = value

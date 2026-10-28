@@ -271,3 +271,18 @@ def test_preview_shows_the_parameters_without_pushing_nor_launching(jenkins):
     assert git(repo, "rev-parse", "HEAD") == head                        # rien n'est commité
     unknown = cr.preview(CLIENT, repo, PROFILE, "@inconnu")
     assert not unknown["ok"] and "aucun scénario actif" in unknown["erreurs"][-1]
+
+
+def test_profile_imposes_job_parameters_over_the_current_configuration(jenkins):
+    repo, remote, calls = jenkins
+    calls["definitions"]["hasSpecific"] = {"type": "BooleanParameterDefinition", "defaut": False}
+    profile = {**PROFILE, "job_params": ["hasSpecific=true", "COMPONENT_NAME=apparel-odatio-app", "INCONNU=1",
+                                         "illisible"]}
+    out = cr.preview(CLIENT, repo, profile, "@feature_a")
+    assert out["parametres"]["hasSpecific"] == "true" and out["parametres"]["COMPONENT_NAME"] == "apparel-odatio-app"
+    assert "hasSpecific" in out["imposes"] and "INCONNU" not in out["parametres"]
+    assert any("INCONNU absent du job" in w for w in out["avertissements"])
+    assert any("illisible" in w for w in out["avertissements"])
+    run = cr.launch(CLIENT, repo, profile, "@feature_a", log=lambda line: None)
+    assert calls["params"][-1]["hasSpecific"] == "true"
+    assert calls["params"][-1]["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@feature_a'")
