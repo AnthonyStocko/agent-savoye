@@ -154,12 +154,42 @@ def test_squashed_patch_uses_the_existing_case_of_a_path(repo, tmp_path, monkeyp
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "base")
     base = git(repo, "rev-parse", "HEAD")
-    git(repo, "rm", "-q", "--cached", "src/test/resources/cucumber/features/clientx/WMS/product/b.feature")
-    git(repo, "commit", "-qm", "retrait")
-    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/WMS/Product/b.feature"), "Feature: B2\n")
-    git(repo, "add", "src/test/resources/cucumber/features/clientx/WMS/Product/b.feature")
-    git(repo, "commit", "-qm", "lot")
+    git(repo, "checkout", "-q", "-b", "agent")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/WMS/product/b.feature"),
+          "Feature: B\n  Scenario: agent\n")
+    git(repo, "commit", "-qam", "lot")
     patch = str(tmp_path / "p.patch")
     assert ct.write_patch(repo, base, patch, "clientx")
     text = open(patch, encoding="utf-8").read()
-    assert "WMS/product/b.feature" in text and "WMS/Product/b.feature" not in text and "Feature: B2" in text
+    assert "WMS/product/b.feature" in text and "Scenario: agent" in text and "WMS/Product" not in text
+
+
+def test_replayed_patch_never_overwrites_a_later_manual_fix(repo, tmp_path, monkeypatch):
+    """Cas réel : fichier corrigé à la main sur la branche après le lot de l'agent ; la synchronisation donnait
+    raison à l'agent (version périmée), le patch ne doit pas la réintroduire."""
+    monkeypatch.delenv("CUCUMBER_PATCH_MODE", raising=False)
+    steps = "src/test/java/cucumber/features/clientx/Steps.java"
+    write(os.path.join(repo, *steps.split("/")), "class Steps {\n  List<JsonNode> find() {}\n}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    base_commit = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "-b", "agent")
+    write(os.path.join(repo, *steps.split("/")), "class Steps {\n  JsonNode find() {}\n}\n")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/n.feature"), "Feature: N\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lot 1 (agent)")
+    git(repo, "checkout", "-q", "integration")
+    write(os.path.join(repo, *steps.split("/")), "class Steps {\n  List<JsonNode> find() { return all(); }\n}\n")
+    git(repo, "commit", "-qam", "correction manuelle")
+    git(repo, "checkout", "-q", "agent")
+    git(repo, "merge", "-q", "--no-edit", "-X", "ours", "integration")    # synchronisation : l'agent gagne
+    patch = str(tmp_path / "p.patch")
+    assert ct.write_patch(repo, "integration", patch, "clientx")
+    text = open(patch, encoding="utf-8").read()
+    assert "n.feature" in text and "Steps.java" not in text                  # correction manuelle préservée
+    ecarts = open(patch + ".ecarts.txt", encoding="utf-8").read()
+    assert "Steps.java" in ecarts and "version de la branche conservée" in ecarts
+    git(repo, "checkout", "-q", "integration")
+    git(repo, "am", "-q", patch)
+    assert "return all();" in open(os.path.join(repo, *steps.split("/")), encoding="utf-8").read()
+    assert base_commit

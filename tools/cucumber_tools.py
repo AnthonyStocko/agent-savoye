@@ -2534,71 +2534,98 @@ def _git_env(repo: str, env: dict, *args, data: bytes = None) -> subprocess.Comp
 
 def _squashed_patch(worktree: str, base: str, output: str, client_name: str = "") -> bool:
     """
-    Un commit sur `base`, construit sans espace de travail temporaire (index temporaire : robuste sous Windows, où
-    un worktree verrouillé faisait retomber sur un patch de tous les commits). Fichiers de l'agent pris dans HEAD
-    (tags @agent_ retirés) ; jamais de suppression d'un fichier présent dans `base` (un scénario n'est jamais
-    supprimé, et un fichier poussé depuis par l'utilisateur ne doit pas disparaître) ; deux chemins qui ne diffèrent
-    que par la casse (même fichier sous Windows) : un seul est livré, celui de `base` à défaut le plus récent.
+    Un commit sur `base` (branche d'intégration actuelle) qui REJOUE les modifications de l'agent, commit par commit
+    (fusions de synchronisation exclues), fichier par fichier, dans un index temporaire — et non l'état final du
+    worktree, qui pouvait contenir une version périmée d'un fichier corrigé depuis à la main (une synchronisation
+    donnait raison à l'agent sur un conflit). Pour chaque modification :
+    - déjà présente dans `base` : ignorée ;
+    - applicable sur `base` (même avec un décalage de lignes) : appliquée ;
+    - en conflit avec une modification faite depuis sur `base` : écartée et signalée (la version de `base` gagne).
+    Jamais de suppression d'un fichier présent dans `base` ; chemin qui ne diffère d'un fichier de `base` que par
+    la casse : livré sous le chemin de `base`. Tags @agent_ retirés des .feature (CUCUMBER_KEEP_AGENT_TAGS=1 :
+    gardés). Écrit `<output>.ecarts.txt` (modifications écartées) s'il y en a.
     """
-    paths = agent_paths(worktree, base)
-    if not paths:
+    commits = _git(worktree, "rev-list", "--reverse", "--no-merges", f"{base}..HEAD").stdout.split()
+    if not commits:
         return False
-    # -z : chemins non ASCII (accents) non échappés, identiques à ceux d'agent_paths
-    head_files = set(filter(None, _git(worktree, "ls-tree", "-r", "-z", "--name-only", "HEAD").stdout.split("\0")))
     base_files = set(filter(None, _git(worktree, "ls-tree", "-r", "-z", "--name-only", base).stdout.split("\0")))
-    skipped = [p for p in paths if p not in head_files and p in base_files]
-    if skipped:
-        print(f"[CUCUMBER] Patch : {len(skipped)} suppression(s) de fichiers existants écartée(s) (jamais livrées) : "
-              + ", ".join(skipped[:5]) + (" …" if len(skipped) > 5 else ""))
-    by_case = {}
-    for rel in (p for p in paths if p in head_files):
-        by_case.setdefault(rel.lower(), []).append(rel)
-    kept = []
-    for variants in by_case.values():
-        if len(variants) > 1:
-            chosen = next((v for v in variants if v in base_files), variants[-1])
-            print(f"[CUCUMBER] Patch : chemins identiques à la casse près ({', '.join(variants)}) : seul {chosen} "
-                  f"est livré")
-            variants = [chosen]
-        kept += variants
-    # Fichier de l'agent dont le chemin ne diffère d'un fichier de `base` que par la casse (dossier renommé entre
-    # temps, ex. WMS/product -> WMS/Product) : livré sous le chemin de `base`, jamais en doublon
     base_by_case = {b.lower(): b for b in base_files}
-    target_of = {}
-    for rel in kept:
-        target = rel if rel in base_files else base_by_case.get(rel.lower(), rel)
-        if target != rel:
-            print(f"[CUCUMBER] Patch : {rel} livré sous le chemin existant {target} (casse différente)")
-        target_of[rel] = target
-    if not kept:
-        return False
-    strip = client_name and os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() != "1"
-    modes = {}
-    for line in filter(None, _git(worktree, "ls-tree", "-r", "-z", "HEAD", "--", *kept).stdout.split("\0")):
-        meta, _, rel = line.partition("\t")
-        modes[rel] = meta.split()[0]
     index = os.path.join(os.path.dirname(worktree), f"patch_index_{os.getpid()}")
     env = {"GIT_INDEX_FILE": index}
+    applied, already, rejected = [], [], []
     try:
         if _git_env(worktree, env, "read-tree", base).returncode != 0:
             return False
-        for rel in kept:
-            data = subprocess.run(["git", "-C", worktree, "show", f"HEAD:{rel}"], capture_output=True).stdout
-            if strip and rel.endswith(".feature"):
-                text = data.decode("utf-8", errors="replace")
-                keep = set(re.findall(r"@agent_\w+", _git(worktree, "show", f"{base}:{target_of[rel]}").stdout))
-                data = strip_agent_tags(text, client_name, keep).encode("utf-8")
-            blob = _git_env(worktree, env, "hash-object", "-w", "--stdin", data=data).stdout.decode().strip()
-            if not blob:
-                return False
-            _git_env(worktree, env, "update-index", "--add", "--cacheinfo",
-                     f"{modes.get(rel, '100644')},{blob},{target_of[rel]}")
+        for commit in commits:
+            subject = _git(worktree, "log", "-1", "--format=%s", commit).stdout.strip()
+            listing = _git(worktree, "diff-tree", "--no-commit-id", "-r", "-z", "--name-status", "--no-renames",
+                           "--root", commit).stdout.split("\0")
+            for status, rel in zip(listing[0::2], listing[1::2]):
+                if not rel or rel.startswith("target/") or "/target/" in rel:
+                    continue
+                target = rel if rel in base_files else base_by_case.get(rel.lower(), rel)
+                if status.startswith("D") and target in base_files:
+                    rejected.append(f"{target} : suppression écartée (jamais livrée) — {subject}")
+                    continue
+                if status.startswith("A") and _git_env(worktree, env, "ls-files", "--", target).stdout.strip():
+                    # Fichier créé par l'agent mais déjà présent sur la branche (poussé depuis) : identique = déjà
+                    # livré, sinon la version de la branche gagne
+                    ours = _git(worktree, "rev-parse", f"{commit}:{rel}").stdout.strip()
+                    theirs = _git_env(worktree, env, "ls-files", "-s", "--", target).stdout.decode().split()
+                    if theirs and theirs[1] == ours:
+                        already.append(target)
+                    else:
+                        rejected.append(f"{target} : créé par l'agent mais déjà présent, différent, sur la branche "
+                                        f"(version de la branche conservée) — {subject}")
+                    continue
+                parent = f"{commit}^" if _git(worktree, "rev-parse", "-q", "--verify", f"{commit}^").stdout.strip() \
+                    else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+                diff = subprocess.run(["git", "-C", worktree, "diff", "--binary", "--full-index", parent, commit,
+                                       "--", rel], capture_output=True).stdout
+                if not diff.strip():
+                    continue
+                if target != rel:
+                    diff = diff.replace(f"a/{rel}".encode(), f"a/{target}".encode()).replace(
+                        f"b/{rel}".encode(), f"b/{target}".encode())
+                if _git_env(worktree, env, "apply", "--cached", "--check", "-", data=diff).returncode == 0:
+                    _git_env(worktree, env, "apply", "--cached", "-", data=diff)
+                    applied.append(target)
+                elif _git_env(worktree, env, "apply", "--cached", "--reverse", "--check", "-",
+                              data=diff).returncode == 0:
+                    already.append(target)
+                else:
+                    rejected.append(f"{target} : modification de l'agent en conflit avec une modification faite "
+                                    f"depuis sur la branche (version de la branche conservée) — {subject}")
+        if client_name and os.getenv("CUCUMBER_KEEP_AGENT_TAGS", "").strip() != "1":
+            changed = _git_env(worktree, env, "diff-index", "--cached", "--name-only", "-z", base).stdout.decode(
+                "utf-8", "replace").split("\0")
+            for rel in (r for r in changed if r.endswith(".feature")):
+                text = _git_env(worktree, env, "show", f":{rel}").stdout.decode("utf-8", "replace")
+                keep = set(re.findall(r"@agent_\w+", _git(worktree, "show", f"{base}:{rel}").stdout))
+                cleaned = strip_agent_tags(text, client_name, keep).encode("utf-8")
+                blob = _git_env(worktree, env, "hash-object", "-w", "--stdin", data=cleaned).stdout.decode().strip()
+                mode = (_git_env(worktree, env, "ls-files", "-s", "--", rel).stdout.decode().split() or ["100644"])[0]
+                _git_env(worktree, env, "update-index", "--cacheinfo", f"{mode},{blob},{rel}")
         tree = _git_env(worktree, env, "write-tree").stdout.decode().strip()
+        ecarts = output + ".ecarts.txt"
+        if rejected:
+            with open(ecarts, "w", encoding="utf-8") as f:
+                f.write("Modifications de l'agent non livrées (à reprendre si besoin) :\n"
+                        + "\n".join(f"- {r}" for r in dict.fromkeys(rejected)) + "\n")
+            print(f"[CUCUMBER] Patch : {len(set(rejected))} modification(s) écartée(s) (conflit ou suppression), "
+                  f"détail : {ecarts}")
+        elif os.path.exists(ecarts):
+            os.remove(ecarts)
+        if already:
+            print(f"[CUCUMBER] Patch : {len(set(already))} fichier(s) dont les modifications sont déjà sur la branche.")
         if not tree or tree == _git(worktree, "rev-parse", f"{base}^{{tree}}").stdout.strip():
             return False
-        subjects = _git(worktree, "log", "--no-merges", "--reverse", "--format=- %s", f"{base}..HEAD").stdout.strip()
+        subjects = "\n".join(dict.fromkeys(
+            f"- {_git(worktree, 'log', '-1', '--format=%s', c).stdout.strip()}" for c in commits))
         message = (f"Cucumber : tests des spécifiques {client_name or ''} (agent)".replace("  ", " ")
-                   + f"\n\nÉcart net avec {base}, en un commit. Commits de l'agent :\n{subjects}")
+                   + f"\n\nModifications de l'agent rejouées sur {base}, en un commit. Commits de l'agent :\n"
+                   + subjects + (f"\n\nÉcartées (voir {os.path.basename(ecarts)}) : {len(set(rejected))}"
+                                 if rejected else ""))
         commit = _git_env(worktree, env, "commit-tree", tree, "-p", rev_parse(worktree, base), "-m",
                           message).stdout.decode().strip()
         return bool(commit) and format_patch(worktree, f"{commit}~1..{commit}", output)
