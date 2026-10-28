@@ -116,3 +116,44 @@ def test_fix_own_init_corrects_commits_and_reruns_the_init(main_module, worktree
                            "branche", "@INIT", {}, {}, {}, "", {"java_std": "j"}, {"sources": "s"}, "",
                            sys.executable, os.getcwd(), "w")
     assert not other["ok"] and calls == []
+
+
+def test_fix_from_an_imported_run_delivers_a_patch(main_module, monkeypatch, tmp_path):
+    import json
+    import subprocess
+    from types import SimpleNamespace
+    m = main_module
+    monkeypatch.setattr(m.cucumber_tools, "CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(m.cucumber_tools, "WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("CUCUMBER_COMPILE_CMD", "")
+    monkeypatch.delenv("CUCUMBER_AGENT_JENKINS", raising=False)
+    worktree = m.cucumber_tools.worktree_dir(CLIENT)
+    os.makedirs(worktree)
+    git(worktree, "init", "-q", "-b", "integration")
+    git(worktree, "config", "user.email", "t@e.x")
+    git(worktree, "config", "user.name", "t")
+    write(os.path.join(worktree, *COMPLEMENTS.split("/")), FEATURE)
+    write(os.path.join(worktree, *JAVA.split("/")), FAILING)
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-qm", "base")
+    folder = os.path.join(m.cucumber_import.imports_dir(CLIENT), "5")
+    os.makedirs(folder)
+    identifier = f"{COMPLEMENTS}::Clientx - Contrôle de l'environnement (lecture seule)"
+    with open(os.path.join(folder, "analyse.json"), "w", encoding="utf-8") as f:
+        json.dump({"init_en_echec": {"id": identifier, "step": ce.check_expression(CLIENT),
+                                     "message": "java.lang.AssertionError: non confirmées"},
+                   "resultats": {identifier: {"journal": "Dépendances de l'environnement non confirmées"}}}, f)
+    monkeypatch.setattr(m.cucumber_tools, "standard_java_catalogue", lambda *a: {"java_std": "j"})
+    monkeypatch.setattr(m.cucumber_tools, "std_step_code", lambda *a: {"sources": "s"})
+    monkeypatch.setattr(m, "report_token_usage", lambda *a, **k: None)
+
+    def claude(prompt, *a, **k):
+        assert "non confirmées" in prompt
+        write(os.path.join(worktree, *JAVA.split("/")), FIXED)
+        return 0, '{"cause": "dépendance non confirmée en échec"}', {}, False
+    monkeypatch.setattr(m, "run_cucumber_claude", claude)
+    args = SimpleNamespace(client_name=CLIENT, cucumber_base_branch="integration", cucumber_repo="clientx-cucumber")
+    assert m.fix_init_from_import(args, 5, "", "", "", sys.executable, os.getcwd()) == 0
+    patch = tmp_path / f"{CLIENT}-cucumber-init-correction.patch"
+    assert patch.exists() and "scenario.log(missing.toString());" in patch.read_text(encoding="utf-8")
+    assert "Assertions.fail(missing" in patch.read_text(encoding="utf-8")       # ligne retirée

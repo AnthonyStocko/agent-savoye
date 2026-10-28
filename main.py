@@ -919,6 +919,7 @@ def main():
     parser.add_argument("--health-only", action="store_true", help="generate-cucumber-client : bilan de santé du dépôt <client>-cucumber avant génération (emplacement et tags des features, fichiers de données manquants, compilation et dry-run de toutes ses features), sans appel à Claude")
     parser.add_argument("--import-run", nargs="*", default=None, help="generate-cucumber-client : import d'un rapport d'exécution (console Jenkins, rapport Cucumber JSON, exports de logs serveur CSV), secrets masqués avant stockage, analysé sans appel à Claude")
     parser.add_argument("--import-url", default="", help="generate-cucumber-client : import d'un build Jenkins (console et rapports Cucumber JSON lus en mémoire), analysé sans appel à Claude")
+    parser.add_argument("--fix-init-from-import", type=int, default=0, help="generate-cucumber-client : l'init du run importé n° N échoue dans les compléments écrits par l'agent : il corrige ces fichiers seuls (contrôlés), puis rejoue l'init si CUCUMBER_AGENT_JENKINS=1, sinon livre <client>-cucumber-init-correction.patch")
     parser.add_argument("--from-import", type=int, default=0, help="generate-cucumber-client --complete : lots « correction » des échecs « test » des scénarios de l'agent de l'import n° N")
     parser.add_argument("--run-jenkins", action="store_true", help="generate-cucumber-client : pousse le worktree sur la branche lue par le job (profil), contrôle le commit, lance le job Jenkins du client, suit le build puis importe sa console et ses rapports (bilan)")
     parser.add_argument("--run-dry", action="store_true", help="generate-cucumber-client --run-jenkins : aperçu sans push ni lancement (0 token) — job, branche, rôles des paramètres, paramètres envoyés (secrets masqués) et nombre de tests attendus pour --run-tags")
@@ -2576,6 +2577,10 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
                                         "corrections": result.get("corrections") or [],
                                         "restantes": result.get("restantes") or []})
         cucumber_tools.save_state(client, state)
+        if not verify_mode:
+            # Sans exécution par l'agent (correction depuis un import) : correction commitée, à vérifier par le run
+            return {"ok": None, "message": "compléments d'init corrigés, à vérifier par un run", "build": "",
+                    "corrige": True}
         push_error = cucumber_checks.push_for_verification(
             worktree, profile["verify_branch"], f"Cucumber : correction de l'initialisation ({attempt})")[0] \
             if profile.get("verify_branch") else ""
@@ -2599,6 +2604,60 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
             break
         errors = [f"l'init échoue encore : {init['message']}"]
     return init
+
+
+def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio_version: str,
+                         token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
+    """
+    Init en échec dans un run importé (n° `numero`), uniquement dans les compléments de l'agent : correction de ces
+    fichiers (fix_own_init), commitée dans le worktree, puis — si l'agent exécute les tests (CUCUMBER_AGENT_JENKINS=1
+    et branche de travail) — init rejouée sur Jenkins ; sinon patch <client>-cucumber-init-correction.patch à
+    appliquer, pousser et vérifier par un run. Renvoie 0 si corrigé (et vérifié le cas échéant), 1 sinon, 2 si rien
+    n'est corrigeable.
+    """
+    client = args.client_name
+    analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
+                                                      "analyse.json"), {}) or {}
+    init = analysis.get("init_en_echec") or {}
+    worktree = cucumber_tools.worktree_dir(client)
+    if not init or not os.path.exists(os.path.join(worktree, ".git")):
+        print(f"[CUCUMBER INIT] Import n° {numero} : " + ("aucun échec d'initialisation." if not init else
+                                                         "aucun espace de travail : lancez d'abord une génération."))
+        return 2
+    rel, title = (init["id"].split("::", 1) + [""])[:2]
+    result = (analysis.get("resultats") or {}).get(init["id"]) or {}
+    failure = {"fichier": rel, "titre": title, "step": init.get("step", ""), "message": init.get("message", ""),
+               "journal": result.get("journal", "")}
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    state = cucumber_tools.load_state(client)
+    std_java = cucumber_tools.standard_java_catalogue(local_cucumber_std_repo, odatio_version)
+    step_code = cucumber_tools.std_step_code(local_cucumber_std_repo, odatio_version)
+    mode, message = cucumber_verify.execution_mode(profile, args.cucumber_base_branch)
+    if mode and mode != "branche":
+        mode = ""
+    print(f"[CUCUMBER INIT] Import n° {numero} : init en échec dans {rel} — {init.get('step')} — "
+          f"{(init.get('message') or '')[:160]}")
+    out = fix_own_init(client, worktree, {"ok": False, "message": "", "echecs": [failure]}, mode,
+                       profile.get("init_tags") or cucumber_verify.init_tags(),
+                       cucumber_verify.branch_sources(profile, args.cucumber_repo), profile, state,
+                       local_cucumber_std_repo, std_java, step_code, token_saving_rules, python_exe, workspace_dir,
+                       cucumber_tools.work_id(client))
+    cucumber_tools.save_state(client, state)
+    if out.get("ok") is False and not out.get("corrige"):
+        if not (state.get("init_corrigee") or {}).get("tentatives"):
+            return 2
+        print(f"[CUCUMBER INIT] ⛔ Init toujours en échec : {out.get('message')}")
+        return 1
+    patch = os.path.join(cucumber_tools.WORKSPACE_DIR, f"{client}-cucumber-init-correction.patch")
+    commits = [c for c in _git_out(worktree, "log", "--format=%H %s", "-20").splitlines()
+               if "compléments d'initialisation" in c and "par l'agent" in c]
+    if commits and cucumber_tools.format_patch(worktree, f"{commits[-1].split()[0]}~1..{commits[0].split()[0]}",
+                                               patch):
+        print(f"[CUCUMBER INIT] Patch de la correction de l'init (à relire, appliquer et pousser) : {patch}")
+    print("[CUCUMBER INIT] " + ("✅ Init vérifiée sur Jenkins après correction." if out.get("ok") else
+                                "Correction faite : appliquez le patch, poussez et relancez votre job, puis importez "
+                                "le résultat."))
+    return 0
 
 
 def check_server_log(client: str, path: str, scenario: str) -> int:
@@ -2680,6 +2739,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         return check_server_log(client, args.server_log, args.log_scenario)
     if args.import_run is not None or args.import_url:
         return run_cucumber_import(client, args.import_run or [], args.import_url, project)
+    if args.fix_init_from_import:
+        return fix_init_from_import(args, args.fix_init_from_import, local_cucumber_std_repo, odatio_version,
+                                    token_saving_rules, python_exe, workspace_dir)
     if args.run_jenkins and args.run_dry:
         return preview_cucumber_jenkins(client, args.run_tags, args.cucumber_repo, args.cucumber_base_branch,
                                         not args.run_no_push, args.run_branch)

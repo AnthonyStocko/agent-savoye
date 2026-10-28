@@ -13,6 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import env_tools
+from tools import cucumber_init_fix
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_import, cucumber_preflight,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
@@ -831,7 +832,7 @@ def render_cucumber_run(ctx: dict, state: dict) -> None:
                            f"celui attendu.")
 
 
-def render_cucumber_import(client: str, state: dict) -> None:
+def render_cucumber_import(client: str, state: dict, cmd: list = None) -> None:
     """
     Étape 5, import d'un rapport d'exécution (0 token) : fichiers déposés ou build Jenkins, secrets masqués en
     mémoire, analyse puis bilan (A_REVOIR.md, répertoire partagé) ; résultat du dernier import (tests, échecs,
@@ -873,6 +874,26 @@ def render_cucumber_import(client: str, state: dict) -> None:
     if init:
         st.error(f"**Initialisation en échec : aucun scénario n'est jugé.** {init['id']} — premier step en échec : "
                  f"`{init['step'] or '—'}` — cause : {init['message']}", icon=":material/block:")
+        # Échec dans les compléments d'init écrits par l'agent : il peut les corriger lui-même (ces fichiers seuls)
+        if cmd and cucumber_init_fix.enabled() and cucumber_init_fix.is_complements(init["id"].split("::", 1)[0]):
+            st.caption("Cet échec est dans les compléments d'initialisation écrits par l'agent : il peut les corriger "
+                       "lui-même (ces fichiers seuls, contrôlés), puis rejouer l'init si CUCUMBER_AGENT_JENKINS est "
+                       "coché, sinon livrer un patch de correction à appliquer.")
+            if st.button("Corriger les compléments d'init", icon=":material/build:", type="primary",
+                         key=f"cucumber_fix_init_{client}_{numero}"):
+                code = run_main_step(cmd + ["--fix-init-from-import", str(numero)])
+                patch = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     f"{client}-cucumber-init-correction.patch")
+                if code == 0 and os.path.exists(patch):
+                    st.success("Compléments d'init corrigés : patch à relire, appliquer et pousser.")
+                    with open(patch, "rb") as f:
+                        st.download_button("Télécharger le patch de correction de l'init", f.read(),
+                                           file_name=os.path.basename(patch), icon=":material/download:",
+                                           key=f"cucumber_fix_init_patch_{client}_{numero}")
+                elif code == 0:
+                    st.success("Init corrigée et vérifiée sur Jenkins.")
+                else:
+                    st.error("Correction impossible ou init toujours en échec : voir le journal technique.")
     for warning in analysis.get("avertissements") or []:
         st.warning(warning, icon=":material/schedule:")
     failures = sum(len(g["scenarios"]) for g in analysis["groupes"])
@@ -2028,7 +2049,7 @@ def render_expert(ctx: dict, data: dict) -> None:
         st.caption("Exécution par vous : appliquez le patch dans votre workspace, commitez, poussez et lancez votre job "
                    "Jenkins complet, puis importez son résultat ci-dessous (URL du build) : l'agent propose les "
                    "corrections. L'agent ne pousse rien et ne lance aucun test (CUCUMBER_AGENT_JENKINS=0).")
-    render_cucumber_import(client, data["state"])
+    render_cucumber_import(client, data["state"], ctx["cmd"])
     st.markdown("##### Corrections et bilan")
     render_cucumber_corrections(client, ctx["cmd"], data["rows"], data["state"])
     render_cucumber_review(client, data["state"])
