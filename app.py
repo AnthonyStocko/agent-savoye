@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+from datetime import datetime
 import re
 import shutil
 import subprocess
@@ -104,11 +105,20 @@ def run_main_step(cmd: list, on_line=None) -> int:
     )
     output_container = st.empty()
     logs = ""
-    for line in process.stdout:
-        logs += line
-        output_container.code(logs, language="text")
-        if on_line:
-            on_line(line)
+    # Journal conservé : .tmp/logs/<date>_<étape>.log (l'affichage de l'IHM disparaît au rechargement)
+    step = cmd[cmd.index("--step") + 1] if "--step" in cmd and cmd.index("--step") + 1 < len(cmd) else "main"
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tmp", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"{datetime.now():%Y-%m-%d_%H%M%S}_{step}.log")
+    st.caption(f"Journal enregistré dans {log_path}")
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        for line in process.stdout:
+            logs += line
+            log_file.write(line)
+            log_file.flush()
+            output_container.code(logs, language="text")
+            if on_line:
+                on_line(line)
     process.wait()
     return process.returncode
 
