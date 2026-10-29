@@ -587,6 +587,15 @@ def run_pr_review(pr_urls: list, feature: str = "") -> int:
         keys += pr["jira"]
         prs.append({**pr, "repere": label, "fichiers": files})
     feature = feature or (keys[0] if keys else "")
+    # Remarques déjà faites sur les PR FUSIONNÉES du même ticket (dans les projets des PR relues et REVIEW_PROJECTS)
+    merged = []
+    if feature:
+        projects = [p["projet"] for p in prs] + [x.strip() for x in os.getenv("REVIEW_PROJECTS", "").split(",")]
+        try:
+            merged = pr_review.merged_feedback(feature, projects)
+        except pr_review.BitbucketError as e:
+            print(f"[REVUE PR] ⚠️ PR fusionnées de {feature} non lues : {e}")
+        print(f"[REVUE PR] {len(merged)} PR fusionnée(s) de {feature} avec des remarques à reprendre.")
     tickets = []
     for key in list(dict.fromkeys(([feature] if feature else []) + keys))[:4]:
         try:
@@ -606,7 +615,12 @@ def run_pr_review(pr_urls: list, feature: str = "") -> int:
         conventions=f"'{conventions}'" if os.path.exists(conventions) else "(fichier de conventions absent)",
         commentaires_existants="\n".join(f"- [{c['pr']}] {c['auteur']} — {c['fichier'] or 'général'}"
                                          + (f":{c['ligne']}" if c["ligne"] else "") + f" : {c['texte'][:200]}"
-                                         for c in comments[:60]) or "(aucun)")
+                                         for c in comments[:60]) or "(aucun)",
+        commentaires_fusionnees="\n".join(
+            f"- PR fusionnée « {m['pr']} » ({m['titre']}, {m['auteur']}) :\n" + "\n".join(
+                f"  - {c['auteur']} — {c['fichier'] or 'général'}" + (f":{c['ligne']}" if c["ligne"] else "")
+                + f" : {c['texte'][:300]}" for c in m["commentaires"][:25]) for m in merged)
+        or "(aucune PR fusionnée commentée pour ce ticket)")
     model = os.getenv("CLAUDE_MODEL_REVIEW", "").strip() or "sonnet"
     effort = claude_effort("CLAUDE_EFFORT_REVIEW")
     turns = _env_int("REVIEW_MAX_TURNS", 40) + 15 * (len(prs) - 1)
@@ -620,13 +634,15 @@ def run_pr_review(pr_urls: list, feature: str = "") -> int:
         print("[REVUE PR] ❌ Pas de résultat exploitable" + (" (quota atteint)." if limit_hit else "."))
         return 1
     # Chaque commentaire est rattaché à sa PR ; ancrage vérifié en Python (ligne hors du diff : commentaire général)
+    # Placement : la PR (repère donné, sinon celle dont le diff contient le fichier), le chemin exact du diff, puis la
+    # ligne si elle est dans le diff, sinon le fichier ; un fichier hors des PR reste un commentaire général
     single = prs[0]["repere"] if len(prs) == 1 else ""
     for comment in review["commentaires"]:
         label = comment.get("pr") if comment.get("pr") in maps else single or next(
-            (l for l, m in maps.items() if comment["fichier"] in m), prs[0]["repere"])
-        comment["pr"] = label
-        comment["ancrable"] = bool(pr_review.anchor_type(maps[label], comment["fichier"], comment["ligne"]))
-        comment["publie"] = False
+            (l for l, m in maps.items() if pr_review.diff_path(m, comment["fichier"])), prs[0]["repere"])
+        resolved, where = pr_review.placement(maps[label], comment["fichier"], comment["ligne"])
+        comment.update(pr=label, fichier=resolved or comment["fichier"], ancrage=where,
+                       ancrable=where == "ligne", publie=False)
     identifier = pr_review.feature_id(prs, feature)
     pr_review.save_result(identifier, {
         **review, "fonctionnalite": feature, "prs": [{k: p[k] for k in ("repere", "projet", "depot", "id", "titre",

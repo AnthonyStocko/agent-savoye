@@ -88,12 +88,17 @@ def test_comment_is_anchored_only_on_a_diff_line(bitbucket, monkeypatch):
         return _Response({"id": len(posted)}, 201)
     monkeypatch.setattr(pr.requests, "post", post)
     _, lines = pr.diff_to_text(DIFF)
-    assert pr.post_comment("P", "app", 7, "Régression", "src/A.java", 11, lines) == {"id": 1, "ancre": True}
+    assert pr.post_comment("P", "app", 7, "Régression", "src/A.java", 11, lines) == {"id": 1, "ancre": "ligne"}
     assert posted[0][0] == "https://git.example.io/rest/api/1.0/projects/P/repos/app/pull-requests/7/comments"
     assert posted[0][1]["anchor"] == {"path": "src/A.java", "line": 11, "lineType": "ADDED", "fileType": "TO",
                                       "diffType": "EFFECTIVE"}
-    assert pr.post_comment("P", "app", 7, "Hors diff", "src/A.java", 99, lines)["ancre"] is False
-    assert "anchor" not in posted[1][1] and posted[1][1]["text"].startswith("`src/A.java:99` — Hors diff")
+    # Ligne hors des parties modifiées : commentaire posé sur le FICHIER (chemin abrégé retrouvé)
+    assert pr.post_comment("P", "app", 7, "Hors diff", "A.java", 99, lines)["ancre"] == "fichier"
+    assert posted[1][1]["anchor"] == {"path": "src/A.java", "fileType": "TO", "diffType": "EFFECTIVE"}
+    assert posted[1][1]["text"] == "Ligne 99 : Hors diff"
+    # Fichier hors de la PR : commentaire général qui le cite
+    assert pr.post_comment("P", "app", 7, "Ailleurs", "src/Autre.java", 3, lines)["ancre"] == "general"
+    assert "anchor" not in posted[2][1] and posted[2][1]["text"].startswith("`src/Autre.java:3` — Ailleurs")
     monkeypatch.setattr(pr.requests, "post", lambda *a, **k: _Response({"errors": []}, 403))
     with pytest.raises(pr.BitbucketError, match="droit d'écriture"):
         pr.post_comment("P", "app", 7, "x")
@@ -153,6 +158,9 @@ def test_feature_review_reads_all_prs_together_without_publishing(tmp_path, monk
     monkeypatch.setattr(pr, "prepare_code", lambda *a: ("", "hors ligne"))
     monkeypatch.setattr(pr, "post_comment", lambda *a, **k: pytest.fail("rien n'est publié par l'analyse"))
     monkeypatch.setattr(m, "get_jira_issue_details", lambda key: f"Ticket {key} : afficher le statut")
+    monkeypatch.setattr(pr, "merged_feedback", lambda key, projects: [
+        {"pr": "app#2", "titre": "APP-1 socle", "auteur": "Léa", "commentaires": [
+            {"auteur": "Moi", "fichier": "src/A.java", "ligne": 4, "texte": "nommer la constante"}]}])
     prompts = []
 
     def claude(prompt, *a, **k):
@@ -170,8 +178,9 @@ def test_feature_review_reads_all_prs_together_without_publishing(tmp_path, monk
     assert "déjà dit" in prompts[0] and "diff seul" in prompts[0] and "2 PULL REQUEST(S)" in prompts[0]
     assert "PR « app#7 »" in prompts[0] and "PR « ui#3 »" in prompts[0] and "afficher le statut" in prompts[0]
     result = pr.load_result("APP-1")
-    assert [(c["pr"], c["ligne"], c["ancrable"]) for c in result["commentaires"]] == [
-        ("ui#3", 5, True), ("app#7", 11, True), ("app#7", 99, False)]          # sans repère : PR du fichier
+    assert [(c["pr"], c["ligne"], c["ancrage"]) for c in result["commentaires"]] == [
+        ("ui#3", 5, "ligne"), ("app#7", 11, "ligne"), ("app#7", 99, "fichier")]   # sans repère : PR du fichier
+    assert "PR fusionnée « app#2 »" in prompts[0] and "nommer la constante" in prompts[0]
     assert result["coherence"].startswith("le front") and [p["repere"] for p in result["prs"]] == ["app#7", "ui#3"]
     assert result["lignes"]["app#7"]["src/A.java"]["11"] == "ADDED"
     assert m.run_pr_review(["pas une adresse"]) == 2 and m.run_pr_review([]) == 2
@@ -196,3 +205,26 @@ def test_project_view_lists_all_open_prs_of_a_project(bitbucket, monkeypatch):
     assert [(p["depot"], p["id"]) for p in found] == [("oxy-ui", 9), ("oxy-back", 4)]
     assert errors == ["NOPE : HTTP 404"]
     assert [(g["cle"], len(g["prs"])) for g in pr.group_by_feature(found)] == [("OXY-7", 2)]
+
+
+def test_merged_prs_feedback_is_collected(bitbucket, monkeypatch):
+    calls = []
+
+    def feature(key, projects, known=(), state="OPEN"):
+        calls.append(state)
+        return [{"projet": "P", "depot": "app", "id": 2, "titre": "APP-1 socle", "auteur": "Léa"},
+                {"projet": "P", "depot": "ui", "id": 1, "titre": "APP-1 écran", "auteur": "Tom"}]
+    monkeypatch.setattr(pr, "feature_prs", feature)
+    monkeypatch.setattr(pr, "existing_comments", lambda p, r, n: [{"auteur": "Moi", "fichier": "A.java", "ligne": 4,
+                                                                   "texte": "constante"}] if r == "app" else [])
+    feedback = pr.merged_feedback("APP-1", ["P"])
+    assert calls == ["MERGED"] and [f["pr"] for f in feedback] == ["app#2"]
+    assert feedback[0]["commentaires"][0]["texte"] == "constante"
+
+
+def test_comment_paths_are_matched_to_the_diff():
+    _, lines = pr.diff_to_text(DIFF)
+    assert pr.diff_path(lines, "./src/A.java") == "src/A.java" and pr.diff_path(lines, "New.java") == "src/New.java"
+    assert pr.placement(lines, "A.java", 12) == ("src/A.java", "ligne")
+    assert pr.placement(lines, "src/A.java", None) == ("src/A.java", "fichier")
+    assert pr.placement(lines, "x/Inconnu.java", 1) == ("", "general")

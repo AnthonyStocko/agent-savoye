@@ -136,10 +136,11 @@ def project_prs(projects: list, limit_per_repo: int = 100) -> tuple:
     return sorted(prs, key=lambda p: -(p.get("maj") or 0)), errors
 
 
-def feature_prs(key: str, projects: list, known: list = ()) -> list:
+def feature_prs(key: str, projects: list, known: list = (), state: str = "OPEN") -> list:
     """
-    Toutes les PR ouvertes d'une fonctionnalité (ticket `key`) dans les dépôts des projets Bitbucket `projects`
-    (titre, branche ou description citant le ticket), en plus des PR `known`. Un dépôt illisible est ignoré.
+    Toutes les PR d'une fonctionnalité (ticket `key`) dans l'état `state` (OPEN, MERGED) des dépôts des projets
+    Bitbucket `projects` (titre, branche ou description citant le ticket), en plus des PR `known`. Un dépôt
+    illisible est ignoré.
     """
     found = {(p["projet"], p["depot"], p["id"]): p for p in known}
     for project in dict.fromkeys(p.upper() for p in projects if p):
@@ -150,7 +151,7 @@ def feature_prs(key: str, projects: list, known: list = ()) -> list:
         for repo in repos:
             try:
                 prs = _paged(f"/rest/api/1.0/projects/{project}/repos/{repo}/pull-requests",
-                             {"state": "OPEN", "filterText": key}, limit=50)
+                             {"state": state, "filterText": key}, limit=50)
             except BitbucketError:
                 continue
             for raw in prs:
@@ -158,6 +159,22 @@ def feature_prs(key: str, projects: list, known: list = ()) -> list:
                 if key in pr["jira"]:
                     found.setdefault((pr["projet"], pr["depot"], pr["id"]), pr)
     return sorted(found.values(), key=lambda p: (p["projet"], p["depot"], p["id"]))
+
+
+def merged_feedback(key: str, projects: list, max_prs: int = 10) -> list:
+    """
+    Remarques faites sur les PR DÉJÀ FUSIONNÉES du même ticket : [{pr, titre, auteur, commentaires: [...]}] (PR sans
+    commentaire omises). Sert à vérifier qu'elles sont appliquées dans les PR relues, et à ne pas les répéter.
+    """
+    out = []
+    for pr in feature_prs(key, projects, state="MERGED")[:max_prs]:
+        try:
+            comments = existing_comments(pr["projet"], pr["depot"], pr["id"])
+        except BitbucketError:
+            continue
+        if comments:
+            out.append({"pr": pr_label(pr), "titre": pr["titre"], "auteur": pr["auteur"], "commentaires": comments})
+    return out
 
 
 def pr_label(pr: dict) -> str:
@@ -276,6 +293,33 @@ def prepare_code(project: str, repo: str, number: int, commit: str) -> tuple:
     return work, ""
 
 
+def diff_path(lines_map: dict, path: str) -> str:
+    """Chemin du diff désigné par `path` (exact, sinon même fin de chemin : l'agent abrège parfois) ; '' sinon."""
+    path = (path or "").strip().lstrip("./").replace("\\", "/")
+    if not path:
+        return ""
+    if path in lines_map:
+        return path
+    matches = [p for p in lines_map if p.endswith("/" + path) or path.endswith("/" + p)]
+    if len(matches) == 1:
+        return matches[0]
+    name = path.rsplit("/", 1)[-1]
+    same_name = [p for p in lines_map if p.rsplit("/", 1)[-1] == name]
+    return same_name[0] if len(same_name) == 1 else ""
+
+
+def placement(lines_map: dict, path: str, line) -> tuple:
+    """
+    (chemin du diff, ancrage) d'un commentaire : « ligne » (ligne présente dans le diff), « fichier » (fichier du
+    diff, ligne hors des parties modifiées ou absente : commentaire posé sur le fichier), « general » (fichier hors
+    de la PR).
+    """
+    resolved = diff_path(lines_map, path)
+    if not resolved:
+        return "", "general"
+    return resolved, ("ligne" if anchor_type(lines_map, resolved, line) else "fichier")
+
+
 def anchor_type(lines_map: dict, path: str, line) -> str:
     """Type de ligne Bitbucket pour ancrer un commentaire ('' : ligne hors du diff, commentaire général)."""
     try:
@@ -287,13 +331,19 @@ def anchor_type(lines_map: dict, path: str, line) -> str:
 def post_comment(project: str, repo: str, number: int, text: str, path: str = "", line=None,
                  lines_map: dict = None) -> dict:
     """
-    Publie UN commentaire sur la PR (au nom du propriétaire du jeton). Ligne présente dans le diff : ancré dessus ;
-    sinon commentaire général préfixé de « fichier:ligne ». Renvoie {"id", "ancre"}.
+    Publie UN commentaire sur la PR (au nom du propriétaire du jeton), au plus près du problème : sur la ligne si
+    elle est dans le diff ; sinon sur le FICHIER (commentaire de fichier, « Ligne n : » en tête) ; sinon, fichier
+    hors de la PR, commentaire général préfixé de « fichier:ligne ». Renvoie {"id", "ancre": ligne|fichier|general}.
     """
-    kind = anchor_type(lines_map or {}, path, line) if path else ""
+    lines_map = lines_map or {}
+    resolved, where = placement(lines_map, path, line) if path else ("", "general")
     body = {"text": text}
-    if kind:
-        body["anchor"] = {"path": path, "line": int(line), "lineType": kind, "fileType": "TO", "diffType": "EFFECTIVE"}
+    if where == "ligne":
+        body["anchor"] = {"path": resolved, "line": int(line), "lineType": anchor_type(lines_map, resolved, line),
+                          "fileType": "TO", "diffType": "EFFECTIVE"}
+    elif where == "fichier":
+        body["anchor"] = {"path": resolved, "fileType": "TO", "diffType": "EFFECTIVE"}
+        body["text"] = (f"Ligne {line} : " if line else "") + text
     elif path:
         body["text"] = f"`{path}" + (f":{line}" if line else "") + f"` — {text}"
     try:
@@ -305,7 +355,7 @@ def post_comment(project: str, repo: str, number: int, text: str, path: str = ""
         raise BitbucketError(f"commentaire refusé (HTTP {response.status_code}) : {response.text[:200]}"
                              + (" — le jeton a-t-il le droit d'écriture ?" if response.status_code in (401, 403)
                                 else ""))
-    return {"id": response.json().get("id"), "ancre": bool(kind)}
+    return {"id": response.json().get("id"), "ancre": where}
 
 
 # ---------------------------------------------------------------------------

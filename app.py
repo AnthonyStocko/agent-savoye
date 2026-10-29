@@ -3080,8 +3080,10 @@ def render_review_result(result: dict, current: list) -> None:
                     st.markdown(f"{head} — ✔️ publié")
                     st.caption(comment["message"])
                     continue
-                st.checkbox(head + ("" if comment.get("ancrable") else " (publié en commentaire général : ligne "
-                                                                         "hors du diff)"),
+                where = comment.get("ancrage") or ("ligne" if comment.get("ancrable") else "general")
+                st.checkbox(head + {"ligne": "", "fichier": " (posé sur le fichier : ligne hors des parties "
+                                                             "modifiées)",
+                                    "general": " (commentaire général : fichier hors de la PR)"}.get(where, ""),
                             key=f"{key}_pick_{index}", value=comment["gravite"] in ("bloquant", "majeur"))
                 st.text_area("Commentaire", comment["message"] + (f"\n\n```\n{comment['suggestion']}\n```"
                                                                    if comment.get("suggestion") else ""),
