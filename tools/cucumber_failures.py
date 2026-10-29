@@ -227,9 +227,9 @@ def sync_with_branch(worktree: str, base: str, log=None) -> str:
         ours = set(_git(worktree, "diff", "--name-only", fork, "HEAD").stdout.splitlines())
         theirs = set(_git(worktree, "diff", "--name-only", fork, base).stdout.splitlines())
         both = ours & theirs
-    merged = _git(worktree, "merge", "--no-edit", "-X", "theirs", "-m",
-                  f"Cucumber: synchronisation avec {base} (la branche l'emporte sur un conflit)", base)
-    if merged.returncode != 0:
+    message = f"Cucumber: synchronisation avec {base} (la branche l'emporte sur un conflit)"
+    merged = _git(worktree, "merge", "--no-edit", "-X", "theirs", "-m", message, base)
+    if merged.returncode != 0 and not _resolve_with_branch(worktree, base, message):
         _git(worktree, "merge", "--abort")
         return f"fusion de {base} impossible : {(merged.stderr or merged.stdout).strip()[:200]}"
     kept = sorted(p for p in both
@@ -238,6 +238,29 @@ def sync_with_branch(worktree: str, base: str, log=None) -> str:
     if kept and log:
         log(kept)
     return ""
+
+
+def _resolve_with_branch(worktree: str, base: str, message: str) -> bool:
+    """
+    Conflits que « -X theirs » ne tranche pas (fichier modifié par l'agent mais supprimé ou renommé sur la branche,
+    ex. correction de casse d'un dossier) : la branche l'emporte — fichier supprimé s'il n'existe plus dans `base`,
+    sinon version de `base`. Commit de la fusion. True si tout est résolu.
+    """
+    unmerged = sorted(set(_git(worktree, "diff", "--name-only", "--diff-filter=U").stdout.splitlines()))
+    if not unmerged:
+        return False
+    for path in unmerged:
+        if _git(worktree, "cat-file", "-e", f"{base}:{path}").returncode == 0:
+            _git(worktree, "checkout", base, "--", path)
+            _git(worktree, "add", "--", path)
+        else:
+            _git(worktree, "rm", "-q", "--cached", "--ignore-unmatch", "--", path)
+            full = os.path.join(worktree, *path.split("/"))
+            if os.path.exists(full) and _git(worktree, "ls-files", "--", path).stdout.strip() == "":
+                os.remove(full)
+    if _git(worktree, "diff", "--name-only", "--diff-filter=U").stdout.strip():
+        return False
+    return _git(worktree, "commit", "--no-edit", "-q", "-m", message).returncode == 0
 
 
 def analysis_path(imports_dir: str, numero) -> str:

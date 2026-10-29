@@ -506,12 +506,57 @@ def verify_branch_error(worktree: str, branch: str) -> str:
     return ""
 
 
+def case_duplicates(worktree: str) -> list:
+    """Fichiers suivis dont le chemin ne diffère que par la casse : [[chemins]] (un seul fichier sous Windows)."""
+    groups = {}
+    for path in _git(worktree, "ls-files", "-z").stdout.split("\0"):
+        if path:
+            groups.setdefault(path.lower(), []).append(path)
+    return [sorted(g) for g in groups.values() if len(g) > 1]
+
+
+def _exact_case(root: str, path: str) -> bool:
+    """Le chemin existe sur le disque avec exactement cette casse, segment par segment (dossiers compris)."""
+    current = root
+    for part in path.split("/"):
+        try:
+            if part not in os.listdir(current):
+                return False
+        except OSError:
+            return False
+        current = os.path.join(current, part)
+    return True
+
+
+def drop_case_duplicates(worktree: str) -> list:
+    """
+    Système de fichiers insensible à la casse (Windows, macOS) : deux chemins suivis ne différant que par la casse
+    n'y font qu'un fichier, que git voit toujours modifié — aucun commit ne le règle et la vérification s'arrêterait.
+    On garde le chemin tel qu'il est sur le disque, les autres sont retirés de l'index (le livrable ne supprime
+    jamais un fichier de la branche et garde sa casse). Sur un système sensible à la casse : rien. Renvoie les
+    chemins retirés.
+    """
+    dropped = []
+    for group in case_duplicates(worktree):
+        on_disk = {path for path in group if _exact_case(worktree, path)}
+        if len(on_disk) != 1 or len(on_disk) == len(group):
+            continue   # sensible à la casse (tous présents) ou indécidable
+        for path in group:
+            if path not in on_disk:
+                _git(worktree, "rm", "-q", "--cached", "--", path)
+                dropped.append(path)
+    return dropped
+
+
 def push_for_verification(worktree: str, branch: str, message: str) -> tuple:
     """
     Commite le worktree (hors sorties Maven, fichiers de test ignorés par le .gitignore ajoutés de force) puis le
     pousse sur `branch` (origin), sans forcer. Renvoie (erreur d'arrêt ou '', commit créé) ; un push refusé (branche
     distante divergente, droits) arrête la vérification.
     """
+    for path in drop_case_duplicates(worktree):
+        print(f"[CUCUMBER] ⚠️ Chemin en double par la casse retiré de l'espace de l'agent (un seul fichier sous ce "
+              f"système) : {path}")
     _git(worktree, "add", "-A", "--", ".", ":(exclude)target", ":(exclude)**/target/**")
     forced = ignored_test_files(worktree)
     if forced:

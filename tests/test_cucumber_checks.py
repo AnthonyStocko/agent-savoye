@@ -310,3 +310,44 @@ def test_runner_health_against_profile():
     assert any("json:" in g for g in gaps) and not any("glue" in g for g in gaps)
     good = {**runner, "features": [f"{RES}/features"], "tags": ["not @A_REVOIR"], "plugin_json": "json:target/c.json"}
     assert cc.runner_health({**conventions, "runner": good}) == []
+
+
+def test_case_duplicates_are_dropped_only_on_a_case_insensitive_disk(repo, monkeypatch):
+    from tools import cucumber_checks as cc
+    lower = "src/test/resources/cucumber/features/clientx/WMS/product/a.feature"
+    upper = "src/test/resources/cucumber/features/clientx/WMS/Product/a.feature"
+    write(os.path.join(repo, *upper.split("/")), "Feature: A\n")
+    git(repo, "add", "-A")
+    blob = git(repo, "hash-object", "-w", os.path.join(repo, *upper.split("/")))
+    git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{lower}")
+    git(repo, "commit", "-qm", "doublon")
+    assert cc.case_duplicates(repo) == [[upper, lower]]
+    # Disque sensible à la casse avec les deux dossiers : rien n'est retiré
+    write(os.path.join(repo, *lower.split("/")), "Feature: A\n")
+    assert cc.drop_case_duplicates(repo) == []
+    # Disque où seul « Product » existe (Windows) : l'autre chemin quitte l'index
+    import shutil
+    shutil.rmtree(os.path.join(repo, *lower.split("/")[:-1]))
+    assert cc.drop_case_duplicates(repo) == [lower]
+    assert git(repo, "ls-files", "--", lower) == ""
+
+
+def test_sync_resolves_a_file_modified_by_the_agent_but_renamed_on_the_branch(repo):
+    from tools import cucumber_failures as cf
+    lower = "src/test/resources/cucumber/features/clientx/WMS/product/a.feature"
+    upper = "src/test/resources/cucumber/features/clientx/WMS/Product/a.feature"
+    write(os.path.join(repo, *lower.split("/")), "Feature: A\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-q", "-b", "agent")
+    write(os.path.join(repo, *lower.split("/")), "Feature: A\n  Scenario: agent\n")
+    git(repo, "commit", "-qam", "lot")
+    git(repo, "checkout", "-q", "integration")
+    os.makedirs(os.path.join(repo, *upper.split("/")[:-1]), exist_ok=True)
+    git(repo, "mv", lower, upper)
+    git(repo, "commit", "-qm", "casse corrigée")
+    git(repo, "checkout", "-q", "agent")
+    assert cf.sync_with_branch(repo, "integration") == ""
+    tracked = git(repo, "ls-files").splitlines()
+    assert upper in tracked and lower not in tracked
+    assert git(repo, "merge-base", "--is-ancestor", "integration", "HEAD") == ""
