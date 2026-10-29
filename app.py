@@ -36,7 +36,9 @@ from tools.poller_control import force_stop, get_poller_status, request_stop, st
 
 # Pleine largeur par défaut (tableaux, revues de PR, état des tests) ; APP_LAYOUT=centered pour une colonne centrale
 st.set_page_config(page_title="Scrum Master IA Dashboard",
-                   layout="centered" if os.getenv("APP_LAYOUT", "").strip().lower() == "centered" else "wide")
+                   layout="centered" if (os.getenv("APP_LAYOUT") or dotenv_values(os.path.join(
+                       os.path.dirname(os.path.abspath(__file__)), ".env")).get("APP_LAYOUT") or "").strip().lower()
+                   == "centered" else "wide")
 
 # Variables indispensables : leur absence est signalée dans l'onglet Lancement
 REQUIRED_ENV = ["JIRA_DOMAIN", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY",
