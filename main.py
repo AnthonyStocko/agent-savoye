@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -541,6 +541,38 @@ def _build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: s
                                 schema_hint=schema_hint, **DB_BLOCK_WORDING.get(step, DB_BLOCK_WORDING["default"]))
 
 
+def run_assistant(question: str, answer_file: str) -> int:
+    """
+    Onglet « Assistant » : réponse à une question libre sur les fonctionnalités de l'application ou ses résultats,
+    par l'agent en lecture seule (code de l'application, résultats de .tmp/ et livrables). La réponse est écrite
+    dans `answer_file` (Markdown, secrets masqués). Renvoie le code de sortie.
+    """
+    question = (question or "").strip()
+    if not question:
+        print("[ASSISTANT] ❌ Question vide.")
+        return 2
+    code_dir = os.path.dirname(os.path.abspath(__file__))
+    prompt = render_prompt(
+        "assistant", utilisateur=os.getenv("JIRA_EMAIL", "").split("@")[0] or "l'utilisateur", code=code_dir,
+        token_saving_rules="\n" + render_prompt("token_saving_rules"), resultats=assistant.results_index(),
+        historique=assistant.recent_exchanges(assistant.load_history()[:-1]), question=question)
+    model = os.getenv("CLAUDE_MODEL_ASSISTANT", "").strip() or "sonnet"
+    effort = claude_effort("CLAUDE_EFFORT_ASSISTANT")
+    returncode, output, usage, limit_hit = run_claude(prompt, model, [code_dir], REVIEW_TOOLS,
+                                                      extra_args=("--max-turns", str(_env_int("ASSISTANT_MAX_TURNS", 25))),
+                                                      cwd=code_dir, effort=effort, lean=lean_session())
+    report_token_usage("ASSISTANT", "ask", model, usage, len(prompt), returncode, effort)
+    answer = assistant.clean_answer(output)
+    if limit_hit or not answer:
+        print("[ASSISTANT] ❌ Pas de réponse" + (" (quota atteint)." if limit_hit else "."))
+        return 1
+    if answer_file:
+        os.makedirs(os.path.dirname(os.path.abspath(answer_file)), exist_ok=True)
+        with open(answer_file, "w", encoding="utf-8") as f:
+            f.write(answer)
+    return 0
+
+
 REVIEW_TOOLS = ["Read", "Grep", "Glob"]
 
 
@@ -1058,11 +1090,13 @@ def main():
     parser.add_argument("--project", default="", help="Clé du projet Jira (ex: PROJ) ; inutile pour generate-cucumber-client")
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
-    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client", "review-pr"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
+    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client", "review-pr", "ask"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
     parser.add_argument("--pr-url", action="append", default=[],
                         help="review-pr : adresse d'une pull request de la fonctionnalité (option répétable : toutes les "
                              "PR de la fonctionnalité sont relues ensemble)")
     parser.add_argument("--feature", default="", help="review-pr : ticket Jira de la fonctionnalité relue")
+    parser.add_argument("--question", default="", help="ask : question posée à l'assistant (onglet Assistant)")
+    parser.add_argument("--answer-file", default="", help="ask : fichier où écrire la réponse")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
@@ -1114,6 +1148,8 @@ def main():
     args = parser.parse_args()
     if args.step == "review-pr":
         sys.exit(run_pr_review(args.pr_url, args.feature))
+    if args.step == "ask":
+        sys.exit(run_assistant(args.question, args.answer_file))
     is_postmerge = args.step == "generate-cucumber-postmerge"
     if is_postmerge:
         if not (args.repo_slug and args.merge_commit):
