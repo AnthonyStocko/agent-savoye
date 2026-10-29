@@ -1841,7 +1841,10 @@ def render_simple_import(client: str, place: str = "simple") -> None:
         st.rerun()
     state = cucumber_tools.load_state(client)
     analysis = cucumber_import.analyse(client, imported["numero"], state, cucumber_tools.worktree_dir(client))
-    cucumber_bilan.after_import(client, analysis, state, cucumber_tools.worktree_dir(client))
+    bilan = cucumber_bilan.after_import(client, analysis, state, cucumber_tools.worktree_dir(client))
+    # Bilan du run déposé dans le répertoire de connaissances partagé (comme depuis le mode expert)
+    if bilan:
+        cucumber_bilan.share_bilan(client, bilan)
     failures = sum(len(g["scenarios"]) for g in analysis.get("groupes") or [])
     fixable = sum(len(p["scenarios"]) for p in analysis.get("propositions") or [])
     st.session_state[f"cucumber_import_message_{client}"] = (

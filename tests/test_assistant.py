@@ -50,6 +50,11 @@ def test_ask_step_writes_a_masked_answer(tmp_path, monkeypatch):
         return 0, "Ils échouent sur **OP introuvable**. Authorization: Bearer abc.def.ghi", {}, False
     monkeypatch.setattr(m, "run_claude", claude)
     monkeypatch.setattr(m, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(a, "known_clients", lambda: ["apparel", "novalia"])
+    monkeypatch.delenv("JIRA_PROJECT_KEY", raising=False)
+    shared = []
+    monkeypatch.setattr(m, "share_knowledge", lambda body, projet, doc_type, sujet, **f: shared.append(
+        (body, projet, doc_type, sujet, f)))
     out = tmp_path / "r.md"
     assert m.run_assistant("Pourquoi 16 échecs ?", str(out)) == 0
     answer = out.read_text(encoding="utf-8")
@@ -57,4 +62,8 @@ def test_ask_step_writes_a_masked_answer(tmp_path, monkeypatch):
     prompt, dirs, tools = prompts[0]
     assert "Pourquoi 16 échecs ?" in prompt and "Réponse avant" in prompt and ".env" in prompt
     assert tools == ["Read", "Grep", "Glob"]
+    assert shared[0][1:4] == ("GENERAL", "analyse-assistant", "Pourquoi 16 échecs ?")
+    assert "# Question" in shared[0][0] and "abc.def.ghi" not in shared[0][0]
+    assert m.run_assistant("Que fait Apparel en réception ?", str(out)) == 0
+    assert shared[-1][1] == "APPAREL" and shared[-1][4]["client"] == "apparel"
     assert m.run_assistant("  ", str(out)) == 2

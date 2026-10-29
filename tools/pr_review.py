@@ -422,3 +422,31 @@ def parse_review(text: str) -> dict:
             "tests": str(data.get("tests", "")).strip(), "conformite_ticket": str(data.get("conformite_ticket", "")).strip(),
             "coherence": str(data.get("coherence", "")).strip(),
             "commentaires": comments[:60]}
+
+
+
+VERDICT_LABELS = {"approuver": "peut être approuvée", "changements_demandes": "changements à demander",
+                  "a_discuter": "à discuter avec l'auteur"}
+
+
+def review_markdown(result: dict) -> str:
+    """Revue d'une fonctionnalité en Markdown (répertoire de connaissances partagé)."""
+    prs = result.get("prs") or []
+    lines = [f"# Revue de la fonctionnalité {result.get('fonctionnalite') or ', '.join(p['repere'] for p in prs)}", "",
+             f"- Verdict : **{VERDICT_LABELS.get(result.get('verdict'), result.get('verdict'))}** ; risque "
+             f"{result.get('risque', '?')}",
+             f"- Pull requests : " + ", ".join(f"{p['projet']}/{p['depot']} #{p['id']} ({p['titre']}, {p['auteur']})"
+                                               for p in prs), "", "## Avis", "", result.get("resume", "")]
+    for title, key in (("Cohérence entre les PR", "coherence"), ("Conformité au ticket", "conformite_ticket"),
+                       ("Tests", "tests")):
+        if result.get(key):
+            lines += ["", f"## {title}", "", result[key]]
+    for title, key in (("Points positifs", "points_positifs"), ("Questions aux auteurs", "questions")):
+        if result.get(key):
+            lines += ["", f"## {title}", ""] + [f"- {x}" for x in result[key]]
+    comments = result.get("commentaires") or []
+    if comments:
+        lines += ["", f"## Commentaires ({len(comments)})", ""]
+        lines += [f"- [{c['gravite']}] {c.get('pr', '')} `{c['fichier']}" + (f":{c['ligne']}" if c.get("ligne") else "")
+                  + f"` — {c['message']}" for c in comments]
+    return "\n".join(lines) + "\n"

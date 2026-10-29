@@ -173,6 +173,9 @@ def test_feature_review_reads_all_prs_together_without_publishing(tmp_path, monk
             False
     monkeypatch.setattr(m, "run_claude", claude)
     monkeypatch.setattr(m, "report_token_usage", lambda *a, **k: None)
+    shared = []
+    monkeypatch.setattr(m, "share_knowledge", lambda body, projet, doc_type, sujet, **f: shared.append(
+        (body, projet, doc_type, sujet, f)))
     assert m.run_pr_review(["https://git.example.io/projects/P/repos/app/pull-requests/7",
                             "https://git.example.io/projects/P/repos/ui/pull-requests/3"], "APP-1") == 0
     assert "déjà dit" in prompts[0] and "diff seul" in prompts[0] and "2 PULL REQUEST(S)" in prompts[0]
@@ -183,6 +186,9 @@ def test_feature_review_reads_all_prs_together_without_publishing(tmp_path, monk
     assert "PR fusionnée « app#2 »" in prompts[0] and "nommer la constante" in prompts[0]
     assert result["coherence"].startswith("le front") and [p["repere"] for p in result["prs"]] == ["app#7", "ui#3"]
     assert result["lignes"]["app#7"]["src/A.java"]["11"] == "ADDED"
+    body, projet, doc_type, sujet, fields = shared[0]
+    assert (projet, doc_type, fields["tickets"]) == ("APP", "revue-pr", ["APP-1"]) and sujet.startswith("Revue APP-1")
+    assert "Cohérence entre les PR" in body and "[bloquant] ui#3 `web/x.ts:5` — champ renommé" in body
     assert m.run_pr_review(["pas une adresse"]) == 2 and m.run_pr_review([]) == 2
 
 

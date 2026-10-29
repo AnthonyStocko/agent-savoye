@@ -108,3 +108,23 @@ def recent_exchanges(messages: list, count: int = 6, max_chars: int = 1500) -> s
 def clean_answer(text: str) -> str:
     """Réponse affichée : secrets masqués, espaces de fin retirés."""
     return mask_secrets((text or "").strip())[0]
+
+
+
+def known_clients() -> list:
+    cucumber = os.path.join(TMP, "cucumber")
+    return sorted(d for d in os.listdir(cucumber) if os.path.isdir(os.path.join(cucumber, d))) \
+        if os.path.isdir(cucumber) else []
+
+
+def subject_project(question: str, answer: str = "") -> tuple:
+    """(projet, client) de l'analyse : client cité dans la question (sinon dans la réponse), sinon projet par défaut."""
+    for text in (question, answer):
+        for client in known_clients():
+            if client and client.lower() in (text or "").lower():
+                return client.upper(), client
+    return (os.getenv("JIRA_PROJECT_KEY", "").strip().upper() or "GENERAL"), ""
+
+
+def analysis_markdown(question: str, answer: str) -> str:
+    return f"# Question\n\n{question.strip()}\n\n# Réponse de l'assistant\n\n{answer.strip()}\n"

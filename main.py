@@ -570,6 +570,10 @@ def run_assistant(question: str, answer_file: str) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(answer_file)), exist_ok=True)
         with open(answer_file, "w", encoding="utf-8") as f:
             f.write(answer)
+    # Analyse déposée dans le répertoire de connaissances partagé (projet du client cité, sinon projet par défaut)
+    project, client = assistant.subject_project(question, answer)
+    share_knowledge(assistant.analysis_markdown(question, answer), project, "analyse-assistant",
+                    " ".join(question.split())[:90], client=client, tags=["assistant"] + ([client] if client else []))
     return 0
 
 
@@ -684,6 +688,13 @@ def run_pr_review(pr_urls: list, feature: str = "") -> int:
         "date": datetime.now().isoformat(timespec="seconds")})
     print(f"[REVUE PR] ✅ Analyse terminée ({len(prs)} PR) : {review['verdict']}, {len(review['commentaires'])} "
           f"commentaire(s) proposé(s).")
+    # Revue déposée dans le répertoire de connaissances partagé (projet Jira du ticket, sinon projet Bitbucket)
+    saved = pr_review.load_result(identifier)
+    project = feature.split("-", 1)[0] if feature else prs[0]["projet"]
+    share_knowledge(pr_review.review_markdown(saved), project, "revue-pr",
+                    f"Revue {feature or prs[0]['repere']} — {prs[0]['titre']}"[:90],
+                    tickets=[feature] if feature else [], composants=sorted({p["depot"] for p in prs}),
+                    tags=["revue-pr"])
     return 0
 
 
