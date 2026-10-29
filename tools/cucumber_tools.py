@@ -2715,7 +2715,7 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
         if [d for d in delivered if d] == ["A_REVOIR.md"]:
             print("[CUCUMBER] Patch : aucune modification de test nouvelle par rapport à la branche (tout ce que "
                   "l'agent a écrit y est déjà) — seul le bilan A_REVOIR.md est livré. Lancer la correction du run "
-                  "importé (étape Correction) pour obtenir de nouveaux correctifs.")
+                  "importé (bouton « Corriger les tests en échec ») pour obtenir de nouveaux correctifs.")
         subjects = "\n".join(dict.fromkeys(
             f"- {_git(worktree, 'log', '-1', '--format=%s', c).stdout.strip()}" for c in commits))
         message = (f"Cucumber : tests des spécifiques {client_name or ''} (agent)".replace("  ", " ")

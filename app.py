@@ -991,17 +991,23 @@ def render_cucumber_decisions(client: str, state: dict) -> None:
     """File des décisions humaines (point 7) : en attente, puis historique (qui, quand, pourquoi)."""
     decisions = cucumber_decisions.load_decisions(client)
     waiting = [d for d in decisions if d["statut"] == "en_attente"]
-    st.markdown(f"##### :material/gavel: Décisions en attente : {len(waiting)}")
-    st.caption("Ce qui change le sens d'un test (réalignement d'un attendu, données d'un step, désactivation, test "
-               "tautologique, écart spécification / code) attend votre décision ; le scénario concerné est désactivé "
-               "provisoirement et l'agent poursuit le reste. Valider applique la modification, Refuser rétablit le "
-               "scénario et transmet votre commentaire à sa prochaine correction.")
+    if cucumber_decisions.autonomous():
+        taken = [d for d in decisions if d.get("auto")]
+        st.markdown(f"##### :material/smart_toy: Choix faits par l'agent : {len(taken)}")
+        st.caption("Autonomie : l'agent applique lui-même ce qui change le sens d'un test (réalignement sur le code, "
+                   "données d'un step, désactivation) et l'enregistre ici, avec l'avant et l'après, pour relecture.")
+    else:
+        st.markdown(f"##### :material/gavel: Décisions en attente : {len(waiting)}")
+        st.caption("Ce qui change le sens d'un test attend votre décision ; le scénario concerné est désactivé "
+                   "provisoirement. Valider applique la modification, Refuser rétablit le scénario et transmet votre "
+                   "commentaire à sa prochaine correction.")
     client_tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))["tag_client"]
     for decision in waiting:
         render_decision(client, decision, state, client_tag)
     decided = [d for d in decisions if d["statut"] != "en_attente"]
     if decided:
-        with st.expander(f"Historique des décisions ({len(decided)})", icon=":material/history:"):
+        with st.expander(f"Historique ({len(decided)})", icon=":material/history:",
+                         expanded=cucumber_decisions.autonomous()):
             st.dataframe([{"Décision": cucumber_decisions.TYPES[d["type"]], "Proposition": d["proposition"],
                            "Statut": cucumber_decisions.STATUSES[d["statut"]], "Par": d["historique"][-1]["auteur"],
                            "Le": d["historique"][-1]["date"][:16].replace("T", " "),
@@ -1027,7 +1033,7 @@ def render_cucumber_corrections(client: str, cucumber_cmd: list, rows: list, sta
                       for r in failing], hide_index=True, width="stretch")
     numero, analysis = latest_import_analysis(client)
     if not analysis or analysis.get("non_analyse"):
-        st.caption("Aucun import analysé : importez la console et le rapport du run (étape Exécution).")
+        st.caption("Aucun import analysé : importe le résultat du run (écran principal, cadre « 3 »).")
         return
     init = analysis.get("init_en_echec") or {}
     if init:
@@ -1556,18 +1562,6 @@ def generable(row: dict) -> bool:
     """
     return (row["etat"] in GENERABLE_STATES and not (row.get("evaluation") or {}).get("attendues")
             and not row.get("relance_inutile"))
-
-
-def coverage_table(rows: list, key: str) -> list:
-    """Lignes de la liste : case « Générer » (cochée pour les tâches générables), titre métier, état, risque."""
-    edits = (st.session_state.get(key) or {}).get("edited_rows") or {}
-    table = []
-    for index, r in enumerate(rows):
-        checked = (edits.get(index) or edits.get(str(index)) or {}).get("Générer", generable(r))
-        table.append({"Générer": checked, "Tâche": r["titre"], "État": cucumber_coverage.state_label(r).split(" (")[0],
-                      "Réponses attendues": str((r.get("evaluation") or {}).get("attendues") or ""),
-                      "Module": r["module"], "Risque": r["risque"], "Tickets": ", ".join(r["tickets"])})
-    return table
 
 
 def generate_tasks(ctx: dict, ids: list) -> None:
@@ -2215,63 +2209,36 @@ def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
 
 
 def render_expert(ctx: dict, data: dict) -> None:
-    """Mode expert : réglages, profil, bilan de santé, initialisation, plan et lots, exécution, corrections, journal."""
+    """
+    Mode expert, en onglets : Projet (profil, santé du dépôt), Couverture (résumé, audit), Génération (plan, lots,
+    vérification), Résultats (exécution, imports, bilan, A_REVOIR.md), Décisions (choix de l'agent, corrections
+    proposées), Journal. Le téléchargement des modifications et le tag client rétroactif sont sur l'écran principal.
+    """
     client = ctx["client"]
-    st.markdown("**" + cucumber_journey.overview_line(
-        client, cucumber_detection.state_label(data["init_status"]), data["rows"], data["analysis"]) + "**")
-    render_cucumber_profile(ctx, data["profile_doc"], data["detected"], data["init_status"])
-    render_cucumber_health(ctx)
-    if data["rows"]:
-        render_coverage_summary(ctx, data["rows"], data["links"],
-                                cucumber_journey.next_action(client, data["rows"], data["links"]))
-    render_delivery_header(ctx)
-    render_cucumber_audit(client, data["inventory"], data["rows"])
-    st.markdown("##### Plan détaillé et lots")
-    render_cucumber_selection(ctx, data["inventory"], data["state"], data["rows"], data["init_status"],
-                              data["dependencies"])
-    render_cucumber_generation(ctx, data["state"], data["dependencies"])
-    st.markdown("##### Exécution détaillée")
-    if cucumber_verify.agent_runs_tests():
-        render_cucumber_run(ctx, data["state"])
-    else:
-        st.caption("Exécution par vous : appliquez le patch dans votre workspace, commitez, poussez et lancez votre job "
-                   "Jenkins complet, puis importez son résultat ci-dessous (URL du build) : l'agent propose les "
-                   "corrections. L'agent ne pousse rien et ne lance aucun test (CUCUMBER_AGENT_JENKINS=0).")
-    render_cucumber_import(client, data["state"], ctx["cmd"])
-    st.markdown("##### Corrections et bilan")
-    render_cucumber_corrections(client, ctx["cmd"], data["rows"], data["state"])
-    render_cucumber_review(client, data["state"])
-    render_technical_journal()
-
-
-def render_delivery_header(ctx: dict) -> None:
-    """En-tête de la vue : patch global de la livraison, règles rétroactives à corriger en un clic."""
-    client = ctx["client"]
-    state = cucumber_tools.load_state(client)
-    retroactive = (state.get("selection") or {}).get("retroactif") or []
-    patch = cucumber_tools.patch_path(client)
-    with st.container(horizontal=True, vertical_alignment="center"):
-        if os.path.exists(patch):
-            with open(patch, "rb") as f:
-                st.download_button("Patch global de la livraison", f.read(), file_name=os.path.basename(patch),
-                                   mime="text/x-diff", icon=":material/download:", key=f"cucumber_global_patch_{client}")
-            st.caption(f"généré le {time.strftime('%d/%m/%Y %H:%M', time.localtime(os.path.getmtime(patch)))}")
-    if retroactive:
-        tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client)).get("tag_client", "")
-        with st.container(border=True):
-            st.markdown(f":orange[:material/rule:] **{len(retroactive)} scénario(s) écrit(s) avant la règle « tag "
-                        f"client » n'ont pas le tag {tag}** : un job filtré sur ce tag ne les exécuterait pas. La "
-                        f"livraison n'est pas bloquée.")
-            if st.button(f"Ajouter le tag {tag} automatiquement", icon=":material/auto_fix_high:",
-                         disabled=not ctx["ready"], key=f"cucumber_fix_tags_{client}",
-                         help="Ajoute le tag au-dessus de chaque scénario actif qui ne l'a pas (scénarios désactivés "
-                              "exclus), commite, contrôle de nouveau et régénère le patch. Aucun appel à Claude."):
-                code = run_main_step(ctx["cmd"] + ["--fix-client-tags"])
-                remaining = len((cucumber_tools.load_state(client).get("selection") or {}).get("retroactif") or [])
-                (st.success if code == 0 else st.error)(
-                    f"Tag {tag} ajouté ; {remaining} scénario(s) encore sans tag." if code in (0, 1) else
-                    f"Correction impossible : {interruption_cause(code)}.")
-                st.rerun()
+    st.caption(cucumber_journey.overview_line(
+        client, cucumber_detection.state_label(data["init_status"]), data["rows"], data["analysis"]))
+    tabs = st.tabs(["Projet", "Couverture", "Génération", "Résultats", "Décisions", "Journal"])
+    with tabs[0]:
+        render_cucumber_profile(ctx, data["profile_doc"], data["detected"], data["init_status"])
+        render_cucumber_health(ctx)
+    with tabs[1]:
+        if data["rows"]:
+            render_coverage_summary(ctx, data["rows"], data["links"],
+                                    cucumber_journey.next_action(client, data["rows"], data["links"]))
+        render_cucumber_audit(client, data["inventory"], data["rows"])
+    with tabs[2]:
+        render_cucumber_selection(ctx, data["inventory"], data["state"], data["rows"], data["init_status"],
+                                  data["dependencies"])
+        render_cucumber_generation(ctx, data["state"], data["dependencies"])
+    with tabs[3]:
+        if cucumber_verify.agent_runs_tests():
+            render_cucumber_run(ctx, data["state"])
+        render_cucumber_import(client, data["state"], ctx["cmd"])
+        render_cucumber_review(client, data["state"])
+    with tabs[4]:
+        render_cucumber_corrections(client, ctx["cmd"], data["rows"], data["state"])
+    with tabs[5]:
+        render_technical_journal()
 
 
 def render_task_card(ctx: dict, row: dict) -> None:
@@ -2429,83 +2396,6 @@ def render_unlinked_tests(ctx: dict, rows: list, links: dict) -> None:
                 st.button("Aucune tâche", type="tertiary", key=f"cucumber_link_none_{item['feature']}",
                           on_click=cucumber_links.confirm, args=(client, item["feature"], ""),
                           help="Test sans tâche de l'inventaire : il n'apparaîtra plus ici.")
-
-
-def render_cucumber_coverage(ctx: dict, inventory: dict, rows: list) -> None:
-    """Étape 2 : tâches couvertes et non couvertes, deux taux, filtres, détail d'une ligne."""
-    if not rows:
-        st.info("Aucune tâche : l'inventaire des spécifiques est fait par l'analyse automatique du projet.",
-                icon=":material/inventory_2:")
-        return
-    client = ctx["client"]
-    render_delivery_header(ctx)
-    retro = cucumber_tools._read_json(cucumber_testability.retro_path(client), {}) if client else {}
-    if retro.get("taches"):
-        st.caption(f":material/published_with_changes: Rétro-analyse de la testabilité du "
-                   f"{retro['date'].replace('T', ' ')[:16]} : {cucumber_testability.retro_line(retro)}.")
-    render_cucumber_audit(client, inventory, rows)
-    with st.container(horizontal=True):
-        states = st.multiselect("État", list(cucumber_coverage.STATES),
-                                format_func=lambda k: " ".join(cucumber_coverage.STATES[k][1::-1]),
-                                key=f"cucumber_cov_states_{client}", placeholder="Tous")
-        modules = st.multiselect("Module", sorted({r["module"] for r in rows}), key=f"cucumber_cov_modules_{client}",
-                                 placeholder="Tous")
-        ticket = st.text_input("Ticket ou mot-clé", key=f"cucumber_cov_text_{client}").strip().casefold()
-        risks = st.pills("Risque", cucumber_coverage.RISKS, selection_mode="multi", key=f"cucumber_cov_risks_{client}")
-    group = st.session_state.get(f"cucumber_group_{client}")
-    if group:
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption(f"Liste filtrée : tâches qui {cucumber_coverage.GROUPS[group]}.")
-            st.button("Afficher toutes les tâches", type="tertiary", key=f"cucumber_group_clear_{client}",
-                      on_click=st.session_state.pop, args=(f"cucumber_group_{client}", None))
-    grouped = set(cucumber_coverage.summary_groups(rows)[group]) if group else None
-    shown = [r for r in rows if (not states or r["etat"] in states) and (not modules or r["module"] in modules)
-             and (grouped is None or r["id"] in grouped) and (not risks or r["risque"] in risks)
-             and (not ticket or ticket in (r["titre"] + " " + r["tache"] + " " + " ".join(r["tickets"])).casefold())]
-    # Liste : cases « Générer » pour générer plusieurs tâches sans ouvrir les cartes
-    list_key = f"cucumber_coverage_list_{client}_{len(shown)}"
-    table = coverage_table(shown, list_key)
-    st.data_editor(table, key=list_key, hide_index=True, width="stretch", height=380,
-                   disabled=[c for c in (table[0] if table else {}) if c != "Générer"],
-                   column_config=COVERAGE_COLUMNS)
-    checked = [r for r, line in zip(shown, coverage_table(shown, list_key)) if line["Générer"]]
-    by_id = {r["id"]: r for r in rows}
-    # Tâche dépendante cochée : proposer de générer à sa place la tâche dont elle dépend
-    wanted, substitutions = cucumber_coverage.substitute_dependents(rows, [r["id"] for r in checked])
-    if substitutions and not st.checkbox(
-            "Générer à leur place la tâche dont elles dépendent : " + " ; ".join(
-                f"« {by_id[d]['titre']} » → « {by_id[t]['titre']} »" for d, t in substitutions if t in by_id),
-            value=True, key=f"cucumber_substitute_{client}"):
-        wanted = [r["id"] for r in checked]
-    ready_ids = [i for i in wanted if i in by_id and generable(by_id[i])]
-    waiting = len(wanted) - len(ready_ids)
-    with st.container(horizontal=True, vertical_alignment="center"):
-        if st.button(f"Générer les tests sélectionnés ({len(ready_ids)})", type="primary", icon=":material/science:",
-                     disabled=not (ctx["ready"] and ready_ids), key=f"cucumber_generate_checked_{client}"):
-            generate_tasks(ctx, ready_ids)
-        if waiting:
-            st.caption(f"{waiting} tâche(s) cochée(s) ignorée(s) : réponses attendues, relance inutile, déjà "
-                       f"couvertes, en attente d'une autre tâche, non testables ou sans objet.")
-    card = st.selectbox("Ouvrir la carte d'une tâche", [""] + list(by_id), key=f"cucumber_card_{client}",
-                        format_func=lambda i: "—" if not i else f"{by_id[i]['titre']} "
-                                                              f"({cucumber_coverage.STATES[by_id[i]['etat']][0]})")
-    if card:
-        render_task_card(ctx, by_id[card])
-    specs = inventory.get("specifiques") or []
-    linked = sum(1 for s in specs if s.get("tests_std"))
-    unresolved_steps = (inventory.get("catalogue_standard") or {}).get("nb_steps_non_resolus")
-    if unresolved_steps:
-        st.caption(f":orange[{unresolved_steps} step(s) du Cucumber Standard déclaré(s) par une constante non "
-                   f"résolue : absents du catalogue (voir le journal de l'inventaire).]")
-    with st.expander(f"Tests Standard liés : {linked}/{len(specs)} tâche(s) avec au moins un équivalent"):
-        for s in specs:
-            tests = s.get("tests_std") or []
-            if not tests:
-                st.markdown(f"- **{s['libelle']}** : :gray[aucun test Standard équivalent]")
-                continue
-            st.markdown(f"- **{s['libelle']}**\n" + "\n".join(
-                f"    - `{t['path'].split('features/', 1)[-1]}` — {t['feature']} :gray[(score {t['score']}, "
-                f"{t['raison']})]" for t in tests))
 
 
 def render_cucumber_audit(client: str, inventory: dict, rows: list) -> None:
@@ -2824,7 +2714,8 @@ def render_cucumber_verification(client: str, state: dict) -> None:
                      "Mutation": st.column_config.TextColumn("Mutation", width="small"),
                      "Statique": st.column_config.TextColumn("Statique", width="small"),
                  })
-    sample = cucumber_verify.review_sample(state)
+    # Autonomie : pas de jugement demandé (les choix de l'agent sont dans l'onglet « Décisions » du mode expert)
+    sample = [] if cucumber_decisions.autonomous() else cucumber_verify.review_sample(state)
     if not sample:
         return
     unverified = sum(1 for item in sample if item["statut"] == "non_verifie")
@@ -2865,7 +2756,8 @@ def render_cucumber_generation(ctx: dict, state: dict, dependencies: dict = None
     """Étape 4 : lots, contrôles, vérification par exécution, reprise, complément et patch."""
     client, ready = ctx["client"], ctx["ready"]
     if not state.get("lots"):
-        st.info("Aucune génération : choisissez les tâches à couvrir (étape Sélection).", icon=":material/science:")
+        st.info("Aucune génération : lance-la depuis l'écran principal (« Lancer » ou « Écrire les tests »).",
+                icon=":material/science:")
         return
     pending = cucumber_tools.pending_lots(state)
     completable = cucumber_tools.completable_specifics(state)
@@ -3697,7 +3589,7 @@ with tab_config:
                  "détection automatique (inventaire, profil, état de l'init) n'est refaite que s'ils ont changé.")
         env_values["CUCUMBER_RUN_JOB"] = st.text_input(
             "CUCUMBER_RUN_JOB", value=os.getenv("CUCUMBER_RUN_JOB", ""), placeholder="DOSSIER/JOB",
-            help="Run Jenkins automatique (onglet Cucumber, étape Exécution) : job qui exécute <client>-cucumber, si "
+            help="Run Jenkins automatique (onglet Cucumber, mode expert, « Résultats ») : job qui exécute <client>-cucumber, si "
                  "le profil client n'en donne pas. Il doit lire la branche du profil et accepter TAGS.")
         env_values["CUCUMBER_VERIFY_LOCAL_CMD"] = st.text_input(
             "CUCUMBER_VERIFY_LOCAL_CMD", value=os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", ""),
@@ -3713,7 +3605,7 @@ with tab_config:
                 help="Corrections au plus par lot après exécution. L'agent continue tant que l'échec change et "
                      "s'arrête pour un scénario dès que son échec revient à l'identique. 0 : aucune correction.")
             review_sample = st.number_input(
-                "CUCUMBER_REVIEW_SAMPLE", min_value=0, step=1, value=env_int("CUCUMBER_REVIEW_SAMPLE", 5),
+                "CUCUMBER_REVIEW_SAMPLE", min_value=0, step=1, value=env_int("CUCUMBER_REVIEW_SAMPLE", 0),
                 help="Scénarios proposés à la revue humaine de l'onglet Cucumber : d'abord les « non vérifié », "
                      "puis des « pertinent » tirés au hasard.")
         env_values["CUCUMBER_VERIFY_TIMEOUT"] = str(int(verify_timeout))

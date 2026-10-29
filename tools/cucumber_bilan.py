@@ -160,9 +160,13 @@ def next_action(analysis: dict, bilan: dict) -> str:
     if init:
         return f"Corriger l'initialisation du client ({init['step'] or init['id']} : {init['message'][:160]}), puis relancer"
     if bilan.get("decisions_en_attente"):
-        return f"Trancher les {bilan['decisions_en_attente']} décision(s) en attente (étape Correction)"
+        return (f"Trancher les {bilan['decisions_en_attente']} décision(s) en attente (mode expert, « Décisions »)"
+                if not cucumber_decisions.autonomous() else
+                f"Relancer la correction : les {bilan['decisions_en_attente']} décision(s) en attente seront prises par "
+                f"l'agent (bouton « Corriger les tests en échec »)")
     if analysis.get("propositions"):
-        return f"Lancer la correction ciblée ({len(analysis['propositions'])} lot(s), étape Correction)"
+        return (f"Corriger les tests en échec ({len(analysis['propositions'])} lot(s)) : bouton « Corriger les tests "
+                f"en échec » de l'onglet Cucumber")
     if analysis.get("a_prouver"):
         return (f"Apporter une preuve pour {len(analysis['a_prouver'])} cause(s) restées en échec après "
                 f"{cucumber_import.max_attempts()} corrections (méthodes proposées dans le bilan)")

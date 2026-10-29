@@ -1677,9 +1677,9 @@ def review_sample(state: dict, size: int = None) -> list:
     """
     if size is None:
         try:
-            size = max(0, int(os.getenv("CUCUMBER_REVIEW_SAMPLE", "").strip() or 5))
+            size = max(0, int(os.getenv("CUCUMBER_REVIEW_SAMPLE", "").strip() or 0))
         except ValueError:
-            size = 5
+            size = 0
     pick = random.Random(state.get("debut", ""))
     sample = []
     for status in ("non_verifie", "pertinent"):

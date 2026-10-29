@@ -135,7 +135,7 @@ def test_bilan_sections_and_next_action(setup, tmp_path):
     assert reported["description"] == "paramètre de stock créé à la main" and reported["origine"].startswith("signalée")
     assert [d["fichier"] for d in bilan["defauts"]] == ["Proc/customized.xml", REL]
     assert bilan["doutes"][0]["certitude"] == "à vérifier" and len(bilan["desactives"]) == 1
-    assert bilan["prochaine_action"].startswith("Lancer la correction ciblée")   # S2 : échec « test » de l'agent
+    assert bilan["prochaine_action"].startswith("Corriger les tests en échec")   # S2 : échec « test » de l'agent
     markdown = open(bilan["fichier"], encoding="utf-8").read()
     assert markdown.index("Défauts détectés") < markdown.index("Corrigés") < markdown.index("# Import n°")
     assert "Proc/customized.xml:42" in markdown and "Correction suggérée : mapper la sortie" in markdown

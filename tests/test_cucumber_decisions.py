@@ -197,7 +197,8 @@ def test_diagnostics_kept_for_next_run_then_removed(client, repo):
     assert "diagnostics_en_attente" not in ct.load_state(client)["lots"][0]
 
 
-def test_correction_step_lists_pending_decisions(client):
+def test_correction_step_lists_pending_decisions(client, monkeypatch):
+    monkeypatch.setenv("CUCUMBER_AUTONOMY", "0")
     cd.propose(client, "tautologique", "sp-1 : scénario qui ne vérifie que sa mise en place", spec="sp-1")
     step = cj.correction_step(client, [], {"a_prouver": [{"id": "x"}]},
                               {"lots": [{"diagnostics_en_attente": ["a:1"]}]})
@@ -206,6 +207,8 @@ def test_correction_step_lists_pending_decisions(client):
     assert step["action"] == "Trancher les décisions en attente"
     bilan = {"manuelles": [], "decisions_en_attente": 1}
     assert cb.next_action({"propositions": [1]}, bilan).startswith("Trancher les 1 décision(s)")
+    monkeypatch.delenv("CUCUMBER_AUTONOMY")
+    assert "prises par l'agent" in cb.next_action({"propositions": [1]}, bilan)
 
 
 def test_autonomy_never_asks(client, repo, monkeypatch):
