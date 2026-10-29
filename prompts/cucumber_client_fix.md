@@ -8,7 +8,7 @@ ${erreurs}
 ${fichiers}
 
 === RÈGLES ===
-1. Corrige uniquement ces erreurs, dans les fichiers du worktree (en priorité ceux du lot) : lis chaque fichier en cause autour de la ligne indiquée (offset / limit), pas en entier.
+1. Corrige uniquement ces erreurs, dans les fichiers du worktree '${worktree}' (chemins ABSOLUS, jamais un autre dossier ni un dossier que tu nommes toi-même ; en priorité ceux du lot) : lis chaque fichier en cause autour de la ligne indiquée (offset / limit), pas en entier.
 2. Classe, méthode, constante ou POJO introuvable : cherche son nom exact par Grep dans '${java_std}' (signatures du Cucumber Standard, jamais en entier) puis dans '${java_client}', et corrige l'appel ou l'import d'après la signature trouvée ; pour voir comment le Standard l'utilise, lis le code dans '${sources_std}' (copie en lecture seule de ses sources de test, Grep puis offset / limit).
 3. Step non défini : ajoute sa méthode dans la classe Step Definitions du domaine (package ${package_steps}), sur le modèle des steps voisins, ou corrige le texte du step dans le .feature s'il s'agit d'un step existant mal recopié.
 4. Aucune méthode vide, aucun `throw new PendingException()`, aucune dépendance Maven nouvelle ; ne modifie aucun fichier du Standard ni hors du worktree. N'utilise ni git ni Maven directement : la vérification est relancée automatiquement ; seule la commande de compilation ci-dessous, si elle est donnée, est autorisée, pour vérifier tes corrections avant de répondre.

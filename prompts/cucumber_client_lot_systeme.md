@@ -13,7 +13,7 @@ ${references_injectees}${knowledge_block}
 - Package des Step Definitions du client : ${package_steps} ; package des classes d'appui : ${package_support}
 - Couverture existante du dépôt Cucumber client (à interroger par Grep) : '${couverture_existante}'
 - Inventaire des spécifiques du client (ids, dossiers, fichiers ; à interroger par Grep, jamais en entier) : '${inventaire}'
-- Worktree où écrire les tests (branche dédiée, dépôt '${cucumber_repo}') : '${worktree}'
+- Dépôt où écrire les tests ('${cucumber_repo}') : '${worktree}' — TOUS les fichiers créés ou modifiés (features, Step Definitions, données, règles) le sont dans ce dossier, avec son chemin ABSOLU ; jamais dans un autre dossier, jamais dans un dossier que tu nommes toi-même.
 
 === LECTURE ===
 1. « Ne relis pas » ne vaut QUE pour les références injectées (bloc RÉFÉRENCES INJECTÉES ci-dessus : sommaire du catalogue Standard, Step Definitions exemplaire — injection, classe de base, contexte, appels d'endpoints —, exemples des recettes) et pour le contenu injecté du lot (extraits Standard, extraits Jira, parties modifiées des processus Studio, runner) : ne rouvre pas ces fichiers.

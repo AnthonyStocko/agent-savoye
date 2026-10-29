@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1587,10 +1587,14 @@ def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns:
         if os.path.exists(journal):
             os.remove(journal)
         os.environ["AGENT_DB_LOG"] = journal
+    started = time.time() - 1
     try:
         return run_claude(prompt, model, [cucumber_tools.STD_CACHE_DIR], allowed_tools, extra_args=extra,
                           cwd=run_dir, effort=effort, lean=lean_session(), budget_usd=cucumber_budget())
     finally:
+        # Fichiers de test écrits hors du dépôt <client>-cucumber (dossier parasite) : rapatriés dans le worktree
+        for source, target in cucumber_stray.relocate(run_dir, os.path.join(run_dir, "worktree"), started):
+            print(f"[CUCUMBER] ⚠️ Fichier écrit hors du dépôt {source} → rapatrié dans le dépôt : {target}")
         if journal:
             os.environ.pop("AGENT_DB_LOG", None)
             db_log.extend({**entry, "etape": db_step} for entry in read_db_journal(journal))
@@ -3034,6 +3038,13 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         if not base or not os.path.exists(os.path.join(worktree, ".git")):
             print("[CUCUMBER] Aucun espace de travail ou branche d'intégration introuvable : rien à livrer.")
             return 2
+        relocated = cucumber_stray.relocate(cucumber_tools.cache_dir(client), worktree)
+        for source, target in relocated:
+            print(f"[CUCUMBER] ⚠️ Fichier écrit hors du dépôt {source} → rapatrié dans le dépôt : {target}")
+        if relocated:
+            cucumber_tools._git(worktree, "add", "--", *[t for _, t in relocated])
+            cucumber_tools._git(worktree, "commit", "-q", "-m",
+                                f"Cucumber : {len(relocated)} fichier(s) de l'agent rapatrié(s) dans le dépôt")
         if local_cucumber_std_repo:
             deliver_std_data(client, worktree, local_cucumber_std_repo,
                              cucumber_profile.effective_profile(cucumber_profile.load_profile(client)))
@@ -3286,6 +3297,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                f"depuis, jamais écrasées) : {', '.join(kept)}"))
         print(f"[CUCUMBER] ⚠️ Espace de travail non synchronisé avec {state['base']} : {problem}" if problem else
               f"[CUCUMBER] Espace de travail synchronisé avec {state['base']} (branche lue par Jenkins).")
+    # Fichiers égarés par l'agent hors du dépôt lors des générations précédentes : rapatriés s'ils sont plus récents
+    for source, target in cucumber_stray.relocate(cucumber_tools.cache_dir(client), worktree):
+        print(f"[CUCUMBER] ⚠️ Fichier écrit hors du dépôt {source} → rapatrié dans le dépôt : {target}")
     # Autonomie : décisions restées en attente (d'avant l'autonomie) prises par l'agent, scénarios réactivés
     for done in cucumber_decisions.auto_resolve_pending(client, worktree, state["base"]):
         print(f"[CUCUMBER] 🤖 Décision en attente prise par l'agent ({cucumber_decisions.TYPES[done['type']]}) : "
