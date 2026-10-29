@@ -2043,21 +2043,27 @@ def main_action(ctx: dict, rows: list, init_status: dict) -> dict:
                           f"{(init.get('step') or init.get('id', ''))[:120]}."}
     init_lot = cucumber_detection.init_lot(init_status)
     first = [r["id"] for r in rows if generable(r)] if not state.get("lots") else []
-    if init_lot:
-        return {"type": "init", "lot": init_lot, "suite": first, "libelle": "Préparer l'initialisation"
-                + (" puis écrire les tests" if first else ""),
-                "detail": "les données de test du projet sont " + ("absentes" if init_lot["mode"] == "init"
-                                                                   else "incomplètes")
-                          + (f", puis première couverture de {len(first)} tâche(s)." if first else ".")}
     fixable = [] if str(numero) in launched or analysis.get("non_analyse") else analysis.get("propositions") or []
+    follow = {}
     if fixable:
         count = sum(len(p["scenarios"]) for p in fixable)
-        return {"type": "corriger", "numero": numero, "specs": [p["spec"] for p in fixable],
-                "libelle": f"Corriger les {count} test(s) en échec",
-                "detail": f"tests en échec au dernier run importé (n° {numero})."}
-    if first:
-        return {"type": "couverture", "ids": first, "libelle": f"Écrire la première couverture ({len(first)})",
-                "detail": f"{len(first)} tâche(s) sans test."}
+        follow = {"type": "corriger", "numero": numero, "specs": [p["spec"] for p in fixable],
+                  "libelle": f"Corriger les {count} test(s) en échec",
+                  "detail": f"tests en échec au dernier run importé (n° {numero})."}
+    elif first:
+        follow = {"type": "couverture", "ids": first, "libelle": f"Écrire la première couverture ({len(first)})",
+                  "detail": f"{len(first)} tâche(s) sans test."}
+    # Préparation déjà réussie : ce qui reste incomplet est listé dans son résultat, on passe aux tests
+    prepared = (state.get("preparation") or {}).get("ok")
+    if init_lot and not prepared:
+        what = "absentes" if init_lot["mode"] == "init" else "incomplètes"
+        return {"type": "init", "lot": init_lot, "suite": follow,
+                "libelle": "Préparer l'initialisation" + (" puis " + follow["libelle"][0].lower()
+                                                         + follow["libelle"][1:] if follow else ""),
+                "detail": f"les données de test du projet sont {what} ; l'agent les complète"
+                          + (f", puis : {follow['detail']}" if follow else ".")}
+    if follow:
+        return follow
     return {"type": "", "libelle": "Lancer",
             "detail": "rien à faire pour l'instant : importe le résultat du prochain run Jenkins, ou choisis des "
                       "tâches ci-dessous."}
@@ -2072,8 +2078,10 @@ def run_main_action(ctx: dict, action: dict) -> None:
             "Initialisation corrigée : les modifications sont prêtes ci-dessous." if code == 0 else
             f"Correction de l'initialisation incomplète : {interruption_cause(code)}.")
     elif action["type"] == "init":
+        # Puis, dans le même clic, la correction des tests en échec ou la première couverture
         if run_cucumber_init_lot(ctx, action["lot"]) == 0 and action.get("suite"):
-            generate_tasks(ctx, action["suite"])
+            run_main_action(ctx, action["suite"])
+            return
     elif action["type"] == "corriger":
         run_cucumber_generation(ctx, ["--complete", "--from-import", str(action["numero"])], action["specs"])
     elif action["type"] == "couverture":
