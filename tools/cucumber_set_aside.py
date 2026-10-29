@@ -28,6 +28,8 @@ def _deliver(client_name: str, worktree: str, state: dict, files: list, message:
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return False
     _git(worktree, "commit", "-q", "-m", message)
+    from tools import cucumber_bilan
+    cucumber_bilan.share_a_revoir(client_name)
     if state.get("base"):
         write_patch(worktree, state["base"], patch_path(client_name), client_name)
     return True

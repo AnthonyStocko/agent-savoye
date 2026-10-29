@@ -2975,6 +2975,18 @@ def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio
     print("[CUCUMBER INIT] " + ("✅ Init vérifiée sur Jenkins après correction." if out.get("ok") else
                                 "Correction faite, non vérifiée sur Jenkins : relisez et appliquez le patch, poussez et "
                                 "relancez votre job, puis importez le résultat."))
+    # Correction de l'init déposée dans le répertoire de connaissances partagé
+    corrected = state.get("init_corrigee") or {}
+    body = (f"# Correction de l'initialisation de {client} (run importé n° {numero})\n\n"
+            f"- Échec : {rel} — {init.get('step', '')} — {(init.get('message') or '')[:400]}\n"
+            f"- Résultat : " + ("vérifiée sur Jenkins après correction" if out.get("ok") else
+                                "corrigée, non vérifiée sur Jenkins") + "\n"
+            + "".join(f"- Fichier corrigé : {f}\n" for f in corrected.get("fichiers") or [])
+            + "".join(f"- Tentative : {json.dumps(t, ensure_ascii=False)[:600]}\n"
+                      for t in (corrected.get("tentatives") or [])[-3:])
+            + (f"\n## Patch\n\n```diff\n{_read_text(patch)[:20000]}\n```\n" if os.path.exists(patch) else ""))
+    share_knowledge(body, (getattr(args, "project", "") or "").strip().upper() or client.upper(), "cucumber-correction-init",
+                    f"Correction de l'initialisation {client} (run n° {numero})", client=client, tags=["cucumber"])
     return 0
 
 

@@ -100,7 +100,28 @@ def record_preparation(client_name: str, ok: bool, message: str, files: list = (
     state["preparation"] = {"date": _now(), "ok": ok, "message": message.strip(), "fichiers": list(files),
                             "patch": patch, "restantes": [str(r).strip() for r in remaining if str(r).strip()][:30]}
     save_state(client_name, state)
+    share_preparation(client_name, state["preparation"])
     return state["preparation"]
+
+
+def share_preparation(client_name: str, preparation: dict) -> dict:
+    """Résultat de la préparation des données de test déposé dans les connaissances partagées (jamais bloquant)."""
+    from tools import knowledge_tools
+    if not knowledge_tools.enabled():
+        return {}
+    patch = preparation.get("patch") or ""
+    body = (f"# Préparation des données de test de {client_name}\n\n"
+            f"- Résultat : {'réussie' if preparation.get('ok') else 'en échec'} — {preparation.get('message', '')}\n"
+            + "".join(f"- Fichier : {f}\n" for f in preparation.get("fichiers") or [])
+            + ("\n## Points non faits, à traiter à la main\n\n" + "".join(
+                f"- {r}\n" for r in preparation["restantes"]) if preparation.get("restantes") else "")
+            + (f"\n## Patch\n\n```diff\n{open(patch, encoding='utf-8', errors='replace').read()[:20000]}\n```\n"
+               if patch and os.path.exists(patch) else ""))
+    result = knowledge_tools.publish_knowledge(body, client_name.upper(), "cucumber-initialisation",
+                                               f"Préparation des données de test {client_name}", client=client_name,
+                                               tags=["cucumber"], resume=preparation.get("message", ""))
+    print(knowledge_tools.publish_line(result))
+    return result
 
 
 def missing_results(state: dict, ids: list, since: str) -> list:

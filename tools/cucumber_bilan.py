@@ -21,6 +21,7 @@ from datetime import datetime
 from tools import cucumber_decisions, cucumber_diagnostic, cucumber_import, knowledge_tools
 from tools.cucumber_a_revoir import A_REVOIR_FILE, CAUSES, UNPROVEN
 from tools.cucumber_tools import (CONSTAT_TYPES, _git, _read_json, _write_json, _write_text, cache_dir, patch_path,
+                                  worktree_dir,
                                   save_state, write_patch)
 from tools.cucumber_verify import failure_category
 
@@ -360,6 +361,19 @@ def share_bilan(client_name: str, bilan: dict, project: str = "") -> dict:
         return {}
     with open(bilan["fichier"], encoding="utf-8") as f:
         body = f.read()
-    return knowledge_tools.publish_knowledge(body, project or client_name.upper(), "cucumber-diagnostic-run",
-                                             f"Bilan du run importé n° {bilan['import']}", client=client_name,
-                                             tags=["cucumber"], resume=bilan["prochaine_action"])
+    result = knowledge_tools.publish_knowledge(body, project or client_name.upper(), "cucumber-diagnostic-run",
+                                               f"Bilan du run importé n° {bilan['import']}", client=client_name,
+                                               tags=["cucumber"], resume=bilan["prochaine_action"])
+    share_a_revoir(client_name, project)
+    return result
+
+
+def share_a_revoir(client_name: str, project: str = "") -> dict:
+    """A_REVOIR.md à jour (après un import, une mise de côté, une réactivation) redéposé dans le partage."""
+    path = os.path.join(worktree_dir(client_name), A_REVOIR_FILE)
+    if not knowledge_tools.enabled() or not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        body = f.read()
+    return knowledge_tools.publish_knowledge(body, project or client_name.upper(), "cucumber-a-revoir",
+                                             f"À revoir Cucumber {client_name}", client=client_name, tags=["cucumber"])

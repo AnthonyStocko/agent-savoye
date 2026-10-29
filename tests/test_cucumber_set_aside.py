@@ -41,3 +41,20 @@ def test_set_aside_then_reactivate(tmp_path, monkeypatch):
     assert sa.reactivate(CLIENT, [f"{REL}::Statut du contenant"], CLIENT_TAG) == [f"{REL}::Statut du contenant"]
     assert open(os.path.join(worktree, REL), encoding="utf-8").read() == FEATURE
     assert ct.load_state(CLIENT)["mis_de_cote"] == [] and cc.disabled_scenarios(worktree) == {}
+
+
+def test_preparation_and_set_aside_are_shared(tmp_path, monkeypatch):
+    from tools import cucumber_results as cr
+    from tools import knowledge_tools as kt
+    monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setenv("AGENT_KNOWLEDGE_DIR", str(tmp_path / "partage"))
+    published = []
+    monkeypatch.setattr(kt, "publish_knowledge", lambda body, projet, doc_type, sujet, **f: published.append(
+        (projet, doc_type, sujet, body)) or {"statut": "depose", "message": "ok", "chemin": "", "remplacements": []})
+    patch = tmp_path / "init.patch"
+    patch.write_text("diff --git a/x b/x\n+Feature: Compléments\n")
+    cr.record_preparation(CLIENT, True, "Compléments écrits (1 fichier).", ["a.feature"], str(patch),
+                          ["entité inconnue"])
+    projet, doc_type, sujet, body = published[-1]
+    assert (projet, doc_type) == (CLIENT.upper(), "cucumber-initialisation") and "entité inconnue" in body
+    assert "+Feature: Compléments" in body
