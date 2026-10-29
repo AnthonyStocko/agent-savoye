@@ -32,7 +32,6 @@ from tools.memory_tools import (
     find_similar_tickets, get_project_lessons, load_ticket_memory, record_manual_edit,
     get_all_memories, clear_memory, delete_ticket_memory, import_existing_deliverables,
 )
-from tools.poller_control import force_stop, get_poller_status, request_stop, start_poller, tail_log
 
 # Pleine largeur par défaut (tableaux, revues de PR, état des tests) ; APP_LAYOUT=centered pour une colonne centrale
 st.set_page_config(page_title="Scrum Master IA Dashboard",
@@ -312,9 +311,9 @@ if env_problems:
                        f".env.bak.")
             st.rerun()
 
-(tab_integration, tab_execution, tab_cucumber, tab_review, tab_assistant, tab_merges, tab_knowledge,
+(tab_integration, tab_execution, tab_cucumber, tab_review, tab_assistant, tab_knowledge,
  tab_config) = st.tabs(["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🔍 Revue de PR", "💬 Assistant",
-                        "🔔 Écoute des merges", "📚 Connaissances partagées", "⚙️ Configuration (.env)"])
+                        "📚 Connaissances partagées", "⚙️ Configuration (.env)"])
 
 # Initialisation de l'état
 if "workflow_step" not in st.session_state:
@@ -2992,51 +2991,6 @@ def render_knowledge_outbox() -> None:
 
 
 # ---------------------------------------------------------
-# ONGLET 3 : ÉCOUTE DES MERGES BITBUCKET (post-merge Cucumber)
-# ---------------------------------------------------------
-@st.fragment(run_every="10s")
-def merge_listener_status():
-    """Statut et journal rafraîchis toutes les 10 s sans recharger toute la page."""
-    status = get_poller_status()
-    # Passage actif <-> arrêté détecté par le rafraîchissement : recharge complète pour réactiver le formulaire
-    running = bool(status)
-    previous = st.session_state.get("merge_listener_running")
-    st.session_state["merge_listener_running"] = running
-    if previous is not None and previous != running:
-        st.rerun()
-
-    with st.container(border=True):
-        if not status:
-            st.markdown(":gray-badge[:material/pause_circle: Écoute arrêtée]")
-        elif status.get("state") == "stopping":
-            st.markdown(":orange-badge[:material/hourglass_top: Arrêt en cours] "
-                        "— l'écoute finit le traitement en cours avant de s'arrêter.")
-        else:
-            st.markdown(f":green-badge[:material/sensors: Écoute active] sur **{status['projects']}**")
-            started = status["started_at"].replace("T", " ")
-            last_poll = status.get("last_poll", "").replace("T", " ") or "en cours…"
-            st.caption(f"Depuis {started} · toutes les {status['interval'] // 60} min · "
-                       f"dernier passage : {last_poll} · en file : {status.get('queued', 0)}")
-            if status.get("repositories"):
-                st.caption("Dépôts surveillés : " + ", ".join(status["repositories"]))
-
-        if status and status.get("state") != "stopping":
-            with st.container(horizontal=True):
-                if st.button("Arrêter l'écoute", icon=":material/stop_circle:",
-                             help="Plus aucun nouveau merge n'est pris ; un traitement déjà lancé va jusqu'au bout."):
-                    request_stop()
-                    st.rerun()
-                if st.button("Forcer l'arrêt", icon=":material/dangerous:",
-                             help="Arrête immédiatement, y compris l'agent s'il est en train de traiter un merge."):
-                    st.toast(force_stop())
-                    st.rerun()
-
-    with st.expander("Journal de l'écoute", icon=":material/receipt_long:"):
-        st.code(tail_log(40) or "Journal vide.", language="text")
-    return status
-
-
-# ---------------------------------------------------------
 # ONGLET REVUE DE PR : RELIRE LES PULL REQUESTS DES COLLABORATEURS (BITBUCKET)
 # ---------------------------------------------------------
 REVIEW_VERDICTS = {"approuver": "✅ Peut être approuvée", "changements_demandes": "⛔ Changements à demander",
@@ -3292,56 +3246,6 @@ with tab_assistant:
     render_assistant_tab()
 
 
-with tab_merges:
-    st.subheader("Écoute des merges Bitbucket")
-    postmerge_project = os.getenv("POSTMERGE_JIRA_PROJECT", "").strip() or os.getenv("JIRA_PROJECT_KEY", "").strip()
-    target_branches = " ou ".join(b.strip() for b in os.getenv("WEBHOOK_TARGET_BRANCHES", "integration,dev").split(",")
-                                  if b.strip()) or "n'importe quelle branche"
-    st.caption(f"À chaque Pull Request fusionnée vers {target_branches}, l'agent analyse le code fusionné, "
-               f"crée le ticket {postmerge_project} « [CUCUMBER] Adaptation des tests post-merge » et y attache le patch Cucumber.")
-
-    listener_status = merge_listener_status()
-
-    with st.form("merge_listener_form"):
-        listen_projects = st.text_input(
-            "Projets Bitbucket à écouter",
-            value=os.getenv("POLL_REPOSITORIES", ""),
-            help="Clé de projet (tous ses dépôts) ou PROJET/dépôt, séparés par des virgules. "
-                 "Ex : CLIENT, AUTRE/odatio-autre. Les dépôts *cucumber* sont toujours ignorés."
-        )
-        listen_interval = st.number_input(
-            "Fréquence de vérification (minutes)", min_value=1, max_value=60,
-            value=max(int(os.getenv("POLL_INTERVAL_SECONDS", "300")) // 60, 1)
-        )
-        listen_catch_up = st.checkbox(
-            "Traiter aussi les merges survenus pendant l'arrêt de l'écoute", value=False,
-            help="Décoché : seuls les merges postérieurs au démarrage sont traités."
-        )
-        start_listening = st.form_submit_button(
-            "Démarrer l'écoute", type="primary", icon=":material/play_circle:",
-            disabled=bool(listener_status),
-            help="Arrêtez l'écoute pour en modifier les paramètres." if listener_status else None
-        )
-
-    if start_listening:
-        projects_value = ",".join(p.strip().upper() if "/" not in p else p.strip()
-                                  for p in listen_projects.split(",") if p.strip())
-        if not projects_value:
-            st.error("Renseignez au moins un projet Bitbucket.")
-        else:
-            env_tools.write_env(ENV_PATH, {"POLL_REPOSITORIES": projects_value,
-                                           "POLL_INTERVAL_SECONDS": str(int(listen_interval) * 60)})
-            os.environ["POLL_REPOSITORIES"] = projects_value
-            os.environ["POLL_INTERVAL_SECONDS"] = str(int(listen_interval) * 60)
-            with st.spinner("Démarrage de l'écoute…"):
-                ok, message = start_poller(projects_value, int(listen_interval) * 60, listen_catch_up)
-            if ok:
-                st.toast(message, icon=":material/sensors:")
-                st.rerun()
-            else:
-                st.error(message)
-
-
 # ---------------------------------------------------------
 # ONGLET CONNAISSANCES PARTAGÉES : RECHERCHE, APERÇU, STATUT, IMPORT
 # ---------------------------------------------------------
@@ -3549,22 +3453,11 @@ with tab_config:
         env_values["JIRA_APPLICATION_MAX_TICKETS"] = str(int(application_max))
 
         st.markdown("---")
-        st.markdown("#### 🎫 Tickets Jira créés par l'agent (tâches d'épopée, post-merge Cucumber)")
+        st.markdown("#### 🎫 Tickets Jira créés par l'agent (tâches d'épopée)")
         with st.container(horizontal=True):
-            env_values["POSTMERGE_JIRA_PROJECT"] = st.text_input(
-                "POSTMERGE_JIRA_PROJECT", value=os.getenv("POSTMERGE_JIRA_PROJECT", ""),
-                help="Projet des tickets [CUCUMBER] post-merge. Vide = JIRA_PROJECT_KEY.")
             env_values["POSTMERGE_JIRA_COMPONENT"] = st.text_input(
                 "POSTMERGE_JIRA_COMPONENT", value=os.getenv("POSTMERGE_JIRA_COMPONENT", ""),
-                help="Composant Jira ou équipe Atlassian posé sur les tickets créés (post-merge et tâches d'épopée). "
-                     "Vide = aucun.")
-            env_values["POSTMERGE_JIRA_LABEL"] = st.text_input(
-                "POSTMERGE_JIRA_LABEL", value=os.getenv("POSTMERGE_JIRA_LABEL", ""),
-                help="Label des tickets post-merge. Vide = aucun.")
-        with st.container(horizontal=True):
-            env_values["JIRA_POSTMERGE_ISSUE_TYPE"] = st.text_input(
-                "JIRA_POSTMERGE_ISSUE_TYPE", value=os.getenv("JIRA_POSTMERGE_ISSUE_TYPE", "Development"),
-                help="Type des tickets post-merge.")
+                help="Composant Jira ou équipe Atlassian posé sur les tâches créées sous une épopée. Vide = aucun.")
             env_values["JIRA_EPIC_TASK_ISSUE_TYPE"] = st.text_input(
                 "JIRA_EPIC_TASK_ISSUE_TYPE", value=os.getenv("JIRA_EPIC_TASK_ISSUE_TYPE", ""),
                 help="Type des tâches créées sous une épopée. Vide = premier type existant parmi Tâche, Task, "
@@ -3584,14 +3477,6 @@ with tab_config:
             "REVIEW_PROJECTS", value=os.getenv("REVIEW_PROJECTS", ""), placeholder="OXY, APPAREL",
             help="Projets Bitbucket proposés dans la vue « Par projet » de l'onglet Revue de PR (toutes leurs PR "
                  "ouvertes).").strip().upper()
-        env_values["BITBUCKET_WEBHOOK_SECRET"] = st.text_input(
-            "BITBUCKET_WEBHOOK_SECRET",
-            value=os.getenv("BITBUCKET_WEBHOOK_SECRET", ""),
-            type="password",
-            help="Secret partagé avec le webhook Bitbucket (champ Secret) pour signer les événements post-merge. "
-                 "Générer : python -c \"import secrets; print(secrets.token_hex(32))\". "
-                 "Redémarrer webhook_server.py après modification."
-        )
 
         st.markdown("---")
         st.markdown("#### 🏗️ Connexion Jenkins (Cucumber / Tirs de tests)")
@@ -3876,32 +3761,6 @@ with tab_config:
             help="Mode local : chemin du jacoco.exec produit par l'environnement client.")
 
         st.markdown("---")
-        st.markdown("#### 🔔 Post-merge Cucumber & écoute des merges")
-        with st.container(horizontal=True):
-            env_values["POSTMERGE_CUCUMBER_REPOS"] = st.text_input(
-                "POSTMERGE_CUCUMBER_REPOS", value=os.getenv("POSTMERGE_CUCUMBER_REPOS", ""),
-                help="Dépôt Cucumber de chaque projet client. Ex: CLIENT=client-cucumber-2,AUTRE=autre-cucumber. "
-                     "Vide = détection du dépôt *cucumber* du projet.")
-            env_values["POSTMERGE_CUCUMBER_BASE_BRANCH"] = st.text_input(
-                "POSTMERGE_CUCUMBER_BASE_BRANCH", value=os.getenv("POSTMERGE_CUCUMBER_BASE_BRANCH", "integration"),
-                help="Branche de base des patchs Cucumber post-merge.")
-        with st.container(horizontal=True):
-            env_values["WEBHOOK_TARGET_BRANCHES"] = st.text_input(
-                "WEBHOOK_TARGET_BRANCHES", value=os.getenv("WEBHOOK_TARGET_BRANCHES", "integration,dev"),
-                help="Branches dont les merges déclenchent l'agent, séparées par une virgule.")
-            env_values["WEBHOOK_IGNORED_REPOS"] = st.text_input(
-                "WEBHOOK_IGNORED_REPOS", value=os.getenv("WEBHOOK_IGNORED_REPOS", "cucumber"),
-                help="Motifs de dépôts ignorés, séparés par une virgule.")
-            env_values["WEBHOOK_STD_PROJECT"] = st.text_input(
-                "WEBHOOK_STD_PROJECT", value=os.getenv("WEBHOOK_STD_PROJECT", ""),
-                help="Projet Bitbucket du socle Standard. Vide = déduit de BITBUCKET_STD_REPO_PATH.")
-        with st.container(horizontal=True):
-            env_values["WEBHOOK_HOST"] = st.text_input("WEBHOOK_HOST", value=os.getenv("WEBHOOK_HOST", "0.0.0.0"),
-                                                       help="Mode webhook uniquement (python webhook_server.py).")
-            env_values["WEBHOOK_PORT"] = st.text_input("WEBHOOK_PORT", value=os.getenv("WEBHOOK_PORT", "8085"),
-                                                       help="Mode webhook uniquement (python webhook_server.py).")
-
-        st.markdown("---")
         st.markdown("#### 🔑 Compte Claude")
         # Valeur du .env seule : celle héritée du shell n'est pas enregistrée par défaut
         saved_config_dir = (dotenv_values(ENV_PATH).get("CLAUDE_CONFIG_DIR") or "").strip()
@@ -3948,7 +3807,6 @@ with tab_config:
             env_values["CLAUDE_MODEL_REFINE"] = st.text_input("CLAUDE_MODEL_REFINE", value=os.getenv("CLAUDE_MODEL_REFINE", ""), help=model_help)
         with st.container(horizontal=True):
             env_values["CLAUDE_MODEL_PATCH"] = st.text_input("CLAUDE_MODEL_PATCH", value=os.getenv("CLAUDE_MODEL_PATCH", ""), help=model_help)
-            env_values["CLAUDE_MODEL_POSTMERGE"] = st.text_input("CLAUDE_MODEL_POSTMERGE", value=os.getenv("CLAUDE_MODEL_POSTMERGE", ""), help=model_help)
         with st.container(horizontal=True):
             env_values["CLAUDE_MODEL_BESOIN"] = st.text_input("CLAUDE_MODEL_BESOIN", value=os.getenv("CLAUDE_MODEL_BESOIN", ""),
                                                               help=model_help + " Utilisé par la rédaction du besoin (onglet Intégration).")
@@ -3967,7 +3825,6 @@ with tab_config:
             env_values["CLAUDE_EFFORT_REFINE"] = st.text_input("CLAUDE_EFFORT_REFINE", value=os.getenv("CLAUDE_EFFORT_REFINE", ""), help=effort_help)
         with st.container(horizontal=True):
             env_values["CLAUDE_EFFORT_PATCH"] = st.text_input("CLAUDE_EFFORT_PATCH", value=os.getenv("CLAUDE_EFFORT_PATCH", ""), help=effort_help)
-            env_values["CLAUDE_EFFORT_POSTMERGE"] = st.text_input("CLAUDE_EFFORT_POSTMERGE", value=os.getenv("CLAUDE_EFFORT_POSTMERGE", ""), help=effort_help)
         with st.container(horizontal=True):
             env_values["CLAUDE_EFFORT_BESOIN"] = st.text_input("CLAUDE_EFFORT_BESOIN", value=os.getenv("CLAUDE_EFFORT_BESOIN", ""),
                                                                help=effort_help + " Utilisé par la rédaction du besoin (onglet Intégration).")
