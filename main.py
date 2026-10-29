@@ -544,72 +544,98 @@ def _build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: s
 REVIEW_TOOLS = ["Read", "Grep", "Glob"]
 
 
-def run_pr_review(pr_url: str) -> int:
+def run_pr_review(pr_urls: list, feature: str = "") -> int:
     """
-    Revue assistée d'une pull request Bitbucket (lecture seule) : diff, code de la PR, ticket(s) Jira, conventions
-    de l'équipe et commentaires déjà posés donnés à l'agent ; résultat (résumé, verdict, commentaires ligne par
-    ligne) enregistré pour l'onglet « Revue de PR ». Rien n'est publié sur Bitbucket ici. Renvoie le code de sortie.
+    Revue assistée d'une FONCTIONNALITÉ (lecture seule) : toutes ses pull requests Bitbucket relues ensemble — diff et
+    code de chaque PR, ticket(s) Jira, conventions de l'équipe, commentaires déjà posés. Résultat (résumé, cohérence
+    entre les PR, verdict, commentaires ligne par ligne rattachés à leur PR) enregistré pour l'onglet « Revue de PR ».
+    Rien n'est publié sur Bitbucket ici. Renvoie le code de sortie.
     """
-    try:
-        project, repo, number = pr_review.parse_pr_url(pr_url)
-        pr = pr_review.pr_details(project, repo, number)
-        diff, lines_map, files = pr_review.pr_diff(project, repo, number)
-        comments = pr_review.existing_comments(project, repo, number)
-    except (ValueError, pr_review.BitbucketError) as e:
-        print(f"[REVUE PR] ❌ {e}")
+    urls = [u for u in dict.fromkeys(u.strip() for u in pr_urls or [] if u and u.strip())]
+    if not urls:
+        print("[REVUE PR] ❌ Aucune pull request à relire (--pr-url).")
         return 2
-    print(f"[REVUE PR] {project}/{repo} #{number} — {pr['titre']} ({pr['auteur']}, {len(files)} fichier(s), "
-          f"commit {pr['commit'][:10]})")
-    run_dir = os.path.join(pr_review.ROOT, "runs", f"{project}_{repo}_{number}")
+    run_dir = os.path.join(pr_review.ROOT, "runs", re.sub(r"[^\w.-]", "_", feature or "pr")
+                           + f"_{datetime.now().strftime('%Y%m%d%H%M%S')}")
     os.makedirs(run_dir, exist_ok=True)
-    diff_file = os.path.join(run_dir, "pr.diff")
-    with open(diff_file, "w", encoding="utf-8") as f:
-        f.write(diff)
-    code, why = pr_review.prepare_code(project, repo, number, pr["commit"])
-    print(f"[REVUE PR] Code de la PR : {code}" if code else f"[REVUE PR] ⚠️ Analyse sur le diff seul : {why}")
-    code_block = (f"Code complet de la PR au dernier commit (lecture seule) : '{code}' — ouvre les fichiers modifiés "
-                  f"autour des changements et Grep les appelants des méthodes modifiées." if code else
-                  "Code complet indisponible : analyse sur le diff seul ; formule en question ce que tu ne peux pas "
-                  "vérifier.")
-    tickets = []
-    for key in pr["jira"][:3]:
+    prs, blocks, comments, maps, dirs, keys = [], [], [], {}, [run_dir], []
+    for url in urls:
         try:
-            tickets.append(f"{key} :\n{get_jira_issue_details(key)[:4000]}")
+            project, repo, number = pr_review.parse_pr_url(url)
+            pr = pr_review.pr_details(project, repo, number)
+            diff, lines_map, files = pr_review.pr_diff(project, repo, number)
+            existing = pr_review.existing_comments(project, repo, number)
+        except (ValueError, pr_review.BitbucketError) as e:
+            print(f"[REVUE PR] ❌ {url} : {e}")
+            return 2
+        label = pr_review.pr_label(pr)
+        diff_file = os.path.join(run_dir, f"{label.replace('#', '_')}.diff")
+        with open(diff_file, "w", encoding="utf-8") as f:
+            f.write(diff)
+        code, why = pr_review.prepare_code(project, repo, number, pr["commit"])
+        print(f"[REVUE PR] {label} — {pr['titre']} ({pr['auteur']}, {len(files)} fichier(s)) : "
+              + (f"code {code}" if code else f"⚠️ diff seul ({why})"))
+        if code:
+            dirs.append(code)
+        blocks.append(f"- PR « {label} » : {project}/{repo} #{number} — {pr['titre']} ; auteur {pr['auteur']} ; "
+                      f"{pr['source']} → {pr['cible']} ; {len(files)} fichier(s)\n  diff : '{diff_file}'\n  code : "
+                      + (f"'{code}'" if code else "indisponible (diff seul : formule en question ce que tu ne peux "
+                                                  "pas vérifier)")
+                      + (f"\n  description : {' '.join(pr['description'].split())[:800]}" if pr["description"] else ""))
+        comments += [{**c, "pr": label} for c in existing]
+        maps[label] = lines_map
+        keys += pr["jira"]
+        prs.append({**pr, "repere": label, "fichiers": files})
+    feature = feature or (keys[0] if keys else "")
+    tickets = []
+    for key in list(dict.fromkeys(([feature] if feature else []) + keys))[:4]:
+        try:
+            tickets.append(f"{key} :\n{get_jira_issue_details(key)[:5000]}")
         except Exception as e:  # noqa: BLE001 — Jira facultatif pour une revue
             tickets.append(f"{key} : lecture impossible ({type(e).__name__})")
     conventions = os.getenv("DEV_CONVENTIONS_PATH", "").strip() or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "odatio-specific-code-conventions-dev.md")
+    if os.path.exists(conventions):
+        dirs.append(os.path.dirname(conventions))
     prompt = render_prompt(
-        "pr_review", relecteur=os.getenv("JIRA_EMAIL", "").split("@")[0] or "l'utilisateur",
-        token_saving_rules="\n" + render_prompt("token_saving_rules"), titre=pr["titre"], projet=project,
-        depot=repo, numero=number, auteur=pr["auteur"], source=pr["source"], cible=pr["cible"],
-        nb_fichiers=len(files), description=pr["description"][:3000] or "(aucune)",
-        jira="\n\n".join(tickets) or "(aucun ticket cité dans le titre, la branche ou la description)",
-        diff_file=diff_file, code_block=code_block,
+        "pr_review", relecteur=os.getenv("JIRA_EMAIL", "").split("@")[0] or "l'utilisateur", nb_prs=len(prs),
+        token_saving_rules="\n" + render_prompt("token_saving_rules"),
+        fonctionnalite=(f"{feature} — " if feature else "") + prs[0]["titre"],
+        jira="\n\n".join(tickets) or "(aucun ticket cité dans les titres, branches ou descriptions)",
+        prs="\n".join(blocks),
         conventions=f"'{conventions}'" if os.path.exists(conventions) else "(fichier de conventions absent)",
-        commentaires_existants="\n".join(f"- {c['auteur']} — {c['fichier'] or 'général'}"
+        commentaires_existants="\n".join(f"- [{c['pr']}] {c['auteur']} — {c['fichier'] or 'général'}"
                                          + (f":{c['ligne']}" if c["ligne"] else "") + f" : {c['texte'][:200]}"
-                                         for c in comments[:40]) or "(aucun)")
+                                         for c in comments[:60]) or "(aucun)")
     model = os.getenv("CLAUDE_MODEL_REVIEW", "").strip() or "sonnet"
     effort = claude_effort("CLAUDE_EFFORT_REVIEW")
-    dirs = [run_dir] + ([code] if code else []) + ([os.path.dirname(conventions)] if os.path.exists(conventions) else [])
-    returncode, output, usage, limit_hit = run_claude(prompt, model, dirs, REVIEW_TOOLS,
-                                                      extra_args=("--max-turns", str(_env_int("REVIEW_MAX_TURNS", 40))),
-                                                      cwd=run_dir, effort=effort, lean=lean_session())
-    report_token_usage(f"PR-{project}-{repo}-{number}", "review-pr", model, usage, len(prompt), returncode, effort)
+    turns = _env_int("REVIEW_MAX_TURNS", 40) + 15 * (len(prs) - 1)
+    returncode, output, usage, limit_hit = run_claude(prompt, model, list(dict.fromkeys(dirs)), REVIEW_TOOLS,
+                                                      extra_args=("--max-turns", str(turns)), cwd=run_dir,
+                                                      effort=effort, lean=lean_session())
+    report_token_usage(f"REVUE-{feature or prs[0]['repere']}", "review-pr", model, usage, len(prompt), returncode,
+                       effort)
     review = pr_review.parse_review(output)
     if limit_hit or not (review["resume"] or review["commentaires"]):
         print("[REVUE PR] ❌ Pas de résultat exploitable" + (" (quota atteint)." if limit_hit else "."))
         return 1
-    # Ancrage vérifié en Python : une ligne hors du diff sera publiée en commentaire général
+    # Chaque commentaire est rattaché à sa PR ; ancrage vérifié en Python (ligne hors du diff : commentaire général)
+    single = prs[0]["repere"] if len(prs) == 1 else ""
     for comment in review["commentaires"]:
-        comment["ancrable"] = bool(pr_review.anchor_type(lines_map, comment["fichier"], comment["ligne"]))
+        label = comment.get("pr") if comment.get("pr") in maps else single or next(
+            (l for l, m in maps.items() if comment["fichier"] in m), prs[0]["repere"])
+        comment["pr"] = label
+        comment["ancrable"] = bool(pr_review.anchor_type(maps[label], comment["fichier"], comment["ligne"]))
         comment["publie"] = False
-    pr_review.save_result(project, repo, number, {**review, "pr": pr, "commit": pr["commit"], "fichiers": files,
-                                                  "lignes": {p: {str(k): v for k, v in m.items()}
-                                                             for p, m in lines_map.items()},
-                                                  "date": datetime.now().isoformat(timespec="seconds")})
-    print(f"[REVUE PR] ✅ Analyse terminée : {review['verdict']}, {len(review['commentaires'])} commentaire(s) proposé(s).")
+    identifier = pr_review.feature_id(prs, feature)
+    pr_review.save_result(identifier, {
+        **review, "fonctionnalite": feature, "prs": [{k: p[k] for k in ("repere", "projet", "depot", "id", "titre",
+                                                                        "auteur", "commit", "url", "fichiers")}
+                                                     for p in prs],
+        "lignes": {l: {path: {str(k): v for k, v in m.items()} for path, m in lm.items()} for l, lm in maps.items()},
+        "date": datetime.now().isoformat(timespec="seconds")})
+    print(f"[REVUE PR] ✅ Analyse terminée ({len(prs)} PR) : {review['verdict']}, {len(review['commentaires'])} "
+          f"commentaire(s) proposé(s).")
     return 0
 
 
@@ -989,7 +1015,10 @@ def main():
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
     parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client", "review-pr"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
-    parser.add_argument("--pr-url", default="", help="review-pr : adresse de la pull request Bitbucket à relire")
+    parser.add_argument("--pr-url", action="append", default=[],
+                        help="review-pr : adresse d'une pull request de la fonctionnalité (option répétable : toutes les "
+                             "PR de la fonctionnalité sont relues ensemble)")
+    parser.add_argument("--feature", default="", help="review-pr : ticket Jira de la fonctionnalité relue")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
@@ -1040,7 +1069,7 @@ def main():
 
     args = parser.parse_args()
     if args.step == "review-pr":
-        sys.exit(run_pr_review(args.pr_url))
+        sys.exit(run_pr_review(args.pr_url, args.feature))
     is_postmerge = args.step == "generate-cucumber-postmerge"
     if is_postmerge:
         if not (args.repo_slug and args.merge_commit):

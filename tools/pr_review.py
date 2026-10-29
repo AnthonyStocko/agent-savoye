@@ -97,6 +97,53 @@ def review_inbox(role: str = "REVIEWER") -> list:
     return [summarize(p) for p in prs]
 
 
+def group_by_feature(prs: list) -> list:
+    """
+    PR regroupées par fonctionnalité (premier ticket Jira cité ; sans ticket : la PR seule), plus récentes d'abord :
+    [{"cle", "titre", "prs": [...]}].
+    """
+    groups = {}
+    for pr in prs:
+        key = (pr.get("jira") or [None])[0] or f"{pr['projet']}/{pr['depot']}#{pr['id']}"
+        group = groups.setdefault(key, {"cle": key, "titre": pr["titre"], "prs": []})
+        if (pr["projet"], pr["depot"], pr["id"]) not in {(p["projet"], p["depot"], p["id"]) for p in group["prs"]}:
+            group["prs"].append(pr)
+    return sorted(groups.values(), key=lambda g: -max(p.get("maj") or 0 for p in g["prs"]))
+
+
+def project_repos(project: str) -> list:
+    return [r.get("slug") for r in _paged(f"/rest/api/1.0/projects/{project}/repos", limit=300) if r.get("slug")]
+
+
+def feature_prs(key: str, projects: list, known: list = ()) -> list:
+    """
+    Toutes les PR ouvertes d'une fonctionnalité (ticket `key`) dans les dépôts des projets Bitbucket `projects`
+    (titre, branche ou description citant le ticket), en plus des PR `known`. Un dépôt illisible est ignoré.
+    """
+    found = {(p["projet"], p["depot"], p["id"]): p for p in known}
+    for project in dict.fromkeys(p.upper() for p in projects if p):
+        try:
+            repos = project_repos(project)
+        except BitbucketError:
+            continue
+        for repo in repos:
+            try:
+                prs = _paged(f"/rest/api/1.0/projects/{project}/repos/{repo}/pull-requests",
+                             {"state": "OPEN", "filterText": key}, limit=50)
+            except BitbucketError:
+                continue
+            for raw in prs:
+                pr = summarize(raw)
+                if key in pr["jira"]:
+                    found.setdefault((pr["projet"], pr["depot"], pr["id"]), pr)
+    return sorted(found.values(), key=lambda p: (p["projet"], p["depot"], p["id"]))
+
+
+def pr_label(pr: dict) -> str:
+    """Repère court et stable d'une PR dans une revue de fonctionnalité (« depot#42 »)."""
+    return f"{pr['depot']}#{pr['id']}"
+
+
 def parse_pr_url(url: str) -> tuple:
     """(projet, dépôt, numéro) d'une adresse de PR Bitbucket ; ValueError si elle n'en est pas une."""
     match = _PR_URL.search(urlsplit((url or "").strip()).path)
@@ -244,20 +291,27 @@ def post_comment(project: str, repo: str, number: int, text: str, path: str = ""
 # Résultats d'analyse (un fichier par PR)
 # ---------------------------------------------------------------------------
 
-def result_path(project: str, repo: str, number: int) -> str:
-    return os.path.join(ROOT, "revues", f"{project}_{repo}_{number}.json")
+def feature_id(prs: list, key: str = "") -> str:
+    """Identifiant d'une revue : le ticket de la fonctionnalité, sinon les PR concernées."""
+    if key and JIRA_KEY.fullmatch(key):
+        return key
+    return "+".join(sorted(f"{p['projet']}_{p['depot']}_{p['id']}" for p in prs))
 
 
-def load_result(project: str, repo: str, number: int) -> dict:
+def result_path(identifier: str) -> str:
+    return os.path.join(ROOT, "revues", re.sub(r"[^\w.+-]", "_", identifier) + ".json")
+
+
+def load_result(identifier: str) -> dict:
     try:
-        with open(result_path(project, repo, number), encoding="utf-8") as f:
+        with open(result_path(identifier), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
 
 
-def save_result(project: str, repo: str, number: int, result: dict) -> None:
-    path = result_path(project, repo, number)
+def save_result(identifier: str, result: dict) -> None:
+    path = result_path(identifier)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
@@ -283,7 +337,7 @@ def parse_review(text: str) -> dict:
         except (TypeError, ValueError):
             line = None
         severity = str(c.get("gravite", "mineur")).lower()
-        comments.append({"fichier": str(c.get("fichier", "")).strip(), "ligne": line,
+        comments.append({"pr": str(c.get("pr", "")).strip(), "fichier": str(c.get("fichier", "")).strip(), "ligne": line,
                          "gravite": severity if severity in SEVERITIES else "mineur",
                          "message": str(c["message"]).strip(), "suggestion": str(c.get("suggestion", "")).strip()})
     order = {s: i for i, s in enumerate(SEVERITIES)}
@@ -295,4 +349,5 @@ def parse_review(text: str) -> dict:
                 str(p) for p in data.get("points_positifs") or []][:10],
             "questions": [str(q) for q in data.get("questions") or []][:10],
             "tests": str(data.get("tests", "")).strip(), "conformite_ticket": str(data.get("conformite_ticket", "")).strip(),
+            "coherence": str(data.get("coherence", "")).strip(),
             "commentaires": comments[:60]}

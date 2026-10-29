@@ -99,13 +99,38 @@ def test_comment_is_anchored_only_on_a_diff_line(bitbucket, monkeypatch):
         pr.post_comment("P", "app", 7, "x")
 
 
-def test_results_are_saved_per_pr(tmp_path, monkeypatch):
+def test_results_are_saved_per_feature(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "ROOT", str(tmp_path))
-    pr.save_result("P", "app", 7, {"verdict": "approuver"})
-    assert pr.load_result("P", "app", 7) == {"verdict": "approuver"} and pr.load_result("P", "app", 8) == {}
+    prs = [{"projet": "P", "depot": "app", "id": 7}, {"projet": "P", "depot": "ui", "id": 3}]
+    assert pr.feature_id(prs, "APP-12") == "APP-12" and pr.feature_id(prs) == "P_app_7+P_ui_3"
+    pr.save_result("APP-12", {"verdict": "approuver"})
+    assert pr.load_result("APP-12") == {"verdict": "approuver"} and pr.load_result("APP-13") == {}
 
 
-def test_review_step_writes_a_result_without_publishing(tmp_path, monkeypatch):
+def test_prs_are_grouped_by_feature_and_searched_across_repos(bitbucket, monkeypatch):
+    a = {"projet": "P", "depot": "app", "id": 7, "titre": "APP-12 back", "jira": ["APP-12"], "maj": 2}
+    b = {"projet": "P", "depot": "ui", "id": 3, "titre": "APP-12 front", "jira": ["APP-12"], "maj": 5}
+    c = {"projet": "P", "depot": "app", "id": 8, "titre": "sans ticket", "jira": [], "maj": 1}
+    groups = pr.group_by_feature([a, b, c, a])
+    assert [(g["cle"], len(g["prs"])) for g in groups] == [("APP-12", 2), ("P/app#8", 1)]
+
+    def paged(path, params=None, limit=200):
+        if path.endswith("/repos"):
+            return [{"slug": "app"}, {"slug": "ui"}, {"slug": "studio"}]
+        if "/repos/studio/" in path:
+            assert params["filterText"] == "APP-12"
+            return [{"id": 1, "title": "Studio pour APP-12", "fromRef": {"displayId": "feature/APP-12"},
+                     "toRef": {"repository": {"slug": "studio", "project": {"key": "P"}}}},
+                    {"id": 2, "title": "APP-120 autre", "toRef": {"repository": {"slug": "studio",
+                                                                               "project": {"key": "P"}}}}]
+        return []
+    monkeypatch.setattr(pr, "_paged", paged)
+    found = pr.feature_prs("APP-12", ["P", "p"], [a, b])
+    assert [(f["depot"], f["id"]) for f in found] == [("app", 7), ("studio", 1), ("ui", 3)]
+    assert pr.pr_label(found[1]) == "studio#1"
+
+
+def test_feature_review_reads_all_prs_together_without_publishing(tmp_path, monkeypatch):
     import importlib
     import io
     import sys
@@ -116,28 +141,37 @@ def test_review_step_writes_a_result_without_publishing(tmp_path, monkeypatch):
     finally:
         sys.stdout, sys.stderr = saved
     monkeypatch.setattr(pr, "ROOT", str(tmp_path))
-    monkeypatch.setattr(pr, "pr_details", lambda *a: {"titre": "APP-1 x", "auteur": "Léa", "source": "f", "cible": "d",
-                                                       "commit": "c1", "description": "", "jira": [], "id": 7,
-                                                       "projet": "P", "depot": "app"})
-    monkeypatch.setattr(pr, "pr_diff", lambda *a: (pr.diff_to_text(DIFF)[0], pr.diff_to_text(DIFF)[1],
-                                                   ["src/A.java", "src/New.java"]))
+
+    def details(project, repo, number):
+        return {"titre": f"APP-1 {repo}", "auteur": "Léa", "source": "f", "cible": "d", "commit": f"c{number}",
+                "description": "", "jira": ["APP-1"], "id": number, "projet": project, "depot": repo, "url": ""}
+    monkeypatch.setattr(pr, "pr_details", details)
+    monkeypatch.setattr(pr, "pr_diff", lambda p, r, n: (pr.diff_to_text(DIFF)[0], pr.diff_to_text(DIFF)[1] if r == "app"
+                                                        else {"web/x.ts": {5: "ADDED"}}, ["src/A.java"]))
     monkeypatch.setattr(pr, "existing_comments", lambda *a: [{"auteur": "Tom", "fichier": "", "ligne": None,
                                                               "texte": "déjà dit"}])
     monkeypatch.setattr(pr, "prepare_code", lambda *a: ("", "hors ligne"))
     monkeypatch.setattr(pr, "post_comment", lambda *a, **k: pytest.fail("rien n'est publié par l'analyse"))
+    monkeypatch.setattr(m, "get_jira_issue_details", lambda key: f"Ticket {key} : afficher le statut")
     prompts = []
 
     def claude(prompt, *a, **k):
         prompts.append(prompt)
-        return 0, ('{"resume": "R", "verdict": "a_discuter", "risque": "faible", "commentaires": ['
-                   '{"fichier": "src/A.java", "ligne": 11, "gravite": "majeur", "message": "M"},'
-                   '{"fichier": "src/A.java", "ligne": 99, "gravite": "mineur", "message": "N"}]}'), {}, False
+        return 0, ('{"resume": "R", "verdict": "a_discuter", "risque": "faible", "coherence": "le front attend '
+                   'statusCode", "commentaires": ['
+                   '{"pr": "app#7", "fichier": "src/A.java", "ligne": 11, "gravite": "majeur", "message": "M"},'
+                   '{"pr": "app#7", "fichier": "src/A.java", "ligne": 99, "gravite": "mineur", "message": "N"},'
+                   '{"fichier": "web/x.ts", "ligne": 5, "gravite": "bloquant", "message": "champ renommé"}]}'), {}, \
+            False
     monkeypatch.setattr(m, "run_claude", claude)
     monkeypatch.setattr(m, "report_token_usage", lambda *a, **k: None)
-    assert m.run_pr_review("https://git.example.io/projects/P/repos/app/pull-requests/7") == 0
-    assert "déjà dit" in prompts[0] and "diff seul" in prompts[0]
-    result = pr.load_result("P", "app", 7)
-    assert [(c["ligne"], c["ancrable"], c["publie"]) for c in result["commentaires"]] == [(11, True, False),
-                                                                                         (99, False, False)]
-    assert result["commit"] == "c1" and result["lignes"]["src/A.java"]["11"] == "ADDED"
-    assert m.run_pr_review("pas une adresse") == 2
+    assert m.run_pr_review(["https://git.example.io/projects/P/repos/app/pull-requests/7",
+                            "https://git.example.io/projects/P/repos/ui/pull-requests/3"], "APP-1") == 0
+    assert "déjà dit" in prompts[0] and "diff seul" in prompts[0] and "2 PULL REQUEST(S)" in prompts[0]
+    assert "PR « app#7 »" in prompts[0] and "PR « ui#3 »" in prompts[0] and "afficher le statut" in prompts[0]
+    result = pr.load_result("APP-1")
+    assert [(c["pr"], c["ligne"], c["ancrable"]) for c in result["commentaires"]] == [
+        ("ui#3", 5, True), ("app#7", 11, True), ("app#7", 99, False)]          # sans repère : PR du fichier
+    assert result["coherence"].startswith("le front") and [p["repere"] for p in result["prs"]] == ["app#7", "ui#3"]
+    assert result["lignes"]["app#7"]["src/A.java"]["11"] == "ADDED"
+    assert m.run_pr_review(["pas une adresse"]) == 2 and m.run_pr_review([]) == 2
