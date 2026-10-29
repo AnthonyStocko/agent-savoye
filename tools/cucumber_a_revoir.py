@@ -48,6 +48,9 @@ CAUSES = {
                                                                    "déployé"),
     "deploiement": ("déploiement en retard sur le dépôt", "réactiver quand le code et les personnalisations "
                                                           "déployés sont à jour"),
+    # Choix de l'utilisateur : test en échec mis de côté pour être analysé plus tard (écran principal)
+    "mis_de_cote": ("mis de côté par l'utilisateur pour analyse ultérieure",
+                    "réactiver depuis l'onglet Cucumber (« État des tests ») une fois la cause analysée"),
     # Autonomie : échec côté test que les corrections n'ont pas résolu, désactivé par l'agent (jamais supprimé)
     "test_persistant": ("échec côté test persistant après les corrections de l'agent",
                         "réactiver après correction du scénario : message d'échec, base et logs du run cités dans "
@@ -265,6 +268,8 @@ def proof_status(cause: str, item: dict) -> tuple:
     défaut produit derrière une erreur serveur, scénario en cascade d'une mise en place, déploiement en retard,
     cause que le message ne montre pas ; la vérification à faire indique la fenêtre d'export des logs serveur.
     """
+    if cause == "mis_de_cote":
+        return True, ""   # choix de l'utilisateur, pas une cause à prouver
     logs = log_request(item)
     if item.get("statut") == "cascade":
         return False, ("le scénario n'a pas été jugé sur ses propres steps (mise en place en échec) : le rejouer seul "
@@ -406,7 +411,7 @@ def generated_section(state: dict, specifics: dict) -> str:
     """Section générée d'A_REVOIR.md : défauts détectés, scénarios désactivés, scénarios faibles, arrêts."""
     lots = state.get("lots", [])
     label = lambda i: specifics.get(i, {}).get("libelle", i)  # noqa: E731
-    disabled = [e for lot in lots for e in lot.get("a_revoir") or []]
+    disabled = [e for lot in lots for e in lot.get("a_revoir") or []] + list(state.get("mis_de_cote") or [])
     weak = [e for lot in lots for e in lot.get("faibles") or []]
     # Défauts avérés (preuve directe) en tête
     defects = sorted((e for e in disabled if e["cause"] == "bug_applicatif"),
@@ -452,7 +457,7 @@ def write_a_revoir(worktree: str, state: dict, specifics: dict) -> str:
     fichier créé s'il n'y a rien à revoir. Renvoie le chemin relatif ('' si rien n'est écrit).
     """
     lots = state.get("lots", [])
-    if not any(lot.get("a_revoir") or lot.get("faibles") or lot.get("statut") == "decision_humaine"
+    if not state.get("mis_de_cote") and not any(lot.get("a_revoir") or lot.get("faibles") or lot.get("statut") == "decision_humaine"
                or any(c.get("type") == "ecart_spec_code" for r in lot.get("resultats") or []
                       for c in r.get("constats") or []) for lot in lots):
         return ""

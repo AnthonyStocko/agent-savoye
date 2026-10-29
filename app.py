@@ -25,7 +25,7 @@ from tools.jira_tools import (
     set_jira_description_markdown, std_only_projects,
 )
 from tools.db_tools import DB_TYPES, test_connection
-from tools import pr_review
+from tools import pr_review, cucumber_overview, cucumber_set_aside
 from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
@@ -2154,6 +2154,84 @@ def render_deliverable(client: str) -> None:
             st.markdown("\n".join(cucumber_decisions.summary_lines(taken, limit=50)))
 
 
+def render_tests_overview(ctx: dict, rows: list) -> None:
+    """
+    « État des tests » : en échec (raison, mise de côté), désactivés (cause, réactivation), couvertes (dont par une
+    autre), non testées (raison), hors périmètre (raison). Tout part des mêmes lignes que le résumé.
+    """
+    client = ctx["client"]
+    state = cucumber_tools.load_state(client)
+    client_tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client)).get("tag_client", "")
+    failing = cucumber_overview.failing(rows)
+    disabled = cucumber_overview.disabled(rows, state.get("mis_de_cote") or [])
+    covered = cucumber_overview.covered(rows)
+    untested = cucumber_overview.untested(rows)
+    outside = cucumber_overview.out_of_scope(rows)
+    st.markdown("**État des tests**")
+    message = st.session_state.pop(f"cucumber_overview_message_{client}", "")
+    if message:
+        st.success(message, icon=":material/task_alt:")
+    with st.expander(f"🔴 Tests en échec : {len(failing)}", expanded=False):
+        if not failing:
+            st.caption("Aucun test en échec au dernier résultat connu.")
+        else:
+            st.caption("Raison du dernier échec connu (run Jenkins importé, ou vérification de l'agent si elle est plus "
+                       "récente). Coche ceux à mettre de côté : ils sont désactivés (jamais supprimés) avec leur raison, "
+                       "et sortent du livrable actif jusqu'à leur réactivation.")
+            edited = st.data_editor(
+                [{"Mettre de côté": False, "Fonctionnalité": ", ".join(f["fonctionnalites"]),
+                  "Scénario": f["scenario"], "Raison de l'échec": f["raison"], "Constaté": f["constate"],
+                  "Feature": f["feature"]} for f in failing],
+                hide_index=True, width="stretch", key=f"cucumber_overview_failing_{client}",
+                disabled=["Fonctionnalité", "Scénario", "Raison de l'échec", "Constaté", "Feature"],
+                column_config={"Raison de l'échec": st.column_config.TextColumn(width="large")})
+            chosen = [failing[i] for i, line in enumerate(edited) if line["Mettre de côté"]]
+            with st.container(horizontal=True):
+                if st.button(f"Mettre de côté ({len(chosen)})", icon=":material/pause_circle:", disabled=not chosen,
+                             key=f"cucumber_overview_aside_{client}"):
+                    done = cucumber_set_aside.set_aside(client, [{"id": f["id"], "motif": f["raison"]} for f in chosen],
+                                                        client_tag)
+                    st.session_state[f"cucumber_overview_message_{client}"] = (
+                        f"{len(done)} test(s) mis de côté : désactivés avec leur raison, modifications à appliquer à "
+                        f"jour.")
+                    st.rerun()
+                if st.button(f"Tout mettre de côté ({len(failing)})", type="tertiary",
+                             key=f"cucumber_overview_aside_all_{client}"):
+                    done = cucumber_set_aside.set_aside(client, [{"id": f["id"], "motif": f["raison"]}
+                                                                 for f in failing], client_tag)
+                    st.session_state[f"cucumber_overview_message_{client}"] = f"{len(done)} test(s) mis de côté."
+                    st.rerun()
+    with st.expander(f"⏸ Tests désactivés : {len(disabled)}"):
+        if not disabled:
+            st.caption("Aucun test désactivé.")
+        else:
+            edited = st.data_editor(
+                [{"Réactiver": False, "Fonctionnalité": ", ".join(d["fonctionnalites"]), "Scénario": d["scenario"],
+                  "Raison": d["raison"], "Décidé par": d["par"], "Feature": d["feature"]} for d in disabled],
+                hide_index=True, width="stretch", key=f"cucumber_overview_disabled_{client}",
+                disabled=["Fonctionnalité", "Scénario", "Raison", "Décidé par", "Feature"],
+                column_config={"Raison": st.column_config.TextColumn(width="large")})
+            chosen = [disabled[i] for i, line in enumerate(edited) if line["Réactiver"]]
+            if st.button(f"Réactiver ({len(chosen)})", icon=":material/play_circle:", disabled=not chosen,
+                         key=f"cucumber_overview_reactivate_{client}"):
+                done = cucumber_set_aside.reactivate(client, [d["id"] for d in chosen], client_tag)
+                st.session_state[f"cucumber_overview_message_{client}"] = f"{len(done)} test(s) réactivé(s)."
+                st.rerun()
+    indirect = sum(1 for c in covered if c["etat"] == "indirect")
+    with st.expander(f"✅ Fonctionnalités couvertes : {len(covered)} (dont {indirect} par une autre)"):
+        st.dataframe([{"Fonctionnalité": c["fonctionnalite"], "Module": c["module"], "Couverte": c["couverture"]}
+                      for c in covered], hide_index=True, width="stretch")
+    with st.expander(f"⚪ Fonctionnalités non testées : {len(untested)}"):
+        st.dataframe([{"Fonctionnalité": u["fonctionnalite"], "Module": u["module"], "Raison": u["raison"]}
+                      for u in untested], hide_index=True, width="stretch",
+                     column_config={"Raison": st.column_config.TextColumn(width="large")})
+    if outside:
+        with st.expander(f"⚫ Non testables ou sans objet : {len(outside)}"):
+            st.dataframe([{"Fonctionnalité": o["fonctionnalite"], "Module": o["module"], "État": o["etat"],
+                           "Raison": o["raison"]} for o in outside], hide_index=True, width="stretch",
+                         column_config={"Raison": st.column_config.TextColumn(width="large")})
+
+
 def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
     """
     Écran minimal : bouton « Lancer » (init, première couverture, corrections), choix de tâches non testées, import
@@ -2163,6 +2241,7 @@ def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
     action = main_action(ctx, rows, init_status)
     st.markdown(" ".join(text for text, _ in cucumber_coverage.status_sentences(rows, cucumber_coverage.last_run(
         client))))
+    render_tests_overview(ctx, rows)
     with st.container(border=True):
         st.markdown("**1. Lancer**")
         with st.container(horizontal=True, vertical_alignment="center"):

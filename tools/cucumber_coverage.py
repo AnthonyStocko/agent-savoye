@@ -194,8 +194,14 @@ def import_results(client_name: str) -> dict:
 
 def verified_results(state: dict) -> dict:
     """Statut de vérification des scénarios des lots : {id: {statut, motif, lot}}."""
-    return {item["id"]: {"statut": item.get("statut", ""), "motif": item.get("motif", ""), "lot": item["lot"]}
-            for item in all_verified(state) if item.get("id")}
+    ends = {lot.get("numero"): lot.get("fin", "") for lot in state.get("lots") or []}
+    out = {}
+    # Lots dans l'ordre : la vérification la plus récente d'un scénario l'emporte
+    for item in sorted(all_verified(state), key=lambda i: ends.get(i["lot"]) or ""):
+        if item.get("id"):
+            out[item["id"]] = {"statut": item.get("statut", ""), "motif": item.get("motif", ""), "lot": item["lot"],
+                               "date": ends.get(item["lot"]) or ""}
+    return out
 
 
 def scenario_status(identifier: str, sources: dict) -> dict:
@@ -210,12 +216,15 @@ def scenario_status(identifier: str, sources: dict) -> dict:
     if identifier in sources["desactives"]:
         return {**out, "etat": "desactive", "cause": sources["desactives"][identifier]}
     imported = sources["imports"].get(identifier)
-    if imported:
+    verified = sources["verifies"].get(identifier)
+    # Vérifié par l'agent APRÈS le dernier run importé (correction de ce run) : c'est l'état le plus récent
+    newer = bool(imported and verified and verified["statut"] not in _NOT_RUN
+                 and (verified.get("date") or "") > (imported.get("date") or "~"))
+    if imported and not newer:
         passed = imported["statut"] == "passe"
         return {**out, "etat": "vert" if passed else "echec", "cause": "" if passed else imported["motif"],
                 "nature": imported["nature"], "derniere": f"import n° {imported['import']} du "
                                                           f"{imported['date'][:10]}"}
-    verified = sources["verifies"].get(identifier)
     if verified and verified["statut"] not in _NOT_RUN:
         green = verified["statut"] in _GREEN
         return {**out, "etat": "vert" if green else "echec", "faible": verified["statut"] == "faible",
@@ -768,8 +777,9 @@ def status_sentences(rows: list, run: dict) -> list:
         if failed:
             parts.append((f"et {failed} en échec.", "echec"))
     if groups["indirect"]:
+        total = len(groups["test"]) + len(groups["indirect"])
         parts.append((f"{len(groups['indirect'])} {'sont couvertes' if len(groups['indirect']) > 1 else 'est couverte'}"
-                      f" par une autre.", "indirect"))
+                      f" par une autre, soit {total} couverte{'s' if total > 1 else ''} au total.", "indirect"))
     remaining = len(groups["a_couvrir"]) + len(groups["partiel"])
     parts.append((f"{remaining} {'restent' if remaining > 1 else 'reste'} à tester.", "a_tester"))
     if groups["non_testable"]:
