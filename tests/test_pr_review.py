@@ -175,3 +175,24 @@ def test_feature_review_reads_all_prs_together_without_publishing(tmp_path, monk
     assert result["coherence"].startswith("le front") and [p["repere"] for p in result["prs"]] == ["app#7", "ui#3"]
     assert result["lignes"]["app#7"]["src/A.java"]["11"] == "ADDED"
     assert m.run_pr_review(["pas une adresse"]) == 2 and m.run_pr_review([]) == 2
+
+
+def test_project_view_lists_all_open_prs_of_a_project(bitbucket, monkeypatch):
+    def paged(path, params=None, limit=200):
+        if path == "/rest/api/1.0/projects/OXY/repos":
+            return [{"slug": "oxy-back"}, {"slug": "oxy-ui"}]
+        if path == "/rest/api/1.0/projects/NOPE/repos":
+            raise pr.BitbucketError("HTTP 404")
+        if path.endswith("/oxy-back/pull-requests"):
+            assert params["state"] == "OPEN"
+            return [{"id": 4, "title": "OXY-7 back", "updatedDate": 10,
+                     "toRef": {"repository": {"slug": "oxy-back", "project": {"key": "OXY"}}}}]
+        if path.endswith("/oxy-ui/pull-requests"):
+            return [{"id": 9, "title": "OXY-7 front", "updatedDate": 20,
+                     "toRef": {"repository": {"slug": "oxy-ui", "project": {"key": "OXY"}}}}]
+        return []
+    monkeypatch.setattr(pr, "_paged", paged)
+    found, errors = pr.project_prs(["oxy", " nope ", ""])
+    assert [(p["depot"], p["id"]) for p in found] == [("oxy-ui", 9), ("oxy-back", 4)]
+    assert errors == ["NOPE : HTTP 404"]
+    assert [(g["cle"], len(g["prs"])) for g in pr.group_by_feature(found)] == [("OXY-7", 2)]

@@ -115,6 +115,27 @@ def project_repos(project: str) -> list:
     return [r.get("slug") for r in _paged(f"/rest/api/1.0/projects/{project}/repos", limit=300) if r.get("slug")]
 
 
+def project_prs(projects: list, limit_per_repo: int = 100) -> tuple:
+    """
+    PR ouvertes de tous les dépôts des projets Bitbucket `projects` (ex. OXY), plus récentes d'abord. Renvoie
+    (PR, erreurs) : un projet ou un dépôt illisible est signalé sans arrêter les autres.
+    """
+    prs, errors = [], []
+    for project in dict.fromkeys(p.strip().upper() for p in projects if p and p.strip()):
+        try:
+            repos = project_repos(project)
+        except BitbucketError as e:
+            errors.append(f"{project} : {e}")
+            continue
+        for repo in repos:
+            try:
+                prs += [summarize(p) for p in _paged(f"/rest/api/1.0/projects/{project}/repos/{repo}/pull-requests",
+                                                     {"state": "OPEN", "order": "NEWEST"}, limit=limit_per_repo)]
+            except BitbucketError as e:
+                errors.append(f"{project}/{repo} : {e}")
+    return sorted(prs, key=lambda p: -(p.get("maj") or 0)), errors
+
+
 def feature_prs(key: str, projects: list, known: list = ()) -> list:
     """
     Toutes les PR ouvertes d'une fonctionnalité (ticket `key`) dans les dépôts des projets Bitbucket `projects`

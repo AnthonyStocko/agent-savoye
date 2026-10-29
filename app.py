@@ -3050,14 +3050,28 @@ def render_review_tab() -> None:
                    icon=":material/key:")
         return
     with st.container(horizontal=True, vertical_alignment="bottom"):
-        role = st.segmented_control("PR", ["À relire", "Où je participe", "Les miennes"], default="À relire",
-                                    key="review_role")
+        role = st.segmented_control("PR", ["À relire", "Où je participe", "Les miennes", "Par projet"],
+                                    default="À relire", key="review_role") or "À relire"
+        projects_input = ""
+        if role == "Par projet":
+            projects_input = st.text_input("Projets Bitbucket", key="review_projects_list",
+                                           value=os.getenv("REVIEW_PROJECTS", "").strip() or "OXY",
+                                           help="Clés de projets Bitbucket séparées par des virgules (ex. OXY, "
+                                                "APPAREL) : toutes leurs PR ouvertes, quel que soit ton rôle. Valeur "
+                                                "par défaut : REVIEW_PROJECTS du .env.").strip().upper()
         refresh = st.button("Actualiser", icon=":material/refresh:", key="review_refresh")
     roles = {"À relire": "REVIEWER", "Où je participe": "PARTICIPANT", "Les miennes": "AUTHOR"}
-    cache_key = f"review_inbox_{roles.get(role or 'À relire')}"
+    cache_key = (f"review_projet_{projects_input}" if role == "Par projet" else f"review_inbox_{roles[role]}")
     if refresh or cache_key not in st.session_state:
         try:
-            st.session_state[cache_key] = pr_review.review_inbox(roles.get(role or "À relire", "REVIEWER"))
+            if role == "Par projet":
+                with st.spinner(f"Lecture des PR ouvertes de {projects_input or '…'}…"):
+                    found, problems = pr_review.project_prs(projects_input.split(","))
+                for problem in problems[:5]:
+                    st.warning(problem, icon=":material/warning:")
+                st.session_state[cache_key] = found
+            else:
+                st.session_state[cache_key] = pr_review.review_inbox(roles[role])
         except pr_review.BitbucketError as e:
             st.error(str(e))
             st.session_state[cache_key] = []
@@ -3417,6 +3431,10 @@ with tab_config:
         env_values["BITBUCKET_HTTP_TOKEN"] = st.text_input("BITBUCKET_HTTP_TOKEN", value=os.getenv("BITBUCKET_HTTP_TOKEN", ""),
                                                            type="password",
                                                            help="Jeton d'accès HTTP personnel Bitbucket (lecture des dépôts).")
+        env_values["REVIEW_PROJECTS"] = st.text_input(
+            "REVIEW_PROJECTS", value=os.getenv("REVIEW_PROJECTS", ""), placeholder="OXY, APPAREL",
+            help="Projets Bitbucket proposés dans la vue « Par projet » de l'onglet Revue de PR (toutes leurs PR "
+                 "ouvertes).").strip().upper()
         env_values["BITBUCKET_WEBHOOK_SECRET"] = st.text_input(
             "BITBUCKET_WEBHOOK_SECRET",
             value=os.getenv("BITBUCKET_WEBHOOK_SECRET", ""),
