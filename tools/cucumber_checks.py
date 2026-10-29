@@ -754,10 +754,11 @@ def health_report(client_name: str, cucumber_repo_dir: str, base: str, cucumber_
                  f" ; nombre attendu (dry-runs) : {selection['nombre_attendu']}" if selection["nombre_attendu"]
                  else "")]
     if drifted:
-        lines.append("- ⚠️ **Le projet client est décalé de sa bibliothèque de steps** : ses features EXISTANTES ne "
-                     "compilent pas ou ont des steps non définis ou ambigus. Ce n'est pas un problème de génération : "
-                     "leurs échecs à l'exécution ne viendront pas des tests générés. Mettez à jour le dépôt client (ou "
-                     "la version de sa bibliothèque) avant de générer.")
+        lines.append(f"- ⚠️ **Features existantes en {build['etape']} en échec** (détail ci-dessous) : des steps non "
+                     "définis ou ambigus, ou du code qui ne compile pas, dans le dépôt tel qu'il est sur la branche. Ce "
+                     "n'est pas dû aux tests générés. Causes possibles : step renommé dans la bibliothèque, classe de "
+                     "steps manquante, dépendance absente de cette machine (si Jenkins exécute ces scénarios, c'est "
+                     "plutôt la compilation locale qui est en cause).")
     for title, errors in sections.items():
         lines += ["", f"## {title} : {len(errors)}", ""] + [f"- {e}" for e in errors]
     if steps_report["ref_bibliotheque"] or steps_report["avertissement"]:

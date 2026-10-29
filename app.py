@@ -3454,6 +3454,10 @@ with tab_config:
             help="URL du projet Bitbucket/KISCloud (ex: https://git.kiscloud.io/projects/COMPONENT) "
                  "ou chemin local d'un clone (ex: C:\\development\\branch_dev)."
         )
+        env_values["ODATIO_VERSION"] = st.text_input(
+            "ODATIO_VERSION (facultatif)", value=os.getenv("ODATIO_VERSION", ""), placeholder="ex. 26.16",
+            help="Version d'Odatio déployée sur l'environnement de test. Vide : lue dans le pom du Socle Standard "
+                 "(propriété odatio / kis, parent Odatio) ; une version de dépôt comme 1.0.0 est ignorée.").strip()
         env_values["BITBUCKET_CLIENT_REPO_PATH"] = st.text_input(
             "BITBUCKET_CLIENT_REPO_PATH (Dépôt client par défaut)",
             value=os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""),

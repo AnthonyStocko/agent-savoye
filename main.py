@@ -648,30 +648,58 @@ def bitbucket_base_url(repo_url: str = "") -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
+ODATIO_VERSION = re.compile(r"^\d{2}\.\d+(\.\d+)*$")
+
+
+def odatio_version_from_pom(text: str) -> tuple:
+    """
+    (version d'Odatio, d'où elle vient) lue dans un pom.xml : propriété odatio / kis (…version), puis version du
+    parent Odatio / KIS, puis version du projet — retenue seulement si elle a la forme d'une version Odatio (26.16,
+    25.4.2) : la version propre d'un dépôt (1.0.0) n'est pas celle de la plateforme. ('', raison) sinon.
+    """
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        return "", f"pom.xml illisible ({e})"
+    tag = lambda node: node.tag.rsplit("}", 1)[-1]  # noqa: E731
+    clean = lambda v: (v or "").strip().replace("-SNAPSHOT", "")  # noqa: E731
+    candidates = []
+    for props in (n for n in root if tag(n) == "properties"):
+        for prop in props:
+            if re.search(r"(odatio|kis).*version|version.*(odatio|kis)", tag(prop), re.I):
+                candidates.append((clean(prop.text), f"propriété <{tag(prop)}>"))
+    parent = next((n for n in root if tag(n) == "parent"), None)
+    if parent is not None:
+        fields = {tag(n): (n.text or "") for n in parent}
+        if re.search(r"odatio|kis", fields.get("groupId", "") + fields.get("artifactId", ""), re.I):
+            candidates.append((clean(fields.get("version")), f"parent {fields.get('artifactId', '')}"))
+    own = next((n for n in root if tag(n) == "version"), None)
+    if own is not None:
+        candidates.append((clean(own.text), "version du projet"))
+    for version, origin in candidates:
+        if ODATIO_VERSION.match(version or ""):
+            return version, origin
+    seen = ", ".join(f"{v or '?'} ({o})" for v, o in candidates) or "aucune"
+    return "", f"aucune version au format Odatio (ex. 26.16) dans le pom ; vu : {seen}"
+
+
 def detect_odatio_version(std_repo_path: str) -> str:
     """
-    Lit le fichier pom.xml racine du dépôt standard pour extraire la version d'Odatio,
-    en nettoyant les suffixes de dev comme -SNAPSHOT.
+    Version d'Odatio du dépôt Standard (pom.xml racine, voir odatio_version_from_pom) ; ODATIO_VERSION du .env
+    prime. « dev » si elle est introuvable : aucune comparaison de version n'est alors faite.
     """
+    forced = os.getenv("ODATIO_VERSION", "").strip()
+    if forced:
+        print(f"[VERSION ODATIO] {forced} (ODATIO_VERSION du .env)")
+        return forced
     pom_path = os.path.join(std_repo_path, "pom.xml")
     if os.path.exists(pom_path):
-        try:
-            tree = ET.parse(pom_path)
-            root = tree.getroot()
-            ns = {'mvn': 'http://maven.apache.org/POM/4.0.0'}
-            version_node = root.find('mvn:version', ns)
-            if version_node is None:
-                parent_node = root.find('mvn:parent', ns)
-                if parent_node is not None:
-                    version_node = parent_node.find('mvn:version', ns)
-            if version_node is not None and version_node.text:
-                raw_version = version_node.text.strip()
-                # On retire -SNAPSHOT pour correspondre aux tags/branches Git
-                clean_version = raw_version.replace("-SNAPSHOT", "").strip()
-                print(f"[VERSION ODATIO] Version brute : {raw_version} | Version nettoyée : {clean_version}")
-                return clean_version
-        except Exception as e:
-            print(f"[VERSION ODATIO] Impossible de lire pom.xml ({e})")
+        version, origin = odatio_version_from_pom(_read_text(pom_path))
+        if version:
+            print(f"[VERSION ODATIO] {version} ({origin} du pom du Standard)")
+            return version
+        print(f"[VERSION ODATIO] ⚠️ {origin} — renseignez ODATIO_VERSION (onglet Configuration) ; comparaisons de "
+              f"version désactivées.")
     return "dev"
 
 
@@ -2939,8 +2967,8 @@ def run_cucumber_health(client: str, local_cucumber_std_repo: str, cucumber_repo
         print(f"[CUCUMBER SANTÉ] {len(report['todo_version'])} marqueur(s) {cucumber_versions.TODO_MARKER} dans le "
               f"dépôt client")
     if report["decale"]:
-        print("[CUCUMBER SANTÉ] ⚠️ Projet client décalé de sa bibliothèque de steps : ses features existantes ne "
-              "compilent pas ou ont des steps non définis ou ambigus (pas un problème de génération).")
+        print("[CUCUMBER SANTÉ] ⚠️ Features existantes en échec de compilation ou de dry-run (steps non définis ou "
+              "ambigus) : détail dans le rapport (pas un problème de génération).")
     print(f"[CUCUMBER SANTÉ] Rapport : {report['fichier']}")
     share_file(report["fichier"], project or client.upper(), "cucumber-sante", f"Santé du dépôt {client}-cucumber",
                client=client, tags=["cucumber"], depots=knowledge_tools.repo_commits(cucumber_repo_dir))

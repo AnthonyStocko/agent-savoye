@@ -351,3 +351,24 @@ def test_sync_resolves_a_file_modified_by_the_agent_but_renamed_on_the_branch(re
     tracked = git(repo, "ls-files").splitlines()
     assert upper in tracked and lower not in tracked
     assert git(repo, "merge-base", "--is-ancestor", "integration", "HEAD") == ""
+
+
+def test_odatio_version_is_not_a_repository_version(monkeypatch):
+    import importlib
+    import io
+    import sys
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        m = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    ns = 'xmlns="http://maven.apache.org/POM/4.0.0"'
+    assert m.odatio_version_from_pom(f"<project {ns}><version>1.0.0</version></project>")[0] == ""
+    assert m.odatio_version_from_pom(
+        f"<project {ns}><version>1.0.0</version><properties><odatio.version>26.16-SNAPSHOT</odatio.version>"
+        f"</properties></project>") == ("26.16", "propriété <odatio.version>")
+    assert m.odatio_version_from_pom(
+        f"<project {ns}><parent><groupId>com.kis</groupId><artifactId>odatio-parent</artifactId>"
+        f"<version>25.4.2</version></parent><version>1.0.0</version></project>")[0] == "25.4.2"
+    assert m.odatio_version_from_pom(f"<project {ns}><version>26.16</version></project>")[0] == "26.16"

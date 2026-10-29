@@ -166,7 +166,7 @@ def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
                    runner=runner_profile(worktree, ref, list(std_runners)),
                    reference_codes={k: list((init.get("codes") or {}).get(k) or []) for k in REFERENCE_CATEGORIES},
                    library_version=cucumber_checks.library_version(worktree),
-                   server_version=server_version if re.match(r"\d", server_version or "") else "")
+                   server_version=server_version if re.match(r"^\d{2}\.\d+", server_version or "") else "")
     profile["workarounds"] = cucumber_versions.todo_markers(worktree, ref)
     inventory = load_inventory(client_name)
     if "initialiseurs" in inventory:
