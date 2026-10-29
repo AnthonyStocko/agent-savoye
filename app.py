@@ -3564,27 +3564,6 @@ with tab_config:
             placeholder="namespace:apparel-cucumber",
             help="Filtre gcQL de l'environnement où Jenkins joue les tests (namespace, workload, cluster…), ajouté à "
                  "toute requête : obligatoire, sans lui les logs groundcover ne sont pas lus.").strip()
-        if st.button("Tester groundcover", key="test_groundcover"):
-            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-            from tools import groundcover_tools
-            saved = {k: os.environ.get(k) for k in ("GROUNDCOVER_API_KEY", "GROUNDCOVER_BACKEND_ID",
-                                                     "GROUNDCOVER_API_URL", "CUCUMBER_GROUNDCOVER_FILTER")}
-            os.environ.update({k: env_values[k] for k in saved})
-            try:
-                now = _dt.now(_tz.utc)
-                rows = groundcover_tools.search(now - _td(minutes=15), now, limit=3)
-                st.success(f"groundcover joignable : {len(rows)} ligne(s) sur les 15 dernières minutes avec le filtre "
-                           f"« {env_values['CUCUMBER_GROUNDCOVER_FILTER']} »."
-                           + (f" Dernière : {groundcover_tools.format_row(rows[-1])[:200]}" if rows else
-                              " Aucune ligne : filtre trop strict, ou environnement inactif."))
-            except groundcover_tools.GroundcoverError as e:
-                st.error(str(e))
-            finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
         env_values["CUCUMBER_SLOW_SCENARIO_SECONDS"] = str(int(slow_seconds))
         env_values["CUCUMBER_LOG_EXPORT_MAX_LINES"] = str(int(export_cap)) if export_cap else ""
         jacoco = st.checkbox(
@@ -3803,6 +3782,23 @@ with tab_config:
                 st.success(db_message, icon=":material/check_circle:")
             else:
                 st.error(db_message, icon=":material/error:")
+
+    # Hors formulaire : teste les logs groundcover enregistrés (clé, filtre de l'environnement de test)
+    if os.getenv("GROUNDCOVER_API_KEY", "").strip():
+        if st.button("Tester groundcover", icon=":material/lan:", key="test_groundcover"):
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            from tools import groundcover_tools
+            try:
+                now = _dt.now(_tz.utc)
+                with st.spinner("Lecture des logs groundcover…"):
+                    rows = groundcover_tools.search(now - _td(minutes=15), now, limit=3)
+                st.success(f"groundcover joignable : {len(rows)} ligne(s) sur les 15 dernières minutes avec le filtre "
+                           f"« {groundcover_tools.config()['filter']} »."
+                           + (f" Dernière : {groundcover_tools.format_row(rows[-1])[:200]}" if rows else
+                              " Aucune ligne : filtre trop strict, ou environnement inactif."),
+                           icon=":material/check_circle:")
+            except groundcover_tools.GroundcoverError as e:
+                st.error(str(e), icon=":material/error:")
 
     # Hors formulaire : teste le répertoire partagé enregistré (existence, écriture, temps d'accès)
     with st.container(horizontal=True, vertical_alignment="center"):
