@@ -757,14 +757,33 @@ def analysis_markdown(analysis: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def already_fixed(state: dict, numero) -> set:
+    """Scénarios d'un run importé déjà corrigés par l'agent ET vérifiés verts sur Jenkins (lots de correction)."""
+    return {item.get("id") for lot in state.get("lots") or []
+            if lot.get("type") == "correction" and str(lot.get("import")) == str(numero)
+            for item in ((lot.get("execution") or {}).get("scenarios") or {}).values()
+            if item.get("statut") == "pertinent"}
+
+
+def remaining_proposals(state: dict, analysis: dict) -> list:
+    """Propositions d'une analyse sans les scénarios déjà corrigés et vérifiés verts (relance d'une correction)."""
+    done, out = already_fixed(state, analysis.get("numero")), []
+    for proposal in analysis.get("propositions") or []:
+        scenarios = [s for s in proposal["scenarios"] if s.get("id") not in done]
+        if scenarios:
+            out.append({**proposal, "scenarios": scenarios})
+    return out
+
+
 def add_correction_lots(state: dict, analysis: dict) -> list:
     """
     Lots « correction » ajoutés à la génération pour les propositions d'une analyse : scénarios existants avec leur
-    message réel, sans spécifique à générer (ids vides). Renvoie les nouveaux lots.
+    message réel, sans spécifique à générer (ids vides). Une relance sur le même run écarte les scénarios déjà
+    corrigés et vérifiés verts. Renvoie les nouveaux lots.
     """
     start = max((lot["numero"] for lot in state.get("lots", [])), default=0)
     new = []
-    for offset, proposal in enumerate(analysis.get("propositions") or [], 1):
+    for offset, proposal in enumerate(remaining_proposals(state, analysis), 1):
         scenarios = proposal["scenarios"]
         new.append({"numero": start + offset, "ids": [], "type": "correction", "statut": "a_faire",
                     "complement": True, "import": analysis["numero"], "spec_correction": proposal["spec"],

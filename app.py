@@ -2069,6 +2069,40 @@ def main_action(ctx: dict, rows: list, init_status: dict) -> dict:
                       "tâches ci-dessous."}
 
 
+def fix_action(ctx: dict) -> dict:
+    """
+    Bouton « Corriger les tests en échec » : toujours proposé d'après le dernier run importé, même si une correction
+    de ce run a déjà été lancée (nouvelle tentative) — l'initialisation en échec d'abord, sinon les tests en erreur
+    ou en échec que l'agent sait corriger. {"type": "", ...} si rien n'est corrigeable.
+    """
+    numero, analysis = latest_import_analysis(ctx["client"])
+    if not numero:
+        return {"type": "", "libelle": "Corriger les tests en échec",
+                "detail": "aucun résultat Jenkins importé : dépose-le dans « 3 »."}
+    if analysis.get("non_analyse"):
+        return {"type": "", "libelle": "Corriger les tests en échec",
+                "detail": f"le dernier résultat importé n'est pas exploitable : {analysis['non_analyse']}"}
+    if analysis.get("init_en_echec"):
+        return {"type": "init_echec", "numero": numero, "libelle": "Corriger l'initialisation en échec",
+                "detail": f"run importé n° {numero} : l'initialisation a échoué, aucun test n'a été jugé."}
+    fixable = cucumber_import.remaining_proposals(cucumber_tools.load_state(ctx["client"]), analysis)
+    failures = sum(len(g["scenarios"]) for g in analysis.get("groupes") or [])
+    count = sum(len(p["scenarios"]) for p in fixable)
+    if not count and analysis.get("propositions"):
+        return {"type": "", "libelle": "Corriger les tests en échec",
+                "detail": f"run importé n° {numero} : tous les tests corrigeables ont été corrigés et vérifiés verts "
+                          f"par l'agent — télécharge les modifications, puis relance le job Jenkins."}
+    if not count:
+        return {"type": "", "libelle": "Corriger les tests en échec",
+                "detail": f"run importé n° {numero} : " + (f"{failures} échec(s), aucun corrigeable dans les tests "
+                                                           f"(causes hors test, voir le bilan)." if failures else
+                                                           "aucun test en échec.")}
+    return {"type": "corriger", "numero": numero, "specs": [p["spec"] for p in fixable],
+            "libelle": f"Corriger les tests en échec ({count})",
+            "detail": f"run importé n° {numero} : {count} test(s) en erreur ou en échec à corriger"
+                      + (f" sur {failures}" if failures > count else "") + "."}
+
+
 def run_main_action(ctx: dict, action: dict) -> None:
     client = ctx["client"]
     if action["type"] == "init_echec":
@@ -2140,8 +2174,18 @@ def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
             clicked = st.button(action["libelle"], type="primary", icon=":material/play_arrow:",
                                 disabled=not (ctx["ready"] and action["type"]), key=f"cucumber_simple_go_{client}")
             st.caption(action["detail"][:1].upper() + action["detail"][1:])
+        fix = fix_action(ctx)
+        same = fix["type"] and fix["type"] == action["type"] and fix.get("numero") == action.get("numero")
+        fix_clicked = False
+        if not same:
+            with st.container(horizontal=True, vertical_alignment="center"):
+                fix_clicked = st.button(fix["libelle"], icon=":material/build:",
+                                        disabled=not (ctx["ready"] and fix["type"]), key=f"cucumber_simple_fix_{client}")
+                st.caption(fix["detail"][:1].upper() + fix["detail"][1:])
         if clicked:
             run_main_action(ctx, action)
+        elif fix_clicked:
+            run_main_action(ctx, fix)
     with st.container(border=True):
         st.markdown("**2. Écrire les tests de tâches choisies**")
         candidates = sorted((r for r in rows if generable(r)), key=lambda r: (r["module"], r["titre"].casefold()))

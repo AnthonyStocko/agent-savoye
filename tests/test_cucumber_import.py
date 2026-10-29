@@ -172,3 +172,18 @@ def test_correction_lot_sends_the_real_messages(setup, monkeypatch):
     files = main.run_correction_lot(lot, "2/2", repo, {}, "sonnet", "K", "/run", lambda u: None)
     assert files == [REL] and prompts[0]["etape"] == "RAPPORT D'EXÉCUTION IMPORTÉ"
     assert f"@agent_{CLIENT}_1_0" in prompts[0]["erreurs"] and "expected:<A> but was:<B>" in prompts[0]["erreurs"]
+
+
+def test_relaunched_correction_skips_scenarios_already_verified_green():
+    analysis = {"numero": 7, "propositions": [
+        {"spec": "sp-1", "scenarios": [{"id": "a::1", "tag": "@t1", "fichier": "a", "titre": "1"},
+                                       {"id": "a::2", "tag": "@t2", "fichier": "a", "titre": "2"}]},
+        {"spec": "sp-2", "scenarios": [{"id": "b::1", "tag": "@t3", "fichier": "b", "titre": "1"}]}]}
+    state = {"lots": [{"numero": 54, "type": "correction", "import": 7, "execution": {"scenarios": {
+        "@t1": {"id": "a::1", "statut": "pertinent"}, "@t3": {"id": "b::1", "statut": "pertinent"}}}},
+        {"numero": 55, "type": "correction", "import": 6, "execution": {"scenarios": {
+            "@t2": {"id": "a::2", "statut": "pertinent"}}}}]}
+    remaining = cimp.remaining_proposals(state, analysis)
+    assert [(p["spec"], [s["id"] for s in p["scenarios"]]) for p in remaining] == [("sp-1", ["a::2"])]
+    new = cimp.add_correction_lots(state, analysis)
+    assert len(new) == 1 and new[0]["numero"] == 56 and list(new[0]["tags"]) == ["@t2"]
