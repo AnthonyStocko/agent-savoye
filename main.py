@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1944,6 +1944,11 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         return {t: v for t, v in result["scenarios"].items()
                 if v["statut"] in ("invalide", "faible", "donnee_reference")
                 or (v["statut"] == "cascade" and cucumber_verify.failure_category(v.get("cause", "")) == "test")}
+    # Auto-amélioration : échecs de départ (vérification, ou run importé pour un lot de correction) et corrections
+    initial = {t: v.get("motif", "") for t, v in to_fix().items()}
+    if lot.get("type") == "correction":
+        initial.update({s.get("tag"): s.get("message", "") for s in lot.get("corrections") or [] if s.get("tag")})
+    described = list((lot.get("correction") or {}).get("corrections") or [])
     # Plafond adaptatif (cucumber_fix_budget) : on continue tant que l'échec change, scénario par scénario
     for attempt in range(cucumber_fix_budget.max_attempts() if mode else 0):
         bad = {t: v for t, v in to_fix().items() if t not in stuck}
@@ -1962,7 +1967,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             # Sortie d'un diagnostic temporaire exécuté au tour précédent
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
-        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         effort = cucumber_fix_effort()
@@ -1974,8 +1979,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         if limit_hit:
             break
         # D8 : déploiement retenu seulement si l'extrait cité par l'agent est dans le journal de l'exécution
-        deployed, refused = cucumber_diagnostic.deployment_findings(
-            cucumber_diagnostic.parse_fix_result(output), result["scenarios"])
+        fix_result = cucumber_diagnostic.parse_fix_result(output)
+        described += [c for c in fix_result.get("corrections") or [] if isinstance(c, dict)]
+        skills.record_use(fix_result.get("competences_utilisees") or [])
+        deployed, refused = cucumber_diagnostic.deployment_findings(fix_result, result["scenarios"])
         for tag, update in deployed.items():
             result["scenarios"][tag].update(update)
             print(f"[LOT {label}] 🚚 {result['scenarios'][tag]['id']} : {update['motif']}")
@@ -2015,6 +2022,16 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             print(f"[LOT {label}] ⏹ {result['scenarios'][tag]['id']} : même échec après correction, arrêt des "
                   f"tentatives (cause à prouver au prochain run importé).")
         stuck |= newly
+    # Échecs rendus verts sur Jenkins par les corrections de l'agent : procédure retenue comme compétence
+    fixed = [t for t in initial if t in result["scenarios"] and result["scenarios"][t]["statut"] == "pertinent"]
+    if mode and fixed and (described or lot.get("type") == "correction"):
+        success = "\n".join(
+            f"- {result['scenarios'][t]['id']} : échec « {initial[t][:400]} »" for t in fixed) + "\n\nCorrections :\n" \
+            + "\n".join(f"- {c.get('tag', '')} : cause {c.get('cause', '')} ; correction {c.get('correction', '')}"
+                        for c in described[:20])
+        learn_skill(client, "cucumber-correction", success, f"{len(fixed)} scénario(s) vert(s) sur Jenkins après "
+                    f"correction", worktree, lot.get("avant", ""), run_dir, work_key,
+                    int((lot.get("tokens") or {}).get("tours") or 0))
     keep_diagnostics(lot, label, worktree, mode, conventions, lambda: on_branch(base, sources)[0])
     # Scénarios dont une modification attend une décision humaine : désactivés provisoirement, hors jugement
     waiting = set(lot.get("decisions_en_attente") or [])
@@ -2248,7 +2265,7 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
         resumed = bool(lot and lot.get("session") and resume_lot_session())
         print(f"[LOT {label}] Correction {attempt + 1}/{attempts} "
               + ("(reprise de la session du lot)..." if resumed else f"({fix_model}, effort {effort or 'défaut'})..."))
-        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), **values}, lot_label=label, etape=check["etape"].upper(),
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", " ".join(check["erreurs"])), **values}, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
@@ -2740,6 +2757,34 @@ def print_import(analysis: dict) -> None:
     print(f"{label} : rapport analyse.md dans le dossier de l'import.")
 
 
+def learn_skill(client: str, domain: str, success: str, proof: str, worktree: str, since: str, run_dir: str,
+                work_key: str, turns: int) -> str:
+    """
+    Auto-amélioration : réussite PROUVÉE d'une tâche complexe (au moins SKILLS_MIN_TURNS tours) transformée en
+    compétence réutilisable par un appel court (skills, skill_extraction.md). Renvoie le chemin enregistré ('' sinon).
+    """
+    if not skills.enabled() or turns < skills.min_turns() or not success.strip():
+        return ""
+    diff = _git_out(worktree, "diff", since, "HEAD", "--", "src/test") if since else ""
+    prompt = render_prompt("skill_extraction", domaine_libelle=skills.DOMAINS.get(domain, domain), client_name=client,
+                           preuve=proof, reussite=success[:6000], diff=diff[:12000] or "(non disponible)",
+                           existantes=skills.index_text(domain))
+    model = os.getenv("CLAUDE_MODEL_SKILLS", "").strip() or "sonnet"
+    returncode, output, usage, limit_hit = run_claude(prompt, model, [], ["Read"], extra_args=("--max-turns", "2"),
+                                                      cwd=run_dir, lean=lean_session())
+    report_token_usage(work_key, "skill-extraction", model, usage, len(prompt), returncode, "")
+    if limit_hit or returncode:
+        return ""
+    proposal = skills.parse_proposal(output)
+    path = skills.save_proposal(domain, proposal, origin=f"{client} — {proof}"[:200], client=client)
+    if path:
+        print(f"[COMPÉTENCES] 🧠 Compétence {'mise à jour' if proposal.get('action') == 'mettre_a_jour' else 'acquise'}"
+              f" : {proposal.get('nom')} ({path})")
+    else:
+        print("[COMPÉTENCES] Rien de réutilisable à retenir de cette réussite.")
+    return path
+
+
 def enforce_db_proofs(worktree: str, lot: dict, data: list, fixed: dict, before: dict, db_start: int,
                       label: str) -> list:
     """
@@ -2808,7 +2853,7 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     if data:
         print(f"[LOT {label}] {len(data)} échec(s) lié(s) aux données : "
               + ("preuve en base exigée." if db_available else "aucun accès base, causes NON PROUVÉES."))
-    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
+    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
                            erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available),
                            fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
@@ -2821,6 +2866,7 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     report_token_usage(work_key, "cucumber-import-fix", model, usage, len(prompt), returncode, effort)
     # Ce que la correction a fait (bilan après le prochain import) : corrections, restantes, réalignés, constats
     fixed = cucumber_diagnostic.parse_fix_result(output)
+    skills.record_use(fixed.get("competences_utilisees") or [])
     cucumber_tools.normalize_constats(fixed)
     lot["correction"] = {"corrections": [c for c in fixed.get("corrections") or [] if isinstance(c, dict)][:30],
                          "restantes": [str(r) for r in fixed.get("restantes") or []][:30],
@@ -2872,11 +2918,14 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
                                          profile="cucumber"),
               "logs_block": build_logs_block(python_exe, workspace_dir)}
     errors, corrected = [], state.setdefault("init_corrigee", {"fichiers": [], "tentatives": []})
+    turns, start_head = 0, cucumber_tools.rev_parse(worktree, "HEAD")
+    first_failure = cucumber_init_fix.failure_lines(init.get("echecs") or [])
     for attempt in range(1, cucumber_init_fix.attempts() + 1):
         print(f"[CUCUMBER INIT] Correction des compléments d'init par l'agent, tentative {attempt} : "
               f"{', '.join(files)}")
         before = cucumber_init_fix.snapshot(worktree, files)
         prompt = render_prompt("cucumber_init_correction", **values, tentative=attempt,
+                               competences=skills.prompt_block("cucumber-init", first_failure),
                                echecs=cucumber_init_fix.failure_lines(init.get("echecs") or []),
                                erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
         returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, lot_tools(values),
@@ -2885,10 +2934,12 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
                                                                    db_log=corrected.setdefault("base", []),
                                                                    db_step="correction de l'initialisation")
         report_token_usage(work_key, "cucumber-init-fix", model, usage, len(prompt), returncode, effort)
+        turns += int((usage or {}).get("tours") or 0)
         if limit_hit:
             print("[CUCUMBER INIT] ⛔ Quota ou budget atteint pendant la correction de l'init.")
             break
         result = cucumber_diagnostic.parse_fix_result(output)
+        skills.record_use(result.get("competences_utilisees") or [])
         errors = cucumber_init_fix.check_correction(worktree, client, files, before)
         if not errors and compile_cmd:
             try:
@@ -2937,6 +2988,11 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
                                         init_tags, sources)
         print(f"[CUCUMBER INIT] {'✅' if init['ok'] else '🌐'} Après correction {attempt} : {init['message']}")
         if init["ok"]:
+            learn_skill(client, "cucumber-init", f"Échec de l'initialisation :\n{first_failure}\n\nCorrections :\n"
+                        + "\n".join(f"- tentative {t['tentative']} : cause {t['cause']} ; "
+                                     f"{'; '.join(map(str, t['corrections']))}" for t in corrected["tentatives"]),
+                        "initialisation rejouée sur Jenkins et passée après correction", worktree, start_head,
+                        run_dir, work_key, turns)
             return init
         if not cucumber_init_fix.fixable(init.get("echecs") or [], files):
             print("[CUCUMBER INIT] L'échec restant est hors des compléments de l'agent : init à corriger à la main.")
@@ -3540,7 +3596,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     print(f"[CUCUMBER] Compilation par l'agent pendant les lots : "
           f"{'oui' if agent_compile else 'non (CUCUMBER_AGENT_COMPILE=0 ou pas de CUCUMBER_COMPILE_CMD)'} | "
           f"code de {len(step_code['steps'])} step(s) Standard disponible ; sources : {step_code['sources']}")
-    total = {"tokens_entree": 0, "cache_ecrit": 0, "cache_lu": 0, "tokens_sortie": 0, "cout_usd": 0.0}
+    total = {"tokens_entree": 0, "cache_ecrit": 0, "cache_lu": 0, "tokens_sortie": 0, "cout_usd": 0.0, "tours": 0}
     lots = state["lots"]
     exit_code = 0
 
@@ -3594,6 +3650,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             with open(system_file, "w", encoding="utf-8") as f:
                 f.write(system_prompt)
             prompt = render_prompt("cucumber_client_lot", **values, **java_values, runner_status=java["runner_status"],
+                                   competences=skills.prompt_block("cucumber-correction", " ".join(
+                                       f"{s.get('libelle', '')} {s.get('dossier', '')}" for s in lot_specs)),
                                    runner_block=cucumber_tools.runner_block(std_java["runner_example"],
                                                                             java["runner_status"], inline_max),
                                    lot_block=cucumber_tools.lot_block(

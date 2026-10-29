@@ -6,4 +6,4 @@ ${consignes}
 ${profil_block}
 ${runner_block}
 ${lot_block}
-${db_block}
+${db_block}${competences}
