@@ -17,11 +17,12 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
     fetch_application_tickets, find_jira_issue_by_summary, get_epic_children, get_full_jira_issue_context,
+    get_jira_issue_details,
     get_issue_field_values, std_only_projects, update_jira_cadrage, update_jira_release_note,
 )
 from tools.memory_tools import (
@@ -540,6 +541,78 @@ def _build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: s
                                 schema_hint=schema_hint, **DB_BLOCK_WORDING.get(step, DB_BLOCK_WORDING["default"]))
 
 
+REVIEW_TOOLS = ["Read", "Grep", "Glob"]
+
+
+def run_pr_review(pr_url: str) -> int:
+    """
+    Revue assistée d'une pull request Bitbucket (lecture seule) : diff, code de la PR, ticket(s) Jira, conventions
+    de l'équipe et commentaires déjà posés donnés à l'agent ; résultat (résumé, verdict, commentaires ligne par
+    ligne) enregistré pour l'onglet « Revue de PR ». Rien n'est publié sur Bitbucket ici. Renvoie le code de sortie.
+    """
+    try:
+        project, repo, number = pr_review.parse_pr_url(pr_url)
+        pr = pr_review.pr_details(project, repo, number)
+        diff, lines_map, files = pr_review.pr_diff(project, repo, number)
+        comments = pr_review.existing_comments(project, repo, number)
+    except (ValueError, pr_review.BitbucketError) as e:
+        print(f"[REVUE PR] ❌ {e}")
+        return 2
+    print(f"[REVUE PR] {project}/{repo} #{number} — {pr['titre']} ({pr['auteur']}, {len(files)} fichier(s), "
+          f"commit {pr['commit'][:10]})")
+    run_dir = os.path.join(pr_review.ROOT, "runs", f"{project}_{repo}_{number}")
+    os.makedirs(run_dir, exist_ok=True)
+    diff_file = os.path.join(run_dir, "pr.diff")
+    with open(diff_file, "w", encoding="utf-8") as f:
+        f.write(diff)
+    code, why = pr_review.prepare_code(project, repo, number, pr["commit"])
+    print(f"[REVUE PR] Code de la PR : {code}" if code else f"[REVUE PR] ⚠️ Analyse sur le diff seul : {why}")
+    code_block = (f"Code complet de la PR au dernier commit (lecture seule) : '{code}' — ouvre les fichiers modifiés "
+                  f"autour des changements et Grep les appelants des méthodes modifiées." if code else
+                  "Code complet indisponible : analyse sur le diff seul ; formule en question ce que tu ne peux pas "
+                  "vérifier.")
+    tickets = []
+    for key in pr["jira"][:3]:
+        try:
+            tickets.append(f"{key} :\n{get_jira_issue_details(key)[:4000]}")
+        except Exception as e:  # noqa: BLE001 — Jira facultatif pour une revue
+            tickets.append(f"{key} : lecture impossible ({type(e).__name__})")
+    conventions = os.getenv("DEV_CONVENTIONS_PATH", "").strip() or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "odatio-specific-code-conventions-dev.md")
+    prompt = render_prompt(
+        "pr_review", relecteur=os.getenv("JIRA_EMAIL", "").split("@")[0] or "l'utilisateur",
+        token_saving_rules="\n" + render_prompt("token_saving_rules"), titre=pr["titre"], projet=project,
+        depot=repo, numero=number, auteur=pr["auteur"], source=pr["source"], cible=pr["cible"],
+        nb_fichiers=len(files), description=pr["description"][:3000] or "(aucune)",
+        jira="\n\n".join(tickets) or "(aucun ticket cité dans le titre, la branche ou la description)",
+        diff_file=diff_file, code_block=code_block,
+        conventions=f"'{conventions}'" if os.path.exists(conventions) else "(fichier de conventions absent)",
+        commentaires_existants="\n".join(f"- {c['auteur']} — {c['fichier'] or 'général'}"
+                                         + (f":{c['ligne']}" if c["ligne"] else "") + f" : {c['texte'][:200]}"
+                                         for c in comments[:40]) or "(aucun)")
+    model = os.getenv("CLAUDE_MODEL_REVIEW", "").strip() or "sonnet"
+    effort = claude_effort("CLAUDE_EFFORT_REVIEW")
+    dirs = [run_dir] + ([code] if code else []) + ([os.path.dirname(conventions)] if os.path.exists(conventions) else [])
+    returncode, output, usage, limit_hit = run_claude(prompt, model, dirs, REVIEW_TOOLS,
+                                                      extra_args=("--max-turns", str(_env_int("REVIEW_MAX_TURNS", 40))),
+                                                      cwd=run_dir, effort=effort, lean=lean_session())
+    report_token_usage(f"PR-{project}-{repo}-{number}", "review-pr", model, usage, len(prompt), returncode, effort)
+    review = pr_review.parse_review(output)
+    if limit_hit or not (review["resume"] or review["commentaires"]):
+        print("[REVUE PR] ❌ Pas de résultat exploitable" + (" (quota atteint)." if limit_hit else "."))
+        return 1
+    # Ancrage vérifié en Python : une ligne hors du diff sera publiée en commentaire général
+    for comment in review["commentaires"]:
+        comment["ancrable"] = bool(pr_review.anchor_type(lines_map, comment["fichier"], comment["ligne"]))
+        comment["publie"] = False
+    pr_review.save_result(project, repo, number, {**review, "pr": pr, "commit": pr["commit"], "fichiers": files,
+                                                  "lignes": {p: {str(k): v for k, v in m.items()}
+                                                             for p, m in lines_map.items()},
+                                                  "date": datetime.now().isoformat(timespec="seconds")})
+    print(f"[REVUE PR] ✅ Analyse terminée : {review['verdict']}, {len(review['commentaires'])} commentaire(s) proposé(s).")
+    return 0
+
+
 def bitbucket_base_url(repo_url: str = "") -> str:
     """BITBUCKET_URL du .env, à défaut l'hôte de l'URL de dépôt fournie."""
     configured = os.getenv("BITBUCKET_URL", "").strip().rstrip("/")
@@ -915,7 +988,8 @@ def main():
     parser.add_argument("--project", default="", help="Clé du projet Jira (ex: PROJ) ; inutile pour generate-cucumber-client")
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
-    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
+    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client", "review-pr"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
+    parser.add_argument("--pr-url", default="", help="review-pr : adresse de la pull request Bitbucket à relire")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
@@ -965,6 +1039,8 @@ def main():
     postmerge.add_argument("--jira-label", default=os.getenv("POSTMERGE_JIRA_LABEL", "").strip())
 
     args = parser.parse_args()
+    if args.step == "review-pr":
+        sys.exit(run_pr_review(args.pr_url))
     is_postmerge = args.step == "generate-cucumber-postmerge"
     if is_postmerge:
         if not (args.repo_slug and args.merge_commit):

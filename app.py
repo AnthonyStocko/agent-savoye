@@ -25,6 +25,7 @@ from tools.jira_tools import (
     set_jira_description_markdown, std_only_projects,
 )
 from tools.db_tools import DB_TYPES, test_connection
+from tools import pr_review
 from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
@@ -307,9 +308,9 @@ if env_problems:
                        f".env.bak.")
             st.rerun()
 
-tab_integration, tab_execution, tab_cucumber, tab_merges, tab_knowledge, tab_config = st.tabs(
-    ["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🔔 Écoute des merges", "📚 Connaissances partagées",
-     "⚙️ Configuration (.env)"])
+tab_integration, tab_execution, tab_cucumber, tab_review, tab_merges, tab_knowledge, tab_config = st.tabs(
+    ["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🔍 Revue de PR", "🔔 Écoute des merges",
+     "📚 Connaissances partagées", "⚙️ Configuration (.env)"])
 
 # Initialisation de l'état
 if "workflow_step" not in st.session_state:
@@ -3055,6 +3056,148 @@ def merge_listener_status():
     with st.expander("Journal de l'écoute", icon=":material/receipt_long:"):
         st.code(tail_log(40) or "Journal vide.", language="text")
     return status
+
+
+# ---------------------------------------------------------
+# ONGLET REVUE DE PR : RELIRE LES PULL REQUESTS DES COLLABORATEURS (BITBUCKET)
+# ---------------------------------------------------------
+REVIEW_VERDICTS = {"approuver": "✅ Peut être approuvée", "changements_demandes": "⛔ Changements à demander",
+                   "a_discuter": "💬 À discuter avec l'auteur"}
+REVIEW_SEVERITIES = {"bloquant": "🔴 Bloquant", "majeur": "🟠 Majeur", "mineur": "🟡 Mineur", "suggestion": "💡 Suggestion"}
+
+
+def review_label(pr: dict) -> str:
+    return f"{pr['projet']}/{pr['depot']} #{pr['id']} — {pr['titre']} ({pr['auteur']})"
+
+
+def render_review_result(pr: dict, result: dict) -> None:
+    """Résultat d'une analyse : verdict, résumé, commentaires à cocher, modifier et publier."""
+    project, repo, number = pr["projet"], pr["depot"], pr["id"]
+    stale = result.get("commit") and pr.get("commit") and result["commit"] != pr["commit"]
+    st.markdown(f"#### {REVIEW_VERDICTS.get(result['verdict'], result['verdict'])} · risque {result['risque']}")
+    if stale:
+        st.warning("De nouveaux commits ont été poussés depuis cette analyse : relance-la pour les prendre en compte.",
+                   icon=":material/update:")
+    st.markdown(result["resume"])
+    if result.get("conformite_ticket"):
+        st.caption(f"Ticket : {result['conformite_ticket']}")
+    if result.get("points_positifs"):
+        with st.expander(f"Points positifs ({len(result['points_positifs'])})"):
+            st.markdown("\n".join(f"- {p}" for p in result["points_positifs"]))
+    if result.get("questions"):
+        with st.expander(f"Questions à poser à l'auteur ({len(result['questions'])})"):
+            st.markdown("\n".join(f"- {q}" for q in result["questions"]))
+    if result.get("tests"):
+        st.caption(f"Tests : {result['tests']}")
+    comments = result.get("commentaires") or []
+    st.markdown(f"**Commentaires proposés ({len(comments)})** — coche ceux à publier, modifie-les si besoin.")
+    key = f"review_{project}_{repo}_{number}"
+    for index, comment in enumerate(comments):
+        with st.container(border=True):
+            where = comment["fichier"] + (f":{comment['ligne']}" if comment.get("ligne") else "")
+            head = f"{REVIEW_SEVERITIES.get(comment['gravite'], comment['gravite'])} · `{where}`"
+            if comment.get("publie"):
+                st.markdown(f"{head} — ✔️ publié")
+                st.caption(comment["message"])
+                continue
+            st.checkbox(head + ("" if comment.get("ancrable") else " (publié en commentaire général : ligne hors "
+                                                                     "du diff)"),
+                        key=f"{key}_pick_{index}", value=comment["gravite"] in ("bloquant", "majeur"))
+            st.text_area("Commentaire", comment["message"] + (f"\n\n```\n{comment['suggestion']}\n```"
+                                                               if comment.get("suggestion") else ""),
+                         key=f"{key}_text_{index}", label_visibility="collapsed", height=110)
+    picked = [i for i, c in enumerate(comments) if not c.get("publie") and st.session_state.get(f"{key}_pick_{i}")]
+    with st.container(horizontal=True, vertical_alignment="center"):
+        publish = st.button(f"Publier sur Bitbucket ({len(picked)})", type="primary", icon=":material/send:",
+                            disabled=not picked, key=f"{key}_publish")
+        st.caption("Publiés sous ton nom, sur les lignes concernées de la PR. Rien n'est approuvé ni refusé "
+                   "automatiquement.")
+    if publish:
+        lines_map = {p: {int(k): v for k, v in m.items()} for p, m in (result.get("lignes") or {}).items()}
+        done, errors = 0, []
+        for index in picked:
+            comment = comments[index]
+            text = (st.session_state.get(f"{key}_text_{index}") or comment["message"]).strip()
+            try:
+                pr_review.post_comment(project, repo, number, text, comment["fichier"], comment.get("ligne"),
+                                       lines_map)
+                comment["publie"], comment["message"] = True, text
+                done += 1
+            except pr_review.BitbucketError as e:
+                errors.append(f"{comment['fichier']}:{comment.get('ligne')} — {e}")
+        pr_review.save_result(project, repo, number, result)
+        if done:
+            st.success(f"{done} commentaire(s) publié(s) sur la PR.", icon=":material/task_alt:")
+        for error in errors:
+            st.error(error)
+        if done and not errors:
+            st.rerun()
+
+
+def render_review_tab() -> None:
+    st.markdown("### Relire les pull requests de tes collaborateurs")
+    st.caption("L'agent lit la PR (diff, code complet, ticket Jira, conventions de l'équipe, commentaires déjà "
+               "posés) et propose un avis et des commentaires ligne par ligne. Tu choisis ce qui est publié.")
+    if not pr_review.configured():
+        st.warning("Renseigne BITBUCKET_URL et BITBUCKET_HTTP_TOKEN dans l'onglet Configuration.",
+                   icon=":material/key:")
+        return
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        role = st.segmented_control("PR", ["À relire", "Où je participe", "Les miennes"], default="À relire",
+                                    key="review_role")
+        refresh = st.button("Actualiser", icon=":material/refresh:", key="review_refresh")
+    roles = {"À relire": "REVIEWER", "Où je participe": "PARTICIPANT", "Les miennes": "AUTHOR"}
+    cache_key = f"review_inbox_{roles.get(role or 'À relire')}"
+    if refresh or cache_key not in st.session_state:
+        try:
+            st.session_state[cache_key] = pr_review.review_inbox(roles.get(role or "À relire", "REVIEWER"))
+        except pr_review.BitbucketError as e:
+            st.error(str(e))
+            st.session_state[cache_key] = []
+    prs = {f"{p['projet']}/{p['depot']}/{p['id']}": p for p in st.session_state.get(cache_key) or []}
+    url = st.text_input("Ou adresse d'une PR", key="review_url",
+                        placeholder="https://git.kiscloud.io/projects/APPAREL/repos/odatio-app/pull-requests/42")
+    chosen = None
+    if url.strip():
+        try:
+            project, repo, number = pr_review.parse_pr_url(url)
+            chosen = pr_review.pr_details(project, repo, number)
+        except (ValueError, pr_review.BitbucketError) as e:
+            st.error(str(e))
+    elif prs:
+        choice = st.selectbox(f"Pull requests ({len(prs)})", list(prs), format_func=lambda k: review_label(prs[k]),
+                              key="review_choice")
+        chosen = prs.get(choice)
+    else:
+        st.info("Aucune pull request ouverte dans cette liste.", icon=":material/inbox:")
+    if not chosen:
+        return
+    with st.container(border=True):
+        st.markdown(f"**{chosen['titre']}** — {chosen['auteur']} · `{chosen['source']}` → `{chosen['cible']}`")
+        details = [f"[Ouvrir dans Bitbucket]({chosen['url']})"] if chosen.get("url") else []
+        if chosen.get("jira"):
+            details.append("Jira : " + ", ".join(chosen["jira"]))
+        if chosen.get("relecteurs"):
+            details.append("Relecteurs : " + ", ".join(f"{r['nom']} ({r['statut'].lower()})"
+                                                      for r in chosen["relecteurs"]))
+        st.caption(" · ".join(details))
+        result = pr_review.load_result(chosen["projet"], chosen["depot"], chosen["id"])
+        analysed = bool(result) and result.get("commit") == chosen.get("commit")
+        if st.button("Relancer l'analyse" if result else "Analyser la PR", type="secondary" if analysed else "primary",
+                     icon=":material/troubleshoot:", key=f"review_run_{chosen['projet']}_{chosen['depot']}_{chosen['id']}"):
+            pr_url = chosen.get("url") or (f"{pr_review.base_url()}/projects/{chosen['projet']}/repos/"
+                                           f"{chosen['depot']}/pull-requests/{chosen['id']}")
+            with st.spinner("Analyse de la PR en cours (lecture du code, du ticket et des conventions)…"):
+                code = run_main_step([sys.executable, "main.py", "--step", "review-pr", "--pr-url", pr_url])
+            if code == 0:
+                st.rerun()
+            st.error(f"Analyse interrompue : {interruption_cause(code)}.")
+        if result:
+            render_review_result(chosen, result)
+
+
+with tab_review:
+    render_review_tab()
 
 
 with tab_merges:
