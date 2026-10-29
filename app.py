@@ -25,7 +25,7 @@ from tools.jira_tools import (
     set_jira_description_markdown, std_only_projects,
 )
 from tools.db_tools import DB_TYPES, test_connection
-from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant
+from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant, db_restore
 from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
@@ -1204,7 +1204,7 @@ with tab_integration:
 NEW_PROJECT = "__nouveau__"
 PROJECT_KEYS = {"client_repo": "cucumber_repo", "client_name": "cucumber_client_name",
                 "db_schema": "cucumber_db_schema", "application": "cucumber_application",
-                "std_repo": "cucumber_std_repo"}
+                "std_repo": "cucumber_std_repo", "source_schema": "cucumber_source_schema"}
 
 
 def load_cucumber_project() -> None:
@@ -1233,6 +1233,7 @@ def cucumber_header() -> dict:
     st.session_state.setdefault("cucumber_db_schema", os.getenv("CUCUMBER_DB_SCHEMA", "") or os.getenv("DB_SCHEMA", ""))
     st.session_state.setdefault("cucumber_application", "")
     st.session_state.setdefault("cucumber_std_repo", os.getenv("BITBUCKET_CUCUMBER_STD_REPO", ""))
+    st.session_state.setdefault("cucumber_source_schema", "")
     projects = cucumber_detection.known_projects(cucumber_tools.CACHE_ROOT)
     options = list(projects) + [NEW_PROJECT]
     current = st.session_state.get("cucumber_project")
@@ -1272,7 +1273,8 @@ def cucumber_header() -> dict:
     ready = bool(repo_input and client)
     if ready:
         settings = {"client_repo": repo_input, "client_name": client, "db_schema": schema,
-                    "application": application, "std_repo": std_input}
+                    "application": application, "std_repo": std_input,
+                    "source_schema": (st.session_state.get("cucumber_source_schema") or "").strip()}
         if projects.get(client) != settings:
             cucumber_detection.save_project(client, settings)
     cucumber_cmd = [
@@ -1314,6 +1316,10 @@ def render_project_settings(ctx: dict) -> None:
         if ctx["client"]:
             st.caption(f"Dépôt cible : **{ctx['client']}-cucumber** · identifiant de travail "
                        f"**{cucumber_tools.work_id(ctx['client'])}**")
+        st.text_input("Schéma de la config client (base client) :", key="cucumber_source_schema",
+                      help="Schéma de la base client (connexion CLIENT_SOURCE_DB_*, à défaut DB_*) dont la "
+                           "configuration est recopiée dans le schéma des tests Cucumber par le bouton « Recopier la "
+                           "config client ».")
         std_input = st.text_input(
             "Dépôt Bitbucket du Cucumber Standard :", key="cucumber_std_repo",
             help="URL de navigation (.../projects/X/repos/Y/browse), URL clonable (.../scm/x/y.git) ou chemin d'un "
@@ -2238,6 +2244,59 @@ def render_tests_overview(ctx: dict, rows: list) -> None:
                          column_config={"Raison": st.column_config.TextColumn(width="large")})
 
 
+def render_client_config_restore(ctx: dict) -> None:
+    """
+    Recopie de la config client (base client) dans le schéma des tests Cucumber, avant les tests : base PARTAGÉE avec
+    Jenkins, donc nom du schéma cible à retaper, refus pendant un build, sauvegarde et retour arrière.
+    """
+    client = ctx["client"]
+    source_schema = (st.session_state.get("cucumber_source_schema") or "").strip()
+    target_schema = ((st.session_state.get("cucumber_db_schema") or "").strip()
+                     or os.getenv("CUCUMBER_DB_SCHEMA", "").strip())
+    history = db_restore.load_history(client)
+    last = history[-1] if history else {}
+    title = "🗄️ Config client dans la base des tests" + (
+        f" — dernière recopie le {last['date'][:16].replace('T', ' à ')} ({'✅' if last.get('ok') else '❌'})"
+        if last else "")
+    with st.expander(title):
+        source, target = db_restore.source_connection(), db_restore.target_connection()
+        st.caption(f"Recopie la configuration du schéma client **{source_schema or '?'}** "
+                   f"({db_restore.describe(source)}) dans le schéma des tests **{target_schema or '?'}** "
+                   f"({db_restore.describe(target)}), comme le script de restauration de l'équipe : toutes les tables, "
+                   f"sans les données d'historique et de journaux. Le schéma des tests est d'abord sauvegardé, puis "
+                   f"remplacé. ⚠️ Cette base est partagée avec Jenkins : rien n'est fait pendant un build.")
+        problems = db_restore.check_plan(source_schema, target_schema, source, target)
+        if problems:
+            st.warning("À compléter avant de pouvoir recopier : " + " ; ".join(problems)
+                       + ". Schéma client : « Données du projet » ; connexions : onglet Configuration "
+                         "(CLIENT_SOURCE_DB_*, CUCUMBER_DB_*).", icon=":material/info:")
+        confirm = st.text_input(f"Pour confirmer, tape le nom du schéma des tests qui sera remplacé "
+                                f"({target_schema or '?'})", key=f"restore_confirm_{client}")
+        ok = not problems and confirm.strip() == target_schema
+        if st.button("Recopier la config client", type="primary", icon=":material/sync:", disabled=not ok,
+                     key=f"restore_run_{client}"):
+            with st.spinner("Recopie de la config client (lecture, sauvegarde, remplacement)…"):
+                code = run_main_step([sys.executable, "main.py", "--step", "restore-config", "--client-name", client,
+                                      "--source-schema", source_schema, "--target-schema", target_schema])
+            entry = (db_restore.load_history(client) or [{}])[-1]
+            (st.success if code == 0 else st.error)(entry.get("message") or interruption_cause(code))
+        backups = [h for h in history if h.get("ok") and h.get("sauvegarde") and os.path.exists(h["sauvegarde"])]
+        if backups:
+            latest = backups[-1]
+            st.caption(f"Sauvegarde du schéma d'avant la dernière recopie : {os.path.basename(latest['sauvegarde'])}")
+            if st.button("Revenir à cette sauvegarde", icon=":material/undo:", disabled=confirm.strip() != target_schema,
+                         key=f"restore_back_{client}", help="Tape aussi le nom du schéma ci-dessus pour confirmer."):
+                with st.spinner("Remise en place de la sauvegarde…"):
+                    code = run_main_step([sys.executable, "main.py", "--step", "restore-config", "--client-name",
+                                          client, "--target-schema", target_schema, "--backup", latest["sauvegarde"]])
+                entry = (db_restore.load_history(client) or [{}])[-1]
+                (st.success if code == 0 else st.error)(entry.get("message") or interruption_cause(code))
+        if history:
+            st.dataframe([{"Date": h["date"][:16].replace("T", " "), "Opération": "retour arrière" if h.get("retour")
+                           else "recopie", "Résultat": ("✅ " if h.get("ok") else "❌ ") + h.get("message", "")}
+                          for h in reversed(history[-10:])], hide_index=True, width="stretch")
+
+
 def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
     """
     Écran minimal : bouton « Lancer » (init, première couverture, corrections), choix de tâches non testées, import
@@ -2289,6 +2348,7 @@ def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
         if message:
             st.info(message, icon=":material/info:")
         render_simple_import(client, "minimal")
+    render_client_config_restore(ctx)
     st.markdown("**Modifications à appliquer**")
     render_deliverable(client)
 
@@ -3879,6 +3939,25 @@ with tab_config:
         env_values["CUCUMBER_DB_SCHEMA"] = st.text_input(
             "CUCUMBER_DB_SCHEMA (valeur par défaut)", value=os.getenv("CUCUMBER_DB_SCHEMA", ""),
             help="Pré-remplit le champ « Schéma BDD » de l'onglet Cucumber.")
+
+        st.markdown("**Base client source de la config recopiée dans la base des tests** (vide : connexion DB_*)")
+        with st.container(horizontal=True):
+            for key, default, kind in (("CLIENT_SOURCE_DB_HOST", "", "default"), ("CLIENT_SOURCE_DB_PORT", "", "default"),
+                                       ("CLIENT_SOURCE_DB_NAME", "", "default"), ("CLIENT_SOURCE_DB_USER", "", "default"),
+                                       ("CLIENT_SOURCE_DB_PASSWORD", "", "password")):
+                env_values[key] = st.text_input(key, value=os.getenv(key, default), type=kind)
+        with st.container(horizontal=True):
+            env_values["PG_BIN_DIR"] = st.text_input(
+                "PG_BIN_DIR", value=os.getenv("PG_BIN_DIR", ""), placeholder=r"C:\Program Files\PostgreSQL\16\bin",
+                help="Dossier de pg_dump, pg_restore et psql. Vide : ceux du PATH.").strip()
+            env_values["RESTORE_POST_SQL"] = st.text_input(
+                "RESTORE_POST_SQL", value=os.getenv("RESTORE_POST_SQL", ""),
+                help="Script SQL passé après la recopie (comme Script_a_passer_apres_import.sql), précédé de "
+                     "« set schema '<schéma des tests>'; ». Vide : aucun.").strip()
+            env_values["RESTORE_EXCLUDE_DATA"] = st.text_input(
+                "RESTORE_EXCLUDE_DATA", value=os.getenv("RESTORE_EXCLUDE_DATA", ""),
+                help="Tables dont les DONNÉES ne sont pas recopiées, en plus de celles du script (historiques, "
+                     "journaux), séparées par des virgules.").strip()
 
         st.markdown("---")
         st.markdown("#### :material/folder_shared: Connaissances partagées")

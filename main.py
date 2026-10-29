@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant
+from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -577,6 +577,35 @@ def run_assistant(question: str, answer_file: str) -> int:
     return 0
 
 
+def run_restore_config(client: str, source_schema: str, target_schema: str, backup: str = "") -> int:
+    """
+    Recopie de la config client (base client en direct, schéma `source_schema`) dans le schéma des tests Cucumber
+    `target_schema`, méthode du script de restauration de l'équipe (db_restore) ; `backup` : retour arrière vers une
+    sauvegarde. Jamais pendant un build Jenkins des jobs Cucumber. Compte rendu dans le répertoire partagé.
+    """
+    if not (client and target_schema):
+        print("[CONFIG CLIENT] ❌ Client et schéma cible obligatoires.")
+        return 2
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+
+    def busy() -> list:
+        return jenkins_tools.busy_builds(jenkins_tools.exclusive_jobs(profile.get("run_job", "")))
+
+    log = lambda message: print(f"[CONFIG CLIENT] {message}")  # noqa: E731
+    entry = (db_restore.restore_backup(client, backup, target_schema, log, busy) if backup else
+             db_restore.restore_client_config(client, source_schema, target_schema, log, busy))
+    print(f"[CONFIG CLIENT] {'✅' if entry['ok'] else '❌'} {entry['message']}")
+    if entry.get("sauvegarde"):
+        print(f"[CONFIG CLIENT] Sauvegarde du schéma d'avant : {entry['sauvegarde']}")
+    share_knowledge(f"# {'Retour arrière' if backup else 'Recopie'} de la config client {client}\n\n"
+                    f"- Date : {entry['date']}\n- Source : {entry['source']}\n- Cible : {entry['cible']}\n"
+                    f"- Résultat : {'réussi' if entry['ok'] else 'échec'} — {entry['message']}\n"
+                    + (f"- Sauvegarde du schéma d'avant : {entry['sauvegarde']}\n" if entry.get("sauvegarde") else ""),
+                    client.upper(), "config-client-tests", f"Config client {client} dans le schéma {target_schema}",
+                    client=client, tags=["cucumber", "base"])
+    return 0 if entry["ok"] else 1
+
+
 REVIEW_TOOLS = ["Read", "Grep", "Glob"]
 
 
@@ -1101,11 +1130,14 @@ def main():
     parser.add_argument("--project", default="", help="Clé du projet Jira (ex: PROJ) ; inutile pour generate-cucumber-client")
     parser.add_argument("--client-repo", default="", help="Chemin local ou URL du dépôt client")
     parser.add_argument("--std-repo", default="", help="Chemin local ou URL du dépôt socle standard")
-    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client", "review-pr", "ask"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
+    parser.add_argument("--step", choices=["cadrage", "epic-cadrage", "epic-sync", "refine", "patch", "generate-cucumber-postmerge", "besoin", "cadrage-reponses", "generate-cucumber-client", "review-pr", "ask", "restore-config"], default="cadrage", help="Étape du traitement (epic-cadrage : découpe une épopée en tâches enfants analysées ; besoin : reformulation du besoin et questions ouvertes ; cadrage-reponses : complète le cadrage avec les réponses de l'onglet Intégration ; generate-cucumber-client : patch de tests Cucumber couvrant tous les spécifiques d'un client)")
     parser.add_argument("--pr-url", action="append", default=[],
                         help="review-pr : adresse d'une pull request de la fonctionnalité (option répétable : toutes les "
                              "PR de la fonctionnalité sont relues ensemble)")
     parser.add_argument("--feature", default="", help="review-pr : ticket Jira de la fonctionnalité relue")
+    parser.add_argument("--source-schema", default="", help="restore-config : schéma de la config client (base client)")
+    parser.add_argument("--target-schema", default="", help="restore-config : schéma des tests Cucumber à remplacer")
+    parser.add_argument("--backup", default="", help="restore-config : sauvegarde à remettre en place (retour arrière)")
     parser.add_argument("--question", default="", help="ask : question posée à l'assistant (onglet Assistant)")
     parser.add_argument("--answer-file", default="", help="ask : fichier où écrire la réponse")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
@@ -1161,6 +1193,9 @@ def main():
         sys.exit(run_pr_review(args.pr_url, args.feature))
     if args.step == "ask":
         sys.exit(run_assistant(args.question, args.answer_file))
+    if args.step == "restore-config":
+        sys.exit(run_restore_config(args.client_name.strip().lower(), args.source_schema.strip(),
+                                    args.target_schema.strip(), args.backup.strip()))
     is_postmerge = args.step == "generate-cucumber-postmerge"
     if is_postmerge:
         if not (args.repo_slug and args.merge_commit):
