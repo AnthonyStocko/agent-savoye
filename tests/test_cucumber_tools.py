@@ -293,3 +293,24 @@ def test_patch_delivers_or_reports_data_files_read_by_client_features(repo, tmp_
     missing = open(patch + ".donnees-manquantes.txt", encoding="utf-8").read()
     assert "files/clientx/WMS/Preparation/CIN-2.xml" in missing
     assert "rules/WMS/01-Contexte/rule-Defaut.json" in missing and "CIN-1.xml" not in missing
+
+
+def test_patch_never_delivers_temporary_diagnostics_even_already_on_the_branch(repo, tmp_path, monkeypatch):
+    """Cas réel (bilan de santé) : steps TEMPORAIRE- arrivés sur la branche sans leur méthode → dry-run en échec."""
+    monkeypatch.delenv("CUCUMBER_PATCH_MODE", raising=False)
+    feat = "src/test/resources/cucumber/features/clientx/a.feature"
+    write(os.path.join(repo, *feat.split("/")),
+          "Feature: A\n  Scenario: s\n    Given x\n    When TEMPORAIRE- Etat du dossier avant analyse\n    Then y\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    git(repo, "checkout", "-q", "-b", "agent")
+    write(os.path.join(repo, "src/test/resources/cucumber/features/clientx/b.feature"), "Feature: B\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "lot 1")
+    patch = str(tmp_path / "p.patch")
+    assert ct.write_patch(repo, "integration", patch, "clientx")
+    text = open(patch, encoding="utf-8").read()
+    assert "-    When TEMPORAIRE- Etat du dossier avant analyse" in text and "b.feature" in text
+    git(repo, "checkout", "-q", "integration")
+    git(repo, "am", "-q", patch)
+    assert "TEMPORAIRE-" not in open(os.path.join(repo, *feat.split("/")), encoding="utf-8").read()

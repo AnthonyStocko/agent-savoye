@@ -2532,6 +2532,29 @@ def _git_env(repo: str, env: dict, *args, data: bytes = None) -> subprocess.Comp
     return subprocess.run(["git", "-C", repo, *args], input=data, capture_output=True, env={**os.environ, **env})
 
 
+def _strip_temporary_in_index(worktree: str, env: dict) -> list:
+    """
+    Arbre livré : aucun step de diagnostic TEMPORAIRE- (lignes de features et méthodes Java), même déjà présent sur
+    la branche — sans sa méthode, un tel step fait échouer le dry-run et le run. Renvoie les fichiers nettoyés.
+    """
+    from tools import cucumber_diagnostic
+    listing = _git_env(worktree, env, "ls-files", "-z").stdout.decode("utf-8", "replace").split("\0")
+    cleaned = []
+    for rel in (p for p in listing if p.endswith((".feature", ".java")) and p.startswith("src/test/")):
+        text = _git_env(worktree, env, "show", f":{rel}").stdout.decode("utf-8", "replace")
+        if cucumber_diagnostic.TEMP_PREFIX not in text:
+            continue
+        stripped = (cucumber_diagnostic._strip_feature(text) if rel.endswith(".feature")
+                    else cucumber_diagnostic._strip_java(text))
+        if stripped == text:
+            continue
+        blob = _git_env(worktree, env, "hash-object", "-w", "--stdin", data=stripped.encode("utf-8")).stdout.decode().strip()
+        mode = (_git_env(worktree, env, "ls-files", "-s", "--", rel).stdout.decode().split() or ["100644"])[0]
+        _git_env(worktree, env, "update-index", "--cacheinfo", f"{mode},{blob},{rel}")
+        cleaned.append(rel)
+    return cleaned
+
+
 def _deliver_missing_data(worktree: str, env: dict, client_name: str) -> tuple:
     """
     Arbre livré (index temporaire = branche + patch) : chaque fichier de données lu par une feature du client doit y
@@ -2681,6 +2704,10 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
                 blob = _git_env(worktree, env, "hash-object", "-w", "--stdin", data=cleaned).stdout.decode().strip()
                 mode = (_git_env(worktree, env, "ls-files", "-s", "--", rel).stdout.decode().split() or ["100644"])[0]
                 _git_env(worktree, env, "update-index", "--cacheinfo", f"{mode},{blob},{rel}")
+        cleaned = _strip_temporary_in_index(worktree, env)
+        if cleaned:
+            print(f"[CUCUMBER] Patch : diagnostic(s) temporaire(s) retiré(s) du livrable (y compris déjà présents sur "
+                  f"la branche) : {', '.join(cleaned[:5])}")
         recovered, unresolved = _deliver_missing_data(worktree, env, client_name)
         missing_file = output + ".donnees-manquantes.txt"
         if unresolved:
