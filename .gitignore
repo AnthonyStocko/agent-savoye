@@ -13,6 +13,7 @@ __pycache__/
 
 # Livrables produits par ticket à la racine du projet
 *.patch
+*.patch.*.txt
 *.diff
 *-cadrage.md
 *-release-note.md
