@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Position conservée sur l'UM          # src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0006-Position.feature:41
+[2026-10-28T10:00:00.000Z]   When CONTENT- Vérification de la position de l'UM # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0006-Position.Position conservée sur l'UM -- Time elapsed: 0.42 s <<< FAILURE!
+[2026-10-28T10:00:00.000Z] org.junit.ComparisonFailure: customString2 expected:<[QUAI-01]> but was:<[]>
+[2026-10-28T10:00:00.000Z] 	at org.junit.Assert.assertEquals(Assert.java:117)
+[2026-10-28T10:00:00.000Z] 	at ✽.CONTENT- Vérification de la position de l'UM(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0006-Position.feature:44)
+[2026-10-28T10:00:00.000Z] 

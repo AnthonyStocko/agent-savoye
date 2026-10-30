@@ -5,6 +5,7 @@ import pytest
 
 from tests.conftest import CLIENT, CLIENT_TAG, git, write
 from tools import cucumber_a_revoir as ar
+from tools import cucumber_arbitrage as arb
 from tools import cucumber_bilan as cb
 from tools import cucumber_decisions as cd
 from tools import cucumber_import as cimp
@@ -40,26 +41,71 @@ def _scenarios(worktree):
     return {s["titre"]: s for s in cv.parse_scenarios(_text(worktree))}
 
 
-def test_realignment_is_applied_when_the_code_wins(client, repo, monkeypatch):
-    """Politique par défaut : le code fait foi, le réalignement reste actif et n'attend aucune décision."""
-    monkeypatch.delenv("CUCUMBER_SPEC_CODE_POLICY", raising=False)
-    monkeypatch.setenv("CUCUMBER_AUTONOMY", "0")
-    write(os.path.join(repo, REL), FEATURE)
-    before = ar.snapshot(repo, [REL])
+def _realign(repo, ticket="SPEC-1234"):
+    """Correction qui réaligne « LIBRE » sur « BLOQUE » (code) en citant le ticket du scénario."""
     write(os.path.join(repo, REL), FEATURE.replace(
         f'  {CLIENT_TAG}\n  Scenario: Statut du contenant', f'  # Réaligné sur le code : StockService.java\n'
+                                                             f'  # Ticket : {ticket}\n'
                                                              f'  {CLIENT_TAG}\n  Scenario: Statut du contenant')
           .replace('Then le statut est "LIBRE"', 'Then le statut est "BLOQUE"'))
-    held = cd.held_changes(repo, before, CLIENT_TAG)
-    assert [(h["type"], h["applique"], h["code"]) for h in held] == [("realignement", True, "StockService.java")]
-    scenario = _scenarios(repo)["Statut du contenant"]
-    assert "@A_REVOIR" not in scenario["tags"] and '"BLOQUE"' in _text(repo)
-    assert cd.PENDING_COMMENT not in _text(repo)
-    # Une valeur de données changée reste soumise à décision
+
+
+@pytest.fixture
+def jira(monkeypatch):
+    """Description des tickets lue par l'arbitre (outil Jira simulé) : {clé: description}."""
+    tickets = {}
+    monkeypatch.setattr(arb, "_fetch_description", lambda key: tickets.get(key, ""))
+    monkeypatch.delenv("CUCUMBER_SPEC_CODE_POLICY", raising=False)
+    monkeypatch.setenv("CUCUMBER_AUTONOMY", "1")
+    return tickets
+
+
+def test_realignment_applied_when_the_jira_ticket_matches_the_code(client, repo, jira):
+    jira["SPEC-1234"] = "Contexte\nUn contenant bloqué…\nCritères d'acceptation\n- le statut du contenant est BLOQUE"
+    write(os.path.join(repo, REL), FEATURE)
     before = ar.snapshot(repo, [REL])
-    write(os.path.join(repo, REL), _text(repo).replace("| C1   | 2   |", "| C1   | 5   |"))
-    assert [(h["type"], h["applique"]) for h in cd.held_changes(repo, before, CLIENT_TAG)] == [("donnees", False)]
-    assert "CODE FAIT FOI" in cd.spec_code_rule() and "désactivé" not in cd.spec_code_rule()
+    _realign(repo)
+    held = cd.held_changes(repo, before, CLIENT_TAG)
+    assert [(h["type"], h["applique"], h["arbitrage"]["verdict"]) for h in held] == [("realignement", True, "code")]
+    assert held[0]["arbitrage"]["ticket"] == "SPEC-1234"
+    assert '"BLOQUE"' in _text(repo) and cd.PENDING_COMMENT not in _text(repo)
+    assert "@A_REVOIR" not in _scenarios(repo)["Statut du contenant"]["tags"]
+    rule = cd.spec_code_rule()
+    assert "critère d'acceptation" in rule and "TECHNIQUES" in rule and "CODE FAIT FOI" not in rule
+
+
+def test_ticket_matching_the_test_is_a_detected_defect_never_realigned(client, repo, jira):
+    jira["SPEC-1234"] = "Critères d'acceptation :\n- un contenant sans anomalie reste LIBRE après réception"
+    write(os.path.join(repo, REL), FEATURE)
+    before = ar.snapshot(repo, [REL])
+    _realign(repo)
+    held = cd.held_changes(repo, before, CLIENT_TAG)
+    assert [(h["type"], h["applique"]) for h in held] == [("defaut", False)]
+    text = _text(repo)
+    assert '"LIBRE"' in text and '"BLOQUE"' not in text and arb.DEFECT_COMMENT + " SPEC-1234" in text
+    scenario = _scenarios(repo)["Statut du contenant"]
+    assert CLIENT_TAG in scenario["tags"] and "@A_REVOIR" not in scenario["tags"]     # actif, reste en échec
+    assert not cd.pending(client)
+
+
+def test_no_usable_criterion_requires_a_human_decision(client, repo, jira):
+    jira["SPEC-1234"] = "Description sans critère d'acceptation exploitable"
+    write(os.path.join(repo, REL), FEATURE)
+    before = ar.snapshot(repo, [REL])
+    _realign(repo)
+    held = cd.held_changes(repo, before, CLIENT_TAG)
+    assert [(h["type"], h["applique"], h["arbitrage"]["verdict"]) for h in held] == [("realignement", False, "aucun")]
+    scenario = _scenarios(repo)["Statut du contenant"]
+    assert '"LIBRE"' in _text(repo) and cd.PENDING_COMMENT in _text(repo)
+    assert CLIENT_TAG in scenario["tags"] and "@A_REVOIR" not in scenario["tags"]     # jamais désactivé
+    # Autonomie : un réalignement en attente n'est jamais pris par l'agent (seules les données le sont)
+    cd.propose(client, "realignement", held[0]["proposition"], fichier=REL, titre="Statut du contenant",
+               scenario=f"{REL}::Statut du contenant", avant=held[0]["avant"], apres=held[0]["apres"])
+    assert cd.auto_resolve_pending(client, repo) == [] and len(cd.pending(client)) == 1
+    # Ticket introuvable ou valeurs citées toutes deux : pas de verdict
+    jira["SPEC-1234"] = "Critères d'acceptation\n- statut LIBRE puis BLOQUE après contrôle"
+    assert arb.arbitrate(held[0]["avant"], held[0]["apres"], ["SPEC-1234"])["verdict"] == "aucun"
+    assert arb.arbitrate(held[0]["avant"], held[0]["apres"], [])["verdict"] == "aucun"
 
 
 def test_realignment_is_held_then_validated(client, repo, monkeypatch):
@@ -73,9 +119,9 @@ def test_realignment_is_held_then_validated(client, repo, monkeypatch):
           .replace('Then le statut est "LIBRE"', 'Then le statut est "BLOQUE"'))
     held = cd.held_changes(repo, before, CLIENT_TAG)
     assert [(h["type"], h["titre"]) for h in held] == [("realignement", "Statut du contenant")]
-    # En attente : bloc d'origine, désactivé provisoirement, modification gardée à part
+    # En attente : bloc d'origine, actif (en échec), modification gardée à part
     scenario = _scenarios(repo)["Statut du contenant"]
-    assert "@A_REVOIR" in scenario["tags"] and CLIENT_TAG not in scenario["tags"]
+    assert "@A_REVOIR" not in scenario["tags"] and CLIENT_TAG in scenario["tags"]
     assert '"LIBRE"' in _text(repo) and cd.PENDING_COMMENT in _text(repo)
     decision = cd.propose(client, "realignement", held[0]["proposition"], fichier=REL, titre="Statut du contenant",
                           scenario=f"{REL}::Statut du contenant", lot=1, avant=held[0]["avant"],
@@ -215,7 +261,7 @@ def test_autonomy_never_asks(client, repo, monkeypatch):
     """Autonomie (défaut) : données changées appliquées, échec persistant désactivé sans arrêt, ancienne décision
     en attente prise par l'agent."""
     monkeypatch.delenv("CUCUMBER_AUTONOMY", raising=False)
-    assert cd.autonomous() and "AUTONOMIE" in cd.spec_code_rule()
+    assert cd.autonomous() and "TECHNIQUES" in cd.spec_code_rule()
     write(os.path.join(repo, REL), FEATURE)
     before = ar.snapshot(repo, [REL])
     write(os.path.join(repo, REL), FEATURE.replace("| C1   | 2   |", "| C1   | 5   |"))
@@ -223,13 +269,19 @@ def test_autonomy_never_asks(client, repo, monkeypatch):
     assert [(h["type"], h["applique"]) for h in held] == [("donnees", True)] and "| C1   | 5   |" in _text(repo)
     agent = cd.record_agent_decision(client, "donnees", held[0]["proposition"], scenario="s")
     assert agent["statut"] == "validee" and agent["historique"][0]["auteur"] == "agent" and not cd.pending(client)
-    # Échec côté test persistant : désactivé (jamais supprimé), aucun arrêt ; le seuil devient une alerte
+    # Échec côté test persistant : jamais désactivé, laissé en échec (alerte) ; seule une cause hors test PROUVÉE
+    # désactive, et le seuil reste bloquant en autonomie
     scenarios = {"@t1": {"id": "a::1", "statut": "invalide", "motif": "expected:<A> but was:<B>"},
-                 "@t2": {"id": "a::2", "statut": "environnement", "motif": "non vérifié — environnement : 503"}}
-    decision = ar.decide(scenarios, {"a::1": "sp", "a::2": "sp"}, max_pct=10, autonomous=True)
-    assert decision["arret"] is False and decision["desactiver"] == {"@t1": "test_persistant", "@t2": "environnement"}
-    assert decision["alertes"]
-    assert ar.decide(scenarios, {}, max_pct=10)["arret"] is True                 # sans autonomie : arrêt
+                 "@t2": {"id": "a::2", "statut": "environnement",
+                         "motif": "Unable to find the custom field customString1"},
+                 "@t3": {"id": "a::3", "statut": "environnement", "motif": "non vérifié — environnement : 503"}}
+    spec_of = {"a::1": "sp", "a::2": "sp", "a::3": "sp"}
+    decision = ar.decide(scenarios, spec_of, max_pct=100, autonomous=True)
+    assert decision["arret"] is False and decision["desactiver"] == {"@t2": "environnement"}
+    assert decision["bloquants"] == ["@t1"] and decision["non_prouves"] == ["@t3"] and len(decision["alertes"]) == 2
+    decision = ar.decide(scenarios, spec_of, max_pct=10, autonomous=True)
+    assert decision["arret"] is True and decision["desactiver"] == {}            # seuil : arrêt, décision humaine
+    assert ar.decide(scenarios, spec_of, max_pct=100)["arret"] is True           # sans autonomie : arrêt
     # Décision restée en attente d'avant l'autonomie : prise par l'agent au lancement suivant
     monkeypatch.setenv("CUCUMBER_AUTONOMY", "0")
     write(os.path.join(repo, REL), FEATURE)

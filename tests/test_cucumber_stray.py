@@ -27,7 +27,7 @@ def test_files_written_in_a_parasite_folder_are_moved_into_the_worktree(tmp_path
     moved = cs.relocate(str(run), str(worktree), since)
     assert sorted(t for _, t in moved) == ["src/test/java/cucumber/features/apparel/BSteps.java",
                                            "src/test/resources/cucumber/features/apparel/A.feature"]
-    assert (worktree / "src/test/resources/cucumber/features/apparel/A.feature").read_text() == "Feature: corrigée\n"
+    assert (worktree / "src/test/resources/cucumber/features/apparel/A.feature").read_text(encoding="utf-8") == "Feature: corrigée\n"
     assert (worktree / "src/test/java/cucumber/features/apparel/BSteps.java").exists()
     assert not (run / "cucumber_apparel_agent2").exists()
     assert old.exists() and (run / "build" / "src/test/java/X.java").exists()      # ancien / compilation : intacts
@@ -44,4 +44,4 @@ def test_catch_up_never_overwrites_a_newer_worktree_version(tmp_path):
     write(str(run / "egare/src/test/java/B.java"), "nouveau")
     moved = cs.relocate(str(run), str(worktree))
     assert [t for _, t in moved] == ["src/test/java/B.java"]
-    assert (worktree / "src/test/java/A.java").read_text() == "version du dépôt, plus récente"
+    assert (worktree / "src/test/java/A.java").read_text(encoding="utf-8") == "version du dépôt, plus récente"

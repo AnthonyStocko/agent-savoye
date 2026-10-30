@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Création du dossier d'arrivage          # src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0002-Dossier.feature:12
+[2026-10-28T10:00:00.000Z]   When GOODSIN- Création du dossier d'arrivage du client # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0002-Dossier.Création du dossier d'arrivage -- Time elapsed: 0.42 s <<< ERROR!
+[2026-10-28T10:00:00.000Z] io.cucumber.junit.UndefinedStepException: The step 'GOODSIN- Création du dossier d'arrivage du client' is undefined.
+[2026-10-28T10:00:00.000Z] You can implement this step using the snippet(s) below:
+[2026-10-28T10:00:00.000Z] 	at ✽.GOODSIN- Création du dossier d'arrivage du client(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0002-Dossier.feature:15)
+[2026-10-28T10:00:00.000Z] 

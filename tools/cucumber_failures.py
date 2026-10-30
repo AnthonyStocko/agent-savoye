@@ -37,6 +37,9 @@ NATURES = {
     "brouillon_complet": "mettre à jour par le brouillon complet lu, en ne modifiant que les champs visés",
     "mecanisme_ecriture": "diagnostiquer le mécanisme d'écriture du champ (écrit puis relu vide)",
     "chemin_fichier": "corriger le chemin du fichier de données ou de règles du test",
+    "regle_standard": "copier dans le dépôt client le fichier de règle du Standard que le test charge",
+    "deploiement": "déployer le code testé, puis relancer (le test n'est pas modifié)",
+    "configuration_partagee": "rendre le scénario autonome : poser dans son Background la configuration qu'il lit",
     "assertion": "corriger le scénario d'après l'écart constaté",
     "technique": "corriger le step, la colonne ou le fichier du test",
     "version": "écart de version entre la bibliothèque de steps et le serveur",
@@ -52,13 +55,14 @@ NATURES = {
 _UNDEFINED = re.compile(r"UndefinedStep|\bis undefined\b|\bare undefined\b|step(?:s)? (?:is|are) undefined|"
                         r"Undefined step", re.I)
 _UNDEFINED_STEP = re.compile(r"[Tt]he step [\"'](.+?)[\"']")
-_EMPTY_READ = re.compile(r"expected:?\s*<[^<>]+>\s*but was:?\s*<\s*>|relue?s?\s+vide|lue?\s+vide apr[eè]s [ée]criture|"
+_EMPTY_READ = re.compile(r"expected:?\s*<[^<>]+>\s*but was:?\s*<\s*(?:\[\s*\])?\s*>|relue?s?\s+vide|lue?\s+vide apr[eè]s [ée]criture|"
                          r"[ée]crit(?:e|s)?\b.{0,80}\brelu(?:e|s)?\b.{0,40}\bvide", re.I)
 _EMPTY_CHOICES = re.compile(r"liste de choix vide|aucun choix (?:n'est )?disponible|no (?:available )?(?:choices|"
                             r"options) (?:available|for)|empty (?:choice|option) list", re.I)
 _CODE_LENGTH = re.compile(r"taille de la valeur.{0,200}trop grande|value too long|exceeds? (?:the )?max(?:imum)? length",
                           re.I)
 _DRAFT_REQUIRED = re.compile(r"La propri[ée]t[ée]\b.{0,120}\best requise", re.I)
+_STANDARD_RULE = re.compile(r"/cucumber/rules/[\w./'-]+\.json", re.I)
 _FILE_MISSING = re.compile(r"FileNotFoundException|NoSuchFileException|No such file or directory", re.I)
 _VERSION = re.compile(r"No route found|has no field|Invalid path|UnrecognizedPropertyException|Unrecognized field",
                       re.I)
@@ -80,6 +84,19 @@ def classify(result: dict) -> dict:
 
     def out(categorie, nature, cause, action):
         return {"categorie": categorie, "nature": nature, "cause": _sentence(cause), "action": _sentence(action)}
+    # Contexte du run établi hors du message (code testé absent du déploiement, configuration partagée écrite par
+    # une autre feature) : prime sur le message, qui n'en montre que l'effet
+    context = result.get("contexte") or {}
+    if context.get("code_non_deploye"):
+        return out("environnement", "deploiement", f"Le test vérifie un code pas encore déployé sur l'environnement "
+                                                   f"({context['code_non_deploye']}).",
+                   "Déployer la version qui contient ce code, puis relancer ; le test n'est pas modifié.")
+    if context.get("configuration_partagee"):
+        return out("correction", "configuration_partagee", f"Le scénario dépend d'une configuration partagée "
+                                                           f"modifiée par une autre feature "
+                                                           f"({context['configuration_partagee']}).",
+                   "Poser dans le Background du scénario la configuration qu'il lit, sans dépendre de l'ordre des "
+                   "features.")
     if result.get("statut") == "indefini" or _UNDEFINED.search(full):
         name = (_UNDEFINED_STEP.search(full) or [None, step])[1] or step
         return out("correction", "step_equivalent", f"Le step « {name} » n'est défini nulle part.",
@@ -87,7 +104,7 @@ def classify(result: dict) -> dict:
     if _EMPTY_CHOICES.search(full):
         return out("produit", "liste_choix_vide", f"Liste de choix vide sur un champ obligatoire de l'écran "
                                                   f"(step « {step} ») : l'écran ne peut pas être validé.",
-                   "Désactiver le scénario (patch proposé) et signaler le défaut de l'écran Studio, preuve jointe.")
+                   "Désactiver le scénario (modifications proposées, à télécharger) et signaler le défaut de l'écran Studio, preuve jointe.")
     if _EMPTY_READ.search(full):
         return out("diagnostic", "mecanisme_ecriture", f"Le champ écrit est relu vide (step « {step} ») : le "
                                                        f"mécanisme d'écriture n'est pas prouvé.",
@@ -110,6 +127,11 @@ def classify(result: dict) -> dict:
         return out("correction", "champ_non_renvoye", f"Le champ contrôlé est renvoyé vide (null) par le step "
                                                       f"« {step} ».",
                    "Corriger la colonne contrôlée ou le step : champ non renvoyé par l'endpoint ou non mappé.")
+    if _FILE_MISSING.search(full) and _STANDARD_RULE.search(full):
+        path = _STANDARD_RULE.search(full).group(0).lstrip("/")
+        return out("correction", "regle_standard", f"Fichier de règle du Standard non copié dans le dépôt client : "
+                                                   f"{path}.",
+                   "Copier ce fichier de règle du Standard dans le dépôt client, au même chemin (le chemin est juste).")
     if _FILE_MISSING.search(full):
         path = (re.search(r"([\w./'-]+\.(?:json|csv|xml|xlsm|xlsx|txt))", full) or [None, ""])[1]
         return out("correction", "chemin_fichier", f"Fichier introuvable : {path or _sentence(message, 120)}.",
@@ -124,7 +146,7 @@ def classify(result: dict) -> dict:
     if nature == "bug_applicatif":
         return out("produit", "bug_applicatif", f"Erreur du serveur sur le step « {step} » : "
                                                 f"{_sentence(message, 140)}",
-                   "Désactiver le scénario (patch proposé) et signaler le défaut, preuve jointe.")
+                   "Désactiver le scénario (modifications proposées, à télécharger) et signaler le défaut, preuve jointe.")
     if nature == "assertion":
         return out("correction", "assertion", f"Écart constaté au step « {step} » : {_sentence(message, 150)}",
                    "Corriger le scénario d'après l'écart (données, étapes manquantes, valeurs attendues).")
@@ -294,11 +316,11 @@ def record_correction(imports_dir: str, lot: dict, worktree: str) -> list:
         item.update(lot=lot["numero"], statut="traite", patch=patch if touched or done else "")
         if touched and "TEMPORAIRE-" in diff:
             item.update(categorie="diagnostic", cause=_sentence((done or {}).get("cause") or item["cause"]),
-                        action="Diagnostic temporaire ajouté au patch : appliquer le patch, relancer le run, puis "
+                        action="Diagnostic temporaire ajouté aux modifications : les appliquer, relancer le run, puis "
                                "importer sa console.")
         elif touched or done:
             item.update(categorie="correction", cause=_sentence((done or {}).get("cause") or item["cause"]),
-                        action=_sentence((done or {}).get("correction") or "Correction écrite dans le patch.", 300))
+                        action=_sentence((done or {}).get("correction") or "Correction écrite dans les modifications.", 300))
         else:
             item.update(categorie="diagnostic", patch="",
                         cause=_sentence(remaining[0] if remaining else

@@ -110,7 +110,7 @@ def last_analysis(client_name: str) -> dict:
     if not index.get("imports"):
         return {}
     numero = max(e["numero"] for e in index["imports"])
-    return _read_json(os.path.join(cucumber_import.imports_dir(client_name), str(numero), "analyse.json"), {}) or {}
+    return cucumber_import.load_analysis(client_name, numero)
 
 
 def run_counts(analysis: dict) -> tuple:

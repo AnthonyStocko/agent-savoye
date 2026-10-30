@@ -7,8 +7,9 @@ Scénarios à revoir (RÈGLE 3, 0 token) : un scénario n'est jamais supprimé.
 - Une cause hors du test, prouvée par le message d'échec (environnement, version, donnée de référence absente après
   correction, défaut produit probable, déploiement), désactive le scénario : tag générique CUCUMBER_TAG_A_REVOIR au
   niveau du scénario, commentaire de cause au-dessus, tag client déplacé sur les seuls scénarios actifs.
-- Seuil CUCUMBER_MAX_RETRACT_PCT : au-delà (ou si un spécifique perdrait tous ses scénarios actifs, ou si un échec
-  côté test persiste), rien n'est désactivé et la génération s'arrête pour une décision humaine.
+- Seuil CUCUMBER_MAX_RETRACT_PCT, bloquant même en autonomie : au-delà (ou si un spécifique perdrait tous ses
+  scénarios actifs), rien n'est désactivé et la génération s'arrête pour une décision humaine. Une cause hors test
+  NON PROUVÉE ou un échec côté test persistant ne désactive jamais : le scénario reste en échec avec son diagnostic.
 - A_REVOIR.md à la racine du dépôt client (section générée entre deux marqueurs, le reste conservé) : défauts
   détectés en tête, puis scénarios désactivés (cause, preuve, condition de réactivation) et scénarios faibles. Une
   cause déduite (défaut produit derrière une erreur serveur, cascade d'une mise en place, déploiement) est notée NON
@@ -51,7 +52,7 @@ CAUSES = {
     # Choix de l'utilisateur : test en échec mis de côté pour être analysé plus tard (écran principal)
     "mis_de_cote": ("mis de côté par l'utilisateur pour analyse ultérieure",
                     "réactiver depuis l'onglet Cucumber (« État des tests ») une fois la cause analysée"),
-    # Autonomie : échec côté test que les corrections n'ont pas résolu, désactivé par l'agent (jamais supprimé)
+    # Ancienne autonomie (états existants seulement) : un échec côté test n'est plus jamais désactivé
     "test_persistant": ("échec côté test persistant après les corrections de l'agent",
                         "réactiver après correction du scénario : message d'échec, base et logs du run cités dans "
                         "A_REVOIR.md"),
@@ -224,18 +225,28 @@ def cause_of(item: dict) -> str:
 def decide(scenarios: dict, spec_of: dict, max_pct: float = None, autonomous: bool = False) -> dict:
     """
     Décision sur les scénarios vérifiés d'un lot ({tag: résultat}) : {"desactiver": {tag: cause}, "faibles": [tags],
-    "bloquants": [tags], "arret": bool, "motifs": [...]}. Une désactivation exige une cause hors test ET une preuve
-    (message d'échec) ; arrêt (rien n'est désactivé) si un échec côté test persiste, si les désactivations
-    dépassent `max_pct` % du lot ou si un spécifique n'aurait plus aucun scénario actif.
+    "bloquants": [tags], "non_prouves": [tags], "arret": bool, "motifs": [...], "alertes": [...]}.
+    - Désactivation : uniquement sur cause hors test PROUVÉE par le message d'échec ; une cause déduite (NON PROUVÉE)
+      laisse le scénario en échec avec son diagnostic.
+    - Un échec côté test n'est jamais désactivé : il reste en échec avec son diagnostic (alerte en autonomie, arrêt
+      pour décision humaine sinon).
+    - Seuil bloquant, autonomie comprise : désactivations au-delà de `max_pct` % du lot, ou spécifique sans plus
+      aucun scénario actif → arrêt pour décision humaine, rien n'est désactivé.
     """
     max_pct = max_retract_pct() if max_pct is None else max_pct
-    disable = {t: cause_of(v) for t, v in scenarios.items() if cause_of(v) and v.get("motif")}
+    causes = {t: cause_of(v) for t, v in scenarios.items() if cause_of(v) and v.get("motif")}
+    disable = {t: c for t, c in causes.items() if proof_status(c, scenarios[t])[0]}
+    unproven = sorted(set(causes) - set(disable))
     blocking = sorted(t for t, v in scenarios.items() if v.get("statut") == "invalide")
     weak = sorted(t for t, v in scenarios.items() if v.get("statut") == "faible")
-    reasons = []
+    reasons, alerts = [], []
     if blocking:
-        reasons.append(f"{len(blocking)} scénario(s) toujours en échec pour une cause côté test après les corrections "
-                       f"(jamais désactivés)")
+        message = (f"{len(blocking)} scénario(s) toujours en échec pour une cause côté test après les corrections "
+                   f"(jamais désactivés, laissés en échec avec leur diagnostic)")
+        (alerts if autonomous else reasons).append(message)
+    if unproven:
+        alerts.append(f"{len(unproven)} scénario(s) en échec pour une cause hors test {UNPROVEN} : laissés en échec "
+                      f"avec leur diagnostic (preuve à apporter avant toute désactivation)")
     pct = 100 * len(disable) / len(scenarios) if scenarios else 0
     if disable and pct > max_pct:
         reasons.append(f"{len(disable)} désactivation(s) sur {len(scenarios)} scénario(s) ({pct:.0f} % > "
@@ -243,18 +254,12 @@ def decide(scenarios: dict, spec_of: dict, max_pct: float = None, autonomous: bo
     by_spec = {}
     for tag, item in scenarios.items():
         by_spec.setdefault(spec_of.get(item.get("id", ""), ""), []).append(tag)
-    emptied = sorted(s for s, tags in by_spec.items() if s and all(t in disable or t in blocking for t in tags))
+    emptied = sorted(s for s, tags in by_spec.items() if s and all(t in disable for t in tags))
     if disable and emptied:
         reasons.append(f"spécifique(s) sans aucun scénario actif après désactivation : {', '.join(emptied)}")
-    if autonomous:
-        # Aucun arrêt : les échecs côté test persistants sont désactivés eux aussi (cause NON PROUVÉE, listés), les
-        # seuils deviennent des alertes du bilan
-        disable.update({t: "test_persistant" for t in blocking if scenarios[t].get("motif")})
-        return {"desactiver": disable, "faibles": weak, "bloquants": blocking, "arret": False, "motifs": [],
-                "alertes": reasons}
     stop = bool(reasons)
-    return {"desactiver": {} if stop else disable, "faibles": weak, "bloquants": blocking, "arret": stop,
-            "motifs": reasons, "alertes": []}
+    return {"desactiver": {} if stop else disable, "faibles": weak, "bloquants": blocking, "non_prouves": unproven,
+            "arret": stop, "motifs": reasons, "alertes": alerts}
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +423,10 @@ def generated_section(state: dict, specifics: dict) -> str:
                      key=lambda e: not e.get("prouvee", True))
     defects += [{"constat": c, "spec": r["id"]} for lot in lots for r in lot.get("resultats") or []
                 for c in r.get("constats") or [] if c.get("type") == "ecart_spec_code"]
+    # Défauts détectés par l'arbitrage Jira (ticket conforme au test) : prouvés par le critère d'acceptation
+    defects += [{"fichier": c.get("fichier", ""), "titre": c["detail"], "preuve": c.get("preuve", ""), "prouvee": True}
+                for lot in lots for c in (lot.get("correction") or {}).get("constats") or []
+                if c.get("type") == "defaut_code" and c.get("certitude") == "prouvé"]
     stops = [lot for lot in lots if lot.get("statut") == "decision_humaine"]
     lines = [BEGIN, "", "# À revoir (généré par l'agent Cucumber)", "",
              "Rien n'a été supprimé : chaque scénario listé reste dans sa feature, désactivé par le tag "
@@ -457,7 +466,8 @@ def write_a_revoir(worktree: str, state: dict, specifics: dict) -> str:
     fichier créé s'il n'y a rien à revoir. Renvoie le chemin relatif ('' si rien n'est écrit).
     """
     lots = state.get("lots", [])
-    if not state.get("mis_de_cote") and not any(lot.get("a_revoir") or lot.get("faibles") or lot.get("statut") == "decision_humaine"
+    if not state.get("mis_de_cote") and not any(lot.get("a_revoir") or lot.get("faibles") or lot.get("defauts_detectes")
+               or lot.get("statut") == "decision_humaine"
                or any(c.get("type") == "ecart_spec_code" for r in lot.get("resultats") or []
                       for c in r.get("constats") or []) for lot in lots):
         return ""

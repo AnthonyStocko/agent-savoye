@@ -170,3 +170,39 @@ def test_full_path_without_expert_mode(project, monkeypatch):
     # Modifications à appliquer : téléchargeables sur l'écran minimal
     found = sorted({m.group(0) for t in visible_texts(at) for m in FORBIDDEN.finditer(t)})
     assert found == [], found
+
+
+def test_imported_console_with_failures_gives_one_result_per_failure(project):
+    """
+    Console Jenkins réelle (extraits du jeu de référence) avec trois échecs, importée comme depuis l'écran : un
+    résultat par échec sur l'écran simple (catégorie, cause, action), les modifications téléchargeables pour celui
+    qui en a dès l'import (désactivation proposée d'un défaut du produit), sans vocabulaire interne.
+    """
+    reference = os.path.join(ROOT, "tests", "reference")
+    names = ["02-champ-controle-null", "09-additional-properties", "10-liste-choix-vide-studio"]
+    console = "\n".join(open(os.path.join(reference, f"{n}.console.txt"), encoding="utf-8").read().replace(
+        "/features/client/", f"/features/{CLIENT}/") for n in names)
+    worktree = project["worktree"]
+    # Features des scénarios en échec présentes dans le dépôt de l'agent
+    for title, feature in re.findall(r"Scenario: (.+?)\s+# (src/\S+?\.feature):\d+", console):
+        write(os.path.join(worktree, *feature.split("/")),
+              f"Feature: F\n\n  {CLIENT_TAG}\n  Scenario: {title}\n    When x\n    Then y\n")
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-qm", "features")
+    imported = cucumber_import.import_files(CLIENT, {"console.txt": console.encode("utf-8")})
+    analysis = cucumber_import.analyse(CLIENT, imported["numero"], ct.load_state(CLIENT), worktree)
+    failures = analysis["echecs"]
+    assert [(e["categorie"], e["nature"]) for e in failures] == [
+        ("correction", "champ_non_renvoye"), ("environnement", "version"), ("produit", "liste_choix_vide")]
+    assert all(e["cause"] and e["action"] for e in failures)
+    at = open_app()
+    markdown = " ".join(m.value for m in at.markdown)
+    assert f"Échecs du run importé n° {imported['numero']} : 3" in markdown
+    assert all(e["titre"] in markdown for e in failures)
+    captions = " ".join(c.value for c in at.caption)
+    assert all(e["cause"][:40] in captions for e in failures)
+    downloads = [b for b in at.get("download_button") if b.proto.label == "Télécharger les modifications"]
+    assert len(downloads) == 1                                           # désactivation proposée du défaut produit
+    assert "Modifications écrites par « Corriger »" in captions           # la correction : par le bouton 1
+    found = sorted({m.group(0) for t in visible_texts(at) for m in FORBIDDEN.finditer(t)})
+    assert found == [], found

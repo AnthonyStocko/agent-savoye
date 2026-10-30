@@ -322,12 +322,13 @@ def test_case_duplicates_are_dropped_only_on_a_case_insensitive_disk(repo, monke
     git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{lower}")
     git(repo, "commit", "-qm", "doublon")
     assert cc.case_duplicates(repo) == [[upper, lower]]
-    # Disque sensible à la casse avec les deux dossiers : rien n'est retiré
-    write(os.path.join(repo, *lower.split("/")), "Feature: A\n")
-    assert cc.drop_case_duplicates(repo) == []
+    # Disque sensible à la casse avec les deux dossiers : rien n'est retiré (vérifiable sur un tel disque seulement)
+    if not os.path.exists(os.path.join(repo, *upper.split("/")[:-2], "PRODUCT")):
+        write(os.path.join(repo, *lower.split("/")), "Feature: A\n")
+        assert cc.drop_case_duplicates(repo) == []
+        import shutil
+        shutil.rmtree(os.path.join(repo, *lower.split("/")[:-1]))
     # Disque où seul « Product » existe (Windows) : l'autre chemin quitte l'index
-    import shutil
-    shutil.rmtree(os.path.join(repo, *lower.split("/")[:-1]))
     assert cc.drop_case_duplicates(repo) == [lower]
     assert git(repo, "ls-files", "--", lower) == ""
 

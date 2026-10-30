@@ -1,0 +1,9 @@
+[2026-10-28T10:00:00.000Z] Scenario: Statut du contenant après réception          # src/test/resources/cucumber/features/client/WMS/Content/SPEC-0003-Statut.feature:20
+[2026-10-28T10:00:00.000Z]   When CONTENT- Vérification du contenant # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0003-Statut.Statut du contenant après réception -- Time elapsed: 0.42 s <<< FAILURE!
+[2026-10-28T10:00:00.000Z] org.junit.ComparisonFailure: customString3 expected:<LIBRE> but was:<null>
+[2026-10-28T10:00:00.000Z] 	at org.junit.Assert.assertEquals(Assert.java:117)
+[2026-10-28T10:00:00.000Z] 	at cucumber.features.BaseStep.checkField(BaseStep.java:201)
+[2026-10-28T10:00:00.000Z] 	at ✽.CONTENT- Vérification du contenant(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Content/SPEC-0003-Statut.feature:23)
+[2026-10-28T10:00:00.000Z] 

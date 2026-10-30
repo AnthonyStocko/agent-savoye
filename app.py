@@ -15,7 +15,8 @@ from dotenv import dotenv_values, load_dotenv
 from tools import env_tools
 from tools import cucumber_init_fix
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
-                   cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_import, cucumber_preflight,
+                   cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
+                   cucumber_preflight,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
                    cucumber_links, cucumber_results, cucumber_studio, cucumber_testability, cucumber_tools,
                    cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
@@ -109,12 +110,21 @@ def show_release_note(ticket: str, since: float) -> None:
 CUCUMBER_ENV_PREFIX = "[CUCUMBER ENVIRONNEMENT] ❌"
 JOURNAL_PATH = os.path.join(".tmp", "journal_technique.log")
 JOURNAL_MAX_BYTES = 5_000_000
+# Journal conservé de chaque exécution (le journal technique tourne, l'affichage disparaît au rechargement)
+RUN_LOGS_DIR = os.path.join(".tmp", "logs")
+
+
+def run_log_path(cmd: list) -> str:
+    """Journal d'une exécution de main.py : .tmp/logs/<AAAA-MM-JJ_HHMMSS>_<étape>.log."""
+    step = cmd[cmd.index("--step") + 1] if "--step" in cmd and cmd.index("--step") + 1 < len(cmd) else "main"
+    return os.path.join(RUN_LOGS_DIR, f"{time.strftime('%Y-%m-%d_%H%M%S')}_{re.sub(r'[^\w.-]', '_', step)}.log")
 
 
 def run_main_step(cmd: list, on_line=None, quiet: bool = True) -> int:
     """
     Lance main.py (`on_line` : appelé à chaque ligne). Toute la sortie va dans le journal technique
-    (.tmp/journal_technique.log, panneau « Journal technique » replié de l'en-tête) ; par défaut (`quiet`), rien de
+    (.tmp/journal_technique.log, panneau « Journal technique » replié de l'en-tête) et dans le journal conservé de
+    l'exécution (.tmp/logs/<date>_<étape>.log) ; par défaut (`quiet`), rien de
     brut n'est affiché : seul un indicateur d'avancement, et la dernière exécution est gardée pour en tirer des
     phrases (journal_phrases). `quiet=False` réservé au diagnostic. Renvoie le code retour.
     """
@@ -136,10 +146,16 @@ def run_main_step(cmd: list, on_line=None, quiet: bool = True) -> int:
     if spinner:
         spinner.__enter__()
     logs, lines = "", []
-    with open(JOURNAL_PATH, "a", encoding="utf-8") as journal:
+    os.makedirs(RUN_LOGS_DIR, exist_ok=True)
+    log_path = run_log_path(cmd)
+    st.session_state["last_run_log"] = log_path
+    with open(JOURNAL_PATH, "a", encoding="utf-8") as journal, open(log_path, "w", encoding="utf-8") as run_log:
         journal.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} — {' '.join(cmd[1:])[:300]}\n")
+        run_log.write(f"===== {' '.join(cmd[1:])[:300]}\n")
         for line in process.stdout:
             journal.write(line)
+            run_log.write(line)
+            run_log.flush()
             lines.append(line.rstrip("\n"))
             if output_container is not None:
                 logs += line
@@ -147,7 +163,8 @@ def run_main_step(cmd: list, on_line=None, quiet: bool = True) -> int:
             if on_line:
                 on_line(line)
         process.wait()
-        journal.write(f"===== code retour {process.returncode}\n")
+        journal.write(f"===== code retour {process.returncode} — journal de l'exécution : {log_path}\n")
+        run_log.write(f"===== code retour {process.returncode}\n")
     if spinner:
         spinner.__exit__(None, None, None)
     st.session_state["last_run_lines"] = lines
@@ -180,7 +197,10 @@ def render_technical_journal() -> None:
             return
         with open(JOURNAL_PATH, "r", encoding="utf-8", errors="replace") as f:
             tail = f.readlines()[-400:]
-        st.caption(f"Sortie brute des derniers traitements (400 dernières lignes) — {JOURNAL_PATH}")
+        st.caption(f"Sortie brute des derniers traitements (400 dernières lignes) — {JOURNAL_PATH} ; journal "
+                   f"conservé de chaque exécution dans {RUN_LOGS_DIR}"
+                   + (f" (dernière : {st.session_state['last_run_log']})" if st.session_state.get("last_run_log")
+                      else ""))
         st.code("".join(tail), language="text")
 
 
@@ -300,6 +320,23 @@ if not os.getenv("CLAUDE_CONFIG_DIR", "").strip():
     os.environ["CLAUDE_CONFIG_DIR"] = os.environ["AGENT_SHELL_CLAUDE_CONFIG_DIR"]
 
 st.title("🤖 Tableau de bord - Agent Scrum Master")
+
+
+def agent_version() -> str:
+    """Version de l'agent : branche et commit du dépôt (« modifié » si des fichiers suivis ne sont pas commités)."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    git = lambda *args: subprocess.run(["git", "-C", root, *args], capture_output=True, text=True,  # noqa: E731
+                                       encoding="utf-8", errors="replace").stdout.strip()
+    try:
+        commit = git("log", "-1", "--format=%h du %cd", "--date=format:%d/%m/%Y %H:%M")
+        branch = git("rev-parse", "--abbrev-ref", "HEAD")
+        dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    except OSError:
+        return ""
+    return f"Version de l'agent : {commit or 'inconnue'}" + (f" ({branch})" if branch else "") +         (" — modifications locales non commitées" if dirty else "")
+
+
+st.caption(agent_version())
 
 env_problems = env_tools.check_env(ENV_PATH)
 if env_problems:
@@ -943,8 +980,7 @@ def latest_import_analysis(client: str) -> tuple:
     if not index["imports"]:
         return 0, {}
     numero = max(e["numero"] for e in index["imports"])
-    return numero, cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
-                                                          "analyse.json"), {}) or {}
+    return numero, cucumber_import.load_analysis(client, numero)
 
 
 def refresh_a_revoir(client: str, state: dict, decision: dict) -> None:
@@ -2297,6 +2333,31 @@ def render_client_config_restore(ctx: dict) -> None:
                           for h in reversed(history[-10:])], hide_index=True, width="stretch")
 
 
+def render_failure_results(client: str) -> None:
+    """
+    Un résultat par échec du dernier run importé (cucumber_failures) : catégorie, scénario, cause en une phrase,
+    action, et les modifications téléchargeables quand l'échec en a (correction écrite, désactivation proposée).
+    """
+    numero, analysis = latest_import_analysis(client)
+    failures = analysis.get("echecs") or []
+    if not failures:
+        return
+    st.markdown(f"**Échecs du run importé n° {numero} : {len(failures)}**")
+    for index, item in enumerate(failures):
+        with st.container(border=True):
+            st.markdown(f"{cucumber_failures.failure_title(item)} — **{item['titre']}**")
+            st.caption(f"Cause : {item['cause']}  \nÀ faire : {item['action']}")
+            patch = item.get("patch") or ""
+            if patch and os.path.exists(patch):
+                with open(patch, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+                st.download_button("Télécharger les modifications", text, file_name=os.path.basename(patch),
+                                   icon=":material/download:", mime="text/x-diff",
+                                   key=f"cucumber_echec_{client}_{numero}_{index}")
+            elif item.get("statut") == "a_traiter" and item.get("categorie") in cucumber_failures.TO_WRITE:
+                st.caption("Modifications écrites par « Corriger » (bouton 1).")
+
+
 def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
     """
     Écran minimal : bouton « Lancer » (init, première couverture, corrections), choix de tâches non testées, import
@@ -2348,6 +2409,7 @@ def render_cucumber_simple(ctx: dict, rows: list, init_status: dict) -> None:
         if message:
             st.info(message, icon=":material/info:")
         render_simple_import(client, "minimal")
+        render_failure_results(client)
     render_client_config_restore(ctx)
     st.markdown("**Modifications à appliquer**")
     render_deliverable(client)
@@ -2981,6 +3043,8 @@ with tab_cucumber:
     st.markdown("### Tests Cucumber des fonctionnalités spécifiques")
     st.caption("Choisissez le projet : l'agent analyse le reste tout seul, sans rien modifier dans les dépôts. Les "
                "tests écrits sont livrés comme des modifications à télécharger : rien n'est envoyé.")
+    if cucumber_verify.unverified_warning():
+        st.warning(cucumber_verify.unverified_warning(), icon=":material/gpp_maybe:")
     cucumber_ctx = cucumber_header()
     cucumber_client = cucumber_ctx["client"]
     render_cucumber_detection(cucumber_ctx)
@@ -3701,8 +3765,9 @@ with tab_config:
                  "contexte du lot. Décoché = compilation après le lot seulement, corrigée par CLAUDE_MODEL_CUCUMBER_FIX.")
         env_values["CUCUMBER_AGENT_COMPILE"] = "1" if agent_compile else "0"
         agent_jenkins = st.checkbox(
-            "CUCUMBER_AGENT_JENKINS", value=os.getenv("CUCUMBER_AGENT_JENKINS", "0").strip() == "1",
-            help="Décoché (défaut) : l'agent livre un patch, ne pousse rien et ne lance aucun test ; vous appliquez le "
+            "CUCUMBER_AGENT_JENKINS", value=cucumber_verify.agent_runs_tests(),
+            help="Coché par défaut dès que JENKINS_USER et JENKINS_API_TOKEN sont renseignés (boucle fermée). "
+                 "Décoché : l'agent livre un patch non vérifié, ne pousse rien et ne lance aucun test ; vous appliquez le "
                  "patch, lancez votre job complet et importez son résultat. Coché : l'agent vérifie en autonomie "
                  "pendant la génération — il pousse ses tests sur sa branche de travail (profil client), lance le "
                  "job du client (profil ou CUCUMBER_VERIFY_JOB) avec les paramètres imposés du profil, un build à la "

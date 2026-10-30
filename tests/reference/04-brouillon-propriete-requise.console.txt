@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Modification de l'article          # src/test/resources/cucumber/features/client/WMS/Article/SPEC-0005-Article.feature:30
+[2026-10-28T10:00:00.000Z]   When ARTICLE- Mise à jour de l'article par brouillon # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0005-Article.Modification de l'article -- Time elapsed: 0.42 s <<< FAILURE!
+[2026-10-28T10:00:00.000Z] java.lang.AssertionError: 428 - La propriété site est requise.
+[2026-10-28T10:00:00.000Z] 	at cucumber.endPoints.EndPoints.checkResponse(EndPoints.java:88)
+[2026-10-28T10:00:00.000Z] 	at ✽.ARTICLE- Mise à jour de l'article par brouillon(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Article/SPEC-0005-Article.feature:33)
+[2026-10-28T10:00:00.000Z] 

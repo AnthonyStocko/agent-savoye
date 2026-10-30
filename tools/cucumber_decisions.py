@@ -2,10 +2,11 @@
 Décisions humaines de l'onglet Cucumber (point 7, D2, D3), 0 token.
 
 Les propositions qui changent le sens d'un test ne sont pas appliquées d'office : réalignement d'un attendu sur le
-code, changement des données d'un step existant, désactivation, test jugé tautologique, écart spécification / code.
-- En attente (D2) : le scénario concerné est désactivé provisoirement par le tag à revoir, avec le commentaire
-  « # Décision en attente : … » (désactivation : « décision en attente » dans son commentaire « # À revoir : … »).
-  La modification proposée (bloc du scénario corrigé) est gardée à part, dans la décision. L'agent poursuit le reste.
+code (arbitré d'abord par le ticket Jira, cucumber_arbitrage), changement des données d'un step existant,
+désactivation, test jugé tautologique, écart spécification / code.
+- En attente (D2) : le scénario d'origine reste actif (en échec), précédé du commentaire « # Décision en attente : … »
+  (désactivation : « décision en attente » dans son commentaire « # À revoir : … »). La modification proposée (bloc
+  du scénario corrigé) est gardée à part, dans la décision. L'agent poursuit le reste.
 - Valider : applique la modification (réalignement, données : scénario corrigé, actif ; désactivation : définitive) ;
   Refuser : rétablit le scénario d'origine, actif, et le commentaire accompagne sa prochaine correction ; Commenter :
   ajoute un avis sans trancher. Test tautologique et écart spécification / code : décisions d'information.
@@ -17,7 +18,7 @@ import os
 import re
 from datetime import datetime
 
-from tools import knowledge_tools
+from tools import cucumber_arbitrage, knowledge_tools
 from tools.cucumber_a_revoir import DISABLED_COMMENT, PENDING, REALIGNED, scenario_blocks
 from tools.cucumber_diagnostic import temporary_steps
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag,
@@ -27,7 +28,7 @@ from tools.cucumber_verify import _title_key, parse_scenarios
 TYPES = {"realignement": "réalignement d'un attendu sur le code", "donnees": "changement de données de test",
          "desactivation": "désactivation", "tautologique": "test jugé tautologique",
          "ecart_spec_code": "écart spécification / code"}
-# Décisions qui gardent une modification à part (scénario désactivé provisoirement en attendant)
+# Décisions qui gardent une modification à part (scénario d'origine actif en attendant)
 HELD_TYPES = ("realignement", "donnees")
 
 
@@ -56,11 +57,13 @@ def record_agent_decision(client_name: str, kind: str, proposal: str, **fields) 
 
 
 def auto_resolve_pending(client_name: str, worktree: str, base: str = "", client_tag: str = "") -> list:
-    """Autonomie : décisions encore en attente (d'avant l'autonomie) validées par l'agent. Renvoie celles traitées."""
+    """Autonomie : décisions techniques encore en attente validées par l'agent. Renvoie celles traitées."""
     if not autonomous():
         return []
     done = []
-    for decision in pending(client_name):
+    # Seules les décisions techniques (données de test) sont prises par l'agent ; un réalignement, une désactivation
+    # ou un écart restent à l'humain
+    for decision in [d for d in pending(client_name) if d["type"] == "donnees"]:
         resolved = resolve(client_name, decision["id"], "valider", AGENT_REASON, worktree, base, client_tag, "agent")
         if resolved:
             resolved["auto"] = True
@@ -74,26 +77,20 @@ def auto_resolve_pending(client_name: str, worktree: str, base: str = "", client
     return done
 
 
-def code_wins() -> bool:
-    """
-    Écart spécification / code : le code fait foi (CUCUMBER_SPEC_CODE_POLICY=code, défaut). Un attendu réaligné sur
-    le code est appliqué tout de suite et consigné comme écart à revoir plus tard, au lieu d'attendre une décision.
-    « decision » : ancien comportement (réalignement gardé à part, scénario désactivé en attendant).
-    """
-    return os.getenv("CUCUMBER_SPEC_CODE_POLICY", "code").strip().lower() != "decision"
-
-
 def spec_code_rule() -> str:
-    """Règle donnée au correcteur, selon la politique."""
-    if autonomous():
-        return ("AUTONOMIE : aucune décision n'est demandée à l'utilisateur. Le CODE FAIT FOI : un réalignement sur "
-                "le code est appliqué tel quel ; une valeur changée dans un step existant aussi. Chacun est enregistré "
-                "comme décision de l'agent, à relire plus tard : justifie-le dans « corrections » (cause prouvée, "
-                "fichier de code lu, requête en base ou ligne de log).")
-    if code_wins():
-        return ("Le CODE FAIT FOI : un réalignement sur le code est appliqué tel quel (pas de décision humaine) et "
-                "consigné automatiquement comme écart spécification / code, à revoir plus tard.")
-    return "Un réalignement est soumis à une décision humaine (gardé à part, scénario désactivé provisoirement)."
+    """Règle donnée au correcteur (politique de qualité par défaut, CUCUMBER_SPEC_CODE_POLICY=jira)."""
+    rule = ("Corrections TECHNIQUES (fichier, colonne, champ non mappé, brouillon, longueur, step, tag, runner) : "
+            "applique-les sans attendre de décision. ÉCART entre l'attendu du test et le code : n'aligne un attendu sur "
+            "le code qu'avec le commentaire « # Réaligné sur le code : <fichier> » ; ce réalignement est ARBITRÉ par le "
+            "critère d'acceptation du ticket Jira (cite sa clé dans le scénario si tu la connais) : ticket conforme au "
+            "code → appliqué ; ticket conforme au test → défaut détecté, le scénario d'origine reste en échec ; pas de "
+            "critère exploitable → décision humaine. Ne désactive jamais un scénario : seule une cause hors test "
+            "PROUVÉE le désactive, et ce n'est pas à toi de le faire.")
+    if cucumber_arbitrage.policy() == "decision":
+        rule += " (CUCUMBER_SPEC_CODE_POLICY=decision : tout réalignement est soumis à une décision humaine.)"
+    return rule
+
+
 STATUSES = {"en_attente": "en attente", "validee": "validée", "refusee": "refusée"}
 PENDING_COMMENT = "# Décision en attente :"
 
@@ -181,25 +178,34 @@ def _replace_block(worktree: str, rel: str, title: str, block: list) -> bool:
     return True
 
 
-def _held_block(block: list, client_tag: str, note: str) -> list:
-    """Bloc d'origine désactivé provisoirement : commentaire de décision en attente, tag à revoir, sans tag client."""
-    tag = a_revoir_tag()
+def _held_block(block: list, note: str) -> list:
+    """Bloc d'origine, actif (jamais désactivé en attendant), précédé du commentaire de décision en attente."""
     keyword = next(i for i, line in enumerate(block) if re.match(r"^\s*(Scenario|Scénario|Example|Exemple|Plan)",
                                                                  line.strip()))
     indent = re.match(r"^\s*", block[keyword]).group(0)
-    head = [line for line in block[:keyword] if not line.strip().startswith("@")]
-    tags = [t for line in block[:keyword] if line.strip().startswith("@") for t in line.split()
-            if t not in (client_tag, tag)]
-    return head + [f"{indent}{PENDING_COMMENT} {note}", indent + " ".join(tags + [tag])] + block[keyword:]
+    head = [line for line in block[:keyword] if not line.strip().startswith(PENDING_COMMENT)]
+    first_tag = next((i for i, line in enumerate(head) if line.strip().startswith("@")), len(head))
+    return head[:first_tag] + [f"{indent}{PENDING_COMMENT} {note}"] + head[first_tag:] + block[keyword:]
 
 
-def held_changes(worktree: str, before: dict, client_tag: str = "") -> list:
+def _default_arbiter(worktree: str):
+    """Arbitre Jira sans spécifique connu : tickets cités par le scénario ou l'en-tête de sa feature."""
+    return lambda rel, before, after: cucumber_arbitrage.arbitrate(
+        before, after, cucumber_arbitrage.ticket_keys("", worktree, rel, before + after))
+
+
+def held_changes(worktree: str, before: dict, client_tag: str = "", arbiter=None) -> list:
     """
     Modifications d'une correction qui changent le sens d'un scénario existant (features `before` {rel: texte}) :
     attendu réaligné sur le code (« # Réaligné sur le code : »), ou valeur d'un step existant (Given / When, table
-    comprise) changée. Chaque bloc corrigé est remplacé dans le worktree par son bloc d'origine désactivé
-    provisoirement ; renvoie [{type, fichier, titre, avant, apres, proposition}].
+    comprise) changée. Renvoie [{type, fichier, titre, avant, apres, proposition, applique, code, arbitrage}].
+    - Données changées (correction technique) : appliquées en autonomie, sinon gardées à part.
+    - Réalignement : arbitré par le critère d'acceptation du ticket Jira (`arbiter(rel, avant, apres)`, voir
+      cucumber_arbitrage) : « code » → appliqué ; « test » → défaut détecté, bloc d'origine actif marqué
+      « # Défaut détecté : » (type « defaut ») ; « aucun » → décision humaine.
+    Un bloc non appliqué est remplacé par son bloc d'origine, actif (en échec), avec le commentaire de décision.
     """
+    arbiter = arbiter or _default_arbiter(worktree)
     held = []
     for rel, text in before.items():
         path = os.path.join(worktree, *rel.split("/"))
@@ -217,12 +223,17 @@ def held_changes(worktree: str, before: dict, client_tag: str = "") -> list:
                               if line.strip().startswith(REALIGNED)), "")
             proposal = (f"attendu réaligné sur le code ({reference})" if kind == "realignement" else
                         "valeur d'un step existant changée par la correction")
-            applied = autonomous() or (kind == "realignement" and code_wins())
-            held.append({"type": kind, "fichier": rel, "titre": scenario["titre"], "avant": block,
-                         "apres": new_block, "proposition": f"{rel} / {scenario['titre']} : {proposal}",
-                         "applique": applied, "code": reference})
-            if not applied:
-                _replace_block(worktree, rel, scenario["titre"], _held_block(block, client_tag, TYPES[kind]))
+            verdict = arbiter(rel, block, new_block) if kind == "realignement" else {}
+            applied = autonomous() if kind == "donnees" else verdict.get("verdict") == "code"
+            entry = {"type": kind, "fichier": rel, "titre": scenario["titre"], "avant": block, "apres": new_block,
+                     "proposition": f"{rel} / {scenario['titre']} : {proposal}", "applique": applied,
+                     "code": reference, "arbitrage": verdict}
+            if verdict.get("verdict") == "test":
+                entry["type"] = "defaut"
+                _replace_block(worktree, rel, scenario["titre"], cucumber_arbitrage.defect_block(block, verdict))
+            elif not applied:
+                _replace_block(worktree, rel, scenario["titre"], _held_block(block, TYPES[kind]))
+            held.append(entry)
     return held
 
 

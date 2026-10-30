@@ -127,6 +127,7 @@ def test_fix_from_an_imported_run_delivers_a_patch(main_module, monkeypatch, tmp
     monkeypatch.setattr(m.cucumber_tools, "WORKSPACE_DIR", str(tmp_path))
     monkeypatch.setenv("CUCUMBER_COMPILE_CMD", "")
     monkeypatch.delenv("CUCUMBER_AGENT_JENKINS", raising=False)
+    monkeypatch.delenv("JENKINS_API_TOKEN", raising=False)                # sans identifiants : patch livré
     worktree = m.cucumber_tools.worktree_dir(CLIENT)
     os.makedirs(worktree)
     git(worktree, "init", "-q", "-b", "integration")

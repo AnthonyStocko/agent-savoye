@@ -5,6 +5,7 @@ résumé se recoupent, l'action suivante tient compte de l'existant, une feature
 """
 import json
 import os
+import re
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -132,8 +133,10 @@ def test_screen_shows_tests_as_covered_and_not_measured(project):
     # Zone « Où en est-on » : sans résultat importé, « pas encore vérifié », jamais 0 %
     assert "2 ont un test, pas encore vérifié." in buttons and "2 restent à tester." in buttons
     assert "Importer un résultat Jenkins" in [p.proto.popover.label for p in at.get("popover")]
-    text = " ".join(m.value for m in at.markdown)
-    assert "4 fonctionnalités spécifiques." in text and "0 %" not in " ".join(buttons) + text
+    # Onglet Cucumber seul (les autres onglets affichent les tickets et la mémoire du poste) ; « 100 % » n'est pas 0 %
+    text = " ".join(m.value for m in at.tabs[2].markdown)
+    assert "4 fonctionnalités spécifiques." in text
+    assert not re.search(r"(?<![\d,.])0 %", " ".join(buttons) + text)
     # Liste : les tests écrits à la main apparaissent « test écrit »
     assert text.count("✍ test écrit") == 2
     # Un nombre cliquable filtre la liste

@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Création du modèle de baie          # src/test/resources/cucumber/features/client/WMS/Stock/SPEC-0004-Baie.feature:8
+[2026-10-28T10:00:00.000Z]   When STOCK- Création des modèles de baie # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0004-Baie.Création du modèle de baie -- Time elapsed: 0.42 s <<< FAILURE!
+[2026-10-28T10:00:00.000Z] java.lang.AssertionError: 400 - La taille de la valeur de la propriété code est trop grande 25 > 20
+[2026-10-28T10:00:00.000Z] 	at cucumber.endPoints.EndPoints.checkResponse(EndPoints.java:88)
+[2026-10-28T10:00:00.000Z] 	at ✽.STOCK- Création des modèles de baie(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Stock/SPEC-0004-Baie.feature:11)
+[2026-10-28T10:00:00.000Z] 

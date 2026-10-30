@@ -1,0 +1,18 @@
+[2026-10-28T17:16:17.276Z] Scenario: Réinitialisation du contexte          # src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0001-Identification_retour.feature:66
+[2026-10-28T17:16:17.276Z]   Given INIT- Réinitialisation des règles "WMS" # cucumber.features.kis.QARuleStep.réinitialisationDesRèglesWMS(java.lang.String,io.cucumber.datatable.DataTable)
+[2026-10-28T17:16:17.276Z]     | fileName                       |
+[2026-10-28T17:16:17.276Z]     | rule-AnalyseGoodsinLine-DEFAUT |
+[2026-10-28T17:16:17.276Z]       java.io.FileNotFoundException: ./src/test/resources/cucumber/rules/WMS/01-Contexte/rule-AnalyseGoodsinLine-DEFAUT.json (No such file or directory)
+[2026-10-28T17:16:17.276Z] 	at java.base/java.io.FileInputStream.open0(Native Method)
+[2026-10-28T17:41:26.219Z] [ERROR] Client - Réception - Identification des retours.Réinitialisation du contexte -- Time elapsed: 0.013 s <<< ERROR!
+[2026-10-28T17:41:26.219Z] java.io.FileNotFoundException: ./src/test/resources/cucumber/rules/WMS/01-Contexte/rule-AnalyseGoodsinLine-DEFAUT.json (No such file or directory)
+[2026-10-28T17:41:26.219Z] 	at java.base/java.io.FileInputStream.open0(Native Method)
+[2026-10-28T17:41:26.219Z] 	at java.base/java.io.FileInputStream.open(FileInputStream.java:219)
+[2026-10-28T17:41:26.219Z] 	at java.base/java.io.FileInputStream.<init>(FileInputStream.java:157)
+[2026-10-28T17:41:26.219Z] 	at java.base/java.io.FileInputStream.<init>(FileInputStream.java:112)
+[2026-10-28T17:41:26.219Z] 	at java.base/java.io.FileReader.<init>(FileReader.java:103)
+[2026-10-28T17:41:26.219Z] 	at cucumber.endPoints.KIS.RuleEndPoints.integrateRule(RuleEndPoints.java:45)
+[2026-10-28T17:41:26.219Z] 	at cucumber.features.kis.QARuleStep.réinitialisationDesRègles(QARuleStep.java:82)
+[2026-10-28T17:41:26.219Z] 	at cucumber.features.kis.QARuleStep.réinitialisationDesRèglesWMS(QARuleStep.java:75)
+[2026-10-28T17:41:26.219Z] 	at ✽.INIT- Réinitialisation des règles "WMS"(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0001-Identification_retour.feature:67)
+[2026-10-28T17:41:26.219Z] 

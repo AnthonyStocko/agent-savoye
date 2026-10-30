@@ -150,6 +150,42 @@ def load_index(client_name: str) -> dict:
     return _read_json(os.path.join(imports_dir(client_name), "index.json"), {}) or {"imports": []}
 
 
+def normalize_analysis(analysis: dict) -> dict:
+    """
+    Analyse validée à la lecture : chaque scénario d'une proposition devient un dict {tag, id, fichier, titre, step,
+    message} (un identifiant « fichier::titre » seul est complété depuis les résultats) ; une entrée inexploitable
+    est écartée.
+    """
+    results = analysis.get("resultats") or {}
+    proposals = []
+    for proposal in analysis.get("propositions") or []:
+        if not isinstance(proposal, dict):
+            continue
+        scenarios = []
+        for item in proposal.get("scenarios") or []:
+            if isinstance(item, str):
+                item = {"id": item}
+            identifier = item.get("id") if isinstance(item, dict) else None
+            if not isinstance(identifier, str) or "::" not in identifier:
+                continue
+            fichier, titre = identifier.split("::", 1)
+            result = results.get(identifier) or {}
+            scenarios.append({"tag": "", "fichier": fichier, "titre": titre, "step": result.get("step", ""),
+                              "message": result.get("message", ""), **item})
+        proposals.append({**proposal, "spec": proposal.get("spec") or "", "scenarios": scenarios})
+    if "propositions" in analysis:
+        analysis = {**analysis, "propositions": proposals}
+    return analysis
+
+
+def load_analysis(client_name: str, numero) -> dict:
+    """Analyse (analyse.json) de l'import `numero`, validée à la lecture ({} si absente)."""
+    if not numero:
+        return {}
+    return normalize_analysis(_read_json(os.path.join(imports_dir(client_name), str(numero), "analyse.json"), {})
+                              or {})
+
+
 def _save_index(client_name: str, index: dict) -> None:
     _write_json(os.path.join(imports_dir(client_name), "index.json"), index)
 

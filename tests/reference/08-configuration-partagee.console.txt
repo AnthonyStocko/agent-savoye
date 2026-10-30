@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Seuil de colisage par défaut          # src/test/resources/cucumber/features/client/WMS/Packing/SPEC-0008-Colisage.feature:22
+[2026-10-28T10:00:00.000Z]   When PACKING- Vérification du nombre de colis # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0008-Colisage.Seuil de colisage par défaut -- Time elapsed: 0.42 s <<< FAILURE!
+[2026-10-28T10:00:00.000Z] java.lang.AssertionError: Il n'existe pas 2 enregistrement(s) pour l'élément {code=XXX-1, status=PACKED}
+[2026-10-28T10:00:00.000Z] 	at cucumber.features.BaseStep.checkNumberRecords(BaseStep.java:266)
+[2026-10-28T10:00:00.000Z] 	at ✽.PACKING- Vérification du nombre de colis(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Packing/SPEC-0008-Colisage.feature:25)
+[2026-10-28T10:00:00.000Z] 

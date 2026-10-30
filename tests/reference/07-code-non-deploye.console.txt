@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Mode de validation automatique          # src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0007-Validation.feature:15
+[2026-10-28T10:00:00.000Z]   When GOODSIN- Vérification du dossier d'arrivage # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0007-Validation.Mode de validation automatique -- Time elapsed: 0.42 s <<< FAILURE!
+[2026-10-28T10:00:00.000Z] org.junit.ComparisonFailure: status expected:<[VALIDATED]> but was:<[IDENTIFIED]>
+[2026-10-28T10:00:00.000Z] 	at org.junit.Assert.assertEquals(Assert.java:117)
+[2026-10-28T10:00:00.000Z] 	at ✽.GOODSIN- Vérification du dossier d'arrivage(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Goodsin/SPEC-0007-Validation.feature:18)
+[2026-10-28T10:00:00.000Z] 

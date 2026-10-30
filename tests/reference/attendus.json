@@ -1,0 +1,133 @@
+{
+  "description": "Jeu de référence du classement des échecs (cucumber_failures.classify) : extrait de console anonymisé et réponse attendue (catégorie, nature de la correction, mots de la cause). « contexte » : fait du run établi hors de la console (code non déployé, configuration partagée).",
+  "cas": [
+    {
+      "cas": "step undefined",
+      "console": "01-step-non-defini.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "correction",
+        "nature": "step_equivalent",
+        "cause_contient": [
+          "n'est défini nulle part"
+        ]
+      }
+    },
+    {
+      "cas": "expected:<…> but was:<null> sur un champ contrôlé",
+      "console": "02-champ-controle-null.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "correction",
+        "nature": "champ_non_renvoye",
+        "cause_contient": [
+          "null"
+        ]
+      }
+    },
+    {
+      "cas": "code trop long (N > M)",
+      "console": "03-code-trop-long.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "correction",
+        "nature": "code_raccourci",
+        "cause_contient": [
+          "longueur"
+        ]
+      }
+    },
+    {
+      "cas": "428 « La propriété … est requise » sur un brouillon",
+      "console": "04-brouillon-propriete-requise.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "correction",
+        "nature": "brouillon_complet",
+        "cause_contient": [
+          "brouillon"
+        ]
+      }
+    },
+    {
+      "cas": "champ écrit puis relu vide",
+      "console": "05-champ-ecrit-relu-vide.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "diagnostic",
+        "nature": "mecanisme_ecriture",
+        "cause_contient": [
+          "relu vide"
+        ]
+      }
+    },
+    {
+      "cas": "FileNotFoundException sur un fichier de règle du Standard non copié",
+      "console": "06-regle-standard-non-copiee.console.txt",
+      "source": "réel : console Jenkins d'un run client du 28/10/2026, anonymisée (client, ticket, titres)",
+      "attendu": {
+        "categorie": "correction",
+        "nature": "regle_standard",
+        "cause_contient": [
+          "rule-AnalyseGoodsinLine-DEFAUT.json",
+          "Standard"
+        ]
+      }
+    },
+    {
+      "cas": "test écrit pour un code non déployé",
+      "console": "07-code-non-deploye.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "contexte": {
+        "code_non_deploye": "GoodsinFolderValidation.java, commit postérieur à la version déployée"
+      },
+      "attendu": {
+        "categorie": "environnement",
+        "nature": "deploiement",
+        "cause_contient": [
+          "pas encore déployé"
+        ]
+      }
+    },
+    {
+      "cas": "dépendance à une configuration partagée modifiée par une autre feature",
+      "console": "08-configuration-partagee.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "contexte": {
+        "configuration_partagee": "règle de colisage réécrite par Packing/SPEC-0011-Regle.feature"
+      },
+      "attendu": {
+        "categorie": "correction",
+        "nature": "configuration_partagee",
+        "cause_contient": [
+          "configuration partagée",
+          "SPEC-0011"
+        ]
+      }
+    },
+    {
+      "cas": "« has no field additionalProperties »",
+      "console": "09-additional-properties.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "environnement",
+        "nature": "version",
+        "cause_contient": [
+          "version"
+        ]
+      }
+    },
+    {
+      "cas": "liste de choix vide sur un champ obligatoire Studio",
+      "console": "10-liste-choix-vide-studio.console.txt",
+      "source": "reconstitué : format des consoles Jenkins réelles, message relevé lors des campagnes précédentes ; à remplacer par un extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "produit",
+        "nature": "liste_choix_vide",
+        "cause_contient": [
+          "Liste de choix vide"
+        ]
+      }
+    }
+  ]
+}

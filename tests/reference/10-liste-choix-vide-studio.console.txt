@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Saisie du motif au poste          # src/test/resources/cucumber/features/client/WMS/Studio/SPEC-0010-Motif.feature:18
+[2026-10-28T10:00:00.000Z]   When STUDIO- Validation de l'écran de saisie du motif # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0010-Motif.Saisie du motif au poste -- Time elapsed: 0.42 s <<< FAILURE!
+[2026-10-28T10:00:00.000Z] java.lang.AssertionError: Le champ obligatoire « Motif » : liste de choix vide, l'écran ne peut pas être validé
+[2026-10-28T10:00:00.000Z] 	at cucumber.features.studio.StudioStep.validateScreen(StudioStep.java:140)
+[2026-10-28T10:00:00.000Z] 	at ✽.STUDIO- Validation de l'écran de saisie du motif(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Studio/SPEC-0010-Motif.feature:21)
+[2026-10-28T10:00:00.000Z] 

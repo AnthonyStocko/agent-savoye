@@ -1,0 +1,8 @@
+[2026-10-28T10:00:00.000Z] Scenario: Lecture du contenu de l'UM          # src/test/resources/cucumber/features/client/WMS/Content/SPEC-0009-Contenu.feature:9
+[2026-10-28T10:00:00.000Z]   When CONTENT- Lecture du contenu # cucumber.features.SomeStep.someStep(java.lang.String)
+[2026-10-28T10:00:00.000Z] 
+[2026-10-28T10:00:00.000Z] [ERROR] Client - SPEC-0009-Contenu.Lecture du contenu de l'UM -- Time elapsed: 0.42 s <<< ERROR!
+[2026-10-28T10:00:00.000Z] java.lang.IllegalArgumentException: class cucumber.pojo.HandlingUnitPojo has no field additionalProperties
+[2026-10-28T10:00:00.000Z] 	at com.google.gson.internal.bind.ReflectiveTypeAdapterFactory.getBoundFields(ReflectiveTypeAdapterFactory.java:173)
+[2026-10-28T10:00:00.000Z] 	at ✽.CONTENT- Lecture du contenu(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/Content/SPEC-0009-Contenu.feature:12)
+[2026-10-28T10:00:00.000Z] 

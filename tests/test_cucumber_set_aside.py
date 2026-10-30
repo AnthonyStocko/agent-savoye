@@ -52,7 +52,7 @@ def test_preparation_and_set_aside_are_shared(tmp_path, monkeypatch):
     monkeypatch.setattr(kt, "publish_knowledge", lambda body, projet, doc_type, sujet, **f: published.append(
         (projet, doc_type, sujet, body)) or {"statut": "depose", "message": "ok", "chemin": "", "remplacements": []})
     patch = tmp_path / "init.patch"
-    patch.write_text("diff --git a/x b/x\n+Feature: Compléments\n")
+    patch.write_text("diff --git a/x b/x\n+Feature: Compléments\n", encoding="utf-8")
     cr.record_preparation(CLIENT, True, "Compléments écrits (1 fichier).", ["a.feature"], str(patch),
                           ["entité inconnue"])
     projet, doc_type, sujet, body = published[-1]

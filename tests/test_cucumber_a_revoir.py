@@ -100,7 +100,7 @@ def test_out_of_test_cause_with_proof_is_disabled():
 def test_lot_that_would_disable_too_much_stops_instead_of_emptying():
     scenarios = {f"@t{i}": _result("pertinent", spec_id="sp-a") for i in range(6)}
     for i in range(6, 10):
-        scenarios[f"@t{i}"] = _result("environnement", "non vérifié — environnement : 503", "sp-a")
+        scenarios[f"@t{i}"] = _result("environnement", "Unable to find the custom field customString1", "sp-a")
     spec_of = {v["id"]: "sp-a" for v in scenarios.values()}
     decision = ar.decide(scenarios, spec_of, max_pct=30)
     assert decision["arret"] and decision["desactiver"] == {} and "40 %" in decision["motifs"][0]
@@ -109,10 +109,19 @@ def test_lot_that_would_disable_too_much_stops_instead_of_emptying():
 
 def test_spec_losing_all_active_scenarios_stops():
     scenarios = {"@t1": _result("pertinent", spec_id="sp-a"),
-                 "@t2": _result("bug_applicatif", "bug applicatif probable : 500", "sp-b")}
+                 "@t2": _result("environnement", "Unable to find the custom field customString1", "sp-b")}
     spec_of = {scenarios["@t1"]["id"]: "sp-a", scenarios["@t2"]["id"]: "sp-b"}
-    decision = ar.decide(scenarios, spec_of, max_pct=100)
+    decision = ar.decide(scenarios, spec_of, max_pct=100, autonomous=True)
     assert decision["arret"] and "sp-b" in decision["motifs"][0] and decision["desactiver"] == {}
+
+
+def test_unproven_out_of_test_cause_stays_failing():
+    """Cause hors test déduite (défaut produit derrière une erreur 500) : jamais désactivée, laissée en échec."""
+    scenarios = {"@t1": _result("pertinent", spec_id="sp-a"),
+                 "@t2": _result("bug_applicatif", "bug applicatif probable : 500", "sp-b")}
+    decision = ar.decide(scenarios, {}, max_pct=100, autonomous=True)
+    assert decision["desactiver"] == {} and decision["non_prouves"] == ["@t2"] and not decision["arret"]
+    assert "NON PROUVÉE" in decision["alertes"][0]
 
 
 def test_test_cause_is_never_disabled():

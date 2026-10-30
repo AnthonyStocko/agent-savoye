@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools
+from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -800,7 +800,9 @@ def _force_rmtree(path: str) -> None:
 
 
 def _git_out(repo_dir: str, *args: str) -> str:
-    return subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True).stdout.strip()
+    # Sortie de git en UTF-8 (messages de commit accentués), pas dans l'encodage de la console Windows
+    return subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace").stdout.strip()
 
 
 def _same_git_url(a: str, b: str) -> bool:
@@ -1839,13 +1841,19 @@ def keep_diagnostics(lot: dict, label: str, worktree: str, mode: str, convention
 
 def hold_meaning_changes(client: str, worktree: str, before: dict, client_tag: str, label: str, lot: dict) -> set:
     """
-    D2 : réalignement d'un attendu sur le code ou valeur d'un step existant changée par une correction — la
-    modification est gardée à part dans une décision en attente, le scénario d'origine est désactivé
-    provisoirement. Renvoie les identifiants des scénarios concernés.
+    D2 : réalignement d'un attendu sur le code ou valeur d'un step existant changée par une correction. Données
+    (technique) : appliquées en autonomie. Réalignement : arbitré par le critère d'acceptation du ticket Jira
+    (cucumber_arbitrage) — ticket conforme au code : appliqué ; conforme au test : défaut détecté (scénario d'origine
+    gardé en échec, marqué, constat « defaut_code » avec le critère en preuve) ; sinon décision humaine (modification
+    gardée à part, scénario d'origine actif). Renvoie les identifiants des scénarios en attente de décision.
     """
+    specs = [s for s in list(lot.get("ids") or []) + [lot.get("spec_correction")] if s]
+    arbiter = lambda rel, avant, apres: cucumber_arbitrage.arbitrate(  # noqa: E731
+        avant, apres, cucumber_arbitrage.ticket_keys(client, worktree, rel, avant + apres, specs))
     held = set()
-    for change in cucumber_decisions.held_changes(worktree, before, client_tag):
+    for change in cucumber_decisions.held_changes(worktree, before, client_tag, arbiter):
         identifier = cucumber_verify.scenario_id(change["fichier"], change["titre"])
+        verdict = change.get("arbitrage") or {}
         if change.get("applique") and change["type"] == "donnees":
             # Autonomie : données de test changées par la correction, appliquées et enregistrées (à relire)
             cucumber_decisions.record_agent_decision(
@@ -1855,26 +1863,39 @@ def hold_meaning_changes(client: str, worktree: str, before: dict, client_tag: s
                   f"{change['proposition']} — appliquée, à relire dans le bilan.")
             continue
         if change.get("applique"):
-            if cucumber_decisions.autonomous():
-                cucumber_decisions.record_agent_decision(
-                    client, "realignement", change["proposition"], fichier=change["fichier"], titre=change["titre"],
-                    scenario=identifier, lot=lot["numero"], avant=change["avant"], apres=change["apres"])
-            # Le code fait foi : réalignement appliqué, écart consigné (bilan « Doutes sur le code fourni »)
-            lot.setdefault("correction", {}).setdefault("constats", []).append({
-                "type": "ecart_spec_code", "detail": f"{change['titre']} : attendu réaligné sur le code (le code fait "
-                                                     f"foi), spécification à revoir",
-                "fichier": change.get("code") or change["fichier"], "effet": "scénario aligné sur le comportement "
-                                                                             "réel du code",
-                "certitude": "probable", "preuve": ""})
-            print(f"[LOT {label}] ↔ Réaligné sur le code (le code fait foi) : {change['proposition']} — écart "
-                  f"spécification / code consigné.")
+            # Ticket conforme au code : le test se trompait, réalignement appliqué avec le critère en preuve
+            cucumber_decisions.record_agent_decision(
+                client, "realignement", f"{change['proposition']} — {verdict['ticket']} : {verdict['motif']}",
+                fichier=change["fichier"], titre=change["titre"], scenario=identifier, lot=lot["numero"],
+                avant=change["avant"], apres=change["apres"], ticket=verdict["ticket"], critere=verdict["critere"])
+            print(f"[LOT {label}] ↔ Réaligné sur le code, ticket {verdict['ticket']} conforme au code : "
+                  f"{change['proposition']}")
             continue
-        cucumber_decisions.propose(client, change["type"], change["proposition"], fichier=change["fichier"],
-                                   titre=change["titre"], scenario=identifier, lot=lot["numero"],
-                                   avant=change["avant"], apres=change["apres"])
+        if change["type"] == "defaut":
+            # Ticket conforme au test : défaut détecté, jamais réaligné ; le scénario reste en échec
+            lot.setdefault("defauts_detectes", [])
+            if identifier not in lot["defauts_detectes"]:
+                lot["defauts_detectes"].append(identifier)
+            lot.setdefault("correction", {}).setdefault("constats", []).append({
+                "type": "defaut_code", "detail": f"{change['titre']} : le code ne respecte pas le critère "
+                                                 f"d'acceptation de {verdict['ticket']}",
+                "fichier": change.get("code") or change["fichier"],
+                "effet": f"attendu du test ({', '.join(verdict['valeurs_test']) or '?'}) conforme au ticket, code : "
+                         f"{', '.join(verdict['valeurs_code']) or '?'}",
+                "preuve": f"{verdict['ticket']} — critère d'acceptation : « {verdict['critere'][:300]} » ; "
+                          f"{verdict['motif']}",
+                "certitude": "prouvé", "correction": "corriger le code (le test reste en échec jusque-là)"})
+            print(f"[LOT {label}] 🐞 Défaut détecté ({verdict['ticket']} conforme au test) : {change['titre']} — "
+                  f"scénario gardé en échec, jamais réaligné.")
+            continue
+        cucumber_decisions.propose(client, change["type"], change["proposition"]
+                                   + (f" — arbitrage Jira : {verdict['motif']}" if verdict else ""),
+                                   fichier=change["fichier"], titre=change["titre"], scenario=identifier,
+                                   lot=lot["numero"], avant=change["avant"], apres=change["apres"])
         held.add(identifier)
-        print(f"[LOT {label}] ✋ Décision en attente ({cucumber_decisions.TYPES[change['type']]}) : "
-              f"{change['proposition']} — scénario désactivé provisoirement, modification gardée à part.")
+        print(f"[LOT {label}] ✋ Décision humaine requise ({cucumber_decisions.TYPES[change['type']]}) : "
+              f"{change['proposition']}" + (f" — {verdict['motif']}" if verdict else "")
+              + " — scénario d'origine gardé actif, modification gardée à part.")
     lot.setdefault("decisions_en_attente", [])
     lot["decisions_en_attente"] = sorted(set(lot["decisions_en_attente"]) | held)
     return held
@@ -2021,7 +2042,12 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     for item in result["scenarios"].values():
         if item["id"] in waiting and "décision en attente" not in item.get("motif", ""):
             item["motif"] = (item.get("motif", "") + " — décision en attente").strip(" —")
-    judged = {t: v for t, v in result["scenarios"].items() if v["id"] not in waiting}
+    # Défauts détectés (ticket Jira conforme au test) : gardés en échec, marqués, hors décision de désactivation
+    defects = set(lot.get("defauts_detectes") or [])
+    for item in result["scenarios"].values():
+        if item["id"] in defects and "défaut détecté" not in item.get("motif", ""):
+            item["motif"] = (item.get("motif", "") + " — défaut détecté (ticket Jira conforme au test)").strip(" —")
+    judged = {t: v for t, v in result["scenarios"].items() if v["id"] not in waiting | defects}
     # RÈGLE 3 : désactivation des seuls blocages hors test prouvés, ou arrêt pour décision humaine
     autonomous = cucumber_decisions.autonomous()
     decision = cucumber_a_revoir.decide(judged, spec_of, autonomous=autonomous) if mode else {
@@ -2042,7 +2068,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         print(f"[LOT {label}] 🔕 Désactivé, " + ("décision de l'agent" if autonomous else "décision en attente")
               + f" ({label_cause}) : {entry['fichier']} / {entry['titre']}")
     for alert in decision.get("alertes") or []:
-        print(f"[LOT {label}] ⚠️ {alert} — l'agent poursuit (autonomie), à relire dans le bilan.")
+        print(f"[LOT {label}] ⚠️ {alert} — à relire dans le bilan.")
     if decision.get("alertes"):
         lot["alertes"] = decision["alertes"]
     if disabled and not cucumber_a_revoir.runner_excludes_a_revoir(conventions.get("runner")):
@@ -2330,8 +2356,7 @@ def current_init_status(client: str, facts: dict) -> dict:
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
     index = cucumber_import.load_index(client)
     numero = max((e["numero"] for e in index.get("imports") or []), default=0)
-    analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
-                                                      "analyse.json"), {}) if numero else {}
+    analysis = cucumber_import.load_analysis(client, numero)
     return cucumber_detection.init_status(facts, profile, client, analysis or {}, cucumber_import.imports_dir(client))
 
 
@@ -2955,8 +2980,7 @@ def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio
     n'est corrigeable.
     """
     client = args.client_name
-    analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(numero),
-                                                      "analyse.json"), {}) or {}
+    analysis = cucumber_import.load_analysis(client, numero)
     init = analysis.get("init_en_echec") or {}
     worktree = cucumber_tools.worktree_dir(client)
     if not init or not os.path.exists(os.path.join(worktree, ".git")):
@@ -3301,8 +3325,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # 2. Lots : complément, reprise, sélection explicite ou, par défaut, tous les spécifiques non couverts ou partiels
     if complete_state and args.from_import:
         state = complete_state
-        analysis = cucumber_tools._read_json(os.path.join(cucumber_import.imports_dir(client), str(args.from_import),
-                                                          "analyse.json"), {}) or {}
+        analysis = cucumber_import.load_analysis(client, args.from_import)
         if analysis.get("non_analyse") or not analysis.get("propositions"):
             print(f"[CUCUMBER] Import n° {args.from_import} : " + (analysis.get("non_analyse") or
                   "aucune correction proposée (ou import inconnu)") + ".")
@@ -3394,7 +3417,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # Fichiers égarés par l'agent hors du dépôt lors des générations précédentes : rapatriés s'ils sont plus récents
     for source, target in cucumber_stray.relocate(cucumber_tools.cache_dir(client), worktree):
         print(f"[CUCUMBER] ⚠️ Fichier écrit hors du dépôt {source} → rapatrié dans le dépôt : {target}")
-    # Autonomie : décisions restées en attente (d'avant l'autonomie) prises par l'agent, scénarios réactivés
+    # Autonomie : décisions techniques restées en attente (données de test) prises par l'agent
     for done in cucumber_decisions.auto_resolve_pending(client, worktree, state["base"]):
         print(f"[CUCUMBER] 🤖 Décision en attente prise par l'agent ({cucumber_decisions.TYPES[done['type']]}) : "
               f"{done['proposition']}")
@@ -3638,7 +3661,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                     # une décision humaine ; sinon l'écart reste un constat du bilan
                     if not cucumber_decisions.autonomous() and (
                             constat["type"] == "tautologique" or (constat["type"] == "ecart_spec_code"
-                                                                  and not cucumber_decisions.code_wins())):
+                                                                  and cucumber_arbitrage.policy() == "decision")):
                         cucumber_decisions.propose(
                             client, constat["type"], f"{specifics.get(result['id'], {}).get('libelle', result['id'])}"
                             f" : {constat['detail']}", spec=result["id"], lot=lot["numero"],

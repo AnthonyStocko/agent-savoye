@@ -369,8 +369,21 @@ def test_override_without_standard_env(monkeypatch, tmp_path):
     assert result["scenarios"]["@agent_acme_1_1"]["statut"] == "non_verifie"
 
 
-def test_agent_runs_no_test_by_default(monkeypatch):
+def test_closed_loop_by_default_with_jenkins_credentials(monkeypatch):
     monkeypatch.delenv("CUCUMBER_AGENT_JENKINS", raising=False)
+    monkeypatch.setenv("JENKINS_USER", "u")
+    monkeypatch.setenv("JENKINS_API_TOKEN", "t")
+    assert cv.agent_runs_tests() and cv.unverified_warning() == ""
+    monkeypatch.setenv("CUCUMBER_AGENT_JENKINS", "0")                      # choix explicite : il prime
+    assert not cv.agent_runs_tests() and "ne sont pas vérifiés" in cv.unverified_warning()
+    monkeypatch.delenv("CUCUMBER_AGENT_JENKINS")
+    monkeypatch.setenv("JENKINS_API_TOKEN", "")
+    assert not cv.agent_runs_tests() and "identifiants Jenkins absents" in cv.unverified_warning()
+
+
+def test_agent_runs_no_test_without_jenkins_credentials(monkeypatch):
+    monkeypatch.delenv("CUCUMBER_AGENT_JENKINS", raising=False)
+    monkeypatch.delenv("JENKINS_API_TOKEN", raising=False)
     monkeypatch.setenv("CUCUMBER_VERIFY_JOB", "QA/VERIFY")
     monkeypatch.setenv("CUCUMBER_VERIFY_LOCAL_CMD", "mvn test")
     mode, message = cv.execution_mode({"verify_branch": "agent"}, "integration")

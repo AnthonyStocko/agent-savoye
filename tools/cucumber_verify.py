@@ -772,12 +772,30 @@ def verification_job(profile: dict = None) -> str:
     return ((profile or {}).get("run_job") or os.getenv("CUCUMBER_RUN_JOB", "")).strip()
 
 
+def jenkins_credentials() -> bool:
+    """JENKINS_USER et JENKINS_API_TOKEN renseignés."""
+    return bool(os.getenv("JENKINS_USER", "").strip() and os.getenv("JENKINS_API_TOKEN", "").strip())
+
+
 def agent_runs_tests() -> bool:
     """
-    CUCUMBER_AGENT_JENKINS (défaut 0) : l'agent exécute-t-il lui-même des tests pendant la génération (job Jenkins,
-    branche de travail poussée, commande locale) ? Par défaut non : il livre un patch, rien n'est poussé ni lancé.
+    CUCUMBER_AGENT_JENKINS : l'agent exécute-t-il lui-même des tests pendant la génération (job Jenkins, branche de
+    travail poussée, commande locale) ? Boucle fermée par défaut : 1 quand JENKINS_USER et JENKINS_API_TOKEN sont
+    renseignés, 0 sinon (il livre alors un patch non vérifié). Une valeur 0 ou 1 explicite prime.
     """
-    return os.getenv("CUCUMBER_AGENT_JENKINS", "0").strip() == "1"
+    value = os.getenv("CUCUMBER_AGENT_JENKINS", "").strip()
+    return value == "1" if value in ("0", "1") else jenkins_credentials()
+
+
+def unverified_warning() -> str:
+    """Avertissement d'en-tête quand les tests livrés ne sont pas vérifiés par exécution ('' sinon)."""
+    if not jenkins_credentials():
+        return ("Les tests livrés ne sont pas vérifiés : identifiants Jenkins absents (JENKINS_USER, "
+                "JENKINS_API_TOKEN, onglet Configuration).")
+    if not agent_runs_tests():
+        return ("Les tests livrés ne sont pas vérifiés : vérification par Jenkins désactivée "
+                "(CUCUMBER_AGENT_JENKINS=0, onglet Configuration).")
+    return ""
 
 
 def execution_mode(profile: dict = None, base_branch: str = "") -> tuple:
