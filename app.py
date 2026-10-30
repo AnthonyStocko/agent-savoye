@@ -26,7 +26,7 @@ from tools.jira_tools import (
     set_jira_description_markdown, std_only_projects,
 )
 from tools.db_tools import DB_TYPES, test_connection
-from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant, db_restore
+from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant, db_restore, skills
 from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
@@ -3468,12 +3468,49 @@ def render_knowledge_document(doc: dict, documents: list) -> None:
     render_knowledge_status(doc, meta, documents)
 
 
+def render_skills() -> None:
+    """Compétences acquises par l'agent (auto-amélioration) : liste, lecture, désactivation, suppression."""
+    all_skills = skills.load_skills(include_disabled=True)
+    active = sum(1 for k in all_skills if k["actif"])
+    with st.expander(f"🧠 Compétences acquises par l'agent : {len(all_skills)} ({active} actives)",
+                     expanded=False):
+        st.caption("Après une tâche complexe réussie et PROUVÉE (test rendu vert sur Jenkins, initialisation repassée), "
+                   "l'agent rédige la procédure qui lui a permis de réussir. Il la relit avant les tâches semblables "
+                   f"suivantes. Rangées dans : {skills.skills_dir()}" + (" (partagé avec l'équipe)" if
+                                                                      os.getenv("AGENT_KNOWLEDGE_DIR", "").strip()
+                                                                      else " (local)") + "."
+                   + ("" if skills.enabled() else " ⚠️ Apprentissage désactivé (SKILLS_AUTO=0)."))
+        if not all_skills:
+            st.caption("Aucune compétence pour l'instant : elles apparaissent après les premières corrections "
+                       "réussies.")
+            return
+        for skill in sorted(all_skills, key=lambda k: (not k["actif"], -k["utilisations"], k.get("nom", ""))):
+            with st.container(border=True):
+                st.markdown(f"**{skill.get('nom', skill['fichier'])}** — {skill.get('description', '')}"
+                            + ("" if skill["actif"] else " :gray[(désactivée)]"))
+                st.caption(f"{skills.DOMAINS.get(skill.get('domaine', ''), skill.get('domaine', ''))} · utilisée "
+                           f"{skill['utilisations']} fois · mise à jour le {skill.get('maj_le', '')[:16].replace('T', ' ')}"
+                           f" · origine : {skill.get('origine', '')}")
+                with st.container(horizontal=True):
+                    show = st.toggle("Voir la procédure", key=f"skill_show_{skill['fichier']}")
+                    if st.button("Réactiver" if not skill["actif"] else "Désactiver", type="tertiary",
+                                 key=f"skill_toggle_{skill['fichier']}"):
+                        skills.set_active(skill["chemin"], not skill["actif"])
+                        st.rerun()
+                    if st.button("Supprimer", type="tertiary", key=f"skill_delete_{skill['fichier']}"):
+                        os.remove(skill["chemin"])
+                        st.rerun()
+                if show:
+                    st.markdown(skill["corps"])
+
+
 def render_knowledge_tab() -> None:
     """Onglet 📚 : état du répertoire partagé, recherche, aperçu, statut et import."""
     st.subheader("Connaissances partagées")
     st.caption("Analyses déposées par l'agent dans le répertoire partagé (AGENT_KNOWLEDGE_DIR), consultées avant "
                "chaque nouvelle analyse comme des données à vérifier. Tout utilisateur du partage lit tous les "
                "documents.")
+    render_skills()
     if not knowledge_tools.enabled():
         st.info("AGENT_KNOWLEDGE_DIR est vide : renseignez le répertoire partagé dans l'onglet ⚙️ Configuration.",
                 icon=":material/info:")
@@ -4026,6 +4063,17 @@ with tab_config:
 
         st.markdown("---")
         st.markdown("#### :material/folder_shared: Connaissances partagées")
+        with st.container(horizontal=True):
+            env_values["SKILLS_AUTO"] = "1" if st.checkbox(
+                "Auto-amélioration (compétences)", value=os.getenv("SKILLS_AUTO", "1").strip() != "0",
+                help="Après une tâche complexe réussie et vérifiée, l'agent enregistre la procédure suivie comme "
+                     "compétence et la relit avant les tâches semblables (SKILLS_AUTO).") else "0"
+            env_values["SKILLS_MIN_TURNS"] = str(int(st.number_input(
+                "SKILLS_MIN_TURNS", min_value=0, step=1, value=env_int("SKILLS_MIN_TURNS", 8),
+                help="Complexité minimale (tours de l'agent) pour qu'une réussite devienne une compétence.")))
+            env_values["CLAUDE_MODEL_SKILLS"] = st.text_input(
+                "CLAUDE_MODEL_SKILLS", value=os.getenv("CLAUDE_MODEL_SKILLS", ""), placeholder="sonnet",
+                help="Modèle de l'appel court qui rédige la compétence.").strip()
         env_values["AGENT_KNOWLEDGE_DIR"] = st.text_input(
             "AGENT_KNOWLEDGE_DIR", value=os.getenv("AGENT_KNOWLEDGE_DIR", ""),
             placeholder=r"\\serveur\partage\agent-savoye, X:\agent-savoye ou /mnt/partage/agent-savoye",
