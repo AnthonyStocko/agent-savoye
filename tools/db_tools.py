@@ -376,6 +376,16 @@ def _cell(value, max_chars: int) -> str:
     return text if len(text) <= max_chars else text[:max_chars] + "…"
 
 
+def driver_sql(sql: str, paramstyle: str) -> str:
+    """
+    Requête passée telle quelle au pilote (exec_driver_sql) : SQLAlchemy lui transmet toujours un jeu de paramètres
+    (vide), et un pilote à paramètres « format » / « pyformat » (psycopg2, pymysql…) lit alors chaque « % » comme un
+    marqueur (LIKE '%x%' -> « immutabledict is not a sequence »). Les « % » sont doublés pour ces pilotes ; la
+    requête n'a aucun paramètre lié (validée en lecture seule par validate_select).
+    """
+    return sql.replace("%", "%%") if paramstyle in ("format", "pyformat") else sql
+
+
 def run_query(sql: str, schema: str = "", limit: int = DEFAULT_LIMIT) -> str:
     """Exécute une requête de lecture validée et renvoie un tableau texte compact."""
     cfg = get_db_config()
@@ -386,7 +396,7 @@ def run_query(sql: str, schema: str = "", limit: int = DEFAULT_LIMIT) -> str:
     except ValueError:
         max_chars = DEFAULT_CELL_CHARS
     with readonly_connection(schema) as conn:
-        result = conn.exec_driver_sql(executed)
+        result = conn.exec_driver_sql(driver_sql(executed, conn.dialect.paramstyle))
         columns = list(result.keys())
         rows = result.fetchmany(limit + 1)
     truncated = len(rows) > limit

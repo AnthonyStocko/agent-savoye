@@ -1178,9 +1178,17 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
     if error:
         return {"ok": False, "message": f"non vérifié : {error}", "build": "", "resultats": {}}
     fixed, _ = cucumber_job.fixed_parameters(profile, info["definitions"])
+    reference = cucumber_job.reference_parameters(job, sources.get("depot", ""), info["definitions"],
+                                                   agent_branch=branch)
+    refused = cucumber_job.client_configuration_error(reference, fixed, sources.get("depot", ""))
+    if refused:
+        return {"ok": False, "message": f"non vérifié : {refused}", "build": "", "resultats": {}}
+    print(f"[CUCUMBER] Paramètres du job repris du build n° {reference.get('numero')} de {sources.get('depot')}"
+          if reference else "[CUCUMBER] Paramètres du job : paramètres imposés du profil client")
     params = cucumber_job.build_parameters(info["definitions"], info["roles"], branch, sources.get("depot", ""),
                                            tags, head, env, fixed=fixed,
-                                           target=cucumber_job.tag_target(profile, info["roles"]))
+                                           target=cucumber_job.tag_target(profile, info["roles"]),
+                                           reference=reference)
     # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
     build = jenkins_tools.run_exclusive(job, lambda: jenkins_tools.trigger_job(job, params), _timeout())
     if build["result"] == "INDISPONIBLE" and not build["url"]:

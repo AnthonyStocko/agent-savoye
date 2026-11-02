@@ -167,14 +167,37 @@ def tag_target(profile: dict, roles: dict) -> str:
     return chosen if chosen in TAG_TARGETS else "arguments"
 
 
+def reference_parameters(job: str, repository: str, definitions: dict = None, builds: list = None,
+                         agent_branch: str = "") -> dict:
+    """
+    Paramètres du dernier build de `job` lancé pour le dépôt Cucumber `repository` (un paramètre a cette valeur) :
+    {"numero", "parametres"} ; {} si aucun. C'est la base d'un run de l'agent : la configuration actuelle du job est
+    celle du DERNIER CLIENT lancé (artefact, versions, suites cochées), jamais celle de ce client. Les builds de la
+    branche de travail de l'agent (`agent_branch`) sont exclus : seul un build lancé pour le client fait référence.
+    """
+    repo = (repository or "").strip().lower()
+    if not repo:
+        return {}
+    for build in builds if builds is not None else jenkins_tools.recent_builds(job, 30):
+        params = build.get("parametres") or {}
+        values = {str(v).strip().lower() for v in params.values()}
+        if repo in values and not (agent_branch and agent_branch.strip().lower() in values):
+            kept = {k: (("true" if v else "false") if isinstance(v, bool) else str(v)) for k, v in params.items()
+                    if v is not None and (not definitions or k in definitions)}
+            return {"numero": build.get("numero"), "parametres": kept}
+    return {}
+
+
 def build_parameters(definitions: dict, roles: dict, branch: str, repository: str = "", tags: str = "",
-                     commit: str = "", env: str = "", fixed: dict = None, target: str = "arguments") -> dict:
+                     commit: str = "", env: str = "", fixed: dict = None, target: str = "arguments",
+                     reference: dict = None) -> dict:
     """
-    Paramètres d'un build : configuration actuelle du job, remplacée par les paramètres imposés du profil (`fixed`),
-    puis branche de travail, dépôt client, attente décochée, commit et environnement (si le job a ces rôles) et
-    filtre de tags ajouté aux arguments.
+    Paramètres d'un build : configuration actuelle du job, remplacée par ceux du dernier build de ce client
+    (`reference`, reference_parameters), puis par les paramètres imposés du profil (`fixed`), puis branche de
+    travail, dépôt client, attente décochée, commit et environnement (si le job a ces rôles) et filtre de tags
+    ajouté aux arguments.
     """
-    params = {**current_values(definitions), **(fixed or {})}
+    params = {**current_values(definitions), **((reference or {}).get("parametres") or {}), **(fixed or {})}
     for role, value in (("branche", branch), ("depot", repository), ("commit", commit), ("environnement", env)):
         if roles.get(role) and value:
             params[roles[role]] = value
@@ -189,6 +212,15 @@ def build_parameters(definitions: dict, roles: dict, branch: str, repository: st
         argument_tags = "" if to_parameter and target == "parametre" else tags
         params[roles["arguments"]] = with_tag_filter(params.get(roles["arguments"], ""), argument_tags)
     return params
+
+
+def client_configuration_error(reference: dict, fixed: dict, repository: str) -> str:
+    """Run refusé sans configuration propre au client (ni build de référence, ni paramètres imposés)."""
+    if (reference or {}).get("parametres") or fixed:
+        return ""
+    return (f"aucun build de référence pour {repository or 'ce client'} sur ce job, ni paramètres imposés dans le "
+            f"profil client (job_params) : le run reprendrait la configuration du dernier client lancé — lancez une "
+            f"fois le job pour ce client, ou renseignez ses paramètres imposés")
 
 
 def visible_parameters(params: dict, roles: dict) -> dict:

@@ -2971,6 +2971,9 @@ def require_compiled(worktree: str, revisions: str) -> dict:
     tree = _git(worktree, "rev-parse", f"{tip}^{{tree}}").stdout.strip()
     if not tree:
         raise DeliveryBlocked(f"Livraison arrêtée : révision {tip} introuvable dans {worktree}.")
+    # Commit résolu dans l'espace de travail : « HEAD » lu dans la copie de compilation désignerait son propre
+    # commit (copie restée sur une ancienne version, erreurs de compilation fantômes)
+    tip = _git(worktree, "rev-parse", f"{tip}^{{commit}}").stdout.strip()
     pom = _git(worktree, "show", f"{tip}:pom.xml").stdout
     version = cucumber_library.pom_library_version(pom)
     if not version:

@@ -54,6 +54,12 @@ def jenkins(tmp_path, repo, monkeypatch):
     calls = {"params": [], "definitions": dict(DEFINITIONS), "console": CONSOLE}
     monkeypatch.setattr(jenkins_tools, "jenkins_configured", lambda: True)
     monkeypatch.setattr(jenkins_tools, "job_definitions", lambda job: calls["definitions"])
+    # Dernier build de ce client sur le job : base de chaque run de l'agent (la configuration actuelle du job est
+    # celle du dernier client lancé)
+    calls["builds"] = [{"numero": n, "parametres": {**{k: v["defaut"] for k, v in DEFINITIONS.items()},
+                                                    "CUCUMBER_SPEC_REPOSITORY": depot}}
+                       for n, depot in ((41, "client-cucumber"), (40, f"{CLIENT}-cucumber"))]
+    monkeypatch.setattr(jenkins_tools, "recent_builds", lambda job, count=20: calls["builds"])
     monkeypatch.setattr(jenkins_tools, "trigger_job", lambda job, params: calls["params"].append(params) or "q/1")
     monkeypatch.setattr(jenkins_tools, "wait_build_result",
                         lambda queue, timeout, *a, **k: {"url": "https://jenkins/job/x/7", "result": "UNSTABLE",
@@ -366,3 +372,24 @@ def test_merged_mutation_copies_rename_agent_tags(tmp_path):
     assert '"12_MUT"' in copies[copy] and "@agent_c_1_1_mut" in copies[copy] and "@agent_c_1_0_mut" in copies[copy]
     assert counts == {"@agent_c_1_1": 1} and where == {"@agent_c_1_1": copy}
     assert run == {"@agent_c_1_1_mut", "@agent_c_1_0_mut"}
+
+
+def test_run_starts_from_the_client_last_build_never_from_another_client(jenkins):
+    repo, _, calls = jenkins
+    # Configuration actuelle du job : celle d'un autre client ; dernier build de ce client : sa propre configuration
+    calls["definitions"]["COMPONENT_OWNER"] = {"type": "StringParameterDefinition", "defaut": "autre-client"}
+    calls["builds"] = [{"numero": 42, "parametres": {"CUCUMBER_SPEC_REPOSITORY": "autre-cucumber",
+                                                     "COMPONENT_OWNER": "autre-client"}},
+                       {"numero": 41, "parametres": {"CUCUMBER_SPEC_REPOSITORY": "client-cucumber",
+                                                     "COMPONENT_OWNER": "com.client", "wait": True}}]
+    reference = cjob.reference_parameters("JOB", "client-cucumber", calls["definitions"])
+    assert reference["numero"] == 41
+    params = cjob.build_parameters(calls["definitions"], cjob.detect_roles(calls["definitions"])[0], BRANCH,
+                                   "client-cucumber", "@x", reference=reference)
+    assert params["COMPONENT_OWNER"] == "com.client" and params["CUCUMBER_SPEC_BRANCH"] == BRANCH
+    # Aucun build de ce client et aucun paramètre imposé : run refusé
+    calls["builds"] = calls["builds"][:1]
+    reference = cjob.reference_parameters("JOB", "client-cucumber", calls["definitions"])
+    assert reference == {} and "aucun build de référence" in cjob.client_configuration_error(reference, {},
+                                                                                            "client-cucumber")
+    assert cjob.client_configuration_error(reference, {"COMPONENT_OWNER": "com.client"}, "client-cucumber") == ""

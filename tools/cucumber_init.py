@@ -313,7 +313,8 @@ def initializer_limits(profile: dict) -> list:
 
 
 def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name: str, base: str,
-                      modules: set, profile: dict = None, recreate=None, environment: dict = None) -> dict:
+                      modules: set, profile: dict = None, recreate=None, environment: dict = None,
+                      jobs=None) -> dict:
     """
     Écrit l'initialisation des `modules` retenus dans le worktree cucumber_<client>_init (repart de `base`), la
     commite en un seul commit et produit le patch init_patch_path(client). Renvoie {"modules", "fichiers", "patch",
@@ -374,6 +375,14 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
             else:
                 shutil.copyfile(source, target)
             result["fichiers"].append(client_path(rel, client_name))
+    # Jobs KIS copiés du Standard : chacun prouvé présent chez le client, sinon commenté (TODO-JOB, cucumber_jobs)
+    if jobs:
+        checked = jobs(worktree, [f for f in result["fichiers"] if f.endswith(".feature")])
+        result["jobs"] = checked
+        if checked.get("non_prouves"):
+            result["avertissements"].append(
+                f"{len(checked['non_prouves'])} job(s) absent(s) chez le client, commenté(s) sous TODO-JOB : "
+                + ", ".join(sorted({m['nom'] for m in checked['non_prouves']}))[:300])
     java = clear_step_path(client_name)
     target = os.path.join(worktree, *java.split("/"))
     os.makedirs(os.path.dirname(target), exist_ok=True)

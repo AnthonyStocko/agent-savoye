@@ -234,3 +234,16 @@ def test_build_output_is_never_taken_for_repository_files(repo):
     write(os.path.join(repo, "target", "test-classes", "cucumber", "features", "client", "A.feature"), "Feature: A\n")
     write(os.path.join(repo, "src", "test", "resources", "cucumber", "files", "target", "test-classes", "x.xml"), "x")
     assert cucumber_checks.repo_files(repo) == {"src/test/resources/cucumber/features/client/A.feature"}
+
+
+@pytest.mark.real_compile
+def test_compile_copy_follows_the_worktree_head(client_repo, tmp_path, monkeypatch):
+    # Copie de compilation déjà préparée sur un ancien commit : « HEAD » est celui de l'espace de travail, jamais
+    # celui de la copie (sinon l'ancienne version est recompilée et ses erreurs bloquent la livraison)
+    monkeypatch.setattr(ct, "COMPILED_DIR", str(tmp_path / "compilation"))
+    monkeypatch.setenv("CUCUMBER_COMPILE_CMD", _fake_maven(tmp_path, "[INFO] BUILD SUCCESS", 0))
+    output = _deliver(client_repo, DELIVERED, tmp_path)
+    with pytest.raises(ct.DeliveryBlocked):
+        ct.format_patch(client_repo, "integration~1..HEAD", output)
+    _deliver(client_repo, ci.clear_step_java("client", API), tmp_path)
+    assert ct.format_patch(client_repo, "integration~1..HEAD", output)

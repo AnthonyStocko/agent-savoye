@@ -22,7 +22,7 @@ import os
 from datetime import datetime
 
 from tools import cucumber_checks, cucumber_job, cucumber_profile, jenkins_tools
-from tools.cucumber_tools import _git, load_state, rev_parse, save_state
+from tools.cucumber_tools import _git, java_package_segment, load_state, rev_parse, save_state
 
 DEFAULT_TIMEOUT = 3600
 
@@ -174,9 +174,21 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     fixed, fixed_warnings = cucumber_job.fixed_parameters(profile, check["definitions"])
     for warning in fixed_warnings:
         log(f"[RUN JENKINS] ⚠️ {warning}")
+    # Dépôt du client (paramètre « depot » ou <client>-cucumber) : son dernier build sert de base au run
+    client_repo = repository or f"{java_package_segment(client_name)}-cucumber"
+    reference = cucumber_job.reference_parameters(check["job"], client_repo, check["definitions"],
+                                                   agent_branch=profile.get("verify_branch", ""))
+    refused = cucumber_job.client_configuration_error(reference, fixed, client_repo)
+    if refused:
+        run["message"] = f"rien n'est lancé : {refused}"
+        record(client_name, run)
+        return run
+    if reference:
+        log(f"[RUN JENKINS] Paramètres repris du build n° {reference['numero']} de {client_repo} (configuration de "
+            f"ce client, pas celle du dernier client lancé).")
     params = cucumber_job.build_parameters(check["definitions"], roles, check["branche"], repository, tags,
                                            run["commit"], fixed=fixed,
-                                           target=cucumber_job.tag_target(profile, roles))
+                                           target=cucumber_job.tag_target(profile, roles), reference=reference)
     run["parametres"] = cucumber_job.visible_parameters(params, roles)
     run["version_testee"] = tested_version(client_name, params, roles, inventory, client_root)
     if run["version_testee"]:
@@ -240,9 +252,17 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
         out["avertissements"] += fixed_warnings
         out["imposes"] = sorted(fixed)
         out["cible_tags"] = cucumber_job.tag_target(profile, check["roles"])
+        client_repo = repository or f"{java_package_segment(client_name)}-cucumber"
+        reference = cucumber_job.reference_parameters(check["job"], client_repo, check["definitions"],
+                                                   agent_branch=profile.get("verify_branch", ""))
+        refused = cucumber_job.client_configuration_error(reference, fixed, client_repo)
+        if refused:
+            out["erreurs"].append(refused)
+            out["ok"] = False
+        out["reference"] = reference.get("numero")
         params = cucumber_job.build_parameters(check["definitions"], check["roles"], check["branche"], repository,
                                                tags, commit or (rev_parse(worktree, "HEAD") if worktree else ""),
-                                               fixed=fixed, target=out["cible_tags"])
+                                               fixed=fixed, target=out["cible_tags"], reference=reference)
         out["parametres"] = cucumber_job.visible_parameters(params, check["roles"])
     if worktree and os.path.exists(os.path.join(worktree, ".git")):
         texts = feature_texts(worktree) if texts is None else texts

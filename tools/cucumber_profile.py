@@ -20,9 +20,10 @@ import re
 from datetime import datetime
 
 from tools import cucumber_checks, cucumber_init_data, cucumber_initializers, cucumber_versions
-from tools.cucumber_tools import (_git, _read_json, _read_text_file, _runners, _test_java_files, _write_json,
+from tools.cucumber_tools import (CLIENT_REFS, _git, _read_json, _read_text_file, _runners, _test_java_files,
+                                  _write_json,
                                   cache_dir, depends_on_std_test_jar, git_repos, java_classes, java_package_segment,
-                                  load_inventory, snapshot)
+                                  load_inventory, pick_ref, snapshot)
 
 REPO_PROFILE = ".agent-savoye.json"
 REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
@@ -113,9 +114,11 @@ def application_clears(client_root: str) -> dict:
     for name, repo in git_repos(client_root).items():
         if "cucumber" in name.lower():
             continue
-        grep = _git(repo, "grep", "-I", "-o", "-E", _APP_CLEAR.pattern, "--", *_APP_CONFIG_GLOBS)
+        # Lu sur la référence distante (copies mises à jour par fetch, jamais par pull)
+        ref = pick_ref(repo, CLIENT_REFS)
+        grep = _git(repo, "grep", "-I", "-o", "-E", _APP_CLEAR.pattern, ref, "--", *_APP_CONFIG_GLOBS)
         for line in grep.stdout.splitlines():
-            path, _, value = line.partition(":")
+            path, _, value = line[len(ref) + 1:].partition(":") if line.startswith(ref + ":") else                 line.partition(":")
             if value and "/test/" not in f"/{path}":
                 places = found.setdefault(value, [])
                 if f"{name}/{path}" not in places:

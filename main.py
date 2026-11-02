@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -972,6 +972,34 @@ def ensure_cucumber_std_repo(repo_url: str, odatio_version: str) -> tuple:
     return report(target_dir, ref)
 
 
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tmp", "sauvegardes")
+
+
+def update_clone(repo_dir: str, name: str, git_cmd_extra: list = (), git_env: dict = None) -> tuple:
+    """
+    Mise à jour d'une copie de code par « git fetch » (jamais de pull : les lectures se font sur les références
+    distantes, la branche locale et l'arbre de travail ne sont pas touchés). Les commits locaux non poussés sont
+    d'abord sauvegardés dans un bundle (.tmp/sauvegardes/<dépôt>-<date>.bundle). Renvoie (succès, message).
+    """
+    unpushed = subprocess.run(["git", "-C", repo_dir, "log", "--branches", "--not", "--remotes", "--oneline"],
+                              capture_output=True, text=True).stdout.strip().splitlines()
+    saved = ""
+    if unpushed:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        saved = os.path.join(BACKUP_DIR, f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.bundle")
+        bundle = subprocess.run(["git", "-C", repo_dir, "bundle", "create", saved, "--branches", "--not",
+                                 "--remotes"], capture_output=True, text=True)
+        if bundle.returncode != 0:
+            return False, (f"{name} : sauvegarde des {len(unpushed)} commit(s) local(aux) non poussé(s) impossible "
+                           f"({bundle.stderr.strip()[:200]}) : dépôt non mis à jour")
+    res = subprocess.run(["git", *git_cmd_extra, "-C", repo_dir, "fetch", "--prune", "origin"],
+                         capture_output=True, text=True, env=git_env)
+    backup = f" ; {len(unpushed)} commit(s) local(aux) non poussé(s) sauvegardé(s) dans {saved}" if saved else ""
+    if res.returncode != 0:
+        return False, f"Erreur fetch sur {name} : {res.stderr.strip()[:300]}{backup}"
+    return True, f"{name} mis à jour (fetch){backup}."
+
+
 def ensure_local_repo(repo_input: str, repo_label: str) -> str:
     """
     Si repo_input est une URL de projet Bitbucket, interroge l'API REST 
@@ -1002,18 +1030,27 @@ def ensure_local_repo(repo_input: str, repo_label: str) -> str:
         print(f"\n==================================================")
         print(f"[API BITBUCKET] Interrogation du projet '{project_key}' sur {bitbucket_url}...")
 
-        api_url = f"{bitbucket_url}/rest/api/1.0/projects/{project_key}/repos?limit=100"
+        api_url = f"{bitbucket_url}/rest/api/1.0/projects/{project_key}/repos"
         headers = {"Authorization": f"Bearer {bitbucket_token}"} if bitbucket_token else {}
 
         repos_to_clone = []
         try:
-            res = requests.get(api_url, headers=headers, timeout=10)
-            if res.status_code == 200:
+            # Toutes les pages : un projet peut compter plus de 100 dépôts (le Standard en a plus de 170)
+            start = 0
+            while True:
+                res = requests.get(api_url, headers=headers, params={"start": start, "limit": 100}, timeout=10)
+                if res.status_code != 200:
+                    print(f"[API BITBUCKET] Code retour {res.status_code}"
+                          + (", passage sur la liste de secours." if not repos_to_clone else
+                             f" sur la page {start} : liste partielle."))
+                    break
                 data = res.json()
-                repos_to_clone = [repo["slug"] for repo in data.get("values", [])]
+                repos_to_clone += [repo["slug"] for repo in data.get("values", [])]
+                if data.get("isLastPage", True):
+                    break
+                start = data.get("nextPageStart", start + 100)
+            if repos_to_clone:
                 print(f"[API BITBUCKET] {len(repos_to_clone)} dépôt(s) trouvé(s) pour {project_key} : {', '.join(repos_to_clone)}")
-            else:
-                print(f"[API BITBUCKET] Code retour {res.status_code}, passage sur la liste de secours.")
         except Exception as e:
             print(f"[API BITBUCKET] Erreur API ({e}), passage sur la liste de secours.")
 
@@ -1037,12 +1074,8 @@ def ensure_local_repo(repo_input: str, repo_label: str) -> str:
 
             if os.path.exists(os.path.join(repo_dir, ".git")):
                 print(f"[{idx}/{len(repos_to_clone)}] 🔄 Mettre à jour {repo_name} dans {repo_dir}...")
-                cmd = ["git"] + git_cmd_extra + ["-C", repo_dir, "pull"]
-                res_pull = subprocess.run(cmd, capture_output=True, text=True, env=git_env)
-                if res_pull.returncode == 0:
-                    print(f"     ✅ {repo_name} mis à jour avec succès.")
-                else:
-                    print(f"     ⚠️ Erreur pull sur {repo_name} : {res_pull.stderr.strip()}")
+                ok, message = update_clone(repo_dir, repo_name, git_cmd_extra, git_env)
+                print(f"     {'✅' if ok else '⚠️'} {message}")
             else:
                 print(f"[{idx}/{len(repos_to_clone)}] 📥 Clonage de {repo_name} depuis {clone_url}...")
                 cmd = ["git"] + git_cmd_extra + ["clone", clone_url, repo_dir]
@@ -1062,12 +1095,8 @@ def ensure_local_repo(repo_input: str, repo_label: str) -> str:
         print(f"\n[GIT SINGLE REPO] Traitement du dépôt unique : {repo_input}")
         if os.path.exists(target_dir) and os.path.exists(os.path.join(target_dir, ".git")):
             print(f"🔄 Mettre à jour le dépôt local {repo_label} : {target_dir}")
-            cmd = ["git"] + git_cmd_extra + ["-C", target_dir, "pull"]
-            res_pull = subprocess.run(cmd, capture_output=True, text=True, env=git_env)
-            if res_pull.returncode == 0:
-                print(f"✅ {clean_name} mis à jour avec succès.")
-            else:
-                print(f"⚠️ Erreur pull sur {clean_name} : {res_pull.stderr.strip()}")
+            ok, message = update_clone(target_dir, clean_name, git_cmd_extra, git_env)
+            print(f"{'✅' if ok else '⚠️'} {message}")
         else:
             if os.path.exists(target_dir):
                 shutil.rmtree(target_dir, ignore_errors=True)
@@ -1274,6 +1303,7 @@ def main():
 
         # 1. Dépôt Socle Standard
         local_std_repo = ensure_local_repo(std_repo_arg, "std")
+        STD_LOCAL_ROOT[0] = local_std_repo
 
         # 2. Détection de la version Odatio (repli global ; un client Cucumber a la sienne, voir plus bas)
         local_cucumber_std_repo = ""
@@ -2457,11 +2487,15 @@ def initializer_sources(client_root: str, items: list, target_dir: str) -> dict:
         repo = repos.get(item["donnee"].get("depot", ""))
         if not classe or classe in out or not repo:
             continue
-        found = cucumber_tools._git(repo, "ls-files", f"*/{classe}.java").stdout.splitlines()
+        # Lu sur la référence distante (copies mises à jour par fetch, arbre de travail non à jour)
+        ref = cucumber_tools.pick_ref(repo, cucumber_tools.CLIENT_REFS)
+        found = [p for p in cucumber_tools._git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines()
+                 if p.endswith(f"/{classe}.java")]
         if found:
             target = os.path.join(target_dir, f"{classe}.java")
             os.makedirs(target_dir, exist_ok=True)
-            shutil.copyfile(os.path.join(repo, *found[0].split("/")), target)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(cucumber_tools._git(repo, "show", f"{ref}:{found[0]}").stdout)
             out[classe] = target
     return out
 
@@ -2652,7 +2686,8 @@ def _run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: st
         result = cucumber_init.build_client_init(
             cucumber_repo_dir, local_cucumber_std_repo, client, base, modules, profile,
             lambda worktree, items: recreate_initializer_data(client, worktree, items, local_client_repo,
-                                                              local_cucumber_std_repo, profile), environment)
+                                                              local_cucumber_std_repo, profile), environment,
+            init_jobs_checker(client, local_client_repo, STD_LOCAL_ROOT[0], odatio_version))
     except RuntimeError as e:
         print(f"[CUCUMBER INIT] ❌ {e}")
         return 1
@@ -3120,6 +3155,99 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
     return init
 
 
+# Copie locale du Standard préparée au démarrage (lectures des contrôles hors du flux principal)
+STD_LOCAL_ROOT = [""]
+
+
+def init_jobs_checker(client: str, client_root: str, std_root: str, version: str):
+    """
+    Contrôle des jobs KIS des features d'init (cucumber_jobs) : base du client (schémas du projet), code de son
+    application, Standard à sa version. Renvoie une fonction (worktree, chemins) -> résultat, qui journalise.
+    """
+    project = cucumber_tools._read_json(os.path.join(cucumber_tools.cache_dir(client), "projet.json"), {}) or {}
+    schemas = [project.get("source_schema", ""), project.get("db_schema", "")]
+
+    def check(worktree: str, paths: list) -> dict:
+        result = cucumber_jobs.apply(worktree, paths, client_root, schemas, std_root, version)
+        for line in cucumber_jobs.summary(result):
+            print(f"[CUCUMBER INIT] Jobs : {line}")
+        return result
+    return check
+
+
+def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, std_root: str,
+                  cucumber_std_dir: str, version: str):
+    """
+    Init du run importé n° `numero` en échec sur un job KIS absent : chaque job des features d'init de la base
+    (profil) est prouvé présent chez le client (cucumber_jobs), les autres sont commentés (TODO-JOB) dans l'espace
+    d'init (repart de la base), commit dédié, patch <client>-cucumber-init-correction.patch ; puis, si l'agent
+    exécute les tests (branche de travail du profil), push sur cette branche et init rejouée seule sur Jenkins.
+    Renvoie None si l'échec ne vient pas d'un job (autre correction), sinon le code de sortie.
+    """
+    client = args.client_name
+    analysis = cucumber_import.load_analysis(client, numero)
+    init = analysis.get("init_en_echec") or {}
+    if "KisJob" not in (init.get("message") or ""):
+        return None
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
+    print(f"[CUCUMBER INIT] Import n° {numero} : init en échec sur un job KIS absent ({init.get('message')[:120]}) "
+          f"— contrôle de chaque job de l'init sur {base}")
+    worktree = cucumber_tools.add_worktree(cucumber_repo_dir, cucumber_init.init_worktree_dir(client),
+                                           cucumber_init.init_branch(client), base, reset=True)
+    paths = [p for p in profile.get("init_features") or [] if p.endswith(".feature")]
+    result = init_jobs_checker(client, client_root, std_root, version)(worktree, paths)
+    if not result["fichiers"]:
+        print("[CUCUMBER INIT] Tous les jobs de l'init sont prouvés présents chez le client : la cause est ailleurs.")
+        return None
+    cucumber_tools._git(worktree, "add", "--", *result["fichiers"])
+    commit = cucumber_tools._git(worktree, "commit", "-m", f"Cucumber : jobs de l'init absents chez {client} "
+                                                           f"commentés (TODO-JOB)")
+    if commit.returncode != 0:
+        print(f"[CUCUMBER INIT] ❌ Commit impossible : {commit.stderr.strip()[:300]}")
+        return 1
+    patch = os.path.join(cucumber_tools.WORKSPACE_DIR, f"{client}-cucumber-init-correction.patch")
+    cucumber_tools.format_patch(worktree, f"{base}..HEAD", patch)
+    print(f"[CUCUMBER INIT] {len(result['non_prouves'])} usage(s) de job commenté(s) dans "
+          f"{', '.join(result['fichiers'])} ; patch : {patch}")
+    state = cucumber_tools.load_state(client)
+    state["init_corrigee"] = {"import": numero, "fichiers": result["fichiers"], "tentatives": [
+        {"tentative": 1, "cause": "jobs absents chez le client", "corrections": cucumber_jobs.summary(result)[1:]}]}
+    cucumber_tools.save_state(client, state)
+    mode, message = cucumber_verify.execution_mode(profile, args.cucumber_base_branch)
+    if mode != "branche" or not profile.get("verify_branch"):
+        print(f"[CUCUMBER INIT] Init corrigée, non rejouée sur Jenkins : {message}. Renseignez la branche de travail "
+              f"de l'agent dans le profil client (verify_branch), ou appliquez le patch et relancez le job.")
+        return 0
+    # Même correction déjà poussée sur la branche de travail (tentative précédente) : reprise telle quelle, le push
+    # sans forcer d'un commit au contenu identique serait refusé
+    cucumber_tools._git(worktree, "fetch", "-q", "origin", profile["verify_branch"])
+    remote = f"origin/{profile['verify_branch']}"
+    same = (cucumber_tools._git(worktree, "rev-parse", "--verify", "--quiet", remote).returncode == 0
+            and cucumber_tools._git(worktree, "diff", "--quiet", remote, "HEAD").returncode == 0)
+    if same:
+        cucumber_tools._git(worktree, "reset", "-q", "--hard", remote)
+        print(f"[CUCUMBER INIT] Correction identique déjà sur {profile['verify_branch']} : reprise de "
+              f"{cucumber_tools.rev_parse(worktree, 'HEAD')[:8]}.")
+    push_error = cucumber_checks.push_for_verification(worktree, profile["verify_branch"],
+                                                       "Cucumber : jobs de l'init absents chez le client")[0]
+    if push_error:
+        print(f"[CUCUMBER INIT] ⚠️ Init non rejouée : {push_error}")
+        return 1
+    head = cucumber_tools.rev_parse(worktree, "HEAD")
+    sources = {**cucumber_verify.branch_sources(profile, args.cucumber_repo), "CUCUMBER_SPEC_COMMIT": head,
+               profile.get("verify_branch_param") or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM:
+                   profile["verify_branch"]}
+    tags = profile.get("init_tags") or cucumber_verify.init_tags()
+    print(f"[CUCUMBER INIT] Init rejouée seule sur Jenkins ({tags}, branche {profile['verify_branch']} @ {head[:8]})")
+    outcome = cucumber_verify.run_init(mode, worktree, head,
+                                       lambda: cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
+                                       tags, sources)
+    print(f"[CUCUMBER INIT] {'✅' if outcome['ok'] else '❌'} {outcome['message']}"
+          + (f" — {outcome.get('build')}" if outcome.get("build") else ""))
+    return 0 if outcome["ok"] else 1
+
+
 def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio_version: str,
                          token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
     """
@@ -3409,6 +3537,12 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"[CUCUMBER] Rien à livrer par rapport à {base}.")
         return 2
     if args.fix_init_from_import:
+        # Jobs KIS absents chez le client (« Pas d'élément correspondant à l'attendu {} pour KisJob ») : correction
+        # déterministe de l'init (0 token), puis init rejouée seule sur Jenkins, avant toute autre correction
+        jobs_code = fix_init_jobs(args, args.fix_init_from_import, cucumber_repo_dir, local_client_repo,
+                                  local_std_repo, local_cucumber_std_repo, odatio_version)
+        if jobs_code is not None:
+            return jobs_code
         return fix_init_from_import(args, args.fix_init_from_import, local_cucumber_std_repo, odatio_version,
                                     token_saving_rules, python_exe, workspace_dir)
     if args.run_jenkins and args.run_dry:
