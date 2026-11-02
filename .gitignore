@@ -29,3 +29,5 @@ __pycache__/
 .agents/
 .claude/
 *.stackdump
+# Connexion OIDC : identifiants du fournisseur d'identité (modèle : .streamlit/secrets.toml.example)
+.streamlit/secrets.toml

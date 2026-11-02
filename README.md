@@ -347,6 +347,60 @@ venv\Scripts\python.exe -m tools.knowledge_tools flush   # dépose la file local
 - Ne créez pas d'autres fichiers dans les dossiers `<projet>/<type>` : seuls les `.md` sont indexés, les fichiers commençant par `.` sont ignorés.
 - Une information tirée d'un document partagé se vérifie dans le code avant d'être reprise.
 
+## Connexion OIDC (compte de l'entreprise)
+
+Optionnelle : sans `AGENT_AUTH`, l'application reste en accès libre, comme avant. Avec `AGENT_AUTH=1`, une page de connexion précède tout accès (authentification native de Streamlit : `st.login`, OpenID Connect). La mise en place se fait seul, en une dizaine de minutes, sans demande à l'infrastructure ni à l'équipe annuaire.
+
+### 1. Enregistrer l'application (vous-même, portail du fournisseur)
+
+Exemple Entra ID (Microsoft 365) : [portail Azure](https://portal.azure.com) → **Microsoft Entra ID** → **Inscriptions d'applications** → **Nouvelle inscription**.
+
+- Nom : `Agent Scrum Master` ; types de comptes : **comptes de cet annuaire uniquement**.
+- URI de redirection : plateforme **Web**, `http://localhost:8501/oauth2callback`. HTTP est accepté pour `localhost` : aucun certificat n'est nécessaire tant que l'application est ouverte sur le poste qui l'exécute.
+- Après création, notez l'**ID d'application (client)** et l'**ID de l'annuaire (locataire)** (page Vue d'ensemble).
+- **Certificats et secrets** → **Nouveau secret client** : copiez sa **valeur** tout de suite (elle n'est plus affichée ensuite) et notez sa date d'expiration.
+
+Par défaut, Entra ID laisse chaque utilisateur inscrire une application : vous en êtes alors le propriétaire, sans aucune intervention de l'annuaire. Si le portail vous le refuse (« Vous n'avez pas accès »), cette possibilité a été désactivée dans votre entreprise : c'est le seul cas où une demande à l'équipe annuaire est nécessaire (« inscrire une application web OIDC, URI de retour http://localhost:8501/oauth2callback »).
+
+Autre fournisseur OIDC (Okta, Keycloak, Google Workspace…) : même principe ; il faut l'URL de son document de découverte `…/.well-known/openid-configuration`.
+
+### 2. Écrire la configuration (une commande)
+
+```
+python -m tools.auth_setup --tenant <ID de l'annuaire> --client-id <ID d'application> --activer --allowed "@monentreprise.com"
+```
+
+Le secret client est demandé sans écho. La commande :
+
+- vérifie que le fournisseur répond ;
+- écrit la section `[auth]` de `.streamlit/secrets.toml` (`redirect_uri`, `cookie_secret` généré, `client_id`, `client_secret`, `server_metadata_url`) ;
+- ajoute ce fichier au `.gitignore` : il n'est **jamais commité** (modèle documenté : `.streamlit/secrets.toml.example`) ;
+- active `AGENT_AUTH=1` et `AGENT_AUTH_ALLOWED` dans le `.env`.
+
+Autre fournisseur : `--metadata-url <URL de découverte>` au lieu de `--tenant`. Puis redémarrez l'application (`streamlit run app.py`).
+
+### 3. Qui peut entrer : `AGENT_AUTH_ALLOWED`
+
+Liste séparée par des virgules ; vide = tout compte authentifié par le fournisseur.
+
+- `prenom.nom@monentreprise.com` : une personne ;
+- `@monentreprise.com` : tout un domaine ;
+- un groupe ou un rôle : nom ou identifiant lu dans les revendications `groups` / `roles` du jeton. Entra ID ne les envoie que si vous l'activez vous-même dans votre inscription (**Configuration du jeton** → **Ajouter une revendication de groupes**). Les groupes y sont désignés par leur identifiant (GUID), visible dans Entra ID → Groupes.
+
+### Ce que la connexion change
+
+- **Auteur tracé** : l'identité connectée (« Nom <adresse> ») remplace l'utilisateur système partout où l'agent écrit un auteur : décisions, corrections manuelles du bilan, connaissances partagées, journal de chaque exécution (« lancé par … »). Elle est transmise aux exécutions de `main.py` lancées depuis l'application.
+- **Comptes techniques** : Jenkins, Bitbucket, Jira, bases et clés d'API restent des comptes de service du `.env`. Connexion active, leurs valeurs ne sont **jamais renvoyées au navigateur** : l'onglet Configuration affiche « renseigné — non affiché » ; un champ laissé vide garde la valeur enregistrée, une saisie la remplace.
+- **Déconnexion** : bouton sous le titre. Le cookie de session est signé par `cookie_secret` ; le changer déconnecte tout le monde.
+
+### Ouvrir l'application depuis d'autres postes
+
+L'URL de retour doit alors être en HTTPS (exigence des fournisseurs, sauf `localhost`). Sans demande à l'infrastructure, Streamlit sert lui-même le HTTPS :
+
+- `server.sslCertFile` et `server.sslKeyFile` dans `.streamlit/config.toml` (certificat de votre poste ; un certificat auto-signé fonctionne mais affiche un avertissement du navigateur) ;
+- ajoutez `https://<nom-du-poste>:8501/oauth2callback` comme URI de redirection dans l'inscription ;
+- relancez `python -m tools.auth_setup … --redirect-uri https://<nom-du-poste>:8501/oauth2callback`.
+
 ## Personnaliser les prompts
 
 Les consignes envoyées à l'agent sont dans `prompts/` :
