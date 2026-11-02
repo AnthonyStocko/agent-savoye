@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -791,6 +791,30 @@ def detect_odatio_version(std_repo_path: str) -> str:
     return "dev"
 
 
+def client_standard_version(client: str, client_root: str, std_root: str, fallback: str) -> str:
+    """
+    Version du Standard propre au client (tools/standard_version) : détectée dans le code de son application
+    (origin/integration), ses derniers builds Jenkins et la bibliothèque de son dépôt Cucumber, enregistrée dans son
+    profil ; un choix saisi dans le profil prime. Conflit ou aucune source : `fallback` (ODATIO_VERSION du .env ou
+    pom du Standard), avec la question affichée.
+    """
+    cucumber_dirs = [path for name, path in cucumber_tools.git_repos(client_root).items()
+                     if name.lower() == f"{cucumber_tools.java_package_segment(client)}-cucumber"]
+    cucumber_dir = cucumber_dirs[0] if cucumber_dirs else ""
+    document = cucumber_profile.load_profile(client)
+    job = (cucumber_profile.effective_profile(document).get("run_job") or os.getenv("CUCUMBER_VERIFY_JOB", "")).strip()
+    builds = jenkins_tools.recent_builds(job) if job and jenkins_tools.jenkins_configured() else []
+    result = standard_version.detect(client_root, std_root, cucumber_dir, os.path.basename(cucumber_dir), builds)
+    standard_version.save(client, result)
+    version, origin = standard_version.client_version(client, "")
+    chosen = ((cucumber_profile.load_profile(client).get("saisi") or {}).get("server_version") or "").strip()
+    print(f"[VERSION STANDARD] {standard_version.line(result, version if chosen else '')}")
+    if version:
+        return version
+    print(f"[VERSION STANDARD] ⚠️ Repli global : {fallback} (ODATIO_VERSION du .env ou pom du Standard).")
+    return fallback
+
+
 def _force_rmtree(path: str) -> None:
     """Supprime un dossier, y compris les fichiers en lecture seule d'un .git sous Windows."""
     def make_writable(func, target, _exc):
@@ -1251,14 +1275,9 @@ def main():
         # 1. Dépôt Socle Standard
         local_std_repo = ensure_local_repo(std_repo_arg, "std")
 
-        # 2. Détection de la version Odatio & Clonage Cucumber Standard (si activé)
+        # 2. Détection de la version Odatio (repli global ; un client Cucumber a la sienne, voir plus bas)
         local_cucumber_std_repo = ""
         odatio_version = detect_odatio_version(local_std_repo)
-        if args.generate_cucumber:
-            cucumber_std_url = args.cucumber_std_repo.strip() or os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "")
-            local_cucumber_std_repo, _ = ensure_cucumber_std_repo(cucumber_std_url, odatio_version)
-        else:
-            print("\n[CUCUMBER STD] Génération des tests Cucumber désactivée par l'utilisateur.")
 
         # 3. Dépôt Client & Règles de branches
         if target_project.upper() in std_only_projects() or args.client_repo == "STD_ONLY":
@@ -1271,6 +1290,18 @@ def main():
             local_client_repo = ensure_local_repo(client_repo_arg, "client")
             branch_rule = f"Projet '{target_project}' : la branche de base sur le dépôt client est 'integration'. Branche de travail : '{target_issue}_dev_...'."
             repo_scope = f"Explore le code source dans le socle '{local_std_repo}' et dans le dépôt client '{local_client_repo}'."
+
+        # 4. Version du Standard propre au client Cucumber (profil client), puis Standard et Cucumber Standard placés
+        # sur la référence de cette version
+        if is_cucumber_client and local_client_repo and args.client_name:
+            odatio_version = client_standard_version(args.client_name, local_client_repo, local_std_repo,
+                                                     odatio_version)
+            cucumber_tools.STD_VERSION[0] = odatio_version
+        if args.generate_cucumber:
+            cucumber_std_url = args.cucumber_std_repo.strip() or os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "")
+            local_cucumber_std_repo, _ = ensure_cucumber_std_repo(cucumber_std_url, odatio_version)
+        else:
+            print("\n[CUCUMBER STD] Génération des tests Cucumber désactivée par l'utilisateur.")
 
     cucumber_instruction = ""
     if args.generate_cucumber:

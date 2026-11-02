@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import env_tools
-from tools import cucumber_init_fix
+from tools import cucumber_init_fix, standard_version
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1352,6 +1352,7 @@ def render_project_settings(ctx: dict) -> None:
         if ctx["client"]:
             st.caption(f"Dépôt cible : **{ctx['client']}-cucumber** · identifiant de travail "
                        f"**{cucumber_tools.work_id(ctx['client'])}**")
+            render_standard_version(ctx["client"])
         st.text_input("Schéma de la config client (base client) :", key="cucumber_source_schema",
                       help="Schéma de la base client (connexion CLIENT_SOURCE_DB_*, à défaut DB_*) dont la "
                            "configuration est recopiée dans le schéma des tests Cucumber par le bouton « Recopier la "
@@ -1363,6 +1364,33 @@ def render_project_settings(ctx: dict) -> None:
         last = st.session_state.get("cucumber_std_ref") or {}
         if last.get("repo") == std_input and last.get("ref"):
             st.caption(f"Référence Git utilisée lors de la dernière exécution : **{last['ref']}**")
+
+
+def render_standard_version(client: str) -> None:
+    """
+    Version du Standard du client, détectée en arrière-plan (code, builds Jenkins, bibliothèque Cucumber) : une
+    ligne ; sources divergentes : les deux avec leurs sources et le choix ; aucune source : saisie proposée.
+    """
+    shown = standard_version.display(client)
+    if not shown["ligne"]:
+        st.caption("Version du Standard : détection en cours (code de l'application, builds Jenkins).")
+        return
+    if shown["statut"] in ("ok", "choisie"):
+        st.caption(shown["ligne"])
+        if shown["statut"] == "choisie" and st.button("Revenir à la détection", key=f"std_version_reset_{client}",
+                                                     type="tertiary"):
+            standard_version.choose(client, "")
+            st.rerun()
+        return
+    st.warning(shown["ligne"], icon=":material/help:")
+    with st.form(f"std_version_{client}", border=False):
+        if shown["statut"] == "conflit":
+            picked = st.radio("Version du Standard à retenir", shown["versions"], horizontal=True)
+        else:
+            picked = st.text_input("Version du Standard", placeholder="ex. 26.22")
+        if st.form_submit_button("Retenir cette version") and (picked or "").strip():
+            standard_version.choose(client, picked)
+            st.rerun()
 
 
 def render_cucumber_detection(ctx: dict) -> None:
@@ -3678,8 +3706,10 @@ with tab_config:
         )
         env_values["ODATIO_VERSION"] = st.text_input(
             "ODATIO_VERSION (facultatif)", value=os.getenv("ODATIO_VERSION", ""), placeholder="ex. 26.16",
-            help="Version d'Odatio déployée sur l'environnement de test. Vide : lue dans le pom du Socle Standard "
-                 "(propriété odatio / kis, parent Odatio) ; une version de dépôt comme 1.0.0 est ignorée.").strip()
+            help="Repli seulement : chaque client Cucumber a sa propre version du Standard, détectée dans le code de "
+                 "son application, ses builds Jenkins et sa bibliothèque Cucumber (profil client, « Données du "
+                 "projet »). Vide : lue dans le pom du Socle Standard (propriété odatio / kis, parent Odatio) ; une "
+                 "version de dépôt comme 1.0.0 est ignorée.").strip()
         env_values["BITBUCKET_CLIENT_REPO_PATH"] = st.text_input(
             "BITBUCKET_CLIENT_REPO_PATH (Dépôt client par défaut)",
             value=os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""),

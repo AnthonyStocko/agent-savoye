@@ -55,6 +55,29 @@ def _job_path(job_name: str) -> str:
     return "/".join(f"job/{part}" for part in job_name.strip().strip("/").split("/") if part)
 
 
+def recent_builds(job_name: str, count: int = 20) -> list:
+    """
+    Derniers builds d'un job, du plus récent au plus ancien : [{numero, url, parametres: {nom: valeur}}] ; [] si
+    Jenkins n'est pas configuré ou injoignable (cause affichée).
+    """
+    jenkins_url, _ = _jenkins()
+    if not jenkins_url or not job_name.strip():
+        return []
+    tree = f"builds[number,url,actions[parameters[name,value]]]{{0,{int(count)}}}"
+    try:
+        response = _get(f"{jenkins_url}/{_job_path(job_name)}/api/json", 20, params={"tree": tree})
+        if response.status_code != 200:
+            print(f"[JENKINS] Builds de {job_name} illisibles : HTTP {response.status_code}")
+            return []
+        builds = response.json().get("builds") or []
+    except (requests.RequestException, ValueError) as e:
+        print(f"[JENKINS] Builds de {job_name} injoignables : {e}")
+        return []
+    return [{"numero": b.get("number"), "url": same_base(b.get("url") or ""),
+             "parametres": {p.get("name"): p.get("value") for a in b.get("actions") or [] if isinstance(a, dict)
+                            for p in a.get("parameters") or [] if p.get("name")}} for b in builds]
+
+
 def job_definitions(job_name: str) -> dict:
     """
     Paramètres d'un job et leur valeur actuelle (configuration du job) : {nom: {"type", "defaut"}} ; defaut vaut None

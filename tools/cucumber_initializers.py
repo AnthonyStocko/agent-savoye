@@ -14,7 +14,7 @@ susceptibles de créer des données sont listés en « partiel », jamais devin�
 import os
 import re
 
-from tools.cucumber_tools import (CLIENT_REFS, STD_REFS, _git, _globs, _java_methods, _mask_java, _matches,
+from tools.cucumber_tools import (CLIENT_REFS, STD_REFS, std_refs as std_version_refs, _git, _globs, _java_methods, _mask_java, _matches,
                                   _resolve, _string_constants, blob_texts, git_repos, ls_tree, pick_ref)
 
 DEFAULT_INITIALIZER_PATTERN = (r"\bclass\s+\w*Initiali[sz]er\w*|"
@@ -194,7 +194,7 @@ def find_initializers(inventory: dict) -> list:
     excluded = _globs("CUCUMBER_INITIALIZER_EXCLUDE_REPOS", "")
     client_repos = git_repos(inventory.get("depot_client", ""))
     std_repos = git_repos(inventory.get("standard", ""))
-    std_refs = {name: pick_ref(path, STD_REFS) for name, path in std_repos.items()}
+    std_refs = {name: pick_ref(path, std_version_refs()) for name, path in std_repos.items()}
     pattern = initializer_pattern()
     found = []
     for repo in sorted(r for r in spec_repos if r in client_repos and not _matches(r, excluded)):

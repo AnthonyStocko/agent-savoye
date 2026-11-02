@@ -27,6 +27,15 @@ STD_CACHE_DIR = os.path.join(CACHE_ROOT, "_standard")
 # Branche de référence de chaque dépôt : intégration côté client, développement côté Standard
 CLIENT_REFS = ("origin/integration", "origin/dev", "origin/HEAD", "HEAD")
 STD_REFS = ("origin/development", "origin/dev", "origin/HEAD", "HEAD")
+# Version du Standard du client en cours (profil client, tools/standard_version) : références de cette version
+# (release/<v>, v<v>, tags) lues avant STD_REFS
+STD_VERSION = [""]
+
+
+def std_refs() -> tuple:
+    """Références candidates des dépôts du Standard pour la version du client en cours (STD_VERSION)."""
+    from tools.standard_version import std_refs as refs_for
+    return refs_for(STD_VERSION[0], STD_REFS)
 
 DEFAULT_EXCLUDE_GLOBS = (
     "pom.xml,kis.descriptor.yaml,*.md,*.iml,.git*,Jenkinsfile,Dockerfile,*.lock,package.json,package-lock.json,"
@@ -296,7 +305,7 @@ def diff_summary(old_text: str, new_text: str, path: str) -> dict:
 
 def _std_index(std_repos: dict) -> dict:
     """Index {nom de fichier Java: (dépôt, ref, chemin, blob)} du Standard, mis en cache selon les commits de référence."""
-    refs = {name: pick_ref(path, STD_REFS) for name, path in std_repos.items()}
+    refs = {name: pick_ref(path, std_refs()) for name, path in std_repos.items()}
     heads = {name: rev_parse(std_repos[name], ref) for name, ref in refs.items() if ref}
     key = hashlib.sha1(json.dumps(heads, sort_keys=True).encode()).hexdigest()[:12]
     cache_file = os.path.join(STD_CACHE_DIR, f"index_java_{key}.json")
@@ -406,7 +415,7 @@ def build_inventory(client_name: str, client_root: str, std_root: str, max_files
         refs[repo] = {"ref": ref, "commit": rev_parse(repo_dir, ref)}
         tree = {p: b for p, b in ls_tree(repo_dir, ref).items() if not _matches(p, exclude)}
         std_dir = std_repos.get(repo)
-        std_ref = pick_ref(std_dir, STD_REFS) if std_dir else ""
+        std_ref = pick_ref(std_dir, std_refs()) if std_dir else ""
         std_tree = ls_tree(std_dir, std_ref) if std_ref else {}
         if std_dir:
             refs[repo]["standard"] = f"{repo}@{std_ref}"
@@ -2335,7 +2344,7 @@ def attach_endpoints(inventory: dict, std_root: str, std_endpoints: dict) -> Non
     nomme son objet métier), au plus 8, les plus utilisés par les steps d'abord.
     """
     std_repos = git_repos(std_root)
-    refs = {name: pick_ref(path, STD_REFS) for name, path in std_repos.items()}
+    refs = {name: pick_ref(path, std_refs()) for name, path in std_repos.items()}
     catalogue = sorted(std_endpoints["endpoints"], key=lambda e: -len(e["steps"]))
     for spec in inventory["specifiques"]:
         exposed, standard_paths = [], set()
@@ -3271,7 +3280,7 @@ def attach_studio_excerpts(inventory: dict, max_lines: int = DEFAULT_INLINE_STUD
                     original = _git(repo_dir, "show", f"{ref}:{f['path'][:-len('customized.xml')]}original.xml").stdout
             elif f.get("kind") == "override" and ":" in standard:
                 repo, path = standard.split(":", 1)
-                ref = pick_ref(std_repos[repo], STD_REFS) if repo in std_repos else ""
+                ref = pick_ref(std_repos[repo], std_refs()) if repo in std_repos else ""
                 if ref:
                     original = _git(std_repos[repo], "show", f"{ref}:{path}").stdout
             customized = _read_text_file(f["local"])

@@ -258,6 +258,10 @@ def refresh_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir:
     document = load_profile(client_name)
     # Rôles des paramètres du job : détectés sur Jenkins (record_job_roles), pas dans le dépôt
     detected["job_roles"] = (document.get("detecte") or {}).get("job_roles") or {}
+    # Version du Standard propre au client (tools/standard_version), jamais la version globale à sa place
+    version = document.get("version_standard") or {}
+    if version:
+        detected["server_version"] = version.get("version", "") if version.get("statut") == "ok" else ""
     depot = repo_profile(worktree, ref)
     if depot.pop("_erreur", ""):
         warnings.append(f"{REPO_PROFILE} du dépôt client illisible : ignoré")
