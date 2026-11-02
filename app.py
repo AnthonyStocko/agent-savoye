@@ -12,7 +12,7 @@ import logging
 
 from dotenv import dotenv_values, load_dotenv
 
-from tools import env_tools
+from tools import auth_tools, env_tools
 from tools import cucumber_init_fix, standard_version
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
@@ -114,6 +114,11 @@ JOURNAL_MAX_BYTES = 5_000_000
 RUN_LOGS_DIR = os.path.join(".tmp", "logs")
 
 
+def secret_input(name: str, label: str = "", **kwargs) -> str:
+    """Champ d'un secret du .env : jamais renvoyé au navigateur quand la connexion OIDC est active (auth_tools)."""
+    return auth_tools.secret_field(st, name, label, **kwargs)
+
+
 def run_log_path(cmd: list) -> str:
     """Journal d'une exécution de main.py : .tmp/logs/<AAAA-MM-JJ_HHMMSS>_<étape>.log."""
     step = cmd[cmd.index("--step") + 1] if "--step" in cmd and cmd.index("--step") + 1 < len(cmd) else "main"
@@ -138,7 +143,8 @@ def run_main_step(cmd: list, on_line=None, quiet: bool = True) -> int:
         text=True,
         encoding="utf-8",
         errors="replace",
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        # Auteur connecté (AGENT_AUTH) transmis à l'exécution : décisions, bilans et connaissances le tracent
+        env={**auth_tools.subprocess_env(), "PYTHONIOENCODING": "utf-8"},
     )
     output_container = st.empty() if not quiet else None
     spinner = st.spinner("Traitement en cours… (sortie détaillée : « Journal technique »)") \
@@ -152,6 +158,10 @@ def run_main_step(cmd: list, on_line=None, quiet: bool = True) -> int:
     with open(JOURNAL_PATH, "a", encoding="utf-8") as journal, open(log_path, "w", encoding="utf-8") as run_log:
         journal.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} — {' '.join(cmd[1:])[:300]}\n")
         run_log.write(f"===== {' '.join(cmd[1:])[:300]}\n")
+        author = auth_tools.current_author()
+        if author:
+            journal.write(f"===== lancé par {author}\n")
+            run_log.write(f"===== lancé par {author}\n")
         for line in process.stdout:
             journal.write(line)
             run_log.write(line)
@@ -319,6 +329,9 @@ load_dotenv(ENV_PATH, override=True)
 if not os.getenv("CLAUDE_CONFIG_DIR", "").strip():
     os.environ["CLAUDE_CONFIG_DIR"] = os.environ["AGENT_SHELL_CLAUDE_CONFIG_DIR"]
 
+# Connexion OIDC (AGENT_AUTH) : rien n'est affiché ni exécuté avant elle
+CONNECTED = auth_tools.require_login(st)
+
 st.title("🤖 Tableau de bord - Agent Scrum Master")
 
 
@@ -336,7 +349,12 @@ def agent_version() -> str:
     return f"Version de l'agent : {commit or 'inconnue'}" + (f" ({branch})" if branch else "") +         (" — modifications locales non commitées" if dirty else "")
 
 
-st.caption(agent_version())
+if CONNECTED:
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.caption(f"{agent_version()} — connecté : {auth_tools.label(CONNECTED)}")
+        st.button("Se déconnecter", on_click=st.logout, icon=":material/logout:", key="auth_logout")
+else:
+    st.caption(agent_version())
 
 env_problems = env_tools.check_env(ENV_PATH)
 if env_problems:
@@ -3616,7 +3634,7 @@ with tab_config:
         env_values["JIRA_DOMAIN"] = st.text_input("JIRA_DOMAIN", value=os.getenv("JIRA_DOMAIN", ""),
                                                   help="Ex: monentreprise.atlassian.net")
         env_values["JIRA_EMAIL"] = st.text_input("JIRA_EMAIL", value=os.getenv("JIRA_EMAIL", ""))
-        env_values["JIRA_API_TOKEN"] = st.text_input("JIRA_API_TOKEN", value=os.getenv("JIRA_API_TOKEN", ""), type="password",
+        env_values["JIRA_API_TOKEN"] = secret_input("JIRA_API_TOKEN",
                                                      help="À créer sur https://id.atlassian.com/manage-profile/security/api-tokens")
         env_values["JIRA_PROJECT_KEY"] = st.text_input("JIRA_PROJECT_KEY (Par défaut)", value=os.getenv("JIRA_PROJECT_KEY", ""))
 
@@ -3668,8 +3686,7 @@ with tab_config:
         st.markdown("#### 🐙 Connexion Bitbucket / KISCloud")
         env_values["BITBUCKET_URL"] = st.text_input("BITBUCKET_URL", value=os.getenv("BITBUCKET_URL", ""),
                                                     help="Ex: https://git.kiscloud.io")
-        env_values["BITBUCKET_HTTP_TOKEN"] = st.text_input("BITBUCKET_HTTP_TOKEN", value=os.getenv("BITBUCKET_HTTP_TOKEN", ""),
-                                                           type="password",
+        env_values["BITBUCKET_HTTP_TOKEN"] = secret_input("BITBUCKET_HTTP_TOKEN",
                                                            help="Jeton d'accès HTTP personnel Bitbucket (lecture des dépôts).")
         env_values["REVIEW_PROJECTS"] = st.text_input(
             "REVIEW_PROJECTS", value=os.getenv("REVIEW_PROJECTS", ""), placeholder="OXY, APPAREL",
@@ -3681,8 +3698,7 @@ with tab_config:
         env_values["JENKINS_URL"] = st.text_input("JENKINS_URL", value=os.getenv("JENKINS_URL", ""),
                                                   help="Ex: https://jenkins.kiscloud.io")
         env_values["JENKINS_USER"] = st.text_input("JENKINS_USER", value=os.getenv("JENKINS_USER", ""))
-        env_values["JENKINS_API_TOKEN"] = st.text_input("JENKINS_API_TOKEN", value=os.getenv("JENKINS_API_TOKEN", ""),
-                                                        type="password")
+        env_values["JENKINS_API_TOKEN"] = secret_input("JENKINS_API_TOKEN")
         with st.container(horizontal=True):
             env_values["MAVEN_REPOSITORY_URL"] = st.text_input(
                 "MAVEN_REPOSITORY_URL", value=os.getenv("MAVEN_REPOSITORY_URL", ""),
@@ -3690,8 +3706,8 @@ with tab_config:
                      "publication, comparée aux commits des tâches, dit quel code a été testé.")
             env_values["MAVEN_REPOSITORY_USER"] = st.text_input(
                 "MAVEN_REPOSITORY_USER", value=os.getenv("MAVEN_REPOSITORY_USER", ""))
-            env_values["MAVEN_REPOSITORY_PASSWORD"] = st.text_input(
-                "MAVEN_REPOSITORY_PASSWORD", value=os.getenv("MAVEN_REPOSITORY_PASSWORD", ""), type="password")
+            env_values["MAVEN_REPOSITORY_PASSWORD"] = secret_input(
+                "MAVEN_REPOSITORY_PASSWORD")
         env_values["JENKINS_CUCUMBER_JOB"] = st.text_input("JENKINS_CUCUMBER_JOB", value=os.getenv("JENKINS_CUCUMBER_JOB", ""),
                                                            help="Job pré-rempli après génération d'un patch. "
                                                                 "Ex: ODATIO_CUCUMBER_NIGHTLY")
@@ -3926,8 +3942,8 @@ with tab_config:
                  "masqués) et donnée au correcteur, sans export ni réimport manuel. Vide : non utilisé.").strip()
         st.markdown("**Logs de l'environnement de test dans groundcover** (lecture seule)")
         with st.container(horizontal=True):
-            env_values["GROUNDCOVER_API_KEY"] = st.text_input(
-                "GROUNDCOVER_API_KEY", value=os.getenv("GROUNDCOVER_API_KEY", ""), type="password",
+            env_values["GROUNDCOVER_API_KEY"] = secret_input(
+                "GROUNDCOVER_API_KEY",
                 help="Clé d'API groundcover (Settings → Access → API Keys), de préférence d'un compte en lecture "
                      "seule.").strip()
             env_values["GROUNDCOVER_BACKEND_ID"] = st.text_input(
@@ -3977,9 +3993,8 @@ with tab_config:
             help="Dossier de configuration de Claude Code du compte à utiliser (abonnement Pro / Max / Team). "
                  "Proposés : ~/.claude et ~/.claude-* du poste ; saisissez un autre chemin si besoin. "
                  "Pour connecter un nouveau compte : CLAUDE_CONFIG_DIR=<dossier> puis `claude auth login`.")
-        env_values["ANTHROPIC_API_KEY"] = st.text_input(
-            "ANTHROPIC_API_KEY (Laissez vide pour utiliser le compte Claude ci-dessus)",
-            value=os.getenv("ANTHROPIC_API_KEY", ""), type="password",
+        env_values["ANTHROPIC_API_KEY"] = secret_input(
+            "ANTHROPIC_API_KEY", label="ANTHROPIC_API_KEY (Laissez vide pour utiliser le compte Claude ci-dessus)",
             help="Renseignée, la clé API est utilisée à la place du compte Claude.")
 
         st.markdown("---")
@@ -4044,7 +4059,7 @@ with tab_config:
         env_values["DB_NAME"] = st.text_input("DB_NAME (base, ou service name Oracle)", value=os.getenv("DB_NAME", ""))
         with st.container(horizontal=True):
             env_values["DB_USER"] = st.text_input("DB_USER", value=os.getenv("DB_USER", ""))
-            env_values["DB_PASSWORD"] = st.text_input("DB_PASSWORD", value=os.getenv("DB_PASSWORD", ""), type="password")
+            env_values["DB_PASSWORD"] = secret_input("DB_PASSWORD")
         env_values["DB_SCHEMA"] = st.text_input(
             "DB_SCHEMA (valeur par défaut)", value=os.getenv("DB_SCHEMA", ""),
             help="Pré-remplit le champ « Schéma BDD cible » de l'onglet Lancement."
@@ -4071,8 +4086,7 @@ with tab_config:
                                                        value=os.getenv("CUCUMBER_DB_NAME", ""))
         with st.container(horizontal=True):
             env_values["CUCUMBER_DB_USER"] = st.text_input("CUCUMBER_DB_USER", value=os.getenv("CUCUMBER_DB_USER", ""))
-            env_values["CUCUMBER_DB_PASSWORD"] = st.text_input("CUCUMBER_DB_PASSWORD", type="password",
-                                                               value=os.getenv("CUCUMBER_DB_PASSWORD", ""))
+            env_values["CUCUMBER_DB_PASSWORD"] = secret_input("CUCUMBER_DB_PASSWORD")
         env_values["CUCUMBER_DB_SCHEMA"] = st.text_input(
             "CUCUMBER_DB_SCHEMA (valeur par défaut)", value=os.getenv("CUCUMBER_DB_SCHEMA", ""),
             help="Pré-remplit le champ « Schéma BDD » de l'onglet Cucumber.")
@@ -4082,7 +4096,7 @@ with tab_config:
             for key, default, kind in (("CLIENT_SOURCE_DB_HOST", "", "default"), ("CLIENT_SOURCE_DB_PORT", "", "default"),
                                        ("CLIENT_SOURCE_DB_NAME", "", "default"), ("CLIENT_SOURCE_DB_USER", "", "default"),
                                        ("CLIENT_SOURCE_DB_PASSWORD", "", "password")):
-                env_values[key] = st.text_input(key, value=os.getenv(key, default), type=kind)
+                env_values[key] = secret_input(key) if kind == "password" else                     st.text_input(key, value=os.getenv(key, default))
         with st.container(horizontal=True):
             env_values["PG_BIN_DIR"] = st.text_input(
                 "PG_BIN_DIR", value=os.getenv("PG_BIN_DIR", ""), placeholder=r"C:\Program Files\PostgreSQL\16\bin",

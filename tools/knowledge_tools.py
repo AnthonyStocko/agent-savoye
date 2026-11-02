@@ -69,7 +69,14 @@ def enabled() -> bool:
 
 
 def author() -> str:
-    """Auteur des documents : AGENT_KNOWLEDGE_AUTHOR, à défaut l'utilisateur système."""
+    """
+    Auteur tracé (documents partagés, décisions, bilans, journal) : l'utilisateur connecté si la connexion OIDC est
+    active (auth_tools), sinon AGENT_KNOWLEDGE_AUTHOR, à défaut l'utilisateur système.
+    """
+    from tools import auth_tools
+    connected = auth_tools.current_author()
+    if connected:
+        return connected
     configured = os.getenv("AGENT_KNOWLEDGE_AUTHOR", "").strip()
     if configured:
         return configured
