@@ -1658,6 +1658,12 @@ def a_revoir_tag() -> str:
     return tag if tag.startswith("@") else "@" + tag
 
 
+def disabled_tags(tags, disabled: str = "") -> list:
+    """Tags de désactivation parmi `tags` : le tag générique et ses variantes écrites par un lot (@A_REVOIR_ENV…)."""
+    disabled = (disabled or a_revoir_tag()).upper()
+    return [t for t in tags if t.upper() == disabled or t.upper().startswith(disabled + "_")]
+
+
 def runner_tag_expression(expressions) -> str:
     """Expression de tags effective d'un runner (filtres combinés par « and »), '' sans filtre."""
     expressions = [e for e in expressions or [] if e.strip()]

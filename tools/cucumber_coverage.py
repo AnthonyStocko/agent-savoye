@@ -176,19 +176,27 @@ def _disabled_in(text: str, rel: str, tag: str) -> dict:
 
 
 def import_results(client_name: str) -> dict:
-    """Dernier résultat de chaque scénario dans les imports analysés : {id: {statut, nature, motif, import, date}}."""
+    """
+    Dernier résultat de chaque scénario dans les imports analysés : {id: {statut, nature, motif, import, date,
+    complet}} ; `complet` : son résultat au dernier RUN COMPLET de la suite (même forme), absent sinon.
+    """
     results = {}
     index = cucumber_import.load_index(client_name)
+    client_tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name)).get(
+        "tag_client", "") if client_name else ""
     for entry in sorted(index.get("imports", []), key=lambda e: e["numero"]):
         analysis = _read_json(os.path.join(cucumber_import.imports_dir(client_name), str(entry["numero"]),
                                            "analyse.json"), {}) or {}
         # Run non analysé ou initialisation en échec : aucun scénario n'y est jugé
         if analysis.get("non_analyse") or analysis.get("init_en_echec"):
             continue
+        full = cucumber_import.full_run(analysis, client_tag or "")
         for identifier, r in (analysis.get("resultats") or {}).items():
-            results[identifier] = {"statut": r.get("statut", ""), "nature": r.get("nature", ""),
-                                   "motif": r.get("message", ""), "import": entry["numero"],
-                                   "date": entry.get("date", "")}
+            result = {"statut": r.get("statut", ""), "nature": r.get("nature", ""), "motif": r.get("message", ""),
+                      "import": entry["numero"], "date": entry.get("date", "")}
+            previous = (results.get(identifier) or {}).get("complet")
+            results[identifier] = {**result, **({"complet": result} if full else
+                                                {"complet": previous} if previous else {})}
     return results
 
 
@@ -207,16 +215,32 @@ def verified_results(state: dict) -> dict:
 def scenario_status(identifier: str, sources: dict) -> dict:
     """
     État d'un scénario : {id, etat (vert | echec | desactive | non_execute), faible, cause, nature, derniere,
-    audit, audit_motifs}. Ordre : désactivé dans le worktree, dernier import, vérification du lot ; verdict du
-    dernier audit joint.
+    audit, audit_motifs}. Ordre : mis de côté par l'utilisateur, dernier RUN COMPLET (il l'emporte sur toute
+    vérification isolée, plus ancienne ou plus récente, et sur une désactivation par l'agent que le run a
+    exécutée), désactivé dans le worktree, dernier import, vérification du lot ; verdict du dernier audit joint.
+    Vert seul mais rouge en run complet : « en échec (dépendance entre tests) ».
     """
     audited = (sources.get("audit") or {}).get(identifier) or {}
     out = {"id": identifier, "etat": "non_execute", "faible": False, "cause": "", "nature": "", "derniere": "",
            "audit": audited.get("verdict", ""), "audit_motifs": audited.get("motifs") or []}
-    if identifier in sources["desactives"]:
+    if identifier in (sources.get("mis_de_cote") or ()) and identifier in sources["desactives"]:
         return {**out, "etat": "desactive", "cause": sources["desactives"][identifier]}
     imported = sources["imports"].get(identifier)
     verified = sources["verifies"].get(identifier)
+    full = (imported or {}).get("complet")
+    if full:
+        where = f"run complet, import n° {full['import']} du {full['date'][:10]}"
+        if full["statut"] == "passe":
+            return {**out, "etat": "vert", "nature": full["nature"], "derniere": where}
+        green = [f"vérification du lot {verified['lot']}"] if verified and verified["statut"] in _GREEN else []
+        green += [f"import n° {imported['import']}"] if imported["statut"] == "passe" else []
+        cause = full["motif"] or "échec sans message"
+        if green:
+            cause = f"en échec (dépendance entre tests) : vert seul ({', '.join(green)}) — {cause}"
+        return {**out, "etat": "echec", "cause": cause, "nature": "dependance" if green else full["nature"],
+                "derniere": where}
+    if identifier in sources["desactives"]:
+        return {**out, "etat": "desactive", "cause": sources["desactives"][identifier]}
     # Vérifié par l'agent APRÈS le dernier run importé (correction de ce run) : c'est l'état le plus récent
     newer = bool(imported and verified and verified["statut"] not in _NOT_RUN
                  and (verified.get("date") or "") > (imported.get("date") or "~"))
@@ -517,6 +541,7 @@ def coverage_sources(client_name: str, state: dict) -> dict:
     """Résultats croisés une fois pour toutes les lignes : imports, vérifications, scénarios désactivés."""
     return {"imports": import_results(client_name), "verifies": verified_results(state),
             "desactives": disabled_scenarios(worktree_dir(client_name)),
+            "mis_de_cote": {e.get("id") for e in state.get("mis_de_cote") or []},
             "audit": cucumber_audit.load_audit(client_name).get("scenarios") or {},
             "existants": cucumber_links.current_links(client_name) if client_name else {}}
 

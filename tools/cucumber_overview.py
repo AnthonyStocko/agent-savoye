@@ -20,19 +20,34 @@ def _scenario_title(identifier: str) -> str:
     return identifier.split("::", 1)[-1]
 
 
-def failing(rows: list) -> list:
-    """Scénarios en échec (une ligne par scénario, ses fonctionnalités jointes), le plus récent d'abord."""
+def _failing_item(scenario: dict) -> dict:
+    return {"id": scenario["id"], "scenario": _scenario_title(scenario["id"]),
+            "feature": scenario["id"].split("::", 1)[0].rsplit("/", 1)[-1], "fonctionnalites": [],
+            "raison": scenario.get("cause") or "échec sans message", "constate": scenario.get("derniere", "")}
+
+
+def failing(rows: list, sources: dict = None) -> list:
+    """
+    Scénarios en échec (une ligne par scénario, ses fonctionnalités jointes), le plus récent d'abord. `sources`
+    (coverage_sources) : les échecs importés rattachés à aucune fonctionnalité sont listés aussi — un échec du run
+    n'est jamais absent de l'écran.
+    """
     found = {}
     for row in rows:
         for scenario in row.get("scenarios") or []:
             if scenario["etat"] != "echec":
                 continue
-            item = found.setdefault(scenario["id"], {"id": scenario["id"], "scenario": _scenario_title(scenario["id"]),
-                                                     "feature": scenario["id"].split("::", 1)[0].rsplit("/", 1)[-1],
-                                                     "fonctionnalites": [], "raison": scenario.get("cause") or
-                                                     "échec sans message", "constate": scenario.get("derniere", "")})
+            item = found.setdefault(scenario["id"], _failing_item(scenario))
             if row["titre"] not in item["fonctionnalites"]:
                 item["fonctionnalites"].append(row["titre"])
+    imports = (sources or {}).get("imports") or {}
+    last = max((r["import"] for r in imports.values()), default=None)
+    for identifier, imported in imports.items():
+        # Scénarios du dernier run importé seulement : un scénario supprimé depuis un ancien run ne revient pas
+        if identifier not in found and imported["import"] == last:
+            scenario = cucumber_coverage.scenario_status(identifier, sources)
+            if scenario["etat"] == "echec":
+                found[identifier] = _failing_item(scenario)
     return sorted(found.values(), key=lambda i: (i["constate"], i["id"]), reverse=True)
 
 

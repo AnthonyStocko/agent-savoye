@@ -129,5 +129,22 @@
         ]
       }
     }
+  ],
+  "runs": [
+    {
+      "console": "11-build-241-run-complet.console.txt",
+      "source": "réel anonymisé (secrets, URL, hôtes, courriels, nom du client) : build 241, run complet de la suite après les corrections de l'agent — 19 échecs contre 17 au build 226",
+      "tag_client": "@CLIENT",
+      "tests": 71,
+      "failures": 10,
+      "errors": 9,
+      "echecs_lus": 19,
+      "run_complet": true,
+      "natures": {
+        "Réinitialisation de la règle MoveStocktakingHandlingUnit": "chemin_fichier",
+        "Contrôle qualité refusé car des lignes de l'UP ne sont pas préparées": "donnee_non_idempotente",
+        "Colisage déclaratif : lignes consolidées de l'UP avec le produit": "donnee_non_idempotente"
+      }
+    }
   ]
 }

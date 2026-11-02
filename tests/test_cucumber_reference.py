@@ -33,3 +33,23 @@ def test_reference_answer(case):
         f"{case['cas']} : {got}"
     missing = [w for w in expected["cause_contient"] if w.lower() not in got["cause"].lower()]
     assert not missing, f"{case['cas']} : cause « {got['cause']} » sans {missing}"
+
+
+RUNS = json.load(open(os.path.join(REFERENCE, "attendus.json"), encoding="utf-8")).get("runs") or []
+
+
+@pytest.mark.parametrize("run", RUNS, ids=[r["console"].split(".")[0] for r in RUNS])
+def test_reference_full_run(run):
+    """Console réelle d'un run complet : chaque échec compté par Surefire est lu, classé, et sans écart."""
+    with open(os.path.join(REFERENCE, run["console"]), encoding="utf-8") as f:
+        console = f.read()
+    facts = cucumber_import.console_facts(console)
+    assert facts["tests"] == {"executes": run["tests"], "echecs": run["failures"], "erreurs": run["errors"],
+                              "ignores": 0}
+    assert cucumber_import.full_run({"console": facts}, run["tag_client"]) is run["run_complet"]
+    failures = {key: r for key, r in cucumber_import.console_results(console).items() if r["statut"] != "passe"}
+    assert len(failures) == run["echecs_lus"] and cucumber_import.console_gap(facts, failures) == ""
+    natures = {title: cucumber_failures.classify(r)["nature"] for (_, title), r in failures.items()}
+    assert all(cucumber_failures.classify(r)["categorie"] in cucumber_failures.CATEGORIES for r in failures.values())
+    for title, nature in run["natures"].items():
+        assert natures[title] == nature, f"{title} : {natures[title]}"

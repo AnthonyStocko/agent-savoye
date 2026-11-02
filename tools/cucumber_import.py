@@ -24,13 +24,14 @@ import os
 import re
 from datetime import datetime, timezone
 
-from tools import (cucumber_decisions, cucumber_failures, cucumber_profile, cucumber_server_logs, db_tools,
-                   groundcover_tools, jenkins_tools)
+from tools import (cucumber_data_rules, cucumber_decisions, cucumber_failures, cucumber_profile,
+                   cucumber_server_logs, db_tools, groundcover_tools, jenkins_tools)
 from tools.cucumber_diagnostic import TEMP_PREFIX
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
-from tools.cucumber_tools import _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag, cache_dir
-from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _duration, _step_outputs, _timestamp, expected_count,
+from tools.cucumber_tools import _git, _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag, cache_dir
+from tools.cucumber_verify import (CAUSE_LABELS, _LOG_STAMP, _duration, _step_outputs, _timestamp, all_verified,
+                                   expected_count,
                                    failure_category, failure_kind, feature_texts, log_coverage, log_request,
                                    parse_cucumber_report, report_rel, report_test_count, scenario_id, selection_gap)
 
@@ -38,10 +39,11 @@ _JENKINS_STAMP = re.compile(r"^\[\d{4}-\d\d-\d\dT[\d:.]+Z\]\s?")
 _CONSOLE_MARK = re.compile(r"\[INFO\] (Scanning for projects|BUILD|Building )|Launching Cucumber|Tests run:|"
                            r"^\s*(\[[^\]]+\]\s*)?Scenario:", re.M)
 _PRETTY_SCENARIO = re.compile(r"^\s*(?:Scenario Outline|Scenario|Scénario|Plan du scénario|Example)\s*:\s*(.+?)\s+#\s+"
-                              r"(src/\S+?\.feature):\d+\s*$")
+                              r"(src/\S+?\.feature):(\d+)\s*$")
 _SUREFIRE_FAILURE = re.compile(r"\[ERROR\]\s+(.+?)\s+--\s+Time elapsed:.*<<<\s*(?:FAILURE|ERROR)!")
-_STEP_AT = re.compile(r"at ✽\.(.+?)\(file:.*?/(src/test/resources/cucumber/features/.+?\.feature):\d+\)")
-_TESTS_RUN = re.compile(r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)")
+_STEP_AT = re.compile(r"at ✽\.(.+?)\(file:.*?/(src/test/resources/cucumber/features/.+?\.feature):(\d+)\)")
+# « ****s run » : console importée avant le masquage par mot entier d'un identifiant court (« Test »)
+_TESTS_RUN = re.compile(r"(?:Tests|\*{4}s) run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)")
 # Valeur entre guillemets, sinon jusqu'à un guillemet, une option suivante (« -X ») ou la fin de la ligne
 _FILTER_TAGS = re.compile(r"cucumber\.filter\.tags=(?:\"([^\"]+)\"|'([^']+)'|([^\"'\n]+?)(?=[\"']|\s+-|\s*$))", re.M)
 _BUILD_NUMBER = re.compile(r"(?:Build|build)\s*#\s*(\d+)|/job/[^\s]+?/(\d+)/")
@@ -85,14 +87,18 @@ def console_results(text: str) -> dict:
     Cucumber (« Scenario: <titre> # <feature>:<ligne> »), échecs du résumé Maven Surefire (« [ERROR] <feature>.<titre>
     -- … <<< FAILURE! », exception, « at ✽.<step>(…<feature>:<ligne>) »). {(feature, titre): résultat au format de
     parse_cucumber_report} ; {} si la console ne montre pas les scénarios.
+    Chaque en-tête Surefire en échec donne un résultat : nom « <feature>.<titre> », ou « <fin de la feature>.<titre>(
+    <début de la feature> » quand le nom de la feature contient une parenthèse ; à défaut de titre reconnu, le
+    scénario est celui qui contient la ligne du step en échec (« at ✽.<step>(…<feature>:<ligne>) »).
     """
-    lines = [_unstamped(line) for line in text.splitlines()]
-    scenarios = {}
+    lines = [_unstamped(line) for line in text.replace("\r", "").splitlines()]
+    scenarios, starts = {}, {}
     for line in lines:
         match = _PRETTY_SCENARIO.match(line)
         if match:
-            scenarios.setdefault((match.group(2), match.group(1).strip()), {
-                "statut": "passe", "step": "", "phase": "", "message": ""})
+            key = (match.group(2), match.group(1).strip())
+            scenarios.setdefault(key, {"statut": "passe", "step": "", "phase": "", "message": ""})
+            starts.setdefault(match.group(2), []).append((int(match.group(3)), key))
     for index, line in enumerate(lines):
         failure = _SUREFIRE_FAILURE.search(line)
         if not failure:
@@ -106,10 +112,16 @@ def console_results(text: str) -> dict:
         error = "\n".join(b for b in block if b.strip())
         step_match = next((m for m in map(_STEP_AT.search, block) if m), None)
         path = step_match.group(2) if step_match else ""
-        candidates = [key for key in scenarios if name.endswith("." + key[1]) or name == key[1]]
+        candidates = [key for key in scenarios if name.endswith("." + key[1]) or name == key[1]
+                      or f".{key[1]}(" in name]
         key = next((k for k in candidates if k[0] == path), candidates[0] if candidates else None)
+        if step_match and (key is None or key[0] != path):
+            # Scénario du fichier qui commence au plus près avant la ligne du step en échec
+            before = [s for s in starts.get(path, []) if s[0] <= int(step_match.group(3))]
+            key = max(before)[1] if before else key
         if key is None:
-            continue
+            # Ni titre ni ligne reconnus : l'échec est gardé sous le nom Surefire, jamais perdu
+            key = (path, re.split(r"\(", name.rsplit(".", 1)[-1], maxsplit=1)[0].strip() or name)
         nature, exception = failure_kind(error)
         message = next((b.strip() for b in block if b.strip() and not b.strip().startswith("at ")), "")
         scenarios[key] = {"statut": "echoue", "step": step_match.group(1) if step_match else "", "phase": "",
@@ -129,6 +141,114 @@ def console_facts(text: str) -> dict:
             "patch_non_applicable": "PATCH_NON_APPLICABLE" in text,
             "tests": dict(zip(("executes", "echecs", "erreurs", "ignores"), map(int, tests[-1]))) if tests else {},
             "debut": f"{first.group(1)}T{first.group(2)}" if first else ""}
+
+
+def full_run(analysis: dict, client_tag: str = "") -> bool:
+    """
+    Run complet de la suite active : la sélection de tags lancée se réduit au tag client (exclusions « not @… »
+    admises) ou est absente, et ne vise aucun lot de l'agent (@agent_…). Inconnu (rapport JSON sans console) : False.
+    """
+    if "run_complet" in analysis:
+        return bool(analysis["run_complet"])
+    facts = analysis.get("console") or {}
+    if not facts:
+        return False
+    included = re.findall(r"@[\w.-]+", re.sub(r"\bnot\s+@[\w.-]+", "", facts.get("tags") or ""))
+    if any(t.lower().startswith("@agent_") for t in included):
+        return False
+    return not included or (bool(client_tag) and {t.lower() for t in included} == {client_tag.lower()})
+
+
+SHARED_MAX = 3
+_DATA_CODE = re.compile(r"(?<![\w-])(?:[A-Z][A-Z0-9]*-)+[A-Z0-9]*\d[A-Z0-9]*(?:-[A-Z0-9]+)*(?![\w-])")
+
+
+def _feature_codes(text: str) -> set:
+    """Codes de données d'une feature (OP, UM, fichiers : « TOW-730 », « CIN-TOW-730 »), hors commentaires et tags."""
+    return set(_DATA_CODE.findall("\n".join(line for line in text.splitlines()
+                                            if not line.strip().startswith(("#", "@")))))
+
+
+def shared_data(worktree: str, rels, init_features=()) -> dict:
+    """
+    Règle « données uniques par feature » : {feature: [{code, features}]} des codes de données que chaque feature
+    de `rels` partage avec une autre feature du dépôt. Exclus : codes des features d'init (références communes
+    voulues) et clés de tickets citées en tag.
+    """
+    if not worktree or not os.path.isdir(worktree):
+        return {}
+    codes, tickets = {}, set()
+    for rel in _git(worktree, "ls-files", "-co", "--exclude-standard", "--", "*.feature").stdout.splitlines():
+        text = _read_text_file(os.path.join(worktree, *rel.split("/")))
+        codes[rel] = _feature_codes(text)
+        tickets.update(t.lstrip("@") for t in re.findall(r"@[\w.-]+", text))
+    common = set().union(*(codes.get(rel, set()) for rel in init_features)) | tickets
+    out = {}
+    for rel in dict.fromkeys(rels):
+        found = [{"code": code, "features": sorted(other.rsplit("/", 1)[-1] for other, theirs in codes.items()
+                                                   if other != rel and other not in init_features and code in theirs)}
+                 for code in sorted(codes.get(rel, set()) - common)]
+        # Code repris par SHARED_MAX autres features ou plus : référence commune (site, donneur d'ordres, poste)
+        out[rel] = [f for f in found if 0 < len(f["features"]) < SHARED_MAX]
+    return {rel: found for rel, found in out.items() if found}
+
+
+def feature_codes(worktree: str, rel: str) -> list:
+    """Codes de données écrits dans la feature elle-même (ce qu'elle crée ou lit), triés."""
+    path = os.path.join(worktree, *rel.split("/")) if worktree and rel else ""
+    return sorted(_feature_codes(_read_text_file(path))) if path and os.path.exists(path) else []
+
+
+def isolated_greens(state: dict) -> dict:
+    """Scénarios vérifiés verts par une exécution isolée de l'agent : {id: « lot N »} (le plus récent)."""
+    out = {}
+    for item in sorted(all_verified(state), key=lambda i: i["lot"]):
+        if item.get("id") and item.get("statut") in ("pertinent", "faible"):
+            out[item["id"]] = f"lot {item['lot']}"
+    return out
+
+
+def run_contexts(results: dict, state: dict, worktree: str, init_features=(), full: bool = False,
+                 client_name: str = "") -> dict:
+    """
+    Contexte de chaque échec (classify) : codes de données de sa feature, données partagées avec d'autres features
+    (règle « données uniques par feature »), contrôles statiques de sa feature (fichier lu absent, création non
+    rejouable, code jamais créé : cucumber_data_rules) et, dans un RUN COMPLET, dépendance entre tests si le
+    scénario a été vérifié vert seul par l'agent.
+    """
+    failures = [i for i, r in results.items() if r.get("statut") != "passe"]
+    greens = isolated_greens(state) if full else {}
+    shared = shared_data(worktree, [i.split("::", 1)[0] for i in failures], init_features)
+    checks = cucumber_data_rules.feature_checks(worktree, sorted({i.split("::", 1)[0] for i in failures}),
+                                                client_name)
+    out = {}
+    for identifier in failures:
+        own = feature_codes(worktree, identifier.split("::", 1)[0])
+        context = {"codes_feature": own} if own else {}
+        if checks.get(identifier.split("::", 1)[0]):
+            context["controles"] = checks[identifier.split("::", 1)[0]]
+        if identifier in greens:
+            context["dependance"] = f"vert seul ({greens[identifier]}) mais rouge en run complet"
+        if shared.get(identifier.split("::", 1)[0]):
+            context["donnees_partagees"] = shared[identifier.split("::", 1)[0]]
+        if context:
+            out[identifier] = context
+    return out
+
+
+def console_gap(facts: dict, failures: dict) -> str:
+    """
+    Contrôle automatique : échecs lus scénario par scénario face au total Surefire de la console (Failures +
+    Errors). '' si égaux ou total absent ; sinon le message d'écart, affiché en erreur.
+    """
+    tests = (facts or {}).get("tests") or {}
+    if not tests:
+        return ""
+    expected = tests.get("echecs", 0) + tests.get("erreurs", 0)
+    if expected == len(failures):
+        return ""
+    return (f"écart console / analyse : la console compte {expected} échec(s) (Failures {tests.get('echecs', 0)} + "
+            f"Errors {tests.get('erreurs', 0)}), l'analyse en lit {len(failures)} — erreur de l'agent, à signaler")
 
 
 def run_start(report: list, facts: dict) -> str:
@@ -668,6 +788,19 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
             console_init_failure(results, *init_markers(client_name))
         out["avertissements"] = log_warnings([(f["nom"], f["texte"]) for f in files if f["type"] == "logs"],
                                              failures)
+        # Contrôle automatique : chaque échec compté par la console a son résultat dans l'analyse
+        out["ecart_console"] = "" if report else console_gap(facts, failures)
+        if out["ecart_console"]:
+            out["avertissements"].insert(0, out["ecart_console"])
+        client_tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name)).get("tag_client")
+        out["run_complet"] = full_run({"console": facts}, client_tag or "")
+        # Créations refusées en doublon (« existe déjà ») relevées dans la console : contrôle d'idempotence
+        learned = cucumber_data_rules.learn_from_console(client_name, console, worktree) if console else {}
+        if any(learned.values()):
+            out["avertissements"].append("créations qui refusent un doublon relevées dans la console : "
+                                         + ", ".join(learned["evenements"] + learned["steps"]))
+        contexts = run_contexts(results, state, worktree, init_markers(client_name)[0], out["run_complet"],
+                                client_name)
         if server["erreur"]:
             out["avertissements"].append(f"logs groundcover non lus : {server['erreur']}")
         for identifier, result in list(failures.items())[:30]:
@@ -692,10 +825,15 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         evidence = {e["id"]: e["preuves"] for e in out["logs"] if e.get("preuves")}
         extras = {i: {k: v for k, v in (("diagnostic", out["diagnostics"].get(i, "")),
                                         ("preuves", evidence.get(i, [])),
-                                        ("refus", cucumber_decisions.refused_comments(client_name, i))) if v}
+                                        ("refus", cucumber_decisions.refused_comments(client_name, i)),
+                                        ("dependance", (contexts.get(i) or {}).get("dependance", "")),
+                                        ("donnees_partagees", (contexts.get(i) or {}).get("donnees_partagees")),
+                                        ("controles", (contexts.get(i) or {}).get("controles")))
+                      if v}
                   for i in failures}
         # Un résultat explicite par échec (cucumber_failures) ; ceux déjà traités par une correction sont gardés
-        out["echecs"] = failure_results(client_name, numero, results, out["init_en_echec"], state, worktree)
+        out["echecs"] = failure_results(client_name, numero, results, out["init_en_echec"], state, worktree,
+                                        contexts)
         if not out["init_en_echec"]:
             out["propositions"], out["a_prouver"] = correction_proposals(
                 failures, state, extras, db_tools.is_db_configured("cucumber"),
@@ -706,7 +844,8 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
     return out
 
 
-def failure_results(client_name: str, numero: int, results: dict, init: dict, state: dict, worktree: str) -> list:
+def failure_results(client_name: str, numero: int, results: dict, init: dict, state: dict, worktree: str,
+                    contexts: dict = None) -> list:
     """
     Résultat explicite de chaque échec du run (cucumber_failures.failure_results) : propriétaire jugé sur le
     worktree et la branche de base, désactivation proposée (patch) pour un défaut du produit, résultats déjà
@@ -715,7 +854,7 @@ def failure_results(client_name: str, numero: int, results: dict, init: dict, st
     base = state.get("base", "")
     is_owned = (lambda rel: cucumber_failures.owned(worktree, base, rel)) if worktree and os.path.isdir(worktree) \
         else None
-    items = cucumber_failures.failure_results(results, init, is_owned)
+    items = cucumber_failures.failure_results(results, init, is_owned, contexts=contexts)
     previous = {e["id"]: e for e in (_read_json(cucumber_failures.analysis_path(imports_dir(client_name), numero),
                                                 {}) or {}).get("echecs") or [] if e.get("statut") == "traite"}
     folder = os.path.join(imports_dir(client_name), str(numero))
@@ -802,8 +941,16 @@ def already_fixed(state: dict, numero) -> set:
 
 
 def remaining_proposals(state: dict, analysis: dict) -> list:
-    """Propositions d'une analyse sans les scénarios déjà corrigés et vérifiés verts (relance d'une correction)."""
-    done, out = already_fixed(state, analysis.get("numero")), []
+    """
+    Propositions d'une analyse sans les scénarios déjà corrigés (relance d'une correction). Run complet : un vert
+    isolé de l'agent ne vaut pas correction (seul le prochain run complet tranche) ; seuls les échecs déjà traités
+    par un lot de correction de ce run sont écartés.
+    """
+    if full_run(analysis):
+        done = {e["id"] for e in analysis.get("echecs") or [] if e.get("statut") == "traite"}
+    else:
+        done = already_fixed(state, analysis.get("numero"))
+    out = []
     for proposal in analysis.get("propositions") or []:
         scenarios = [s for s in proposal["scenarios"] if s.get("id") not in done]
         if scenarios:

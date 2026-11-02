@@ -33,6 +33,9 @@ TELLTALE_PATTERNS = (
 # Variables de configuration dont la valeur est un secret
 _SECRET_ENV_NAME = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)$", re.I)
 MIN_ENV_SECRET_LEN = 6
+# Valeur courte (ex. -DuserName='Test') : masquée seulement comme mot entier, jamais au milieu d'un autre mot
+# (« Tests run: » doit rester lisible : il porte le total des échecs du run)
+SHORT_SECRET_LEN = 8
 # Valeurs secrètes lues pendant l'exécution (arguments d'un job Jenkins) : en mémoire seulement, jamais écrites
 _RUNTIME_SECRETS = set()
 
@@ -56,6 +59,15 @@ def _variants(value: str) -> set:
     return {v for v in out if len(v) >= 4}
 
 
+def _word(value: str):
+    return re.compile(r"(?<![\w])" + re.escape(value) + r"(?![\w])")
+
+
+def _contains(value: str, text: str) -> bool:
+    """Valeur présente dans le texte : comme mot entier si elle est courte (SHORT_SECRET_LEN)."""
+    return bool(_word(value).search(text)) if len(value) < SHORT_SECRET_LEN else value in text
+
+
 def mask_secrets(text: str) -> tuple:
     """(texte masqué, {type de secret: nombre}) : paramètres -D*password*, -DuserName, jetons, en-têtes
     Authorization, mots de passe d'URL ou de JSON, et toute autre occurrence de ces valeurs (base64 comprise)."""
@@ -70,8 +82,8 @@ def mask_secrets(text: str) -> tuple:
             return f"{match.group(1)}{quote}{MASK}{quote}"
         text = pattern.sub(replace, text)
     for value in sorted(values | _RUNTIME_SECRETS, key=len, reverse=True):
-        if value in text:
-            text = text.replace(value, MASK)
+        if _contains(value, text):
+            text = _word(value).sub(MASK, text) if len(value) < SHORT_SECRET_LEN else text.replace(value, MASK)
             if value in _RUNTIME_SECRETS:
                 counts["argument du job"] = counts.get("argument du job", 0) + 1
     return text, counts
@@ -110,6 +122,6 @@ def remaining_secrets(text: str, environ=None) -> list:
     for name, value in env_secrets(environ).items():
         if any(variant in (text or "") for variant in _variants(value)):
             found.append(("configuration", name))
-    if any(value in (text or "") for value in _RUNTIME_SECRETS):
+    if any(_contains(value, text or "") for value in _RUNTIME_SECRETS):
         found.append(("argument du job", "valeur lue dans la configuration du job"))
     return found

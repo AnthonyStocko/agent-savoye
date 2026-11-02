@@ -40,6 +40,11 @@ NATURES = {
     "regle_standard": "copier dans le dépôt client le fichier de règle du Standard que le test charge",
     "deploiement": "déployer le code testé, puis relancer (le test n'est pas modifié)",
     "configuration_partagee": "rendre le scénario autonome : poser dans son Background la configuration qu'il lit",
+    "dependance_tests": "rendre les données du scénario uniques à sa feature (vert seul, rouge en run complet)",
+    "donnee_propre": "corriger la création, dans le Background, de la donnée que la feature crée elle-même",
+    "donnee_non_idempotente": "rendre la création rejouable : suppression préalable, init du client ou code unique "
+                              "par exécution",
+    "donnee_non_creee": "créer dans la feature (Background) l'objet qu'elle utilise sans jamais le créer",
     "assertion": "corriger le scénario d'après l'écart constaté",
     "technique": "corriger le step, la colonne ou le fichier du test",
     "version": "écart de version entre la bibliothèque de steps et le serveur",
@@ -62,10 +67,16 @@ _EMPTY_CHOICES = re.compile(r"liste de choix vide|aucun choix (?:n'est )?disponi
 _CODE_LENGTH = re.compile(r"taille de la valeur.{0,200}trop grande|value too long|exceeds? (?:the )?max(?:imum)? length",
                           re.I)
 _DRAFT_REQUIRED = re.compile(r"La propri[ée]t[ée]\b.{0,120}\best requise", re.I)
-_STANDARD_RULE = re.compile(r"/cucumber/rules/[\w./'-]+\.json", re.I)
+# Règle du Standard : rules/<domaine du Standard>/… ; une règle sous rules/<client>/ est propre au client
+_STANDARD_RULE = re.compile(r"/cucumber/rules/(?:WMS|TMS|OMS|WES)/[\w./'-]+\.json")
 _FILE_MISSING = re.compile(r"FileNotFoundException|NoSuchFileException|No such file or directory", re.I)
+_DUPLICATE = re.compile(r"existe d[ée]j[àa]|already exists?|duplicate key", re.I)
 _VERSION = re.compile(r"No route found|has no field|Invalid path|UnrecognizedPropertyException|Unrecognized field",
                       re.I)
+
+
+def _cites(text: str, code: str) -> bool:
+    return bool(re.search(r"(?<![\w-])" + re.escape(code) + r"(?![\w-])", text))
 
 
 def _sentence(text: str, limit: int = 220) -> str:
@@ -91,6 +102,42 @@ def classify(result: dict) -> dict:
         return out("environnement", "deploiement", f"Le test vérifie un code pas encore déployé sur l'environnement "
                                                    f"({context['code_non_deploye']}).",
                    "Déployer la version qui contient ce code, puis relancer ; le test n'est pas modifié.")
+    # Contrôles statiques de la feature (cucumber_data_rules) : cause prouvée par le texte du dépôt
+    checks = context.get("controles") or {}
+    if _DUPLICATE.search(full):
+        return out("correction", "donnee_non_idempotente", "Donnée créée à chaque exécution et refusée en doublon : "
+                                                          + _sentence(message, 140)
+                   + (" — création dans le Background, rejouée avant chaque scénario."
+                      if any("Background" in e for e in checks.get("idempotence") or []) else ""),
+                   "Rendre la création rejouable : supprimer l'objet juste avant de le créer, le créer une seule fois "
+                   "dans l'init du client, ou un code unique par exécution (longueur maximale du modèle respectée).")
+    if checks.get("non_crees"):
+        codes = checks["non_crees"]
+        cited = [c for c in codes if _cites(full, c)] or codes
+        return out("correction", "donnee_non_creee", f"La feature utilise {', '.join(cited[:4])} sans jamais le "
+                                                     f"créer (ni Background, ni fichier de données, ni init du "
+                                                     f"client).",
+                   "Créer ces objets dans le Background de la feature (fichier de données ou step de création), "
+                   "avec des codes propres à la feature.")
+    if checks.get("fichiers") and _FILE_MISSING.search(full):
+        return out("correction", "chemin_fichier", f"Fichier lu absent du dépôt : {checks['fichiers'][0].split(' ', 1)[1]}.",
+                   "Créer le fichier au chemin attendu (dossier de la feature) ou corriger le nom dans le scénario.")
+    if context.get("dependance"):
+        shared = ", ".join(f"{d['code']} ({', '.join(d['features'][:2])})" for d in context.get("donnees_partagees")
+                           or [])
+        return out("correction", "dependance_tests", f"En échec (dépendance entre tests) : {context['dependance']}"
+                                                     + (f" ; données partagées avec d'autres features : {shared}"
+                                                        if shared else "") + ".",
+                   "Rendre uniques à la feature les données qu'elle crée (codes d'OP, d'UM, fichiers de données), "
+                   "sans dépendre de l'ordre des features ; le test reste en échec jusqu'au prochain run complet vert.")
+    shared = [d for d in context.get("donnees_partagees") or [] if _cites(full, d["code"])]
+    if shared:
+        return out("correction", "dependance_tests", "En échec (dépendance entre tests) : donnée partagée avec "
+                                                     "d'autres features : " + ", ".join(
+                                                         f"{d['code']} ({', '.join(d['features'][:2])})"
+                                                         for d in shared) + ".",
+                   "Rendre uniques à la feature les données qu'elle crée (codes d'OP, d'UM, fichiers de données), "
+                   "sans dépendre de l'ordre des features.")
     if context.get("configuration_partagee"):
         return out("correction", "configuration_partagee", f"Le scénario dépend d'une configuration partagée "
                                                            f"modifiée par une autre feature "
@@ -123,6 +170,12 @@ def classify(result: dict) -> dict:
                                                f"{_sentence(message, 140)}",
                    "Aligner la version de la bibliothèque de steps sur celle du serveur de l'environnement.")
     nature, _ = failure_kind(full)
+    own = [code for code in context.get("codes_feature") or [] if _cites(full, code)]
+    if own and nature in ("donnee_reference", "environnement"):
+        return out("correction", "donnee_propre", f"Donnée absente que la feature crée elle-même : "
+                                                  f"{', '.join(own[:3])} — sa création a échoué ou vient trop tard.",
+                   "Corriger la création de cette donnée dans le Background de la feature (fichier de données, "
+                   "ordre des steps), avec un code propre à la feature.")
     if nature == "champ_absent":
         return out("correction", "champ_non_renvoye", f"Le champ contrôlé est renvoyé vide (null) par le step "
                                                       f"« {step} ».",
@@ -162,11 +215,13 @@ def owned(worktree: str, base: str, fichier: str) -> bool:
                 and _git(worktree, "cat-file", "-e", f"{base}:{fichier}").returncode == 0)
 
 
-def failure_results(results: dict, init_failure: dict = None, is_owned=None, repo_label: str = "") -> list:
+def failure_results(results: dict, init_failure: dict = None, is_owned=None, repo_label: str = "",
+                    contexts: dict = None) -> list:
     """
     Résultats de chaque scénario en échec ({id: résultat} de l'analyse), dans l'ordre du run : classement,
     initialisation en échec (tout relève de l'environnement), cascades (catégorie de l'échec qui les cause),
-    scénarios hors du dépôt de l'agent.
+    scénarios hors du dépôt de l'agent. `contexts` : {id: contexte du run} lu par classify (dépendance entre
+    tests, données partagées).
     """
     failures = [(i, r) for i, r in results.items() if r.get("statut") != "passe"]
     out, by_file = [], {}
@@ -196,7 +251,8 @@ def failure_results(results: dict, init_failure: dict = None, is_owned=None, rep
             if root:
                 item["cause_de"] = root["id"]
         else:
-            item.update(classify(result))
+            item.update(classify({**result, "contexte": {**(result.get("contexte") or {}),
+                                                        **((contexts or {}).get(identifier) or {})}}))
         by_file.setdefault(fichier, []).append(item)
         out.append(item)
     return out

@@ -209,7 +209,8 @@ def build_bilan(client_name: str, analysis: dict, state: dict) -> dict:
              "corriges": fixed, "desactives": disabled(state), "doutes": doubts(state), "manuelles": manual,
              "a_prouver": analysis.get("a_prouver") or [], "diagnostics": analysis.get("diagnostics") or {},
              "decisions": cucumber_decisions.summary_lines(cucumber_decisions.load_decisions(client_name)),
-             "decisions_en_attente": len(cucumber_decisions.pending(client_name))}
+             "decisions_en_attente": len(cucumber_decisions.pending(client_name)),
+             "garde_fou": (state.get("garde_fou") or [])[-1:]}
     bilan["prochaine_action"] = next_action(analysis, bilan)
     return bilan
 
@@ -242,6 +243,15 @@ def bilan_markdown(bilan: dict, level: int = 2) -> str:
         init = bilan["init_en_echec"]
         lines.append(f"- ⛔ Initialisation en échec, aucun scénario jugé : {init['step'] or init['id']} — "
                      f"{init['message']}")
+    for guard in bilan.get("garde_fou") or []:
+        lines += ["", f"{section} Garde-fou de non-régression (corrections de l'import n° {guard['reference']})", "",
+                  f"- {'✅ Corrections livrées' if guard['ok'] else '⛔ Corrections annulées automatiquement'} : "
+                  f"{guard['motif']}"]
+        lines += [f"- Run {n} : " + (f"import n° {r['import']}, " if r.get("import") else "")
+                  + f"{r['avant']} → {r['apres'] if r['apres'] is not None else '?'} échec(s) — {r['motif']}"
+                  for n, r in enumerate(guard.get("runs") or [], 1)]
+        if guard.get("annules"):
+            lines.append(f"- Fichiers remis à leur état d'avant les corrections : {', '.join(guard['annules'][:10])}")
     lines += ["", f"{section} Défauts détectés dans le code spécifique ou le Studio : {len(bilan['defauts'])}", ""]
     for defect in bilan["defauts"]:
         lines += _defect_lines(defect)

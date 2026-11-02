@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools
-from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -2135,8 +2135,16 @@ def fix_client_tags(client: str, local_cucumber_std_repo: str) -> int:
     if not os.path.isdir(worktree) or not profile.get("tag_client"):
         print("[CUCUMBER] Correction impossible : aucune génération (worktree) ou tag client absent du profil.")
         return 2
-    changed = cucumber_checks.add_missing_client_tags(worktree, profile["features_root"], profile["tag_client"],
-                                                      cucumber_a_revoir.a_revoir_tag())
+    # Scénarios désactivés (tag générique ou variante @A_REVOIR_ENV…) : jamais le tag client sans preuve que la
+    # cause a disparu (une variante du tag n'était pas reconnue : scénarios « code non déployé » réactivés)
+    kept = cucumber_disabled.enforce_repo(worktree, cucumber_checks.client_feature_files(
+        worktree, profile["features_root"]), profile["tag_client"], cucumber_job.load_deployment(client),
+        state.get("base", ""))
+    for line in cucumber_disabled.summary(kept["actions"]):
+        print(f"[CUCUMBER] Désactivation : {line}")
+    changed = kept["fichiers"] + [f for f in cucumber_checks.add_missing_client_tags(
+        worktree, profile["features_root"], profile["tag_client"], cucumber_a_revoir.a_revoir_tag())
+        if f not in kept["fichiers"]]
     if changed:
         cucumber_tools._git(worktree, "add", "--", *changed)
         cucumber_tools._git(worktree, "commit", "-m", f"Cucumber: client tag {profile['tag_client']} on scenarios "
@@ -2237,6 +2245,17 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
                                                    context.get("conventions") or {})
         conventions = context.get("conventions") or {}
         present = [f for f in files if f.endswith(".feature") and os.path.exists(os.path.join(worktree, *f.split("/")))]
+        if conventions.get("client_tag"):
+            # Réactivation sans preuve que la cause (code non déployé…) a disparu : le scénario reste désactivé
+            kept = cucumber_disabled.enforce_repo(worktree, present, conventions["client_tag"],
+                                                  cucumber_job.load_deployment(client), base)
+            for line in cucumber_disabled.summary(kept["actions"]):
+                print(f"[LOT {label}] Désactivation : {line}")
+        # Données : rejouables d'une exécution à l'autre, créées avant d'être utilisées
+        errors += cucumber_data_rules.check_idempotent_creations(worktree, present,
+                                                                 cucumber_data_rules.not_idempotent(client),
+                                                                 context.get("init"))
+        errors += cucumber_data_rules.check_created_before_use(worktree, present, context.get("init"))
         if conventions.get("client_tag"):
             errors += cucumber_checks.check_client_tags(
                 {f: cucumber_tools._read_text_file(os.path.join(worktree, *f.split("/"))) for f in present},
@@ -2688,8 +2707,15 @@ def run_cucumber_import(client: str, paths: list, build_url: str = "", project: 
     if not imported["numero"]:
         print("[CUCUMBER IMPORT] Rien de nouveau à importer.")
         return 2
-    analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client),
-                                       cucumber_tools.worktree_dir(client))
+    state, worktree = cucumber_tools.load_state(client), cucumber_tools.worktree_dir(client)
+    if state.get("base") and os.path.isdir(worktree):
+        # Les contrôles des features en échec lisent l'état TESTÉ : espace de travail remis sur la branche lue par
+        # Jenkins (scénarios ajoutés ou déplacés hors de l'agent compris) ; sur un conflit, la branche l'emporte
+        subprocess.run(["git", "-C", worktree, "fetch", "-q", "origin"], capture_output=True)
+        problem = cucumber_failures.sync_with_branch(worktree, state["base"])
+        if problem:
+            print(f"[CUCUMBER IMPORT] ⚠️ Espace de travail non synchronisé avec {state['base']} : {problem}")
+    analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client), worktree)
     print_import(analysis)
     # Bilan (défauts en tête, corrigés, désactivés, doutes, corrections manuelles, prochaine action) : IHM,
     # A_REVOIR.md du worktree et répertoire partagé
@@ -2871,6 +2897,23 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
         lines += [f"  - extrait des logs serveur : {e}" for e in s.get("preuves") or []]
         lines += [f"  - sortie du diagnostic temporaire : {s['diagnostic']}"] if s.get("diagnostic") else []
         lines += [f"  - décision humaine refusée : « {c} »" for c in s.get("refus") or []]
+        if s.get("dependance"):
+            lines.append(f"  - dépendance entre tests : {s['dependance']} — ta vérification isolée ne prouve rien : "
+                         f"la cause est une donnée ou un paramétrage partagé avec une autre feature")
+        if s.get("donnees_partagees"):
+            lines.append("  - données uniques par feature : codes aussi utilisés par d'autres features — "
+                         + " ; ".join(f"{d['code']} ({', '.join(d['features'][:3])})"
+                                      for d in s["donnees_partagees"][:10])
+                         + ". Renomme dans cette feature (et ses fichiers de données) les codes qu'elle CRÉE en "
+                           "codes propres à elle ; les références de l'init (site, donneur d'ordres, emplacement, "
+                           "poste) restent partagées")
+        checks = s.get("controles") or {}
+        lines += [f"  - fichier lu absent (contrôle déterministe) : {e}" for e in checks.get("fichiers") or []]
+        lines += [f"  - création non rejouable (contrôle déterministe) : {e}" for e in checks.get("idempotence") or []]
+        if checks.get("non_crees"):
+            lines.append(f"  - données utilisées jamais créées (contrôle déterministe) : {', '.join(checks['non_crees'])}"
+                         f" — crée-les dans le Background de la feature (fichier de données ou step de création), "
+                         f"ne compte ni sur une autre feature ni sur un run précédent")
     print(f"[LOT {label}] Correction de {len(lines)} scénario(s) en échec dans l'import n° {lot['import']}.")
     # Échecs liés aux données : preuve en base exigée avant toute correction (si l'accès base est accordé)
     data = cucumber_db_proof.data_scenarios(lot["corrections"]) if cucumber_db_proof.enabled() else []
@@ -3175,8 +3218,8 @@ def deliver_std_data(client: str, worktree: str, cucumber_std_dir: str, profile:
     absents du worktree. Présents au Standard : copiés et commités (livrés) ; sinon signalés. Renvoie les copies.
     """
     root = profile.get("features_root") or f"{cucumber_checks.FEATURES_ROOT}{client}"
-    result = cucumber_checks.check_data_files(worktree, cucumber_checks.client_feature_files(worktree, root),
-                                              cucumber_std_dir)
+    result = cucumber_checks.check_data_files(worktree, cucumber_checks.suite_features(
+        worktree, profile.get("tag_client", ""), root), cucumber_std_dir)
     copied = [target for target, _ in result["copies"]]
     if copied:
         cucumber_tools._git(worktree, "add", "-f", "--", *copied)
@@ -3188,6 +3231,93 @@ def deliver_std_data(client: str, worktree: str, cucumber_std_dir: str, profile:
         print(f"[CUCUMBER] ⚠️ {len(result['erreurs'])} fichier(s) de données introuvable(s), y compris au Standard :")
         print("\n".join(f"    {e}" for e in result["erreurs"][:20]))
     return copied
+
+
+def check_delivery(client: str, worktree: str, state: dict, profile: dict, cucumber_std_dir: str) -> list:
+    """
+    Contrôles de livraison sur TOUTES les features exécutées par la suite du client (0 token) : désactivations pour
+    cause prouvée maintenues sans preuve de disparition (commitées), fichiers lus présents, créations rejouables,
+    données créées avant d'être utilisées. Bloquant (renvoyé) pour les features que le patch livre ; avertissement
+    pour les autres, dont les échecs portent la cause à l'import. Renvoie les erreurs bloquantes.
+    """
+    root = profile.get("features_root") or f"{cucumber_checks.FEATURES_ROOT}{client}"
+    tag = profile.get("tag_client", "")
+    features = cucumber_checks.suite_features(worktree, tag, root)
+    if tag:
+        kept = cucumber_disabled.enforce_repo(worktree, sorted(set(features) | set(
+            cucumber_checks.client_feature_files(worktree, root))), tag, cucumber_job.load_deployment(client),
+            state.get("base", ""))
+        if kept["fichiers"]:
+            cucumber_tools._git(worktree, "add", "--", *kept["fichiers"])
+            cucumber_tools._git(worktree, "commit", "-q", "-m", "Cucumber : désactivations pour cause prouvée "
+                                                                "maintenues (cause non disparue)")
+        for line in cucumber_disabled.summary(kept["actions"]):
+            print(f"[CUCUMBER] Désactivation : {line}")
+        features = cucumber_checks.suite_features(worktree, tag, root)
+    init = cucumber_tools._read_json(cucumber_init_data.init_path(client), {})
+    files = cucumber_checks.check_data_files(worktree, features, cucumber_std_dir, copy=False)["erreurs"]
+    data = cucumber_data_rules.data_errors(worktree, features, client, init)
+    errors = files + data["idempotence"] + data["creation"]
+    delivered = cucumber_checks.changed_since(worktree, state["base"]) if state.get("base") else set(features)
+    blocking = [e for e in errors if e.split(":", 1)[0].split(" ", 1)[0] in delivered]
+    others = [e for e in errors if e not in blocking]
+    if others:
+        print(f"[CUCUMBER] ⚠️ {len(others)} défaut(s) de données dans des features que ce patch ne modifie pas "
+              f"(leurs échecs porteront cette cause à l'import) :")
+        print("\n".join(f"    {e}" for e in others[:20]))
+    return blocking
+
+
+def launch_full_run(client: str, profile: dict, worktree: str, repository: str = "", base_branch: str = "",
+                    client_root: str = "") -> dict:
+    """
+    Run complet de la suite active lancé par l'agent (worktree poussé, filtre = tag client seul), importé et analysé
+    avec son bilan. Renvoie l'analyse, {"erreur"} si rien n'a abouti.
+    """
+    run = cucumber_run.launch(client, worktree, profile, profile.get("tag_client", ""), repository=repository,
+                              base_branch=base_branch, inventory=cucumber_tools.load_inventory(client),
+                              client_root=client_root)
+    print(f"[RUN JENKINS] {'✅' if run['ok'] else '⛔'} {run['message']}" + (f" — {run['build']}" if run["build"] else ""))
+    if not run["ok"]:
+        return {"erreur": run["message"] or "run non lancé"}
+    imported = cucumber_import.import_files(client, cucumber_import.build_files(run["build"]), run["build"])
+    if not imported["numero"]:
+        return {"erreur": "build sans console ni rapport importable"}
+    analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client), worktree)
+    print_import(analysis)
+    return analysis
+
+
+def guard_corrections(client: str, state: dict, worktree: str, profile: dict, repository: str = "",
+                      base_branch: str = "", client_root: str = "") -> dict:
+    """
+    Garde-fou de non-régression des lots « correction » d'un import (cucumber_guard) : deux runs complets lancés
+    après les corrections, sinon corrections annulées. Rien tant que des lots de correction restent à faire.
+    """
+    marker = state.get("garde_fou_debut") or {}
+    pending = [lot for lot in state.get("lots") or [] if lot.get("type") == "correction"
+               and str(lot.get("import")) == str(marker.get("import")) and lot.get("statut") != "termine"]
+    if not marker or pending:
+        return {}
+    reference = cucumber_import.load_analysis(client, marker["import"])
+    cucumber_tools.save_state(client, state)
+    result = cucumber_guard.guard(state, reference, worktree, marker["commit"],
+                                  lambda: launch_full_run(client, profile, worktree, repository, base_branch,
+                                                          client_root),
+                                  os.path.join(cucumber_import.imports_dir(client), str(marker["import"])),
+                                  cucumber_verify.agent_runs_tests())
+    # Les imports des runs du garde-fou ont pu écrire l'état : on repart de lui, garde-fou ajouté
+    saved = cucumber_tools.load_state(client)
+    saved["garde_fou"] = state.get("garde_fou") or []
+    saved.pop("garde_fou_debut", None)
+    state.clear()
+    state.update(saved)
+    cucumber_tools.save_state(client, state)
+    last = next((r for r in reversed(result.get("runs") or []) if r.get("import")), None)
+    analysis = cucumber_import.load_analysis(client, last["import"] if last else marker["import"])
+    bilan = cucumber_bilan.after_import(client, analysis, state, worktree)
+    print(f"[GARDE-FOU] Bilan : {bilan['fichier']}")
+    return result
 
 
 def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_repo: str,
@@ -3631,6 +3761,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                 total[key] += value
                 tokens[key] = (tokens.get(key) or 0) + value
 
+    # Garde-fou de non-régression : point de départ des corrections d'un import, annulées si les runs complets
+    # lancés après elles ne comptent pas strictement moins d'échecs, ou comptent un nouvel échec
+    if args.from_import and complete_state and not state.get("garde_fou_debut") and any(
+            lot.get("type") == "correction" and str(lot.get("import")) == str(args.from_import)
+            and lot.get("statut") != "termine" for lot in state.get("lots") or []):
+        state["garde_fou_debut"] = {"import": args.from_import, "commit": cucumber_tools.rev_parse(worktree, "HEAD")}
+        cucumber_tools.save_state(client, state)
+
     # 3. Un appel Claude neuf par lot, puis compilation (et correction) en Python ; commit après chaque lot
     processed = 0
     for lot in lots:
@@ -3824,6 +3962,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     if not check_cucumber_selection(client, worktree, local_cucumber_std_repo, profile, state,
                                     dry_run_cmd if compile_cmd else ""):
         exit_code = 1
+    guarded = guard_corrections(client, state, worktree, profile, args.cucumber_repo, args.cucumber_base_branch,
+                                local_client_repo)
+    if guarded and not guarded["ok"]:
+        exit_code = 1
     patch_file = cucumber_tools.patch_path(client)
     # Fichiers de l'init globale modifiés par la génération : erreur bloquante, aucun patch livré
     own_init = set((state.get("init_corrigee") or {}).get("fichiers") or [])
@@ -3854,6 +3996,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"\n[CUCUMBER] ⛔ Patch non produit : {len(protected['erreurs'])} fichier(s) de l'init globale "
               f"modifié(s).")
         print("\n".join(f"    {e}" for e in protected["erreurs"]))
+        exit_code = 1
+    elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile) is not None and (
+            blocking := check_delivery(client, worktree, state, profile, local_cucumber_std_repo)):
+        if os.path.exists(patch_file):
+            os.remove(patch_file)
+        print(f"\n[CUCUMBER] ⛔ Patch non produit : {len(blocking)} défaut(s) de données dans les features livrées "
+              f"(fichier lu absent, création non rejouable, donnée utilisée jamais créée) :")
+        print("\n".join(f"    {e}" for e in blocking[:30]))
         exit_code = 1
     elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile) is not None and \
             cucumber_tools.write_patch(worktree, state["base"], patch_file, client):

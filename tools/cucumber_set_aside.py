@@ -67,7 +67,10 @@ def set_aside(client_name: str, failures: list, client_tag: str) -> list:
 
 def reactivate(client_name: str, identifiers: list, client_tag: str) -> list:
     """Réactive des scénarios désactivés (mis de côté ou désactivés par l'agent). Renvoie ceux réactivés."""
+    from tools import cucumber_disabled, cucumber_job
     worktree, state = worktree_dir(client_name), load_state(client_name)
+    set_aside_ids = {e.get("id") for e in state.get("mis_de_cote") or []}
+    deployment = cucumber_job.load_deployment(client_name)
     done, files = [], []
     for identifier in identifiers:
         rel, title = _split(identifier)
@@ -79,6 +82,13 @@ def reactivate(client_name: str, identifiers: list, client_tag: str) -> list:
         if start < 0:
             continue
         restored = cucumber_decisions._restore_active(lines[start:end], client_tag)
+        # Désactivé par l'agent pour une cause hors test prouvée : réactivé seulement si la cause a disparu
+        lost = [] if identifier in set_aside_ids else cucumber_disabled.reactivated_without_proof(
+            "Feature: x\n" + "\n".join(lines[start:end]), "Feature: x\n" + "\n".join(restored), client_tag, deployment)
+        if lost:
+            print(f"[CUCUMBER] Réactivation refusée : « {title} » — cause non disparue ({lost[0]['cause'][:160]}), "
+                  f"aucune preuve de déploiement")
+            continue
         if cucumber_decisions._replace_block(worktree, rel, title, restored):
             done.append(identifier)
             files.append(rel)

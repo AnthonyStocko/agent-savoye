@@ -2140,10 +2140,13 @@ def fix_action(ctx: dict) -> dict:
                 "detail": f"run importé n° {numero} : " + (f"{failures} échec(s), aucun corrigeable dans les tests "
                                                            f"(causes hors test, voir le bilan)." if failures else
                                                            "aucun test en échec.")}
+    to_prove = len(analysis.get("a_prouver") or [])
     return {"type": "corriger", "numero": numero, "specs": [p["spec"] for p in fixable],
             "libelle": f"Corriger les tests en échec ({count})",
             "detail": f"run importé n° {numero} : {count} test(s) en erreur ou en échec à corriger"
-                      + (f" sur {failures}" if failures > count else "") + "."}
+                      + (f" sur {failures}" if failures > count else "")
+                      + (f", {to_prove} cause(s) à prouver après {cucumber_import.max_attempts()} corrections "
+                         f"infructueuses (bilan)" if to_prove else "") + "."}
 
 
 def run_main_action(ctx: dict, action: dict) -> None:
@@ -2210,7 +2213,7 @@ def render_tests_overview(ctx: dict, rows: list) -> None:
     client = ctx["client"]
     state = cucumber_tools.load_state(client)
     client_tag = cucumber_profile.effective_profile(cucumber_profile.load_profile(client)).get("tag_client", "")
-    failing = cucumber_overview.failing(rows)
+    failing = cucumber_overview.failing(rows, cucumber_coverage.coverage_sources(client, state))
     disabled = cucumber_overview.disabled(rows, state.get("mis_de_cote") or [])
     covered = cucumber_overview.covered(rows)
     untested = cucumber_overview.untested(rows)
@@ -2339,10 +2342,13 @@ def render_failure_results(client: str) -> None:
     action, et les modifications téléchargeables quand l'échec en a (correction écrite, désactivation proposée).
     """
     numero, analysis = latest_import_analysis(client)
+    if analysis.get("ecart_console"):
+        st.error(f"Run importé n° {numero} : {analysis['ecart_console']}.", icon=":material/error:")
     failures = analysis.get("echecs") or []
     if not failures:
         return
-    st.markdown(f"**Échecs du run importé n° {numero} : {len(failures)}**")
+    st.markdown(f"**Échecs du run importé n° {numero} : {len(failures)}**"
+                + (" — run complet de la suite" if analysis.get("run_complet") else ""))
     for index, item in enumerate(failures):
         with st.container(border=True):
             st.markdown(f"{cucumber_failures.failure_title(item)} — **{item['titre']}**")

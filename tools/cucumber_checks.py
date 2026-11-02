@@ -23,8 +23,8 @@ from collections import Counter
 
 from tools import cucumber_versions
 from tools.cucumber_tools import (WORKSPACE_DIR, _git, _read_text_file, _write_text, a_revoir_tag, add_worktree,
-                                  blob_texts, build_dir, cache_dir, dry_run_errors, java_package_segment, ls_tree,
-                                  run_maven, verify_build)
+                                  blob_texts, build_dir, cache_dir, disabled_tags, dry_run_errors,
+                                  java_package_segment, ls_tree, run_maven, verify_build)
 from tools.cucumber_verify import _read_report, _report_files, expected_count, report_test_count, scenario_units
 
 RESOURCES = "src/test/resources/cucumber/"
@@ -35,7 +35,13 @@ DATA_EXTENSIONS = ("xml", "xlsm", "xlsx", "xls", "csv", "json", "txt", "zip", "p
 _DATA_FILE = re.compile(rf"^[\w.\-/]+\.(?:{'|'.join(DATA_EXTENSIONS)})$", re.I)
 _QUOTED = re.compile(r"\"([^\"]+)\"|'([^']+)'")
 # Step du Standard qui lit des règles : colonne fileName sans extension, dans rules/<dossier de la feature>/
-_RULE_STEP = re.compile(r"\bINIT- Intégration des règles\s*$")
+_RULE_STEP = re.compile(r"\bINIT- Int[ée]gration des r[èe]gles\b")
+# Step qui lit TOUTES les règles du dossier de la feature (QARuleStep.initialisationGlobaleDesRègles) : le dossier
+# rules/<dossier de la feature>/ doit exister et contenir au moins une règle
+_ALL_RULES_STEP = re.compile(r"\bINIT- Initialisation globale des r[èe]gles\s*$")
+# Steps qui ÉCRIVENT un fichier (export) : le nom cité n'est pas lu, il n'a pas à exister
+_WRITE_STEP = re.compile(r"\bExport\b.*\bdans le fichier\b", re.I)
+WHOLE_DIR = "*"
 # Step du Standard qui remet des règles par défaut : colonne fileName sans extension, lue dans
 # rules/<argument>/01-Contexte/ quel que soit le dossier de la feature (QARuleStep.réinitialisationDesRègles…)
 _RULE_RESET_STEP = re.compile(r"\bINIT- Réinitialisation des règles \"([^\"]+)\"\s*$")
@@ -81,7 +87,9 @@ def data_references(text: str) -> list:
         match = _STEP_START.match(line)
         if match:
             step, header = match.group(2), None
-            for quoted in _QUOTED.finditer(step):
+            if _ALL_RULES_STEP.search(step):
+                refs.append({"ligne": number, "nom": WHOLE_DIR, "regle": True})
+            for quoted in _QUOTED.finditer(step) if not _WRITE_STEP.search(step) else ():
                 value = (quoted.group(1) or quoted.group(2)).strip()
                 if _is_data_file(value):
                     refs.append({"ligne": number, "nom": value, "regle": False})
@@ -93,7 +101,7 @@ def data_references(text: str) -> list:
         if header is None:
             header = cells
             continue
-        for column, value in zip(header, cells):
+        for column, value in zip(header, cells) if not _WRITE_STEP.search(step) else ():
             reset = _RULE_RESET_STEP.search(step)
             if reset and column == "fileName" and value and "$" not in value:
                 refs.append({"ligne": number, "nom": value, "regle": True,
@@ -115,9 +123,18 @@ def resolved_path(feature_rel: str, ref: dict) -> str:
     """Chemin, relatif au dépôt, du fichier lu à l'exécution pour la référence `ref` de la feature `feature_rel`."""
     folder = ref.get("dossier") or feature_dir(feature_rel)
     prefix = f"{RULES_ROOT if ref['regle'] else FILES_ROOT}{folder + '/' if folder else ''}"
-    path = prefix + ref["nom"] + (".json" if ref["regle"] else "")
+    if ref["nom"] == WHOLE_DIR:
+        return prefix + WHOLE_DIR
+    path = prefix + ref["nom"] + (".json" if ref["regle"] and not ref["nom"].lower().endswith(".json") else "")
     # Nom relatif remontant d'un dossier (../) : chemin normalisé, comme le système de fichiers à l'exécution
     return posixpath.normpath(path) if ".." in ref["nom"] else path
+
+
+def is_present(target: str, paths: set) -> bool:
+    """Le fichier `target` est dans `paths` ; un dossier entier (…/*) doit y contenir au moins un fichier."""
+    if target.endswith("/" + WHOLE_DIR):
+        return any(p.startswith(target[:-len(WHOLE_DIR)]) for p in paths)
+    return target in paths
 
 
 def repo_files(worktree: str) -> set:
@@ -177,9 +194,14 @@ def check_data_files(worktree: str, features: list, cucumber_std_dir: str, copy:
         text = _read_text_file(os.path.join(worktree, *rel.split("/")))
         for ref in data_references(text):
             target = resolved_path(rel, ref)
-            if target in present or target in seen:
+            if is_present(target, present) or target in seen:
                 continue
             seen.add(target)
+            if ref["nom"] == WHOLE_DIR:
+                errors.append(f"{rel}:{ref['ligne']} « INIT- Initialisation globale des règles » lit toutes les règles "
+                              f"de {target[:-2]} : dossier absent ou vide ; crée-y les règles du test ou remplace ce "
+                              f"step par « INIT- Intégration des règles » avec la liste des fichiers")
+                continue
             source, candidates = std_source(cucumber_std_dir, index, target, inspired)
             if source and copy:
                 destination = os.path.join(worktree, *target.split("/"))
@@ -204,6 +226,25 @@ def client_feature_files(worktree: str, root: str) -> list:
                   and os.path.exists(os.path.join(worktree, *p.split("/"))))
 
 
+def suite_features(worktree: str, client_tag: str, root: str = "") -> list:
+    """
+    Features du dépôt exécutées par la suite du client : au moins un scénario actif (sans tag de désactivation)
+    porte le tag client, directement ou par sa ligne Feature, où qu'elle soit rangée ; plus toutes les features
+    sous la racine du client `root`. Contrôlées toutes, pas seulement les nouvelles.
+    """
+    out = []
+    for rel in sorted(p for p in repo_files(worktree) if p.endswith(".feature")):
+        path = os.path.join(worktree, *rel.split("/"))
+        if not os.path.exists(path):
+            continue
+        if root and rel.startswith(root.rstrip("/") + "/"):
+            out.append(rel)
+        elif client_tag and any(client_tag in u["tags"] and not disabled_tags(u["tags"])
+                                for u in scenario_units(_read_text_file(path))):
+            out.append(rel)
+    return out
+
+
 def missing_data_in_tree(paths: set, texts: dict) -> list:
     """
     Références de données des features `texts` ({chemin: texte}) absentes de l'ensemble de fichiers `paths` (l'arbre
@@ -213,7 +254,7 @@ def missing_data_in_tree(paths: set, texts: dict) -> list:
     for rel, text in sorted(texts.items()):
         for ref in data_references(text):
             target = resolved_path(rel, ref)
-            if target not in paths and target not in seen:
+            if not is_present(target, paths) and target not in seen:
                 seen.add(target)
                 missing.append((rel, ref["ligne"], ref["nom"], target))
     return missing
@@ -302,7 +343,8 @@ def add_client_tag(text: str, client: str, disabled: str = "") -> tuple:
     """
     disabled = disabled or a_revoir_tag()
     lines = text.splitlines(keepends=True)
-    targets = [u["ligne"] for u in scenario_units(text) if disabled not in u["tags"] and client not in u["tags"]]
+    targets = [u["ligne"] for u in scenario_units(text)
+               if not disabled_tags(u["tags"], disabled) and client not in u["tags"]]
     for number in sorted(targets, reverse=True):
         index = number - 1
         indent = lines[index][:len(lines[index]) - len(lines[index].lstrip())]
@@ -345,16 +387,17 @@ def check_client_tags(texts: dict, client: str, disabled: str = "") -> list:
     for rel, text in texts.items():
         for unit in scenario_units(text):
             where = f"{rel}:{unit['ligne']} « {unit['titre']} »"
-            if disabled not in unit["tags"] and client not in unit["tags"]:
+            off = disabled_tags(unit["tags"], disabled)
+            if not off and client not in unit["tags"]:
                 errors.append(f"{where} : {MISSING_CLIENT_TAG} {client} (ni sur la ligne Feature) : il "
                               f"ne serait pas exécuté par un job filtré sur {client} ; ajoute-le au-dessus du scénario")
-            elif disabled in unit["tags"] and client in unit["feature"]:
-                errors.append(f"{where} : scénario désactivé ({disabled}) qui hérite du tag client {client} par sa "
+            elif off and client in unit["feature"]:
+                errors.append(f"{where} : scénario désactivé ({off[0]}) qui hérite du tag client {client} par sa "
                               f"ligne Feature : retire {client} de la ligne Feature et mets-le sur les seuls "
                               f"scénarios actifs")
-            elif disabled in unit["tags"] and client in unit["propres"]:
-                errors.append(f"{where} : scénario désactivé ({disabled}) qui porte le tag client {client} : "
-                              f"retire-le")
+            elif off and client in unit["propres"]:
+                errors.append(f"{where} : scénario désactivé ({off[0]}) qui porte le tag client {client} : "
+                              f"retire-le (réactivation seulement quand la cause a disparu, preuve à l'appui)")
     return errors
 
 
