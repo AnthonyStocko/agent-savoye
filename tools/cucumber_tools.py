@@ -2768,12 +2768,20 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
 def format_patch(worktree: str, revisions: str, output: str) -> bool:
     """
     `git format-patch --binary` de `revisions` dans `output`, en octets : fichiers binaires et encodages autres
-    qu'UTF-8 (CSV, .xlsm) restent intacts. Renvoie False si le patch est vide ou en erreur.
+    qu'UTF-8 (CSV, .xlsm) restent intacts. Renvoie False si le patch est vide ou en erreur. Aucune livraison sans
+    compilation réussie du dépôt client à la fin de `revisions` (require_compiled) : sinon DeliveryBlocked, et un
+    ancien patch à `output` est supprimé.
     """
     result = subprocess.run(["git", "-C", worktree, "format-patch", "--binary", revisions, "--stdout"],
                             capture_output=True)
     if result.returncode != 0 or not result.stdout.strip():
         return False
+    try:
+        require_compiled(worktree, revisions)
+    except DeliveryBlocked:
+        if os.path.exists(output):
+            os.remove(output)
+        raise
     with open(output, "wb") as f:
         f.write(result.stdout)
     return True
@@ -2926,6 +2934,89 @@ def _last_errors(output: str, count: int = 8) -> list:
     errors = [line.strip() for line in output.splitlines() if line.strip().startswith("[ERROR]") and line.strip()
               != "[ERROR]"]
     return list(dict.fromkeys(errors))[-count:] or [line for line in output.strip().splitlines()[-count:]]
+
+
+class DeliveryBlocked(RuntimeError):
+    """Livraison refusée : le dépôt client ne compile pas, ou la compilation n'a pas pu être faite (Maven)."""
+
+
+COMPILED_DIR = os.path.join(CACHE_ROOT, "_compilation")
+
+
+def delivery_compile_cmd() -> str:
+    """Commande de compilation des livraisons : CUCUMBER_COMPILE_CMD, à défaut (même vide) DEFAULT_COMPILE_CMD."""
+    return os.getenv("CUCUMBER_COMPILE_CMD", "").strip() or DEFAULT_COMPILE_CMD
+
+
+def require_compiled(worktree: str, revisions: str) -> dict:
+    """
+    Contrôle bloquant d'une livraison : à la fin de `revisions` (« base..tip »), le dépôt client a un pom.xml, ses
+    classes Java modifiées n'appellent que des méthodes de la bibliothèque de la version de CE pom
+    (cucumber_library), et « mvn test-compile » réussit, dans une copie détachée du dépôt à ce commit. Maven absent,
+    dépendances introuvables ou délai dépassé : arrêt, jamais de contrôle sauté. Lève DeliveryBlocked ; renvoie
+    {"version", "arbre"} (arbre déjà compilé : pas de nouvelle compilation).
+    """
+    from tools import cucumber_library
+    base, _, tip = revisions.rpartition("..")
+    tip = tip or "HEAD"
+    tree = _git(worktree, "rev-parse", f"{tip}^{{tree}}").stdout.strip()
+    if not tree:
+        raise DeliveryBlocked(f"Livraison arrêtée : révision {tip} introuvable dans {worktree}.")
+    pom = _git(worktree, "show", f"{tip}:pom.xml").stdout
+    version = cucumber_library.pom_library_version(pom)
+    if not version:
+        raise DeliveryBlocked("Livraison arrêtée : " + ("pas de pom.xml" if not pom.strip() else
+                                                         "pas de dépendance a-sis:Cucumber dans le pom.xml")
+                              + " du dépôt client — version de la bibliothèque inconnue, compilation impossible.")
+    done_file = os.path.join(COMPILED_DIR, "compiles.json")
+    try:
+        with open(done_file, encoding="utf-8") as f:
+            done = json.load(f)
+    except (OSError, ValueError):
+        done = {}
+    if done.get(tree) == version:
+        return {"version": version, "arbre": tree}
+    common = os.path.abspath(_git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+                             or worktree)
+    build = os.path.join(COMPILED_DIR, hashlib.sha1(os.path.normcase(common).encode()).hexdigest()[:12])
+    if os.path.exists(os.path.join(build, ".git")):
+        prepared = _git(build, "checkout", "-q", "--force", "--detach", tip)
+        _git(build, "clean", "-fdq")
+    else:
+        shutil.rmtree(build, ignore_errors=True)
+        _git(worktree, "worktree", "prune")
+        prepared = _git(worktree, "worktree", "add", "-q", "--detach", build, tip)
+    if prepared.returncode != 0:
+        raise DeliveryBlocked(f"Livraison arrêtée : copie de compilation non préparée ({prepared.stderr.strip()[:200]}).")
+    command = delivery_compile_cmd()
+    code, output = run_maven(command, build)
+    errors = compile_errors(output, build)
+    api = cucumber_library.load_api(version)
+    changed = [r for r in _git(worktree, "diff", "--name-only", f"{base or tip + '~1'}", tip, "--",
+                               "*.java").stdout.splitlines() if r.strip()]
+    api_errors = []
+    for rel in changed:
+        path = os.path.join(build, *rel.split("/"))
+        if os.path.exists(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                api_errors += cucumber_library.check_java(f.read(), api, rel)
+    if code == 0 and not api_errors:
+        done[tree] = version
+        os.makedirs(COMPILED_DIR, exist_ok=True)
+        with open(done_file, "w", encoding="utf-8") as f:
+            json.dump(done, f)
+        print(f"[CUCUMBER] ✅ Compilation du dépôt client (bibliothèque {version} du pom) : OK avant livraison.")
+        return {"version": version, "arbre": tree}
+    if code != 0 and not errors:
+        raise DeliveryBlocked(f"Livraison arrêtée : compilation impossible (« {command} » : Maven indisponible, "
+                              f"dépendances introuvables ou délai dépassé) ; aucun contrôle n'est sauté. "
+                              + " | ".join(_last_errors(output, 4)))
+    # Erreur Maven sur une ligne déjà expliquée par la vérification de l'API : gardée une seule fois
+    explained = {e.split(" ", 1)[0] for e in api_errors}
+    listed = list(dict.fromkeys(api_errors + [e for e in errors if e.split(" ", 1)[0].rsplit(":", 1)[0]
+                                                  not in explained]))
+    raise DeliveryBlocked(f"Livraison arrêtée : le dépôt client ne compile pas avec la bibliothèque {version} de son "
+                          f"pom ({len(listed)} erreur(s)) :\n" + "\n".join(f"- {e}" for e in listed[:MAX_BUILD_ERRORS]))
 
 
 def verify_build(build: str, compile_cmd: str, features: list = None, dry_run_cmd: str = "") -> dict:

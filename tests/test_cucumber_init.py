@@ -104,16 +104,18 @@ def test_client_renaming_in_tags_title_and_paths():
     assert ci.client_path(f"{RES}/features/WMS/01-Contexte/x.feature", "clientx") < f"{RES}/features/clientx/EXC/a.feature"
 
 
-def test_clear_name_from_profile_then_environment(monkeypatch):
-    monkeypatch.delenv("CUCUMBER_CLEAR_NAME", raising=False)
+def test_clear_name_from_the_client_profile_only(monkeypatch):
+    # Aucune valeur globale : une variable commune à tous les clients reprendrait le clear d'un autre client
+    monkeypatch.setenv("CUCUMBER_CLEAR_NAME", "clear-d-un-autre-client")
     assert ci.clear_name({}) == "" and ci.clear_name(PROFILE) == CLEAR
-    monkeypatch.setenv("CUCUMBER_CLEAR_NAME", "mon-clear")
-    assert ci.clear_name({}) == "mon-clear" and ci.clear_name(PROFILE) == CLEAR
     adapted = ci.adapt_feature(INIT_FEATURE.format(m="WMS"), "WMS", "clientx", "mon-clear", "@ClientX")
     assert f'Given {ci.CLEAR_STEP} "mon-clear"' in adapted and adapted.startswith("@INIT_ClientX_WMS @ClientX")
     java = ci.clear_step_java("clientx")
     assert "package cucumber.features.clientx;" in java and "public class InitClientxSteps extends BaseStep" in java
-    assert f'@Given("{ci.CLEAR_STEP} {{string}}")' in java and "KISEndPoints.clear(clearName)" in java
+    assert f'@Given("{ci.CLEAR_STEP} {{string}}")' in java and "fileIntegration.enableInitData();" in java
+    # Sans API connue de la bibliothèque du pom : aucun appel propre à une version (jobs), purge par la ressource REST
+    assert 'EndPoints.sendDeleteRest(URL_CLEAR + module + "/all", null, null, null, true);' in java
+    assert "AllJobs" not in java
 
 
 def test_patch_applies_on_base(std_dir, client_cucumber, isolated_cache, tmp_path):
@@ -150,8 +152,8 @@ def test_patch_applies_on_base(std_dir, client_cucumber, isolated_cache, tmp_pat
 
 
 def test_init_refused_without_clear(std_dir, client_cucumber, isolated_cache, monkeypatch):
-    monkeypatch.delenv("CUCUMBER_CLEAR_NAME", raising=False)
-    with pytest.raises(RuntimeError, match="clear_name vide"):
+    monkeypatch.setenv("CUCUMBER_CLEAR_NAME", "clear-d-un-autre-client")
+    with pytest.raises(RuntimeError, match="clear du client clientx inconnu.*quel est le nom du clear"):
         ci.build_client_init(client_cucumber, std_dir, "clientx", "integration", {"WMS"}, {})
 
 

@@ -127,7 +127,35 @@ def console_results(text: str) -> dict:
         scenarios[key] = {"statut": "echoue", "step": step_match.group(1) if step_match else "", "phase": "",
                           "message": " ".join(message.split())[:300], "nature": nature, "exception": exception,
                           "heure": "", "erreur": error}
+    if not any(r["statut"] == "echoue" for r in scenarios.values()):
+        scenarios.update(compile_failures(lines))
     return scenarios if any(r["statut"] == "echoue" for r in scenarios.values()) or scenarios else {}
+
+
+COMPILE_TITLE = "Compilation du dépôt client"
+_COMPILE_ERROR = re.compile(r"^\[ERROR\]\s+\S*?(src/test/java/[\w/$.-]+?\.java):\[(\d+),\d+\]\s*(.+)$")
+_COMPILE_DETAIL = re.compile(r"^(?:\[ERROR\])?\s*(symbol|location)\s*:\s*(.+)$")
+
+
+def compile_failures(lines: list) -> dict:
+    """
+    Échec de « mvn test-compile » (le run n'a exécuté aucun scénario) : un résultat par classe Java en erreur, clé
+    (chemin de la classe, COMPILE_TITLE), message « ligne : erreur (symbol, location) » des erreurs distinctes.
+    """
+    errors = {}
+    for index, line in enumerate(lines):
+        match = _COMPILE_ERROR.match(line.strip())
+        if not match:
+            continue
+        details = [f"{m.group(1)}: {m.group(2).strip()}" for m in map(_COMPILE_DETAIL.match, lines[index + 1:index + 3])
+                   if m]
+        text = f"ligne {match.group(2)} : {match.group(3).strip()}" + (f" ({', '.join(details)})" if details else "")
+        if text not in errors.setdefault(match.group(1), []):
+            errors[match.group(1)].append(text)
+    return {(path, COMPILE_TITLE): {"statut": "echoue", "step": "", "phase": "compilation",
+                                    "message": " ; ".join(found)[:300], "nature": "compilation",
+                                    "exception": "CompilationFailure", "heure": "", "erreur": "\n".join(found)}
+            for path, found in errors.items()}
 
 
 def console_facts(text: str) -> dict:

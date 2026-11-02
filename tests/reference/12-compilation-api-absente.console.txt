@@ -1,0 +1,48 @@
+Started by user Utilisateur
+Running as SYSTEM
+Building in workspace /home/jenkins/workspace/CUCUMBER-CUSTOMER
+ > git checkout -f 8e1f1ad0000000000000000000000000000000000 # timeout=10
+Commit message: "Cucumber initialisation of client (TMS, WMS)"
+[CUCUMBER-CUSTOMER] $ mvn -B clean test -Dcucumber.filter.tags="@CLIENT and not @A_REVOIR"
+[INFO] Scanning for projects...
+[INFO]
+[INFO] ----------------------< savoye:client-cucumber >-----------------------
+[INFO] Building cucumber-client 1.0
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO]
+[INFO] --- maven-resources-plugin:2.6:testResources (default-testResources) @ client-cucumber ---
+[INFO] Copying 214 resources
+[INFO]
+[INFO] --- maven-compiler-plugin:3.10.1:testCompile (default-testCompile) @ client-cucumber ---
+[INFO] Changes detected - recompiling the module!
+[INFO] Compiling 3 source files to /home/jenkins/workspace/CUCUMBER-CUSTOMER/target/test-classes
+[INFO] -------------------------------------------------------------
+[ERROR] COMPILATION ERROR :
+[INFO] -------------------------------------------------------------
+[ERROR] /home/jenkins/workspace/CUCUMBER-CUSTOMER/src/test/java/cucumber/features/client/InitClientSteps.java:[25,21] cannot find symbol
+  symbol:   method disableAllJobs()
+  location: class cucumber.endPoints.KIS.KISEndPoints
+[ERROR] /home/jenkins/workspace/CUCUMBER-CUSTOMER/src/test/java/cucumber/features/client/InitClientSteps.java:[29,25] cannot find symbol
+  symbol:   method enableAllJobs()
+  location: class cucumber.endPoints.KIS.KISEndPoints
+[INFO] 2 errors
+[INFO] -------------------------------------------------------------
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  7.224 s
+[INFO] Finished at: 2026-11-02T15:24:30+01:00
+[INFO] ------------------------------------------------------------------------
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.10.1:testCompile (default-testCompile) on project client-cucumber: Compilation failure: Compilation failure:
+[ERROR] /home/jenkins/workspace/CUCUMBER-CUSTOMER/src/test/java/cucumber/features/client/InitClientSteps.java:[25,21] cannot find symbol
+[ERROR]   symbol:   method disableAllJobs()
+[ERROR]   location: class cucumber.endPoints.KIS.KISEndPoints
+[ERROR] /home/jenkins/workspace/CUCUMBER-CUSTOMER/src/test/java/cucumber/features/client/InitClientSteps.java:[29,25] cannot find symbol
+[ERROR]   symbol:   method enableAllJobs()
+[ERROR]   location: class cucumber.endPoints.KIS.KISEndPoints
+[ERROR] -> [Help 1]
+[ERROR]
+[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
+[ERROR] Re-run Maven using the -X switch to enable full debug logging.
+Build step 'Invoke top-level Maven targets' marked build as failure
+Finished: FAILURE

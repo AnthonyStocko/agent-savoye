@@ -21,7 +21,7 @@ from datetime import datetime
 
 from tools import cucumber_checks, cucumber_init_data, cucumber_initializers, cucumber_versions
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _runners, _test_java_files, _write_json,
-                                  cache_dir, depends_on_std_test_jar, java_classes, java_package_segment,
+                                  cache_dir, depends_on_std_test_jar, git_repos, java_classes, java_package_segment,
                                   load_inventory, snapshot)
 
 REPO_PROFILE = ".agent-savoye.json"
@@ -59,6 +59,9 @@ LABELS = {"features_root": "racine des features", "tag_client": "tag client", "i
 RUNNER_KEYS = ("classe", "chemin", "features", "glue", "tags", "plugin_json", "surcouche")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _GLOBAL_INIT = "Initialisation globale par fichiers"
+# Ressource REST de clear déclarée par l'application du client (bundle.list, pom, configuration)
+_APP_CLEAR = re.compile(r"init-data-rest-clear-[A-Za-z0-9_-]*[A-Za-z0-9]")
+_APP_CONFIG_GLOBS = ("*.list", "*.xml", "*.properties", "*.yml", "*.yaml", "*.json", "*.java")
 
 
 def profile_path(client_name: str) -> str:
@@ -101,6 +104,49 @@ def init_clear_name(texts: list) -> str:
     return ""
 
 
+def application_clears(client_root: str) -> dict:
+    """
+    Clears déclarés par le code ou la configuration de l'application du client (dépôts de `client_root`, hors
+    dépôts Cucumber, dont l'init a pu être générée avec un mauvais clear) : {nom du clear: [dépôt/fichier]}.
+    """
+    found = {}
+    for name, repo in git_repos(client_root).items():
+        if "cucumber" in name.lower():
+            continue
+        grep = _git(repo, "grep", "-I", "-o", "-E", _APP_CLEAR.pattern, "--", *_APP_CONFIG_GLOBS)
+        for line in grep.stdout.splitlines():
+            path, _, value = line.partition(":")
+            if value and "/test/" not in f"/{path}":
+                places = found.setdefault(value, [])
+                if f"{name}/{path}" not in places:
+                    places.append(f"{name}/{path}")
+    return found
+
+
+def choose_clear(init_clear: str, app_clears: dict, analysed: bool) -> tuple:
+    """
+    (clear retenu, avertissement) : le clear vient de l'application du client ; celui de l'init n'est retenu que
+    s'il y figure. Sans application analysée (`analysed` faux), le clear de l'init est retenu tel quel.
+    """
+    if not analysed:
+        return init_clear, ""
+    if init_clear and init_clear in app_clears:
+        return init_clear, ""
+    names = sorted(app_clears)
+    if len(names) == 1:
+        return names[0], (f"clear de l'init « {init_clear} » absent de l'application du client : clear de "
+                          f"l'application retenu, {names[0]} ({app_clears[names[0]][0]})" if init_clear else "")
+    if names:
+        return "", (f"plusieurs clears dans l'application du client ({', '.join(names)}) : choisissez celui de "
+                    f"l'environnement dans le profil client")
+    return "", (CLEAR_QUESTION + (f" (l'init cite « {init_clear} », absent de l'application : il peut venir d'un "
+                                  f"autre client)" if init_clear else ""))
+
+
+CLEAR_QUESTION = ("aucun clear trouvé dans le code ou la configuration de l'application du client : quel est le nom "
+                  "du clear de ce client ? À renseigner dans le profil client (« clear de l'environnement »)")
+
+
 def init_spec_files(rel: str, text: str) -> list:
     """Fichiers intégrés par une feature d'init APRÈS son initialisation globale, dans l'ordre (module spécifique)."""
     lines = text.splitlines()
@@ -137,12 +183,14 @@ def spec_file_suggestions(worktree: str, cucumber_std_dir: str, chosen: list) ->
 
 
 def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = (),
-                   server_version: str = "") -> tuple:
+                   server_version: str = "", client_root: str = "") -> tuple:
     """
     Profil détecté dans le worktree du dépôt client (à `ref`) : (profil, suggestions, avertissements). Un champ non
     détecté reste vide ; seules exceptions, racine et tag déduits du nom du client, signalés comme tels.
     `server_version` : version lue dans le pom du Standard applicatif, retenue si elle est numérique. Données des
-    initializers serveur : celles de l'inventaire (statut inconnu), non analysées sans inventaire.
+    initializers serveur : celles de l'inventaire (statut inconnu), non analysées sans inventaire. Clear : celui de
+    l'application du client (dépôts de `client_root`, application_clears), jamais repris d'un autre client ;
+    introuvable, il reste vide et la question est posée (CLEAR_QUESTION).
     """
     profile, warnings = empty_profile(), []
     root = cucumber_checks.client_features_root(worktree, ref, client_name, cucumber_std_dir, fallback=False)
@@ -159,8 +207,14 @@ def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
     paths = cucumber_init_data.init_paths(init)
     texts = {p: _read_text_file(os.path.join(worktree, *p.split("/"))) for p in paths}
     init_tags = sorted({t for f in init["features"] for t in f["tags"] if t.upper().startswith("@INIT_")})
+    init_clear = init_clear_name(list(texts.values()))
+    analysed = bool(client_root and git_repos(client_root))
+    app_clears = application_clears(client_root) if analysed else {}
+    clear, clear_warning = choose_clear(init_clear, app_clears, analysed)
+    if clear_warning:
+        warnings.append(clear_warning)
     profile.update(features_root=root, tag_client=tag, init_features=paths, init_tags=" or ".join(init_tags),
-                   clear_name=init_clear_name(list(texts.values())),
+                   clear_name=clear,
                    spec_files=[s for p in paths for s in init_spec_files(p, texts[p])],
                    protected_files=cucumber_init_data.protected_files(init),
                    runner=runner_profile(worktree, ref, list(std_runners)),
@@ -173,7 +227,8 @@ def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
         profile["server_initialized_data"] = cucumber_initializers.initialized_data(inventory["initialiseurs"])
     else:
         warnings.append("initializers serveur non analysés (inventaire absent ou antérieur) : lancez l'inventaire")
-    suggestions = {"spec_files": spec_file_suggestions(worktree, cucumber_std_dir, profile["spec_files"])}
+    suggestions = {"spec_files": spec_file_suggestions(worktree, cucumber_std_dir, profile["spec_files"]),
+                   "clear_init": init_clear, "clears_application": app_clears if analysed else None}
     return profile, suggestions, warnings
 
 
@@ -196,10 +251,10 @@ def load_profile(client_name: str) -> dict:
 
 
 def refresh_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = (),
-                    server_version: str = "") -> dict:
+                    server_version: str = "", client_root: str = "") -> dict:
     """Détection et surcharge du dépôt recalculées, saisie conservée ; profil.json réécrit. Renvoie le document."""
     detected, suggestions, warnings = detect_profile(client_name, worktree, ref, cucumber_std_dir, std_runners,
-                                                     server_version)
+                                                     server_version, client_root)
     document = load_profile(client_name)
     # Rôles des paramètres du job : détectés sur Jenkins (record_job_roles), pas dans le dépôt
     detected["job_roles"] = (document.get("detecte") or {}).get("job_roles") or {}
@@ -240,7 +295,9 @@ def effective_profile(document: dict) -> dict:
     warnings = list((document or {}).get("avertissements_detection") or [])
     warnings += [f"{LABELS[k]} vide : à renseigner dans le profil client" for k in FIELDS
                  if is_empty(profile[k]) and k not in OPTIONAL_FIELDS]
-    return {**profile, "sources": sources, "avertissements": warnings}
+    # Clears déclarés par l'application du client (None : application non analysée)
+    clears = ((document or {}).get("suggestions") or {}).get("clears_application")
+    return {**profile, "sources": sources, "avertissements": warnings, "clears_application": clears}
 
 
 def save_user_fields(client_name: str, fields: dict) -> dict:
@@ -253,21 +310,21 @@ def save_user_fields(client_name: str, fields: dict) -> dict:
 
 
 def client_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: str, std_runners: list = (),
-                   server_version: str = "") -> dict:
+                   server_version: str = "", client_root: str = "") -> dict:
     """Profil appliqué, après détection dans `worktree` à `ref` (profil.json mis à jour)."""
     return effective_profile(refresh_profile(client_name, worktree, ref, cucumber_std_dir, std_runners,
-                                             server_version))
+                                             server_version, client_root))
 
 
 def detect_in_base(client_name: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str,
-                   std_runners: list = (), server_version: str = "") -> dict:
+                   std_runners: list = (), server_version: str = "", client_root: str = "") -> dict:
     """
     Profil détecté dans une copie de lecture du dépôt client à `base` (avant génération) : rien n'est écrit dans le
     dépôt client. Lève RuntimeError.
     """
     commit = snapshot(cucumber_repo_dir, base_worktree_dir(client_name), base)
     return client_profile(client_name, base_worktree_dir(client_name), commit, cucumber_std_dir, std_runners,
-                          server_version)
+                          server_version, client_root)
 
 
 def init_view(profile: dict) -> dict:

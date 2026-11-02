@@ -7,8 +7,10 @@ globale par fichiers via l'écran » depuis le dossier qui correspond à celui d
 purge tout l'environnement : ce sont des profils exclusifs, non cumulables. Le client reçoit donc une copie fidèle
 de l'initialisation de chacun de ses modules, à lancer séparément par son tag @INIT_<CLIENT>_<MOD>, sous
 features/<client>/01-Contexte/<MOD>/ : Cucumber trie les features par chemin, l'initialisation passe ainsi avant
-toutes les autres features du client. La purge utilise le clear CUCUMBER_CLEAR_NAME par un step client (seul code
-Java ajouté, aucun step du Standard ne prend de clear nommé) ; les autres steps restent ceux du Standard.
+toutes les autres features du client. La purge utilise le clear du profil de CE client (détecté dans son
+application, jamais repris d'un autre client) par un step client (seul code Java ajouté, aucun step du Standard ne
+prend de clear nommé) ; les autres steps restent ceux du Standard. Aucune valeur du profil d'un autre client
+(cucumber_isolation) ne doit apparaître dans les fichiers générés.
 
 Chaque intégration échoue si un fichier finit en INTEGRATED_WITH_ERROR : les steps d'intégration sans attente du
 résultat (NON_CHECKING_STEPS) sont remplacés par leur équivalent qui l'attend. Un step absent de la bibliothèque de
@@ -19,7 +21,8 @@ import posixpath
 import re
 import shutil
 
-from tools import cucumber_environment, cucumber_recreation, cucumber_versions
+from tools import (cucumber_environment, cucumber_isolation, cucumber_library, cucumber_recreation,
+                   cucumber_versions)
 from tools.cucumber_tools import (_git, add_worktree, cache_dir, format_patch, git_repos, init_patch_path,
                                   java_class_suffix, java_package_segment)
 from tools.cucumber_verify import _STEP_LINE
@@ -90,10 +93,11 @@ def std_init_files(cucumber_std_dir: str) -> dict:
 
 def clear_name(profile: dict = None) -> str:
     """
-    Seul clear autorisé pour purger l'environnement : clear_name du profil client, à défaut CUCUMBER_CLEAR_NAME ;
-    '' si aucun (propre à chaque environnement : jamais de valeur par défaut).
+    Seul clear autorisé pour purger l'environnement : clear_name du profil de CE client (détecté dans son
+    application, saisi ou fixé par son dépôt) ; '' si aucun. Jamais de valeur globale ni par défaut : une valeur
+    commune à tous les clients reprendrait le clear d'un autre client (404 « No route found » à la purge).
     """
-    return ((profile or {}).get("clear_name") or os.getenv("CUCUMBER_CLEAR_NAME", "")).strip()
+    return ((profile or {}).get("clear_name") or "").strip()
 
 
 def client_path(std_path: str, client_name: str) -> str:
@@ -118,18 +122,44 @@ def clear_step_path(client_name: str) -> str:
             f"Init{java_class_suffix(client_name)}Steps.java")
 
 
-def clear_step_java(client_name: str) -> str:
-    """Step client « INIT- Purge de l'environnement par le clear {string} » : même séquence que la purge Standard."""
+CLEAR_RESOURCE_PREFIX = "init-data-rest-clear-main-"
+_ENDPOINTS, _KIS_ENDPOINTS = "cucumber.endPoints.EndPoints", "cucumber.endPoints.KIS.KISEndPoints"
+
+
+def clear_step_java(client_name: str, api: dict = None) -> str:
+    """
+    Step client « INIT- Purge de l'environnement par le clear {string} » : ressource REST
+    « a-sis/init-data-rest-clear-main-<module> » → DELETE clear/<module>/all, après enableInitData() comme la purge
+    Standard. Écrit d'après l'API de la bibliothèque du pom du client (`api`, cucumber_library) : les jobs ne sont
+    suspendus que si KISEndPoints.disableAllJobs / enableAllJobs existent dans CETTE version. Lève RuntimeError si
+    la version n'a pas EndPoints.sendDeleteRest à 5 arguments.
+    """
     segment, suffix = java_package_segment(client_name), java_class_suffix(client_name)
+    if api and not cucumber_library.has_method(api, _ENDPOINTS, "sendDeleteRest", 5):
+        raise RuntimeError(f"Bibliothèque {api.get('version')} : EndPoints.sendDeleteRest(5 arguments) absent, "
+                           f"purge par clear nommé impossible à écrire.")
+    jobs = bool(api) and all(cucumber_library.has_method(api, _KIS_ENDPOINTS, m, 0)
+                             for m in ("disableAllJobs", "enableAllJobs"))
+    delete = 'EndPoints.sendDeleteRest(URL_CLEAR + module + "/all", null, null, null, true);'
+    body = (f"""        KISEndPoints.disableAllJobs();
+        try {{
+            {delete}
+        }} finally {{
+            KISEndPoints.enableAllJobs();
+        }}""" if jobs else f"        {delete}")
     return f"""package cucumber.features.{segment};
 
-import cucumber.endPoints.KIS.KISEndPoints;
-import cucumber.features.BaseStep;
+import cucumber.endPoints.EndPoints;
+{"import cucumber.endPoints.KIS.KISEndPoints;" + chr(10) if jobs else ""}import cucumber.features.BaseStep;
 import cucumber.features.kis.QAFileIntegrationStep;
 import cucumber.util.context.TestContext;
 import io.cucumber.java.en.Given;
 
 public class Init{suffix}Steps extends BaseStep {{
+
+    // Ressource REST "a-sis/{CLEAR_RESOURCE_PREFIX}<module>" -> DELETE clear/<module>/all
+    private static final String CLEAR_RESOURCE_PREFIX = "{CLEAR_RESOURCE_PREFIX}";
+    private static final String URL_CLEAR = "clear/";
 
     private final QAFileIntegrationStep fileIntegration;
 
@@ -140,17 +170,16 @@ public class Init{suffix}Steps extends BaseStep {{
 
     /**
      * Purge de l'environnement par un clear nommé (propre à l'environnement), comme « {STD_PURGE_STEP} » :
-     * données d'initialisation autorisées, jobs suspendus le temps du clear.
+     * données d'initialisation autorisées{", jobs suspendus le temps du clear" if jobs else ""}.
      */
     @Given("{CLEAR_STEP} {{string}}")
     public void purgeParClear(String clearName) throws Exception {{
-        fileIntegration.enableInitData();
-        KISEndPoints.disableAllJobs();
-        try {{
-            KISEndPoints.clear(clearName);
-        }} finally {{
-            KISEndPoints.enableAllJobs();
+        if (!clearName.startsWith(CLEAR_RESOURCE_PREFIX)) {{
+            throw new IllegalArgumentException("Clear inconnu : " + clearName + " (attendu : " + CLEAR_RESOURCE_PREFIX + "<module>)");
         }}
+        String module = clearName.substring(CLEAR_RESOURCE_PREFIX.length());
+        fileIntegration.enableInitData();
+{body}
     }}
 }}
 """
@@ -294,13 +323,14 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     recréation non livrable reste commentée (TODO-INITIALIZER). `environment` ({controles, recreations, writer}) :
     scénarios de recréation des corrections manuelles puis de contrôle de l'environnement en lecture seule ajoutés
     à chaque feature d'init (cucumber_environment), steps écrits par `writer(worktree, controles, recreations)` ;
-    non livrables, ils restent commentés (TODO-ENVIRONNEMENT). Lève RuntimeError, notamment sans clear_name
-    (profil client ou CUCUMBER_CLEAR_NAME) : le clear est propre à l'environnement.
+    non livrables, ils restent commentés (TODO-ENVIRONNEMENT). Lève RuntimeError, notamment sans clear_name dans le
+    profil du client (le clear est propre au client : la question est posée) ou si une valeur du profil d'un autre
+    client apparaît dans les fichiers générés.
     """
     clear = clear_name(profile)
     if not clear:
-        raise RuntimeError("clear_name vide : renseignez-le dans le profil client (ou CUCUMBER_CLEAR_NAME) ; "
-                           "aucune initialisation n'est générée sans le clear propre à l'environnement.")
+        raise RuntimeError(f"clear du client {client_name} inconnu : {cucumber_profile_question()} ; aucune "
+                           f"initialisation n'est générée sans le clear propre au client (jamais celui d'un autre).")
     client_tag = (profile or {}).get("tag_client", "")
     spec_files = list((profile or {}).get("spec_files") or [])
     std = std_init_files(cucumber_std_dir)
@@ -318,6 +348,11 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     worktree = add_worktree(cucumber_repo_dir, init_worktree_dir(client_name), init_branch(client_name), base,
                             reset=True)
     library, aligned, version = _library_snapshots(cucumber_std_dir, (profile or {}).get("library_version", ""))
+    # Java écrit d'après la bibliothèque du pom du client, jamais d'après les sources du Standard
+    library_api = cucumber_library.load_api(cucumber_library.repo_library_version(worktree))
+    if not clear.startswith(CLEAR_RESOURCE_PREFIX):
+        result["avertissements"].append(f"clear « {clear} » : nom attendu {CLEAR_RESOURCE_PREFIX}<module> "
+                                        f"(ressource REST du Standard) ; la purge échouera à l'exécution")
     items = recreation_plan(cucumber_std_dir, client_name, profile)
     missing = [s for s in spec_files if not os.path.exists(os.path.join(worktree, *s.split("/")))]
     if missing:
@@ -343,7 +378,7 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     target = os.path.join(worktree, *java.split("/"))
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8", newline="\n") as f:
-        f.write(clear_step_java(client_name))
+        f.write(clear_step_java(client_name, library_api))
     result["fichiers"].append(java)
     result["recreation"] = _recreate_project_steps(worktree, base, client_name, items, result["fichiers"], recreate)
     result["avertissements"] += result["recreation"]["avertissements"]
@@ -355,6 +390,7 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
         result["fichiers"].append(cucumber_environment.java_path(client_name))
     extra_java = [p for p in (cucumber_recreation.java_path(client_name), cucumber_environment.java_path(client_name))
                   if p in result["fichiers"]]
+    _check_isolation(client_name, worktree, result["fichiers"], profile, cucumber_std_dir)
     _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java, *extra_java)
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return result
@@ -471,6 +507,7 @@ def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client
     extra = [p for p in (cucumber_recreation.java_path(client_name), cucumber_environment.java_path(client_name))
              if os.path.exists(os.path.join(worktree, *p.split("/")))]
     result["fichiers"] += [p for p in extra if p not in present]
+    _check_isolation(client_name, worktree, result["fichiers"], profile, cucumber_std_dir)
     _git(worktree, "add", "-A", "--", *([target_rel] if target_rel in result["fichiers"] else []), *extra)
     touched = set(_git(worktree, "diff", "--cached", "--name-only").stdout.splitlines())
     if touched & protected:
@@ -484,6 +521,19 @@ def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client
     if format_patch(worktree, f"{base}..HEAD", output):
         result["patch"] = output
     return result
+
+
+def cucumber_profile_question() -> str:
+    from tools.cucumber_profile import CLEAR_QUESTION
+    return CLEAR_QUESTION
+
+
+def _check_isolation(client_name: str, worktree: str, files: list, profile: dict, cucumber_std_dir: str) -> None:
+    """Lève RuntimeError si une valeur du profil d'un autre client apparaît dans les fichiers générés."""
+    errors = cucumber_isolation.check_files(client_name, worktree, files, profile, cucumber_std_dir)
+    if errors:
+        raise RuntimeError("valeur(s) d'un autre client dans l'initialisation générée, rien n'est livré : "
+                           + " ; ".join(errors[:5]) + (f" (+{len(errors) - 5})" if len(errors) > 5 else ""))
 
 
 def recreation_plan(cucumber_std_dir: str, client_name: str, profile: dict) -> list:

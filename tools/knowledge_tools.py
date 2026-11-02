@@ -181,7 +181,7 @@ def test_dir(path: str = None) -> dict:
 KNOWLEDGE_TYPES = (
     "cadrage", "besoin", "decoupage-epopee", "recap-patch", "release-note", "postmerge-cucumber",
     "cucumber-inventaire", "cucumber-sante", "cucumber-couverture", "cucumber-a-revoir",
-    "cucumber-diagnostic-run", "audit", "autre",
+    "cucumber-diagnostic-run", "cucumber-initialisation", "cucumber-reponses", "audit", "autre",
 )
 STATUS_ACTIVE, STATUS_OBSOLETE, STATUS_REPLACED = "actif", "obsolète", "remplacé"
 STATUSES = (STATUS_ACTIVE, STATUS_OBSOLETE, STATUS_REPLACED)

@@ -34,10 +34,28 @@ def init_text(purge: str = PURGE, extra: str = "") -> str:
 FEATURE = f"{CLIENT_TAG}\nFeature: Arrivage\n  Scenario: S\n    Given un step\n      | code | customString4 |\n"
 
 
+APP_ROOT = [""]
+
+
+def application(root: str, bundle: str) -> str:
+    """Application du client (dépôt <client>-odatio-app) dont le bundle.list déclare (ou non) son clear."""
+    app = os.path.join(root, f"{CLIENT}-odatio-app")
+    os.makedirs(app, exist_ok=True)
+    git(app, "init", "-q", "-b", "integration")
+    git(app, "config", "user.name", "test")
+    git(app, "config", "user.email", "test@example.com")
+    write(os.path.join(app, "src", "main", "resources", CLIENT, "bundle.list"), bundle)
+    git(app, "add", "-A")
+    git(app, "commit", "-qm", "app")
+    return root
+
+
 @pytest.fixture
 def cache(tmp_path, monkeypatch):
     monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path / "cache"))
-    monkeypatch.setenv("CUCUMBER_CLEAR_NAME", CLEAR)
+    # Clear du client : déclaré par SON application, jamais par une variable globale
+    monkeypatch.delenv("CUCUMBER_CLEAR_NAME", raising=False)
+    APP_ROOT[0] = application(str(tmp_path / "client"), f"## clear Data\nruntime:a-sis/{CLEAR}@1.0-SNAPSHOT\n")
     monkeypatch.delenv("CUCUMBER_INIT_TAGS", raising=False)
     cd._PROCESSES.clear()
 
@@ -68,7 +86,7 @@ def complete_repo(repo, init: str = None, feature: str = FEATURE) -> str:
 def detect(repo, std_dir, inventory: dict = None, user: dict = None, analysis: dict = None) -> tuple:
     """Profil puis faits relevés à la base `integration` ; état de l'init. Renvoie (faits, état)."""
     ct.save_inventory(CLIENT, inventory or {"specifiques": [], "initialiseurs": []})
-    cp.detect_in_base(CLIENT, repo, "integration", std_dir)
+    cp.detect_in_base(CLIENT, repo, "integration", std_dir, client_root=APP_ROOT[0])
     if user:
         cp.save_user_fields(CLIENT, user)
     profile = cp.effective_profile(cp.load_profile(CLIENT))
@@ -78,6 +96,22 @@ def detect(repo, std_dir, inventory: dict = None, user: dict = None, analysis: d
 
 def kinds(status: dict) -> list:
     return [f["type"] for f in status["constats"]]
+
+
+def test_clear_comes_from_the_client_application(repo, std_dir, cache, tmp_path):
+    # Init écrite avec le clear d'un autre client : le clear de l'application du client est retenu
+    foreign = "init-data-rest-clear-main-autre"
+    facts, status = detect(complete_repo(repo, init_text(f"    Given INIT- Purge de l'environnement par le clear "
+                                                         f"\"{foreign}\"\n")), std_dir)
+    profile = cp.effective_profile(cp.load_profile(CLIENT))
+    assert profile["clear_name"] == CLEAR and kinds(status) == ["clear"]
+    assert any(foreign in w and "absent de l'application" in w for w in profile["avertissements"])
+    # Application sans clear : rien n'est repris, la question est posée et le clear de l'init est à vérifier
+    APP_ROOT[0] = application(str(tmp_path / "client-sans-clear"), "runtime:a-sis/autre-bundle@1.0\n")
+    facts, status = detect(repo, std_dir)
+    profile = cp.effective_profile(cp.load_profile(CLIENT))
+    assert profile["clear_name"] == "" and cp.CLEAR_QUESTION in " ".join(profile["avertissements"])
+    assert kinds(status) == ["clear"] and "nom de clear du client à vérifier" in status["constats"][0]["message"]
 
 
 # ---------------------------------------------------------------------------

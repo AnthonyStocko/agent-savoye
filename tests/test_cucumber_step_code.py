@@ -82,7 +82,8 @@ def test_lot_block_injects_candidate_code(std_repo):
 
 def test_agent_compile_script(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path))
-    assert cucumber_compile.main(["acme"]) == 0 and "contexte absent" in capsys.readouterr().out
+    # Compilation impossible : arrêt (code 3), jamais « poursuis sans compiler »
+    assert cucumber_compile.main(["acme"]) == cucumber_compile.STOPPED and "contexte absent" in capsys.readouterr().out
     worktree = tmp_path / "wt"
     write(str(worktree / "pom.xml"), "<project/>")
     cucumber_compile.write_context("acme", str(worktree), "", "mvn -q -o test-compile")

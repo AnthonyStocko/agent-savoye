@@ -3073,6 +3073,9 @@ with tab_cucumber:
     cucumber_links_now = cucumber_links.current_links(cucumber_client) if cucumber_client else {}
     if cucumber_client and cucumber_rows:
         render_cucumber_simple(cucumber_ctx, cucumber_rows, cucumber_init_status)
+    elif cucumber_client and cucumber_detected.get("statut") == "erreur":
+        st.error(f"L'analyse automatique du projet a échoué : {cucumber_detected.get('cause') or 'cause inconnue'}",
+                 icon=":material/error:")
     elif cucumber_client:
         st.info("Les fonctionnalités spécifiques du projet apparaîtront ici dès la fin de son analyse automatique.",
                 icon=":material/hourglass_top:")
@@ -3840,10 +3843,6 @@ with tab_config:
                  "la vérification s'arrête, les scénarios sont « non vérifiés — environnement non initialisé ». "
                  "Désigne aussi les features d'init dont les codes créés sont imposés aux lots (défaut : tag "
                  "@INIT_*, dossier 0x-Contexte). Vide = pas d'initialisation préalable.")
-        env_values["CUCUMBER_CLEAR_NAME"] = st.text_input(
-            "CUCUMBER_CLEAR_NAME", value=os.getenv("CUCUMBER_CLEAR_NAME", ""),
-            help="Repli si le profil client n'a pas de clear : seul clear autorisé pour purger l'environnement, "
-                 "propre à chaque environnement (aucune valeur par défaut). Le profil client (onglet Cucumber) prime.")
         env_values["CUCUMBER_DETECTION_INTERVAL"] = st.text_input(
             "CUCUMBER_DETECTION_INTERVAL", value=os.getenv("CUCUMBER_DETECTION_INTERVAL", ""), placeholder="300",
             help="Onglet Cucumber : délai en secondes entre deux contrôles des commits des dépôts du projet ; la "

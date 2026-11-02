@@ -138,9 +138,12 @@ def is_present(target: str, paths: set) -> bool:
 
 
 def repo_files(worktree: str) -> set:
-    """Fichiers suivis ou nouveaux (non ignorés) du worktree : ceux que le patch livre au dépôt client."""
+    """
+    Fichiers suivis ou nouveaux (non ignorés) du worktree : ceux que le patch livre au dépôt client. Sortie de build
+    (target/) exclue même sans .gitignore (dépôt client neuf) : ses copies de features ne sont pas des features.
+    """
     out = _git(worktree, "ls-files", "-co", "--exclude-standard", "-z").stdout
-    return {p for p in out.split("\0") if p}
+    return {p for p in out.split("\0") if p and not p.startswith("target/") and "/target/" not in p}
 
 
 def std_data_index(cucumber_std_dir: str) -> dict:

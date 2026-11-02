@@ -277,12 +277,15 @@ def init_facts(worktree: str, client_name: str, profile: dict, inventory: dict) 
 
 def expected_clear(profile: dict) -> str:
     """
-    Clear propre à l'environnement : saisi ou fixé par le dépôt dans le profil, à défaut CUCUMBER_CLEAR_NAME. Le
-    clear détecté dans l'init n'est pas une référence (il serait comparé à lui-même).
+    Clear propre au client : saisi ou fixé par le dépôt dans son profil, ou détecté dans son application (clear
+    retenu parmi clears_application). Le clear lu dans l'init n'est pas une référence (il serait comparé à lui-même
+    et peut venir d'un autre client) ; aucune valeur globale (CUCUMBER_CLEAR_NAME) commune à tous les clients.
     """
     if (profile.get("sources") or {}).get("clear_name") in ("saisi", "depot"):
         return profile.get("clear_name", "")
-    return os.getenv("CUCUMBER_CLEAR_NAME", "").strip()
+    if profile.get("clear_name") and profile["clear_name"] in (profile.get("clears_application") or {}):
+        return profile["clear_name"]
+    return ""
 
 
 def _finding(kind: str, message: str, proofs: list, codes: list = ()) -> dict:
@@ -326,7 +329,14 @@ def init_status(facts: dict, profile: dict, client_name: str, analysis: dict = N
                                                                                              "Purge »"}]))
     else:
         wrong = [p for p in purges if not p["clear"] or (clear and p["clear"] != clear)]
-        if wrong:
+        unverified = [p for p in purges if p["clear"] and not clear
+                      and profile.get("clears_application") is not None]
+        if unverified:
+            # Application analysée sans clear du client : celui de l'init n'est pas prouvé (autre client ?)
+            findings.append(_finding("clear", f"clear « {unverified[0]['clear']} » introuvable dans le code ou la "
+                                              f"configuration de l'application du client : nom de clear du client à "
+                                              f"vérifier (profil client, « clear de l'environnement »)", unverified))
+        elif wrong:
             findings.append(_finding("clear", (f"clear attendu « {clear} »" if clear else
                                                "purge Standard sans clear nommé")
                                      + f" : {len(wrong)} purge(s) non conforme(s)", wrong))

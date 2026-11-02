@@ -30,6 +30,8 @@ TO_WRITE = ("correction", "diagnostic")
 
 # Nature de la correction : libellé lu par l'utilisateur
 NATURES = {
+    "api_bibliotheque": "remplacer l'appel Java absent par l'API existante de la bibliothèque de la version du pom "
+                        "du client (méthode ou step), vérifiée par mvn test-compile",
     "step_equivalent": "remplacer le step non défini par le step existant équivalent",
     "champ_non_renvoye": "champ contrôlé non renvoyé par l'endpoint ou non mappé par le step : corriger la colonne "
                          "ou le step",
@@ -38,6 +40,8 @@ NATURES = {
     "mecanisme_ecriture": "diagnostiquer le mécanisme d'écriture du champ (écrit puis relu vide)",
     "chemin_fichier": "corriger le chemin du fichier de données ou de règles du test",
     "regle_standard": "copier dans le dépôt client le fichier de règle du Standard que le test charge",
+    "clear_client": "nom de clear du client à vérifier : celui de SON application (jamais celui d'un autre client), "
+                    "à renseigner dans son profil, puis régénérer l'initialisation",
     "deploiement": "déployer le code testé, puis relancer (le test n'est pas modifié)",
     "configuration_partagee": "rendre le scénario autonome : poser dans son Background la configuration qu'il lit",
     "dependance_tests": "rendre les données du scénario uniques à sa feature (vert seul, rouge en run complet)",
@@ -70,7 +74,13 @@ _DRAFT_REQUIRED = re.compile(r"La propri[ée]t[ée]\b.{0,120}\best requise", re.
 # Règle du Standard : rules/<domaine du Standard>/… ; une règle sous rules/<client>/ est propre au client
 _STANDARD_RULE = re.compile(r"/cucumber/rules/(?:WMS|TMS|OMS|WES)/[\w./'-]+\.json")
 _FILE_MISSING = re.compile(r"FileNotFoundException|NoSuchFileException|No such file or directory", re.I)
+_COMPILE = re.compile(r"cannot find symbol|COMPILATION ERROR|Compilation failure|incompatible types|"
+                      r"cannot be applied to given types", re.I)
 _DUPLICATE = re.compile(r"existe d[ée]j[àa]|already exists?|duplicate key", re.I)
+# Purge par un clear absent de l'environnement du client (souvent le clear d'un autre client)
+_CLEAR_ROUTE = re.compile(r"No route found|\b404\b", re.I)
+_CLEAR_STEP = re.compile(r"Purge de l'environnement par le clear|\bclear/[\w-]+/", re.I)
+_CLEAR_NAME = re.compile(r"par le clear\s+\"([^\"]+)\"")
 _VERSION = re.compile(r"No route found|has no field|Invalid path|UnrecognizedPropertyException|Unrecognized field",
                       re.I)
 
@@ -95,6 +105,16 @@ def classify(result: dict) -> dict:
 
     def out(categorie, nature, cause, action):
         return {"categorie": categorie, "nature": nature, "cause": _sentence(cause), "action": _sentence(action)}
+    # Le dépôt client ne compile pas : aucun scénario n'a tourné, seul le code Java est en cause
+    if _COMPILE.search(full) or result.get("nature") == "compilation":
+        symbols = list(dict.fromkeys(re.findall(r"symbol:\s*(?:method|variable|class)\s+([\w$]+(?:\([^)]*\))?)", full)))
+        return out("correction", "api_bibliotheque",
+                   "Le code Java du dépôt ne compile pas : " + (f"{', '.join(symbols[:4])} absent(s) de la bibliothèque "
+                                                                f"de steps de la version du pom du client"
+                                                                if symbols else _sentence(message, 160)) + ".",
+                   "Remplacer chaque appel absent par une méthode ou un step existant de la bibliothèque de la version "
+                   "du pom du client (python tools/cucumber_compile.py <client> --api <Classe>), puis vérifier par "
+                   "mvn test-compile ; aucune livraison sans compilation réussie.")
     # Contexte du run établi hors du message (code testé absent du déploiement, configuration partagée écrite par
     # une autre feature) : prime sur le message, qui n'en montre que l'effet
     context = result.get("contexte") or {}
@@ -165,6 +185,14 @@ def classify(result: dict) -> dict:
         return out("correction", "brouillon_complet", "La mise à jour par brouillon omet une propriété requise "
                                                       "(brouillon partiel).",
                    "Repartir du brouillon complet lu et ne modifier que les champs visés.")
+    if _CLEAR_ROUTE.search(full) and (_CLEAR_STEP.search(step) or _CLEAR_STEP.search(full)):
+        name = (_CLEAR_NAME.search(step) or _CLEAR_NAME.search(full) or [None, ""])[1]
+        return out("environnement", "clear_client",
+                   f"Purge refusée par l'environnement (404 - No route found) : le clear{f' « {name} »' if name else ''} "
+                   f"n'existe pas sur l'environnement de ce client — nom de clear du client à vérifier (il peut "
+                   f"venir d'un autre client).",
+                   "Renseigner dans le profil du client le clear déclaré par SON application (bundle de clear), "
+                   "puis régénérer l'initialisation ; ne jamais reprendre le clear d'un autre client.")
     if _VERSION.search(full):
         return out("environnement", "version", f"Écart de version entre la bibliothèque de steps et le serveur : "
                                                f"{_sentence(message, 140)}",
