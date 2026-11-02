@@ -54,3 +54,13 @@ def _delivery_compile_stub(request, monkeypatch):
         return
     from tools import cucumber_tools
     monkeypatch.setattr(cucumber_tools, "require_compiled", lambda worktree, revisions: {"version": "", "arbre": ""})
+
+
+@pytest.fixture(autouse=True)
+def _no_standard_version_task(request, monkeypatch):
+    """
+    Tests de l'IHM : la tâche de fond de détection de la version du Standard (Bitbucket, Jenkins) n'est jamais
+    lancée pour de vrai ; ses propres tests (test_standard_version_task.py) appellent run() directement.
+    """
+    from tools import standard_version_task
+    monkeypatch.setattr(standard_version_task, "start", lambda *args, **kwargs: False)

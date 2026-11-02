@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import cucumber_init_fix, standard_version
+from tools import cucumber_init_fix, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1389,9 +1389,46 @@ def render_standard_version(client: str) -> None:
     Version du Standard du client, détectée en arrière-plan (code, builds Jenkins, bibliothèque Cucumber) : une
     ligne ; sources divergentes : les deux avec leurs sources et le choix ; aucune source : saisie proposée.
     """
+    repo = (st.session_state.get("cucumber_repo") or "").strip()
+    if repo:
+        standard_version_task.start(client, repo, os.getenv("BITBUCKET_STD_REPO_PATH", "").strip(),
+                                    interval_s=cucumber_detection.interval())
+
+    def progress() -> None:
+        task = standard_version_task.view(client)
+        if task.get("statut") == "en_cours":
+            st.session_state[f"std_version_running_{client}"] = True
+            first = (task.get("provisoire") or {})
+            st.caption(f":material/progress_activity: Version du Standard : {task.get('etape') or 'démarrage'}"
+                       + (f" {task['progression']}" if task.get("progression") else "") + "…"
+                       + (f" — premier résultat : {standard_version.line(first)}" if first.get("statut") == "ok"
+                          else ""))
+            return
+        if st.session_state.pop(f"std_version_running_{client}", False):
+            st.rerun()
+
+    task = standard_version_task.view(client)
+    if task.get("statut") == "en_cours":
+        st.fragment(progress, run_every="2s")()
+        return
     shown = standard_version.display(client)
+    if task.get("statut") == "non_detectee" and shown["statut"] != "choisie":
+        st.warning(f"Version du Standard non détectée : {task.get('cause') or 'cause inconnue'}",
+                   icon=":material/help:")
+        proposal = ((task.get("resultat") or {}).get("version") or "")
+        with st.form(f"std_version_manual_{client}", border=False):
+            picked = st.text_input("Version du Standard", value=proposal, placeholder="ex. 26.22")
+            columns = st.columns(2)
+            if columns[0].form_submit_button("Retenir cette version") and picked.strip():
+                standard_version.choose(client, picked)
+                st.rerun()
+            if columns[1].form_submit_button("Relancer la détection", type="tertiary") and repo:
+                standard_version_task.start(client, repo, os.getenv("BITBUCKET_STD_REPO_PATH", "").strip(),
+                                            force=True)
+                st.rerun()
+        return
     if not shown["ligne"]:
-        st.caption("Version du Standard : détection en cours (code de l'application, builds Jenkins).")
+        st.caption("Version du Standard : détection à lancer (dépôt du projet client non renseigné).")
         return
     if shown["statut"] in ("ok", "choisie"):
         st.caption(shown["ligne"])

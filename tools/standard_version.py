@@ -145,13 +145,21 @@ def code_source(client_root: str, group_ids: set, ref: str = CLIENT_REF) -> dict
     """
     if not group_ids:
         return {}
-    found = []
+    poms = {}
     for name, repo in git_repos(client_root).items():
         if "cucumber" in name.lower():
             continue
         shown = _git(repo, "show", f"{ref}:pom.xml")
         if shown.returncode == 0:
-            found += pom_versions(shown.stdout, group_ids, f"{name}/pom.xml")
+            poms[name] = shown.stdout
+    return code_from_poms(poms, group_ids)
+
+
+def code_from_poms(poms: dict, group_ids: set) -> dict:
+    """Source a d'après {dépôt: texte du pom.xml} (lu par git ou par l'API Bitbucket) ; voir code_source."""
+    found = []
+    for name, text in sorted(poms.items()):
+        found += pom_versions(text, group_ids, f"{name}/pom.xml")
     if not found:
         return {}
     counts = {}
@@ -193,6 +201,13 @@ def library_source(cucumber_repo_dir: str, version: str) -> dict:
 
 _TEST_JAR = re.compile(r"<dependency>(?:(?!</dependency>).)*?<type>test-jar</type>(?:(?!</dependency>).)*?"
                        r"</dependency>", re.S)
+
+
+def library_from_pom(text: str) -> str:
+    """Version de la dépendance test-jar (bibliothèque Cucumber) d'un pom ; '' sinon."""
+    dependency = _TEST_JAR.search(text or "")
+    version = re.search(r"<version>\s*([^<\s]+)\s*</version>", dependency.group(0)) if dependency else None
+    return version.group(1) if version else ""
 
 
 def cucumber_library_version(cucumber_repo_dir: str, ref: str = CLIENT_REF) -> str:
