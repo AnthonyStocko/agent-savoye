@@ -149,10 +149,14 @@ def expected_count(texts, expression: str = "", exclude: str = "") -> int:
 
 
 def feature_texts(worktree: str) -> list:
-    """Textes des .feature suivis ou nouveaux du worktree."""
+    """
+    Textes des .feature suivis ou nouveaux du worktree, hors sorties Maven (target/ : copies des features, parfois
+    versionnées par erreur, qui doubleraient le nombre de tests attendus).
+    """
     paths = _git(worktree, "ls-files", "-co", "--exclude-standard", "--", "*.feature").stdout.splitlines()
     return [_read_text_file(os.path.join(worktree, *p.split("/"))) for p in paths
-            if os.path.exists(os.path.join(worktree, *p.split("/")))]
+            if not (p.startswith("target/") or "/target/" in p)
+            and os.path.exists(os.path.join(worktree, *p.split("/")))]
 
 
 def report_test_count(report: list) -> int:
@@ -1252,7 +1256,8 @@ def feature_texts_with(worktree: str, overrides: dict) -> list:
     """Textes des .feature du worktree, avec les `overrides` (remplacés ou ajoutés) : ce que le run exécute."""
     paths = _git(worktree, "ls-files", "-co", "--exclude-standard", "--", "*.feature").stdout.splitlines()
     texts = {p: _read_text_file(os.path.join(worktree, *p.split("/"))) for p in paths
-             if os.path.exists(os.path.join(worktree, *p.split("/")))}
+             if not (p.startswith("target/") or "/target/" in p)
+             and os.path.exists(os.path.join(worktree, *p.split("/")))}
     texts.update({rel: text for rel, text in (overrides or {}).items() if rel.endswith(".feature")})
     return list(texts.values())
 

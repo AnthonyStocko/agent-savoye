@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import env_tools
+from tools import env_tools, secret_tools
 from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
@@ -3171,6 +3171,25 @@ def init_jobs_checker(client: str, client_root: str, std_root: str, version: str
         result = cucumber_jobs.apply(worktree, paths, client_root, schemas, std_root, version)
         for line in cucumber_jobs.summary(result):
             print(f"[CUCUMBER INIT] Jobs : {line}")
+        # Règle générale d'ordre : partenaire, secteur, règle, site référencés après leur création par l'init
+        texts = {p: _read_text(os.path.join(worktree, *p.split("/"))) for p in paths
+                 if os.path.exists(os.path.join(worktree, *p.split("/")))}
+        data = {}
+        for path in texts:
+            folder = os.path.join(worktree, *path.replace("/features/", "/files/", 1).rsplit("/", 1)[0].split("/"))
+            for root, _, names in os.walk(folder):
+                for name in names:
+                    if name.lower().endswith((".csv", ".xml", ".xlsx", ".xlsm")):
+                        # Cellules des fichiers de données (classeurs compris), lues sans dépendance externe
+                        try:
+                            rows = cucumber_init_data.read_rows(os.path.join(root, name))
+                        except Exception:  # noqa: BLE001 - fichier illisible : aucune preuve tirée de lui
+                            rows = []
+                        data[os.path.join(root, name)] = chr(10).join(" ".join(r) for r in rows)
+        result["references"] = cucumber_jobs.reference_order(texts, data)
+        for ref in result["references"]:
+            print(f"[CUCUMBER INIT] Ordre : {ref['fichier'].rsplit('/', 2)[-2]}/{ref['fichier'].rsplit('/', 1)[-1]} "
+                  f"— {ref['raison']}")
         return result
     return check
 
@@ -3225,27 +3244,71 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
     remote = f"origin/{profile['verify_branch']}"
     same = (cucumber_tools._git(worktree, "rev-parse", "--verify", "--quiet", remote).returncode == 0
             and cucumber_tools._git(worktree, "diff", "--quiet", remote, "HEAD").returncode == 0)
+    exists = cucumber_tools._git(worktree, "rev-parse", "--verify", "--quiet", remote).returncode == 0
     if same:
         cucumber_tools._git(worktree, "reset", "-q", "--hard", remote)
         print(f"[CUCUMBER INIT] Correction identique déjà sur {profile['verify_branch']} : reprise de "
               f"{cucumber_tools.rev_parse(worktree, 'HEAD')[:8]}.")
-    push_error = cucumber_checks.push_for_verification(worktree, profile["verify_branch"],
-                                                       "Cucumber : jobs de l'init absents chez le client")[0]
-    if push_error:
-        print(f"[CUCUMBER INIT] ⚠️ Init non rejouée : {push_error}")
-        return 1
-    head = cucumber_tools.rev_parse(worktree, "HEAD")
-    sources = {**cucumber_verify.branch_sources(profile, args.cucumber_repo), "CUCUMBER_SPEC_COMMIT": head,
-               profile.get("verify_branch_param") or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM:
-                   profile["verify_branch"]}
+    elif exists:
+        # Branche de travail de l'agent déjà poussée (correction précédente) : la nouvelle correction devient un
+        # commit au-dessus d'elle (contenu = base corrigée), poussé sans forcer
+        cucumber_tools._git(worktree, "reset", "-q", "--soft", remote)
+        cucumber_tools._git(worktree, "commit", "-q", "-m", f"Cucumber : jobs de l'init de {client} contrôlés "
+                                                             f"(ordre de création, définition déployée)")
     tags = profile.get("init_tags") or cucumber_verify.init_tags()
-    print(f"[CUCUMBER INIT] Init rejouée seule sur Jenkins ({tags}, branche {profile['verify_branch']} @ {head[:8]})")
-    outcome = cucumber_verify.run_init(mode, worktree, head,
+
+    def replay(label: str) -> dict:
+        error = cucumber_checks.push_for_verification(worktree, profile["verify_branch"], label)[0]
+        if error:
+            return {"ok": False, "message": f"init non rejouée : {error}", "build": "", "pousse": False}
+        head = cucumber_tools.rev_parse(worktree, "HEAD")
+        sources = {**cucumber_verify.branch_sources(profile, args.cucumber_repo), "CUCUMBER_SPEC_COMMIT": head,
+                   profile.get("verify_branch_param") or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM:
+                       profile["verify_branch"]}
+        print(f"[CUCUMBER INIT] Init rejouée seule sur Jenkins ({tags}, branche {profile['verify_branch']} @ "
+              f"{head[:8]})")
+        out = cucumber_verify.run_init(mode, worktree, head,
                                        lambda: cucumber_tools.build_dir(client, worktree, cucumber_std_dir),
                                        tags, sources)
-    print(f"[CUCUMBER INIT] {'✅' if outcome['ok'] else '❌'} {outcome['message']}"
-          + (f" — {outcome.get('build')}" if outcome.get("build") else ""))
-    return 0 if outcome["ok"] else 1
+        print(f"[CUCUMBER INIT] {'✅' if out['ok'] else '❌'} {out['message']}"
+              + (f" — {out.get('build')}" if out.get("build") else ""))
+        return {**out, "pousse": True}
+
+    outcome = replay("Cucumber : jobs de l'init absents chez le client")
+    if outcome["ok"] or not outcome.get("pousse") or "KisJob" not in outcome.get("message", ""):
+        return 0 if outcome["ok"] else 1
+    # Échec persistant sur un job : diagnostic temporaire (liste des jobs de l'environnement avant la
+    # désactivation), un seul run, puis retiré de la branche
+    print("[CUCUMBER INIT] Échec persistant sur un job : diagnostic temporaire « "
+          f"{cucumber_jobs.DIAGNOSTIC_STEP} » ajouté pour un run, puis retiré.")
+    java = cucumber_jobs.diagnostic_java_path(client)
+    with open(os.path.join(worktree, *java.split("/")), "w", encoding="utf-8", newline=chr(10)) as f:
+        f.write(cucumber_jobs.diagnostic_java(client))
+    for path in paths:
+        full = os.path.join(worktree, *path.split("/"))
+        if os.path.exists(full):
+            text = _read_text(full)
+            with open(full, "w", encoding="utf-8", newline="") as f:
+                f.write(cucumber_jobs.with_diagnostic(text))
+    diagnostic = replay("TEMPORAIRE : diagnostic des jobs de l'init (à retirer)")
+    console = (secret_tools.mask_secrets(jenkins_tools.build_bytes(diagnostic["build"], "consoleText")
+                                         .decode("utf-8", "replace"))[0] if diagnostic.get("build") else "")
+    listed = cucumber_jobs.diagnostic_lines(console)
+    print(f"[CUCUMBER INIT] Jobs présents sur l'environnement avant la désactivation ({len(listed)} ligne(s)) :")
+    for line in listed[:200]:
+        print(f"    {line}")
+    on_env = {line.split(" | ", 1)[0] for line in listed[1:]}
+    wanted = sorted({u["nom"] for u in result["prouves"] if u["preuve"] == "nom"})
+    if listed:
+        absent = [n for n in wanted if n not in on_env]
+        print("[CUCUMBER INIT] Jobs de l'init absents de l'environnement : " + (", ".join(absent) or "aucun"))
+    # Diagnostic retiré : la branche revient à la correction seule
+    cucumber_tools._git(worktree, "revert", "--no-edit", "HEAD")
+    error = cucumber_checks.push_for_verification(worktree, profile["verify_branch"],
+                                                  "Retrait du diagnostic temporaire des jobs")[0]
+    print("[CUCUMBER INIT] Diagnostic retiré de la branche de travail." if not error else
+          f"[CUCUMBER INIT] ⚠️ Retrait du diagnostic non poussé : {error}")
+    return 1
 
 
 def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio_version: str,
