@@ -19,6 +19,7 @@ import difflib
 import os
 import re
 
+from tools import cucumber_wait_steps
 from tools.cucumber_tools import _git, _read_json, _read_text_file, _write_json, _write_text
 from tools.cucumber_verify import failure_kind, parse_scenarios
 
@@ -58,6 +59,9 @@ NATURES = {
     "donnee_reference": "donnée de référence absente de l'environnement",
     "init": "initialisation du run en échec",
     "liste_choix_vide": "liste de choix vide sur un champ obligatoire d'un écran",
+    "delai_bibliotheque": "remplacer le step d'attente de la bibliothèque (délai fixe dépassé) par un step du projet "
+                          "de nom unique, délai paramétrable, qui suit l'état réel des éléments attendus et échoue "
+                          "immédiatement sur une erreur",
     "bug_applicatif": "erreur du serveur",
     "cascade": "conséquence d'un autre échec",
     "hors_depot": "scénario absent du dépôt de l'agent",
@@ -170,6 +174,18 @@ def classify(result: dict) -> dict:
         name = (_UNDEFINED_STEP.search(full) or [None, step])[1] or step
         return out("correction", "step_equivalent", f"Le step « {name} » n'est défini nulle part.",
                    "Remplacer ce step par le step existant équivalent (Standard ou projet).")
+    # Attente de la bibliothèque à délai fixe dépassé : correction connue (cucumber_wait_steps), step du projet
+    if cucumber_wait_steps.is_library_timeout(full):
+        seconds = cucumber_wait_steps.timeout_seconds(full)
+        known = cucumber_wait_steps.known_step(step)
+        return out("correction", "delai_bibliotheque",
+                   f"Délai dépassé dans l'attente de la bibliothèque (step « {step} »"
+                   + (f", {seconds} s" if seconds else "") + ") : ConditionTimeoutException sans état des éléments "
+                   "attendus ni arrêt sur erreur.",
+                   ("Remplacer ce step par le step du projet à délai paramétrable qui suit les fichiers intégrés et "
+                    "échoue immédiatement sur une erreur (correction connue, 0 token)." if known else
+                    "Écrire un step du projet de nom unique, délai paramétrable, qui suit l'état réel des éléments "
+                    "attendus et échoue immédiatement sur une erreur."))
     if _EMPTY_CHOICES.search(full):
         return out("produit", "liste_choix_vide", f"Liste de choix vide sur un champ obligatoire de l'écran "
                                                   f"(step « {step} ») : l'écran ne peut pas être validé.",

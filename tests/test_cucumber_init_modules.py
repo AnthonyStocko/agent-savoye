@@ -154,39 +154,112 @@ def test_fix_removes_the_tms_clear_pushes_and_runs_the_wms_init(cache, origin, s
     assert cm.retag_state(cp.load_profile(CLIENT), "TMS")["retires"]
 
 
+def _old_generation_workspace(m, tmp_path):
+    """Espace de génération sur une branche de couverture ancienne : l'init WMS n'y est pas (cas Canson)."""
+    worktree = m.cucumber_tools.worktree_dir(CLIENT)
+    os.makedirs(worktree)
+    git(worktree, "init", "-q", "-b", "cucumber_clientx_coverage")
+    for key, value in (("user.name", "t"), ("user.email", "t@e.x"), ("core.autocrlf", "false")):
+        git(worktree, "config", key, value)
+    write(os.path.join(worktree, "README.md"), "ancien\n")
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-qm", "ancienne base")
+    return worktree
+
+
 def test_init_generated_by_the_agent_is_corrected_by_the_agent(cache, origin, std_dir, main_module,  # noqa: F811
                                                                monkeypatch, capsys, tmp_path):
+    """Init générée par l'agent, absente de l'espace de génération : corrigée dans l'espace d'init de sa branche."""
     m = main_module
     _client_profile(cache, origin, std_dir)
     monkeypatch.setattr(m.cucumber_tools, "WORKSPACE_DIR", str(tmp_path))
     monkeypatch.setenv("CUCUMBER_COMPILE_CMD", "")
     monkeypatch.delenv("CUCUMBER_AGENT_JENKINS", raising=False)
-    worktree = m.cucumber_tools.worktree_dir(CLIENT)
-    git(str(tmp_path), "clone", "-q", origin["bare"], worktree)
-    for key, value in (("user.name", "t"), ("user.email", "t@e.x"), ("core.autocrlf", "false")):
-        git(worktree, "config", key, value)
-    assert cif.init_author(worktree, INIT_WMS_PATH)["auteur"] == "agent"
-    _imported(7, "INIT- Initialisation globale par fichiers via l'écran", message="Timeout 360 s")
+    _old_generation_workspace(m, tmp_path)
+    _imported(7, "INIT- Purge de l'environnement par le clear \"wms/all\"", message="AssertionError: purge partielle")
     monkeypatch.setattr(m.cucumber_tools, "standard_java_catalogue", lambda *a: {"java_std": "j"})
     monkeypatch.setattr(m.cucumber_tools, "std_step_code", lambda *a: {"sources": "s"})
     monkeypatch.setattr(m, "report_token_usage", lambda *a, **k: None)
     monkeypatch.setattr(m, "share_knowledge", lambda *a, **k: None)
     prompts = []
+    init_space = m.cucumber_init.init_worktree_dir(CLIENT)
 
     def claude(prompt, *a, **k):
         prompts.append(prompt)
-        path = os.path.join(worktree, *INIT_WMS_PATH.split("/"))
+        path = os.path.join(init_space, *INIT_WMS_PATH.split("/"))
         text = open(path, encoding="utf-8").read().replace("wms/all", "wms/stock")
         write(path, text)
         return 0, '{"cause": "clear trop large"}', {}, False
     monkeypatch.setattr(m, "run_cucumber_claude", claude)
     args = SimpleNamespace(client_name=CLIENT, cucumber_base_branch="integration", cucumber_repo="clientx-cucumber")
     capsys.readouterr()
-    assert m.fix_init_from_import(args, 7, "", "", "", sys.executable, os.getcwd()) == 0
+    assert m.fix_init_from_import(args, 7, "", "", "", sys.executable, os.getcwd(), origin["clone"]) == 0
     out = capsys.readouterr().out
-    assert prompts and "à corriger à la main" not in out and "générée par l'agent" in out
+    assert prompts and INIT_WMS_PATH in prompts[0]                      # fichier corrigeable : l'init de l'agent
+    assert "à corriger à la main" not in out and "(aucun)" not in out and "générée par l'agent" in out
     patch = tmp_path / f"{CLIENT}-cucumber-init-correction.patch"
     assert patch.exists() and "wms/stock" in patch.read_text(encoding="utf-8")
+
+
+def test_empty_correctable_list_for_the_agent_init_is_an_agent_error(main_module, repo):
+    out = main_module.fix_own_init(CLIENT, repo, {"ok": False, "message": "", "echecs": [{"fichier": INIT_WMS_PATH}]},
+                                   "branche", "@INIT", {}, {}, {}, "", {"java_std": "j"}, {"sources": "s"}, "",
+                                   sys.executable, os.getcwd(), "w")
+    assert out["ok"] is False and "Erreur de l'agent" in out["message"] and "Erreur de l'agent" in out["action"]
+
+
+TIMEOUT = ("org.awaitility.core.ConditionTimeoutException: cucumber.endPoints.EndPointsNotification expected <true> "
+           "but was <false> within 360 seconds.")
+GLOBAL = "INIT- Initialisation globale par fichiers via l'écran"
+
+
+def test_library_timeout_is_a_known_correction(cache, origin, std_dir):  # noqa: F811
+    from tools import cucumber_failures as cf
+    from tools import cucumber_wait_steps as cw
+    got = cf.classify({"message": TIMEOUT, "step": GLOBAL})
+    assert (got["categorie"], got["nature"]) == ("correction", "delai_bibliotheque") and "360 s" in got["cause"]
+    assert cw.timeout_seconds(TIMEOUT) == 360 and cw.delay(360) == 900
+    text, notes = cw.apply_text(f"    And {GLOBAL}\n", CLIENT, 900)
+    assert "And CLIENTX- Initialisation globale par fichiers via l'écran avec un délai de 900 secondes" in text
+    assert "# TODO-VERSION:" in text and len(notes) == 1
+    assert cw.apply_text(text, CLIENT, 900)[0] == text                      # rejouable
+    java = cw.java(CLIENT)
+    assert '@Given("CLIENTX- Initialisation globale par fichiers via l\'écran avec un délai de {int} secondes")' in java
+    assert "getException()" in java and "getNbIntegration()" in java and "sendPack(fichiers, false)" in java
+    # Attente écrite par le projet (pas une classe de la bibliothèque) : pas cette correction
+    assert not cw.is_library_timeout("ConditionTimeoutException: Condition with lambda was not fulfilled")
+
+
+def test_known_wait_correction_is_pushed_and_the_init_rerun(cache, origin, std_dir, main_module,  # noqa: F811
+                                                            monkeypatch, capsys):
+    m = main_module
+    _client_profile(cache, origin, std_dir)
+    _imported(8, GLOBAL, message=TIMEOUT)
+    monkeypatch.setattr(m.cucumber_verify, "execution_mode", lambda *a: ("branche", "job"))
+    monkeypatch.setattr(m.cucumber_checks, "push_for_verification", lambda wt, branch, message, decision=True: (
+        "" if m.cucumber_tools._git(wt, "push", "origin", f"HEAD:refs/heads/{branch}").returncode == 0 else "KO",
+        False))
+    monkeypatch.setattr(m.cucumber_verify, "run_init", lambda *a: {
+        "ok": False, "message": "environnement non initialisé", "build": "https://jenkins/job/clientx/13/"})
+    monkeypatch.setattr(m.cucumber_import, "build_files", lambda build: {"console.txt": b"ko"})
+    monkeypatch.setattr(m.cucumber_import, "import_files", lambda *a: {"numero": 9, "messages": []})
+    monkeypatch.setattr(m.cucumber_import, "analyse", lambda *a: {"init_en_echec": {
+        "id": f"{INIT_WMS_PATH}::x", "step": "CLIENTX- Initialisation globale par fichiers via l'écran avec un délai "
+                                           "de 900 secondes",
+        "message": "AssertionError: Délai de 900 s dépassé : 42/47 fichier(s) intégré(s)"}})
+    args = SimpleNamespace(client_name=CLIENT, cucumber_base_branch="integration", cucumber_repo="clientx-cucumber")
+    capsys.readouterr()
+    assert m.fix_init_known_waits(args, 8, origin["clone"]) == 1
+    out = capsys.readouterr().out
+    remote = git(origin["clone"], "ls-remote", "origin", f"refs/heads/{WORK}").split()[0]
+    git(origin["clone"], "fetch", "-q", "origin")
+    pushed = git(origin["clone"], "show", f"{remote}:{INIT_WMS_PATH}")
+    assert "CLIENTX- Initialisation globale par fichiers via l'écran avec un délai de 900 secondes" in pushed
+    git(origin["clone"], "cat-file", "-e", f"{remote}:src/test/java/cucumber/features/clientx/AttenteClientxSteps.java")
+    assert "vérifié par git ls-remote" in out and "Bilan : build #13" in out and "42/47" in out
+    # Hors du cas connu : rien
+    _imported(10, GLOBAL, message="AssertionError: autre")
+    assert m.fix_init_known_waits(args, 10, origin["clone"]) is None
 
 
 def test_hand_written_init_gets_a_diff_and_failure_message_is_never_empty(cache, repo, std_dir, main_module,  # noqa: F811

@@ -1,0 +1,32 @@
+[2026-11-03T20:04:15.187Z] Scenario: Intégration des données                                     # src/test/resources/cucumber/features/client/01-Contexte/WMS/01-Initialisation.feature:4
+[2026-11-03T20:07:25.865Z] 47 // 39  -  07-WmsLocationCreationDraft-EXP-v24.14.0.xlsm / INTEGRATED
+[2026-11-03T20:07:25.865Z] 47 // 40  -  07-WmsLocationCreationDraft-PTS-v24.14.0.xlsm / INTEGRATED
+[2026-11-03T20:08:12.796Z] 47 // 41  -  07-WmsLocationCreationDraft-RES2-v25.14.xlsm / INTEGRATED
+[2026-11-03T20:08:25.127Z] 47 // 42  -  07-WmsLocationCreationDraft-PACK-v24.14.0.xlsm / INTEGRATED
+[2026-11-03T20:10:46.894Z] 0 // 1  -  07-WmsLocationCreationDraft-PICK-v24.14.0.xlsm / INTEGRATED
+[2026-11-03T20:10:46.884Z]   And INIT- Initialisation globale par fichiers via l'écran           # cucumber.features.kis.QAFileIntegrationStep.initialisationGlobaleParFichier()
+
+[2026-11-03T20:10:46.885Z]       org.awaitility.core.ConditionTimeoutException: cucumber.endPoints.EndPointsNotification expected <true> but was <false> within 360 seconds.
+
+[2026-11-03T20:10:46.885Z] 	at org.awaitility.core.ConditionAwaiter.await(ConditionAwaiter.java:136)
+
+[2026-11-03T20:10:46.885Z] 	at org.awaitility.core.AbstractHamcrestCondition.await(AbstractHamcrestCondition.java:89)
+
+[2026-11-03T20:10:46.885Z] 	at org.awaitility.core.ConditionFactory.until(ConditionFactory.java:840)
+
+[2026-11-03T20:10:46.885Z] 	at org.awaitility.core.ConditionFactory.until(ConditionFactory.java:619)
+
+[2026-11-03T20:10:46.885Z] 	at cucumber.endPoints.EndPointsNotification.waitNotification(EndPointsNotification.java:216)
+[2026-11-03T20:10:47.167Z] [ERROR] Tests run: 4, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 394.7 s <<< FAILURE! -- in cucumber.RunnerTest
+
+[2026-11-03T20:10:47.167Z] [ERROR] Client - 01 - Initialisation des données #2.Intégration des données -- Time elapsed: 383.2 s <<< ERROR!
+
+[2026-11-03T20:10:47.167Z] org.awaitility.core.ConditionTimeoutException: cucumber.endPoints.EndPointsNotification expected <true> but was <false> within 360 seconds.
+
+[2026-11-03T20:10:47.167Z] 	at org.awaitility.core.ConditionAwaiter.await(ConditionAwaiter.java:136)
+
+[2026-11-03T20:10:47.167Z] 	at org.awaitility.core.AbstractHamcrestCondition.await(AbstractHamcrestCondition.java:89)
+
+[2026-11-03T20:10:47.167Z] 	at org.awaitility.core.ConditionFactory.until(ConditionFactory.java:840)
+
+[2026-11-03T20:10:47.167Z] 	at org.awaitility.core.ConditionFactory.until(ConditionFactory.java:619)

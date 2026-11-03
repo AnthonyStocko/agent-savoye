@@ -156,6 +156,19 @@
           "nom de clear du client à vérifier"
         ]
       }
+    },
+    {
+      "cas": "ConditionTimeoutException sur un step d'attente de la bibliothèque (intégration des fichiers de l'init, 360 s)",
+      "console": "14-delai-depasse-bibliotheque.console.txt",
+      "source": "réel anonymisé (nom du client) : build 271, init WMS, 42 fichiers sur 47 intégrés puis plus aucune notification jusqu'au délai fixe de 360 s de GS1EndPoints.sendPack",
+      "attendu": {
+        "categorie": "correction",
+        "nature": "delai_bibliotheque",
+        "cause_contient": [
+          "délai dépassé",
+          "360 s"
+        ]
+      }
     }
   ],
   "runs": [
