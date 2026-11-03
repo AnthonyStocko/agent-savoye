@@ -309,8 +309,13 @@ def client_version(client_name: str, fallback: str = "") -> tuple:
     (version, origine) à utiliser pour le client : choix saisi dans son profil, sinon version détectée, sinon
     `fallback` (ODATIO_VERSION du .env ou version du pom du Standard).
     """
-    from tools import cucumber_profile
+    from tools import client_version, cucumber_profile
     document = cucumber_profile.load_profile(client_name)
+    # Version du client choisie : le Standard est celui du pom de l'application à cette version
+    deduced = client_version.chosen(document)
+    if (deduced.get("standard") or {}).get("version"):
+        return deduced["standard"]["version"], (f"version client {deduced.get('version_client')} "
+                                                f"({deduced.get('ref_client')}), {deduced['standard'].get('detail')}")
     chosen = ((document.get("saisi") or {}).get("server_version") or "").strip()
     if chosen:
         return normalize(chosen)[0] or chosen, "profil client (choix)"

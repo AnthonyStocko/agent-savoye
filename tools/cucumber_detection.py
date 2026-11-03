@@ -28,7 +28,7 @@ from datetime import datetime
 
 from tools import (cucumber_environment, cucumber_init_data, cucumber_modules, cucumber_profile, cucumber_recreation,
                    cucumber_versions)
-from tools.cucumber_tools import (CLIENT_REFS, _git, _read_json, _read_text_file, _write_json, cache_dir, git_repos,
+from tools.cucumber_tools import (client_ref, CLIENT_REFS, _git, _read_json, _read_text_file, _write_json, cache_dir, git_repos,
                                   pick_ref)
 
 INIT_STATES = {"absente": "init absente", "incomplete": "init incomplète", "complete": "init complète"}
@@ -112,7 +112,7 @@ def known_projects(cache_root: str) -> dict:
 def repo_commits(client_root: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str) -> dict:
     """Commits des dépôts lus par la détection : dépôts du client, base du dépôt Cucumber client, Standard."""
     # Références distantes : les copies sont mises à jour par fetch (HEAD local ne bouge pas)
-    commits = {f"client/{name}": _git(path, "rev-parse", pick_ref(path, CLIENT_REFS)).stdout.strip()
+    commits = {f"client/{name}": _git(path, "rev-parse", client_ref(path)).stdout.strip()
                for name, path in git_repos(client_root).items()}
     commits["cucumber"] = _git(cucumber_repo_dir, "rev-parse", base).stdout.strip() if base else ""
     commits["standard"] = _git(cucumber_std_dir, "rev-parse", "HEAD").stdout.strip() if cucumber_std_dir else ""

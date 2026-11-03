@@ -20,7 +20,7 @@ import re
 from datetime import datetime
 
 from tools import cucumber_checks, cucumber_init_data, cucumber_initializers, cucumber_modules, cucumber_versions
-from tools.cucumber_tools import (CLIENT_REFS, _git, _read_json, _read_text_file, _runners, _test_java_files,
+from tools.cucumber_tools import (client_ref, CLIENT_REFS, _git, _read_json, _read_text_file, _runners, _test_java_files,
                                   _write_json,
                                   cache_dir, depends_on_std_test_jar, git_repos, java_classes, java_package_segment,
                                   load_inventory, pick_ref, snapshot)
@@ -128,7 +128,7 @@ def application_clears(client_root: str) -> dict:
         if "cucumber" in name.lower():
             continue
         # Lu sur la référence distante (copies mises à jour par fetch, jamais par pull)
-        ref = pick_ref(repo, CLIENT_REFS)
+        ref = client_ref(repo)
         grep = _git(repo, "grep", "-I", "-o", "-E", _APP_CLEAR.pattern, ref, "--", *_APP_CONFIG_GLOBS)
         for line in grep.stdout.splitlines():
             path, _, value = line[len(ref) + 1:].partition(":") if line.startswith(ref + ":") else                 line.partition(":")
@@ -321,8 +321,11 @@ def effective_profile(document: dict) -> dict:
     clears = ((document or {}).get("suggestions") or {}).get("clears_application")
     # Modules exclus (saisie) : leurs features et tags d'init retirés du profil appliqué, partout
     detected_tags = (((document or {}).get("detecte") or {}).get("init_tags") or "")
+    # Version du client choisie (tools/client_version) : paramètres Jenkins des runs de l'agent qui en sont déduits
+    version = (document or {}).get("version_client") or {}
     return cucumber_modules.scope_profile({**profile, "sources": sources, "avertissements": warnings,
-                                           "clears_application": clears, "init_tags_detectes": detected_tags})
+                                           "clears_application": clears, "init_tags_detectes": detected_tags,
+                                           "version_client": version})
 
 
 def save_user_fields(client_name: str, fields: dict) -> dict:

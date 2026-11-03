@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -853,14 +853,24 @@ def cucumber_std_clone_dir(workspace_dir: str, clone_url: str) -> str:
 
 def checkout_cucumber_std_ref(repo_dir: str, odatio_version: str) -> str:
     """
-    Détache le clone sur la première référence existante : branches distantes et tags de la version Odatio, puis
-    origin/dev, origin/main, origin/master, origin/HEAD. Jamais une branche locale, qui peut être en retard sur le
-    distant. Renvoie la référence retenue ('' si aucune).
+    Détache le clone sur la référence de la version du Standard : release/<v>, v<v>, <v> (branches distantes, puis
+    tags) ; absente : version existante la plus proche INFÉRIEURE, avec un avertissement explicite — jamais de repli
+    silencieux sur master. Seule une version illisible (« dev ») prend origin/dev, main, master, HEAD, signalé.
+    Jamais une branche locale, qui peut être en retard sur le distant. Renvoie la référence retenue ('' si aucune).
     """
     clean_ver = odatio_version.replace("-SNAPSHOT", "").strip()
-    candidates = [f"origin/release/{clean_ver}", f"origin/v{clean_ver}", f"origin/{clean_ver}",
-                  f"refs/tags/v{clean_ver}", f"refs/tags/{clean_ver}",
-                  "origin/dev", "origin/main", "origin/master", "origin/HEAD"]
+    if standard_version.normalize(clean_ver)[0]:
+        picked = client_version.cucumber_std_ref(clean_ver, client_version.cucumber_std_names(repo_dir))
+        if picked["avertissement"]:
+            print(f"[CUCUMBER STD] ⚠️ {picked['avertissement']}")
+        if not picked["ref"]:
+            return ""
+        name = picked["ref"]
+        candidates = [f"origin/{name}", f"refs/tags/{name}"]
+    else:
+        print(f"[CUCUMBER STD] ⚠️ Version du Standard illisible ({odatio_version or 'vide'}) : branche de "
+              f"développement du Cucumber Standard retenue (dev, main, master).")
+        candidates = ["origin/dev", "origin/main", "origin/master", "origin/HEAD"]
     for ref in candidates:
         if not _git_out(repo_dir, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"):
             continue
@@ -1359,9 +1369,20 @@ def main():
             STD_READER[0] = local_std_repo
         STD_LOCAL_ROOT[0] = local_std_repo
 
-        # 2. Détection de la version Odatio (repli global ; un client Cucumber a la sienne, voir plus bas)
+        # 2. Détection de la version Odatio (repli global ; un client Cucumber a la sienne, voir plus bas). Version du
+        # client choisie dans « Données du projet » : tout en est déduit, ODATIO_VERSION du .env n'est pas lu
         local_cucumber_std_repo = ""
-        odatio_version = detect_odatio_version(local_std_repo)
+        chosen_version = (client_version.chosen(cucumber_profile.load_profile(args.client_name))
+                          if is_cucumber_client and args.client_name else {})
+        if (chosen_version.get("standard") or {}).get("version"):
+            odatio_version = chosen_version["standard"]["version"]
+            cucumber_tools.CLIENT_VERSION_REF[0] = client_version.client_git_ref(
+                cucumber_profile.load_profile(args.client_name))
+            print(f"[VERSION CLIENT] {client_version.line(chosen_version)}")
+            for warning in chosen_version.get("avertissements") or []:
+                print(f"[VERSION CLIENT] ⚠️ {warning}")
+        else:
+            odatio_version = detect_odatio_version(local_std_repo)
 
         # 3. Dépôt Client & Règles de branches
         if target_project.upper() in std_only_projects() or args.client_repo == "STD_ONLY":
@@ -2609,7 +2630,7 @@ def initializer_sources(client_root: str, items: list, target_dir: str) -> dict:
         if not classe or classe in out or not repo:
             continue
         # Lu sur la référence distante (copies mises à jour par fetch, arbre de travail non à jour)
-        ref = cucumber_tools.pick_ref(repo, cucumber_tools.CLIENT_REFS)
+        ref = cucumber_tools.client_ref(repo)
         found = [p for p in cucumber_tools._git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines()
                  if p.endswith(f"/{classe}.java")]
         if found:

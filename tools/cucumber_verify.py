@@ -1191,7 +1191,7 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
     fixed, _ = cucumber_job.fixed_parameters(profile, info["definitions"])
     reference = cucumber_job.reference_parameters(job, sources.get("depot", ""), info["definitions"],
                                                    agent_branch=branch)
-    refused = cucumber_job.client_configuration_error(reference, fixed, sources.get("depot", ""))
+    refused = cucumber_job.client_configuration_error(reference, fixed, sources.get("depot", ""), profile)
     if refused:
         return {"ok": False, "message": f"non vérifié : {refused}", "build": "", "resultats": {}}
     print(f"[CUCUMBER] Paramètres du job repris du build n° {reference.get('numero')} de {sources.get('depot')}"

@@ -34,6 +34,13 @@ def target_version(document: dict) -> dict:
     Version cible du client d'après sa version du Standard détectée (profil « version_standard ») :
     {"version", "source", "detail", "avertissement"} ; version '' si aucune source.
     """
+    from tools import client_version
+    deduced = client_version.chosen(document)
+    if (deduced.get("standard") or {}).get("version"):
+        # Version du client choisie : cible = Standard du pom de l'application à cette version
+        return {"version": deduced["standard"]["version"], "source": "version_client",
+                "detail": f"version client {deduced.get('version_client')} ({deduced.get('ref_client')})",
+                "avertissement": ""}
     sources = {s.get("source"): s for s in ((document or {}).get("version_standard") or {}).get("sources") or []}
     jenkins, code = sources.get("jenkins") or {}, sources.get("code") or {}
     chosen = jenkins if jenkins.get("version") else code

@@ -184,7 +184,7 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     client_repo = repository or f"{java_package_segment(client_name)}-cucumber"
     reference = cucumber_job.reference_parameters(check["job"], client_repo, check["definitions"],
                                                    agent_branch=profile.get("verify_branch", ""))
-    refused = cucumber_job.client_configuration_error(reference, fixed, client_repo)
+    refused = cucumber_job.client_configuration_error(reference, fixed, client_repo, profile)
     if refused:
         run["message"] = f"rien n'est lancé : {refused}"
         record(client_name, run)
@@ -261,7 +261,7 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
         client_repo = repository or f"{java_package_segment(client_name)}-cucumber"
         reference = cucumber_job.reference_parameters(check["job"], client_repo, check["definitions"],
                                                    agent_branch=profile.get("verify_branch", ""))
-        refused = cucumber_job.client_configuration_error(reference, fixed, client_repo)
+        refused = cucumber_job.client_configuration_error(reference, fixed, client_repo, profile)
         if refused:
             out["erreurs"].append(refused)
             out["ok"] = False

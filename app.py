@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, standard_version, standard_version_task
+from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1372,7 +1372,7 @@ def render_project_settings(ctx: dict) -> None:
         if ctx["client"]:
             st.caption(f"Dépôt cible : **{ctx['client']}-cucumber** · identifiant de travail "
                        f"**{cucumber_tools.work_id(ctx['client'])}**")
-            render_standard_version(ctx["client"])
+            render_client_version(ctx)
             render_tested_modules(ctx)
             render_delivery_settings(ctx)
         st.text_input("Schéma de la config client (base client) :", key="cucumber_source_schema",
@@ -1550,6 +1550,80 @@ def render_tested_modules(ctx: dict) -> None:
                     (st.info if code_rc == 0 else st.error)(
                         "Rien à changer sur la branche de base." if code_rc == 0 else
                         f"Patch non produit : {interruption_cause(code_rc)}.")
+
+
+def client_version_builds(client: str) -> list:
+    """Derniers builds du job du client (artefact du client, registre des versions KIS), [] sans Jenkins."""
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    job = (profile.get("run_job") or os.getenv("CUCUMBER_VERIFY_JOB", "")).strip()
+    return jenkins_tools.recent_builds(job, 60) if job and jenkins_tools.jenkins_configured() else []
+
+
+def apply_client_version(ctx: dict, entry: dict) -> None:
+    """Version choisie : déduction enregistrée, détection relancée (copies de code et montée de bibliothèque)."""
+    client = ctx["client"]
+    with st.spinner(f"Déduction pour la version {entry.get('version')}…"):
+        client_version.choose(client, entry, (st.session_state.get("cucumber_repo") or "").strip(),
+                              os.getenv("BITBUCKET_STD_REPO_PATH", "").strip(),
+                              (st.session_state.get("cucumber_std_repo") or "").strip(),
+                              client_version_builds(client))
+    cucumber_detection.start(client, ctx["cmd"], force=True)
+
+
+def render_client_version(ctx: dict) -> None:
+    """
+    Version du client (branche d'intégration, branches de release, tags, versions publiées) : tout en est déduit —
+    Standard, Cucumber Standard, bibliothèque Cucumber, KIS — sur une ligne, avec un avertissement par écart.
+    """
+    client = ctx["client"]
+    repo = (st.session_state.get("cucumber_repo") or "").strip()
+    current = client_version.saved(client)
+    versions = current.get("versions") or []
+    refresh = st.button("Actualiser les versions", key=f"client_versions_refresh_{client}", type="tertiary",
+                        icon=":material/refresh:")
+    if repo and (refresh or not current.get("versions_date")):
+        with st.spinner("Lecture des versions du client (dépôts, tags, dépôt Maven)…"):
+            try:
+                found = client_version.list_versions(client, repo, os.getenv("BITBUCKET_STD_REPO_PATH", "").strip(),
+                                                     client_version_builds(client))
+            except standard_version_task.SourceError as e:
+                found = {"versions": [], "erreur": str(e)}
+        versions = found["versions"]
+        if found.get("erreur"):
+            st.caption(f":material/info: {found['erreur']}")
+        # Par défaut : la branche d'intégration
+        if versions and not current.get("choix"):
+            apply_client_version(ctx, versions[0])
+            st.rerun()
+    if not versions:
+        st.caption("Version du client : aucune version lue (dépôt de l'application introuvable ou illisible).")
+        render_standard_version(client)
+        return
+    ids = [v["id"] for v in versions]
+    chosen_id = (current.get("choix") or {}).get("id")
+    picked = st.selectbox("Version du client", ids, index=ids.index(chosen_id) if chosen_id in ids else 0,
+                          format_func=lambda i: next(v["libelle"] for v in versions if v["id"] == i),
+                          key=f"client_version_{client}",
+                          help="Branche d'intégration, branches de release, tags de l'application et versions "
+                               "publiées dans le dépôt Maven. Le Standard, le Cucumber Standard, la bibliothèque "
+                               "Cucumber et les paramètres Jenkins des runs de l'agent en sont déduits.")
+    if picked != chosen_id:
+        apply_client_version(ctx, next(v for v in versions if v["id"] == picked))
+        st.rerun()
+    deduction = (current.get("deduction") or {})
+    if deduction:
+        st.caption(client_version.line(deduction))
+    for warning in deduction.get("avertissements") or []:
+        st.warning(warning, icon=":material/warning:")
+    standard = (deduction.get("standard") or {}).get("version")
+    if standard and not (deduction.get("kis") or {}).get("kis"):
+        with st.form(f"client_version_kis_{client}", border=False):
+            kis = st.text_input(f"Version KIS pour le Standard {standard}", placeholder="ex. 3.12",
+                                help="Aucun build n'a démarré d'application de cette version du Standard : la "
+                                     "version KIS n'est jamais reprise d'un build d'une autre version.")
+            if st.form_submit_button("Enregistrer") and kis.strip():
+                client_version.answer_kis(client, kis)
+                st.rerun()
 
 
 def render_standard_version(client: str) -> None:

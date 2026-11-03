@@ -20,7 +20,7 @@ n'est citée qu'à titre d'information. Un job non prouvé n'est jamais deviné 
 """
 import re
 
-from tools.cucumber_tools import CLIENT_REFS, _git, git_repos, pick_ref
+from tools.cucumber_tools import client_ref, CLIENT_REFS, _git, git_repos, pick_ref
 
 TODO_MARKER = "TODO-JOB:"
 # Step -> ce qui doit être prouvé : le nom du job (il doit exister) ou sa classe (job créé)
@@ -109,7 +109,7 @@ def from_code(client_root: str, names: list, classes: list) -> dict:
     for repo_name, repo in git_repos(client_root).items():
         if "cucumber" in repo_name.lower():
             continue
-        ref = pick_ref(repo, CLIENT_REFS)
+        ref = client_ref(repo)
         for name in [n for n in names if n and n not in found["noms"]]:
             grep = _git(repo, "grep", "-I", "-l", "-F", f'"{name}"', ref, "--")
             if grep.stdout.strip():
@@ -155,7 +155,7 @@ def client_bundle_lists(client_root: str) -> list:
     for repo_name, repo in git_repos(client_root).items():
         if "cucumber" in repo_name.lower():
             continue
-        ref = pick_ref(repo, CLIENT_REFS)
+        ref = client_ref(repo)
         for path in _git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines():
             if path.endswith("bundle.list") and "/test/" not in path:
                 lists.append(_git(repo, "show", f"{ref}:{path}").stdout)
@@ -869,7 +869,7 @@ def client_imports(client_root: str) -> set:
     for repo_name, repo in git_repos(client_root).items():
         if "cucumber" in repo_name.lower():
             continue
-        ref = pick_ref(repo, CLIENT_REFS)
+        ref = client_ref(repo)
         for path in _git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines():
             if path.endswith("bundle.list") and "/test/" not in path:
                 found |= {a for k, a in _BUNDLE.findall(_git(repo, "show", f"{ref}:{path}").stdout) if k == "import"}

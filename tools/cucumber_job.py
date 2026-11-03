@@ -36,7 +36,9 @@ ROLES = {"branche": "branche du dépôt client lue par le job (branche de travai
          "environnement": "environnement d'exécution",
          "composant_proprietaire": "propriétaire (groupe Maven) de l'artefact monté",
          "composant_nom": "nom de l'artefact monté",
-         "composant_version": "version de l'artefact monté"}
+         "composant_version": "version de l'artefact monté",
+         "standard_branche": "branche ou tag du Cucumber Standard exécuté",
+         "kis_version": "version KIS de l'environnement"}
 # Rôles sans lesquels l'agent ne peut pas piloter le job
 REQUIRED_ROLES = ("branche", "arguments")
 # Détection : (motif du nom, motif exclu) ; plusieurs candidats pour un rôle = ambiguïté, rôle laissé vide
@@ -51,6 +53,8 @@ _DETECTION = {
     "composant_proprietaire": (r"(COMPONENT|ARTIFACT).*(OWNER|GROUP)", r""),
     "composant_nom": (r"(COMPONENT|ARTIFACT).*NAME|ARTIFACT_?ID", r""),
     "composant_version": (r"(COMPONENT|ARTIFACT).*VERSION", r""),
+    "standard_branche": (r"STANDARD.*BRANCH", r""),
+    "kis_version": (r"KIS.*VERSION", r""),
 }
 TAG_FILTER = "cucumber.filter.tags"
 _TAG_OPTION = re.compile(rf"\s*-D{re.escape(TAG_FILTER)}=(?:'[^']*'|\"[^\"]*\"|\S+)")
@@ -149,7 +153,33 @@ def fixed_parameters(profile: dict, definitions: dict = None) -> tuple:
             warnings.append(f"paramètre imposé {name} absent du job : ignoré")
         else:
             fixed[name] = value.strip()
-    return fixed, warnings
+    # Version du client choisie (« version_client ») : version de l'artefact, branche du Cucumber Standard et version
+    # KIS déduites, jamais recopiées d'un build d'une autre version
+    version, version_warnings = version_parameters(profile, definitions)
+    return {**fixed, **version}, warnings + version_warnings
+
+
+def version_parameters(profile: dict, definitions: dict = None) -> tuple:
+    """
+    Paramètres déduits de la version du client choisie (client_version) : {nom: valeur} pour les rôles
+    composant_version, standard_branche, kis_version trouvés parmi les paramètres du job (noms détectés, jamais en
+    dur). Valeur inconnue (KIS) : absente, avec avertissement (le run est refusé par client_configuration_error).
+    """
+    deduction = (((profile or {}).get("version_client") or {}).get("deduction") or {})
+    values = deduction.get("jenkins") or {}
+    if not values or not definitions:
+        return {}, []
+    roles, _ = effective_roles(profile, definitions)
+    params, warnings = {}, []
+    for role in ("composant_version", "standard_branche", "kis_version"):
+        name = roles.get(role)
+        if not name:
+            continue
+        if values.get(role):
+            params[name] = values[role]
+        else:
+            warnings.append(f"{name} inconnu pour la version client {deduction.get('version_client')} : à renseigner")
+    return params, warnings
 
 
 # Où le filtre de tags d'un run est envoyé : arguments Maven, paramètre de tags du job (rôle « tags »), ou les deux
@@ -214,8 +244,16 @@ def build_parameters(definitions: dict, roles: dict, branch: str, repository: st
     return params
 
 
-def client_configuration_error(reference: dict, fixed: dict, repository: str) -> str:
-    """Run refusé sans configuration propre au client (ni build de référence, ni paramètres imposés)."""
+def client_configuration_error(reference: dict, fixed: dict, repository: str, profile: dict = None) -> str:
+    """
+    Run refusé sans configuration propre au client (ni build de référence, ni paramètres imposés), ou, une version
+    client étant choisie, sans version KIS connue pour sa version du Standard (question posée dans l'IHM).
+    """
+    deduction = (((profile or {}).get("version_client") or {}).get("deduction") or {})
+    if deduction and not (deduction.get("jenkins") or {}).get("kis_version"):
+        return (f"version KIS inconnue pour le Standard {(deduction.get('standard') or {}).get('version') or '?'} "
+                f"(version client {deduction.get('version_client')}) : renseignez-la dans « Données du projet » — "
+                f"aucune valeur n'est reprise d'un build d'une autre version")
     if (reference or {}).get("parametres") or fixed:
         return ""
     return (f"aucun build de référence pour {repository or 'ce client'} sur ce job, ni paramètres imposés dans le "

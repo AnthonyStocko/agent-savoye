@@ -32,6 +32,26 @@ STD_REFS = ("origin/development", "origin/dev", "origin/HEAD", "HEAD")
 STD_VERSION = [""]
 
 
+# Référence Git du code du client pour la version choisie (tools/client_version : origin/<release> ou
+# refs/tags/<tag>), lue avant CLIENT_REFS ; dépôts sans cette référence : intégration, avec un avertissement
+CLIENT_VERSION_REF = [""]
+_CLIENT_REF_WARNED = set()
+
+
+def client_refs() -> tuple:
+    return ((CLIENT_VERSION_REF[0],) if CLIENT_VERSION_REF[0] else ()) + CLIENT_REFS
+
+
+def client_ref(repo: str) -> str:
+    """Référence lue d'un dépôt du client : celle de la version choisie, sinon intégration (avertissement unique)."""
+    ref = pick_ref(repo, client_refs())
+    wanted = CLIENT_VERSION_REF[0]
+    if wanted and ref != wanted and repo not in _CLIENT_REF_WARNED:
+        _CLIENT_REF_WARNED.add(repo)
+        print(f"[VERSION CLIENT] ⚠️ {os.path.basename(repo.rstrip('/'))} : pas de {wanted}, code lu sur {ref or 'aucune référence'}")
+    return ref
+
+
 def std_refs() -> tuple:
     """Références candidates des dépôts du Standard pour la version du client en cours (STD_VERSION)."""
     from tools.standard_version import std_refs as refs_for
@@ -409,7 +429,7 @@ def build_inventory(client_name: str, client_root: str, std_root: str, max_files
     std_index = _std_index(std_repos)
     refs, files = {}, []
     for repo, repo_dir in client_repos.items():
-        ref = pick_ref(repo_dir, CLIENT_REFS)
+        ref = client_ref(repo_dir)
         if not ref:
             continue
         refs[repo] = {"ref": ref, "commit": rev_parse(repo_dir, ref)}
