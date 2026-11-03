@@ -11,7 +11,8 @@ Sources, dans l'ordre :
      ancienne que le serveur sans que ce soit un conflit, voir cucumber_versions).
 Normalisation : 26.22, 26.22.3, 26.22-SNAPSHOT, v26.22, release/26.22 → « 26.22 », version complète gardée.
 Résultat : « version_standard » du profil du client (server_version détecté) ; ODATIO_VERSION du .env n'est plus
-qu'un repli. Sources a et b divergentes : conflit, l'utilisateur choisit (saisie du profil) ; aucune : saisie.
+qu'un repli. Sources a et b divergentes : la version de l'application (a) est retenue, l'écart signalé ; aucune
+source : saisie.
 """
 import re
 import xml.etree.ElementTree as ET
@@ -66,8 +67,37 @@ def pom_group_id(text: str) -> str:
     return _text(root, "groupId") or _text(_child(root, "parent"), "groupId")
 
 
-def std_group_ids(std_root: str, ref_candidates=("origin/development", "origin/dev", "origin/HEAD", "HEAD")) -> set:
-    """groupIds du Standard : ceux des pom racine des dépôts du projet Standard configuré."""
+GROUP_IDS_TTL_S = 24 * 3600
+
+
+def std_group_ids(std_root, ref_candidates=("origin/development", "origin/dev", "origin/HEAD", "HEAD")) -> set:
+    """
+    groupIds du Standard : ceux des pom racine des dépôts du projet Standard configuré. `std_root` : dossier de
+    clones, ou source Bitbucket (tools/bitbucket_std, résultat gardé GROUP_IDS_TTL_S en cache disque).
+    """
+    import json
+    import os
+    import time
+    if hasattr(std_root, "find_quoted"):
+        cache = os.path.join(std_root.cache_dir, "group_ids.json")
+        try:
+            with open(cache, encoding="utf-8") as f:
+                stored = json.load(f)
+            if time.time() - stored["date"] < GROUP_IDS_TTL_S and stored["ids"]:
+                return set(stored["ids"])
+        except (OSError, ValueError, KeyError):
+            pass
+        out = set()
+        for repo in std_root.repos():
+            ref = std_root.ref(repo, ref_candidates)
+            group = pom_group_id(std_root.show(repo, ref, "pom.xml")) if ref else ""
+            if group:
+                out.add(group)
+        if out:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump({"date": time.time(), "ids": sorted(out)}, f)
+        return out
     out = set()
     for repo in git_repos(std_root).values():
         for ref in ref_candidates:
@@ -228,18 +258,21 @@ def detect(client_root: str, std_root: str, cucumber_repo_dir: str, cucumber_rep
 
 def resolve(code: dict, jenkins: dict, library: dict) -> dict:
     """
-    Version retenue : code, sinon Jenkins, sinon bibliothèque. Code et Jenkins divergents : statut « conflit »,
-    aucune version retenue, les deux affichées avec leurs sources. Aucune source : « introuvable ».
+    Version retenue : celle qu'utilise le client — code de son application, sinon Jenkins, sinon bibliothèque.
+    Jenkins divergent du code (branche du Standard du dernier build, plus ancienne ou plus récente que
+    l'application) : la version du code est gardée, l'écart signalé (« ecart »). Aucune source : « introuvable ».
     """
     sources = [s for s in (code, jenkins, library) if s]
     main = [s for s in (code, jenkins) if s]
-    if len({s["version"] for s in main}) > 1:
-        return {"statut": "conflit", "version": "", "complete": "", "detail": "", "sources": sources}
     chosen = (main or sources or [None])[0]
     if not chosen:
         return {"statut": "introuvable", "version": "", "complete": "", "detail": "", "sources": []}
+    gap = ""
+    if code and jenkins and code["version"] != jenkins["version"]:
+        gap = (f"Jenkins exécute le Standard {jenkins['version']} ({jenkins['detail']}), l'application du client "
+               f"utilise {code['version']} ({code['detail']})")
     return {"statut": "ok", "version": chosen["version"], "complete": chosen["complete"],
-            "detail": chosen["detail"], "source": chosen["source"], "sources": sources}
+            "detail": chosen["detail"], "source": chosen["source"], "sources": sources, "ecart": gap}
 
 
 def line(result: dict, chosen: str = "") -> str:
@@ -247,7 +280,8 @@ def line(result: dict, chosen: str = "") -> str:
     if chosen:
         return f"Standard {chosen} — choisie dans le profil client"
     if (result or {}).get("statut") == "ok":
-        return f"Standard {result['version']} — source : {result['detail']}"
+        return (f"Standard {result['version']} — source : {result['detail']}"
+                + (f" — écart : {result['ecart']}" if result.get("ecart") else ""))
     if (result or {}).get("statut") == "conflit":
         return "Versions du Standard divergentes : " + " ; ".join(
             f"{s['version']} ({s['detail']})" for s in result["sources"]) + " — laquelle retenir ?"

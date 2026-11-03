@@ -100,13 +100,15 @@ def test_jenkins_source_only_reads_the_client_builds():
     assert (found["version"], found["complete"]) == ("26.21", "v26.21") and "n° 8" in found["detail"]
 
 
-def test_conflict_between_code_and_jenkins_is_reported():
+def test_client_version_wins_over_jenkins_and_gap_is_reported():
     code = {"source": "code", "version": "26.22", "complete": "26.22.3", "detail": "app/pom.xml, std-parent 26.22.3"}
     jenkins = {"source": "jenkins", "version": "26.21", "complete": "v26.21", "detail": "build Jenkins n° 8"}
     result = sv.resolve(code, jenkins, {})
-    assert result["statut"] == "conflit" and result["version"] == ""
+    # La version retenue est celle qu'utilise le client (son application) ; Jenkins divergent : écart signalé
+    assert result["statut"] == "ok" and result["version"] == "26.22" and result["source"] == "code"
     text = sv.line(result)
-    assert "26.22 (app/pom.xml" in text and "26.21 (build Jenkins n° 8)" in text and "laquelle retenir" in text
+    assert "Standard 26.22" in text and "écart" in text and "26.21 (build Jenkins n° 8)" in text
+    assert not sv.resolve(code, {**jenkins, "version": "26.22"}, {})["ecart"]
     # Bibliothèque Cucumber plus ancienne : pas un conflit (repli seulement)
     library = sv.library_source("x-cucumber", "26.16")
     assert sv.resolve(code, {}, library)["statut"] == "ok"

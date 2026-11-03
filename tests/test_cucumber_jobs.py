@@ -298,3 +298,29 @@ def test_recent_standard_fetch_is_reused(tmp_path, monkeypatch):
     assert main.std_fetch_max_age() == 0
     monkeypatch.setenv("STD_FETCH_MAX_AGE_MINUTES", "abc")
     assert main.std_fetch_max_age() == 60
+
+
+def test_clear_of_a_module_no_longer_imported_is_commented():
+    text = ("  Scenario: Intégration des données\n"
+            "    And INIT- Purge de l'environnement par le clear \"wms/all\"\n"
+            "    And INIT- Purge de l'environnement par le clear \"tms/all\"\n")
+    new, notes = cj.drop_clears_of_absent_modules(text, {"wms-contrib-odatio"})
+    lines = new.splitlines()
+    assert lines[1] == "    And INIT- Purge de l'environnement par le clear \"wms/all\""
+    assert lines[3] == "    # And INIT- Purge de l'environnement par le clear \"tms/all\"" and "TMS non déployé" in lines[2]
+    assert len(notes) == 1
+    # bundle.list illisible (aucun import connu) : rien n'est retiré
+    assert cj.drop_clears_of_absent_modules(text, set()) == (text, [])
+    assert cj.drop_clears_of_absent_modules(text, {"wms-contrib-odatio", "tms-contrib-odatio"})[1] == []
+
+
+def test_configuration_steps_of_a_module_no_longer_imported_are_commented_with_their_table():
+    text = ("    And INIT- Configuration TMS : \"Transport/MESSAGERIE\"\n"
+            "      | courierDispatchOrderManagement |\n"
+            "      | false                          |\n"
+            "    And INIT- Initialisation globale par fichiers via l'écran\n")
+    new, notes = cj.drop_steps_of_absent_modules(text, {"wms-contrib-odatio"})
+    lines = new.splitlines()
+    assert lines[1] == "    # And INIT- Configuration TMS : \"Transport/MESSAGERIE\"" and "TMS non déployé" in lines[0]
+    assert lines[2] == "      # | courierDispatchOrderManagement |" and lines[3] == "      # | false                          |"
+    assert lines[4] == "    And INIT- Initialisation globale par fichiers via l'écran" and len(notes) == 1

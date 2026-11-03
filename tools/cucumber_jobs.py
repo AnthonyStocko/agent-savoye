@@ -123,39 +123,34 @@ def from_code(client_root: str, names: list, classes: list) -> dict:
     return found
 
 
-def from_standard(std_root: str, version: str, classes: list) -> dict:
-    """Classes présentes dans les dépôts du Standard à la référence de la version du client : {classe: source}."""
+def _std_candidates(version: str) -> tuple:
     from tools.cucumber_tools import STD_REFS
     from tools.standard_version import std_refs
-    found, wanted = {}, [c for c in classes if c]
-    if not wanted:
-        return found
-    for repo_name, repo in git_repos(std_root).items():
-        ref = pick_ref(repo, std_refs(version, STD_REFS))
-        if not ref:
-            continue
-        files = _git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines()
-        for cls in [c for c in wanted if c not in found]:
-            suffix = "/" + cls.replace(".", "/") + ".java"
-            hit = next((f for f in files if f.endswith(suffix)), "")
-            if hit:
-                found[cls] = f"Standard {repo_name}@{ref.split('/')[-1]}"
-        if len(found) == len(wanted):
-            break
+    return std_refs(version, STD_REFS)
+
+
+def from_standard(std_root, version: str, classes: list, errors: list = None) -> dict:
+    """
+    Classes présentes dans le Standard à la référence de la version du client : {classe: source}. `std_root` :
+    dossier de clones ou source Bitbucket (tools/bitbucket_std). Classe trouvée seulement hors version : `errors`.
+    """
+    from tools.bitbucket_std import ref_label, standard_source
+    std = standard_source(std_root)
+    found, candidates = {}, _std_candidates(version)
+    for cls in [c for c in classes if c]:
+        hit, unconfirmed = std.find_file("/" + cls.replace(".", "/") + ".java", candidates)
+        if hit:
+            found[cls] = f"Standard {hit[0]}@{ref_label(std, hit[0], hit[1])}"
+        elif unconfirmed and errors is not None:
+            errors.append({"nom": cls, "erreur": "classe non confirmée à la version : " + "; ".join(unconfirmed)[:200]})
     return found
 
 
 _BUNDLE = re.compile(r"^\s*(runtime|import)\s*:\s*[\w.-]+/([\w.-]+)@", re.M)
 
 
-def deployed_modules(client_root: str, std_root: str, version: str) -> set:
-    """
-    Modules du Standard déployés chez le client : artefacts « runtime: » des bundle.list de son application
-    (référence distante), plus ceux des contribs qu'ils importent (« import: »), lus dans le Standard à sa version,
-    récursivement. Vide si rien n'est lisible.
-    """
-    from tools.cucumber_tools import STD_REFS
-    from tools.standard_version import std_refs
+def client_bundle_lists(client_root: str) -> list:
+    """Textes des bundle.list de l'application du client (dépôts hors Cucumber, référence distante)."""
     lists = []
     for repo_name, repo in git_repos(client_root).items():
         if "cucumber" in repo_name.lower():
@@ -164,25 +159,44 @@ def deployed_modules(client_root: str, std_root: str, version: str) -> set:
         for path in _git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines():
             if path.endswith("bundle.list") and "/test/" not in path:
                 lists.append(_git(repo, "show", f"{ref}:{path}").stdout)
-    index = {}
-    for repo in git_repos(std_root).values():
-        ref = pick_ref(repo, std_refs(version, STD_REFS))
+    return lists
+
+
+def _contrib_bundle(std, artifact: str, candidates) -> str:
+    """bundle.list du module `artifact` (contrib importée) dans le Standard à la version, '' s'il est introuvable."""
+    # Bitbucket : dépôts qui déclarent l'artefact (recherche) ; clones : tous les dépôts
+    repos = (dict.fromkeys(r for r, _ in std.search(f"<artifactId>{artifact}</artifactId>"))
+             if hasattr(std, "search") else std.repos())
+    for repo in repos:
+        ref = std.ref(repo, candidates)
         if not ref:
             continue
-        for path in _git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines():
-            # Module Maven = dossier de premier niveau ou suivant (artefact du même nom)
-            if path.endswith("bundle.list") and "/src/main/" in path:
-                for part in path.split("/src/main/")[0].split("/"):
-                    index.setdefault(part, []).append((repo, ref, path))
-    modules, seen, pending = set(), set(), list(lists)
+        for path in std.files(repo, ref):
+            if (path.endswith("bundle.list") and "/src/main/" in path
+                    and artifact in path.split("/src/main/")[0].split("/")):
+                return std.show(repo, ref, path)
+    return ""
+
+
+def deployed_modules(client_root: str, std_root, version: str) -> set:
+    """
+    Modules du Standard déployés chez le client : artefacts « runtime: » des bundle.list de son application
+    (référence distante), plus ceux des contribs qu'ils importent (« import: »), lus dans le Standard à sa version,
+    récursivement. Vide si rien n'est lisible.
+    """
+    from tools.bitbucket_std import standard_source
+    std = standard_source(std_root)
+    candidates = _std_candidates(version)
+    modules, seen, pending = set(), set(), client_bundle_lists(client_root)
     while pending:
         for kind, artifact in _BUNDLE.findall(pending.pop()):
             if kind == "runtime":
                 modules.add(artifact)
             elif artifact not in seen:
                 seen.add(artifact)
-                for repo, ref, path in index.get(artifact, [])[:1]:
-                    pending.append(_git(repo, "show", f"{ref}:{path}").stdout)
+                text = _contrib_bundle(std, artifact, candidates)
+                if text:
+                    pending.append(text)
     return modules
 
 
@@ -192,42 +206,38 @@ def _module_deployed(module: str, deployed: set) -> bool:
     return module in deployed or any(d.startswith(module + "-") for d in deployed)
 
 
-def _embedded(repo: str, ref: str, module: str, deployed: set) -> bool:
+def _embedded(std, repo: str, ref: str, module: str, deployed: set) -> bool:
     """
     Module bibliothèque (ex. *-event) embarqué par un module déployé du même dépôt : son pom.xml en dépend
     (<artifactId>module</artifactId>).
     """
-    poms = [p for p in _git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines()
-            if p.endswith("/pom.xml")]
-    for pom in poms:
+    for pom in [p for p in std.files(repo, ref) if p.endswith("/pom.xml")]:
         owner = pom.rsplit("/", 1)[0].split("/")[-1]
-        if owner != module and _module_deployed(owner, deployed) and                 f"<artifactId>{module}</artifactId>" in _git(repo, "show", f"{ref}:{pom}").stdout:
+        if (owner != module and _module_deployed(owner, deployed)
+                and f"<artifactId>{module}</artifactId>" in std.show(repo, ref, pom)):
             return True
     return False
 
 
-def names_in_standard(std_root: str, version: str, names: list, deployed: set = None) -> tuple:
+def names_in_standard(std_root, version: str, names: list, deployed: set = None, errors: list = None) -> tuple:
     """
     Noms de jobs cités littéralement (entre guillemets) dans le Standard à la version du client, dans un module
     déployé chez lui (`deployed`, deployed_modules ; None : non vérifié). ({nom: source}, {nom: module non déployé}).
+    Source Bitbucket : candidat trouvé sur la branche par défaut mais absent à la version → `errors` (indéterminé).
     """
-    from tools.cucumber_tools import STD_REFS
-    from tools.standard_version import std_refs
-    found, elsewhere, wanted = {}, {}, [n for n in names if n]
-    for repo_name, repo in git_repos(std_root).items():
-        if len(found) == len(wanted):
-            break
-        ref = pick_ref(repo, std_refs(version, STD_REFS))
-        if not ref:
-            continue
-        for name in [n for n in wanted if n not in found]:
-            grep = _git(repo, "grep", "-I", "-l", "-F", f'"{name}"', ref, "--", "*.java")
-            for hit in (line.split(":", 1)[-1] for line in grep.stdout.splitlines()):
-                module = hit.split("/", 1)[0]
-                if deployed is None or _module_deployed(module, deployed) or _embedded(repo, ref, module, deployed):
-                    found[name] = f"Standard {repo_name}@{ref.split('/')[-1]} : {hit}"
-                    break
-                elsewhere.setdefault(name, f"{repo_name}/{hit}")
+    from tools.bitbucket_std import ref_label, standard_source
+    std = standard_source(std_root)
+    found, elsewhere, candidates = {}, {}, _std_candidates(version)
+    for name in [n for n in names if n]:
+        hits, unconfirmed = std.find_quoted(name, candidates)
+        for repo, ref, hit in hits:
+            module = hit.split("/", 1)[0]
+            if deployed is None or _module_deployed(module, deployed) or _embedded(std, repo, ref, module, deployed):
+                found[name] = f"Standard {repo}@{ref_label(std, repo, ref)} : {hit}"
+                break
+            elsewhere.setdefault(name, f"{repo}/{hit}")
+        if name not in found and name not in elsewhere and unconfirmed and errors is not None:
+            errors.append({"nom": name, "erreur": "non confirmé à la version : " + "; ".join(unconfirmed)[:200]})
     return found, {n: m for n, m in elsewhere.items() if n not in found}
 
 
@@ -354,7 +364,7 @@ def comment_unproven(text: str, missing: list) -> str:
     return "".join(out)
 
 
-def check_init(texts: dict, client_root: str, schemas: list, std_root: str = "", version: str = "",
+def check_init(texts: dict, client_root: str, schemas: list, std_root="", version: str = "",
                kis_search=None) -> dict:
     """
     Contrôle des features d'init {chemin: texte} : {"prouves", "non_prouves", "base", "erreur_base"} ; chaque
@@ -367,19 +377,31 @@ def check_init(texts: dict, client_root: str, schemas: list, std_root: str = "",
     classes = sorted({i["classe"] for i in items if i["preuve"] == "classe"})
     code = from_code(client_root, names, classes) if client_root and (names or classes) else {"noms": {}, "classes": {}}
     left = [n for n in names if n not in code["noms"]]
-    deployed = deployed_modules(client_root, std_root, version) if std_root and client_root and left else set()
-    standard_names, not_deployed = names_in_standard(std_root, version, left, deployed or None)         if std_root and left else ({}, {})
-    left = [n for n in left if n not in standard_names]
     search_errors = []
-    kis = names_in_kis(left, kis_search, search_errors) if left else {}
-    standard = from_standard(std_root, version, [c for c in classes if c not in code["classes"]]) if std_root else {}
+    wanted_classes = [c for c in classes if c not in code["classes"]]
+    from tools.bitbucket_std import BitbucketUnavailable
+    try:
+        deployed = deployed_modules(client_root, std_root, version) if std_root and client_root and left else set()
+        standard_names, not_deployed = (names_in_standard(std_root, version, left, deployed or None, search_errors)
+                                        if std_root and left else ({}, {}))
+        standard = from_standard(std_root, version, wanted_classes, search_errors) if std_root else {}
+    except BitbucketUnavailable as exc:
+        # Standard illisible (API Bitbucket) : tout ce qui restait à prouver est indéterminé, jamais absent
+        deployed, standard_names, not_deployed, standard = set(), {}, {}, {}
+        search_errors += [{"nom": n, "erreur": str(exc)} for n in left + wanted_classes]
+    left = [n for n in left if n not in standard_names]
+    kis = names_in_kis([n for n in left if n not in {e["nom"] for e in search_errors}], kis_search,
+                       search_errors) if left else {}
     known = {"noms": {**kis, **standard_names, **code["noms"]}, "classes": {**standard, **code["classes"]}}
     ok, missing = proven(items, known)
     # Recherche en erreur : le job n'est ni prouvé ni absent — jamais commenté, la correction doit s'arrêter
     failed = {e["nom"]: e["erreur"] for e in search_errors}
-    undetermined = [{**m, "raison": f"job « {m['nom']} » indéterminé : {failed[m['nom']]}"} for m in missing
-                    if m["nom"] in failed and "avant sa création" not in m["raison"]]
-    missing = [m for m in missing if not (m["nom"] in failed and "avant sa création" not in m["raison"])]
+
+    def failure(m: dict) -> str:
+        key = m.get("classe") if m["preuve"] == "classe" else m["nom"]
+        return "" if "avant sa création" in m["raison"] else failed.get(key, "")
+    undetermined = [{**m, "raison": f"job « {m['nom']} » indéterminé : {failure(m)}"} for m in missing if failure(m)]
+    missing = [m for m in missing if not failure(m)]
     for item in ok + missing:
         item["en_base"] = item["nom"] in database["noms"]
     for item in missing:
@@ -840,8 +862,75 @@ def drop_rules_without_folder(text: str, feature_rel: str, worktree: str) -> tup
     return "".join(out), notes
 
 
-def apply_environment_rules(worktree: str, paths: list, properties: dict) -> dict:
-    """Règles sans dossier et jobs reliés à un service fourni par le job Jenkins, sur les features `paths`."""
+def client_imports(client_root: str) -> set:
+    """Contribs importées (lignes « import: » actives) par les bundle.list de l'application du client, lus à la
+    référence distante ; une ligne commentée (« ### import: ») ne compte pas."""
+    found = set()
+    for repo_name, repo in git_repos(client_root).items():
+        if "cucumber" in repo_name.lower():
+            continue
+        ref = pick_ref(repo, CLIENT_REFS)
+        for path in _git(repo, "ls-tree", "-r", "--name-only", ref).stdout.splitlines():
+            if path.endswith("bundle.list") and "/test/" not in path:
+                found |= {a for k, a in _BUNDLE.findall(_git(repo, "show", f"{ref}:{path}").stdout) if k == "import"}
+    return found
+
+
+# Steps propres à un module (produit) : son clear, sa configuration (« INIT- Configuration TMS : "…" »)
+_MODULE_STEPS = (
+    (re.compile(r"INIT- Purge de l'environnement par le clear \"([a-z]+)/"), "clear « {m}/… »"),
+    (re.compile(r"INIT- Configuration (TMS|WMS|OMS|WES)\s*:"), "configuration {M}"),
+)
+
+
+def _module_of(line: str) -> tuple:
+    for pattern, label in _MODULE_STEPS:
+        match = pattern.search(line)
+        if match:
+            module = match.group(1).lower()
+            return module, label.format(m=module, M=module.upper())
+    return "", ""
+
+
+def drop_steps_of_absent_modules(text: str, imports: set) -> tuple:
+    """
+    Steps d'un module que l'application du client n'importe plus (aucune contrib « <module>-contrib-* » dans ses
+    bundle.list, ex. TMS désactivé) — son clear, sa configuration — : routes absentes (404 - No route found), step
+    commenté sous TODO-INIT, table comprise. `imports` vide (bundle.list illisible) : rien n'est changé.
+    Renvoie (texte, [raisons]).
+    """
+    if not imports:
+        return text, []
+    lines = text.splitlines(keepends=True)
+    out, notes, i = [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        module, label = _module_of(line) if not line.lstrip().startswith("#") and _STEP.match(line.rstrip("\r\n")) \
+            else ("", "")
+        if not module or any(a.startswith(f"{module}-contrib") for a in imports):
+            out.append(line)
+            i += 1
+            continue
+        indent = line[:len(line) - len(line.lstrip())]
+        eol = "\r\n" if line.endswith("\r\n") else "\n"
+        reason = (f"module {module.upper()} non déployé chez le client (aucune contrib {module}-contrib importée "
+                  f"par ses bundle.list) : route absente (404 - No route found)")
+        out += [f"{indent}# {INIT_MARKER} {reason}{eol}", f"{indent}# {line.lstrip()}"]
+        notes.append(f"l. {i + 1} : {label} commenté — {reason}")
+        i += 1
+        while i < len(lines) and lines[i].strip().startswith("|"):
+            row = lines[i]
+            out.append(f"{row[:len(row) - len(row.lstrip())]}# {row.lstrip()}")
+            i += 1
+    return "".join(out), notes
+
+
+drop_clears_of_absent_modules = drop_steps_of_absent_modules
+
+
+def apply_environment_rules(worktree: str, paths: list, properties: dict, imports: set = frozenset()) -> dict:
+    """Règles sans dossier, clears de modules non déployés et jobs reliés à un service fourni par le job Jenkins,
+    sur les features `paths`."""
     import os
     changed, notes = [], []
     for rel in paths:
@@ -851,6 +940,8 @@ def apply_environment_rules(worktree: str, paths: list, properties: dict) -> dic
         with open(full, encoding="utf-8", newline="") as f:
             text = f.read()
         new, found = drop_rules_without_folder(text, rel, worktree)
+        new, cleared = drop_steps_of_absent_modules(new, set(imports))
+        found += cleared
         new, kept = keep_connected_jobs_active(new, properties)
         if new != text:
             with open(full, "w", encoding="utf-8", newline="") as f:

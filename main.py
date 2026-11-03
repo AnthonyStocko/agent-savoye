@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -804,7 +804,14 @@ def client_standard_version(client: str, client_root: str, std_root: str, fallba
     document = cucumber_profile.load_profile(client)
     job = (cucumber_profile.effective_profile(document).get("run_job") or os.getenv("CUCUMBER_VERIFY_JOB", "")).strip()
     builds = jenkins_tools.recent_builds(job) if job and jenkins_tools.jenkins_configured() else []
-    result = standard_version.detect(client_root, std_root, cucumber_dir, os.path.basename(cucumber_dir), builds)
+    try:
+        result = standard_version.detect(client_root, std_root, cucumber_dir, os.path.basename(cucumber_dir), builds)
+    except bitbucket_std.BitbucketUnavailable as exc:
+        # Standard illisible (réseau) : la détection n'est pas refaite, la version enregistrée du profil est gardée
+        version, origin = standard_version.client_version(client, "")
+        print(f"[VERSION STANDARD] ⚠️ Détection impossible ({exc}) : version enregistrée gardée "
+              f"({version or 'aucune'}, {origin}).")
+        return version or fallback
     standard_version.save(client, result)
     version, origin = standard_version.client_version(client, "")
     chosen = ((cucumber_profile.load_profile(client).get("saisi") or {}).get("server_version") or "").strip()
@@ -1014,7 +1021,7 @@ def std_fetch_max_age() -> float:
         return 60.0
 
 
-def ensure_local_repo(repo_input: str, repo_label: str) -> str:
+def ensure_local_repo(repo_input: str, repo_label: str, only: list = None) -> str:
     """
     Si repo_input est une URL de projet Bitbucket, interroge l'API REST 
     pour récupérer et cloner / mettre à jour TOUS les dépôts du projet.
@@ -1083,6 +1090,10 @@ def ensure_local_repo(repo_input: str, repo_label: str) -> str:
         print(f"==================================================\n")
 
         skipped = []
+        if only is not None:
+            print(f"[GIT REPO] {len(set(only) & set(repos_to_clone))} dépôt(s) sur {len(repos_to_clone)} utiles au client "
+                  f"(modules déployés et dépôts transverses) : les autres ne sont ni clonés ni récupérés.")
+            repos_to_clone = [r for r in repos_to_clone if r in set(only)]
         for idx, repo_name in enumerate(repos_to_clone, 1):
             repo_dir = os.path.join(target_dir, repo_name)
             clone_url = f"{bitbucket_url}/scm/{project_key}/{repo_name}.git"
@@ -1324,8 +1335,17 @@ def main():
         conventions_path = (os.getenv("DEV_CONVENTIONS_PATH", "").strip()
                             or os.path.join(workspace_dir, "odatio-specific-code-conventions-dev.md"))
 
-        # 1. Dépôt Socle Standard
-        local_std_repo = ensure_local_repo(std_repo_arg, "std")
+        # 1. Dépôt Socle Standard. Client Cucumber et Standard projet Bitbucket : lu par l'API (tools/bitbucket_std),
+        # sans fetch ici ; les clones (génération) ne sont récupérés qu'après, pour les seuls dépôts utiles au client
+        std_key = bitbucket_std.project_key(std_repo_arg)
+        remote_std = bool(is_cucumber_client and args.client_name and std_key and os.getenv("BITBUCKET_URL", "").strip())
+        if remote_std:
+            STD_READER[0] = bitbucket_std.RemoteStandard(std_key)
+            local_std_repo = os.path.join(workspace_dir, ".tmp", f"std_{std_key}")
+            print(f"[STANDARD] Code du Standard lu dans Bitbucket (projet {std_key}, API REST) : aucun fetch préalable.")
+        else:
+            local_std_repo = ensure_local_repo(std_repo_arg, "std")
+            STD_READER[0] = local_std_repo
         STD_LOCAL_ROOT[0] = local_std_repo
 
         # 2. Détection de la version Odatio (repli global ; un client Cucumber a la sienne, voir plus bas)
@@ -1347,9 +1367,23 @@ def main():
         # 4. Version du Standard propre au client Cucumber (profil client), puis Standard et Cucumber Standard placés
         # sur la référence de cette version
         if is_cucumber_client and local_client_repo and args.client_name:
-            odatio_version = client_standard_version(args.client_name, local_client_repo, local_std_repo,
+            odatio_version = client_standard_version(args.client_name, local_client_repo, STD_READER[0] or local_std_repo,
                                                      odatio_version)
             cucumber_tools.STD_VERSION[0] = odatio_version
+        if remote_std:
+            if args.fix_init_from_import:
+                # Correction de l'init : preuves lues dans Bitbucket, aucun clone du Standard à récupérer
+                print("[STANDARD] Correction de l'init : Standard lu dans Bitbucket, aucun fetch du Standard.")
+            else:
+                # Génération : clones nécessaires (exploration du code), limités aux dépôts utiles au client
+                try:
+                    deployed = cucumber_jobs.deployed_modules(local_client_repo, STD_READER[0], odatio_version)
+                    useful = bitbucket_std.repos_for_client(STD_READER[0].repos(), deployed)
+                except bitbucket_std.BitbucketUnavailable as exc:
+                    print(f"[STANDARD] ⚠️ Modules déployés illisibles ({exc}) : tous les dépôts du Standard récupérés.")
+                    useful = None
+                local_std_repo = ensure_local_repo(std_repo_arg, "std", only=useful)
+                STD_LOCAL_ROOT[0] = local_std_repo
         if args.generate_cucumber:
             cucumber_std_url = args.cucumber_std_repo.strip() or os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "")
             local_cucumber_std_repo, _ = ensure_cucumber_std_repo(cucumber_std_url, odatio_version)
@@ -2710,7 +2744,7 @@ def _run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: st
             cucumber_repo_dir, local_cucumber_std_repo, client, base, modules, profile,
             lambda worktree, items: recreate_initializer_data(client, worktree, items, local_client_repo,
                                                               local_cucumber_std_repo, profile), environment,
-            init_jobs_checker(client, local_client_repo, STD_LOCAL_ROOT[0], odatio_version))
+            init_jobs_checker(client, local_client_repo, STD_READER[0] or STD_LOCAL_ROOT[0], odatio_version))
     except RuntimeError as e:
         print(f"[CUCUMBER INIT] ❌ {e}")
         return 1
@@ -3180,6 +3214,8 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
 
 # Copie locale du Standard préparée au démarrage (lectures des contrôles hors du flux principal)
 STD_LOCAL_ROOT = [""]
+# Source du Standard pour les contrôles déterministes : RemoteStandard (Bitbucket) ou dossier de clones
+STD_READER = [""]
 
 
 def init_jobs_checker(client: str, client_root: str, std_root: str, version: str):
@@ -3260,7 +3296,8 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
               "build du client) : connexions ADDITIONAL_ARGLINE inconnues, correction arrêtée, rien n'est poussé.")
         return 1
     argline = " ".join(str(v) for k, v in (reference.get("parametres") or {}).items() if "ARGLINE" in k.upper())
-    environment = cucumber_jobs.apply_environment_rules(worktree, paths, cucumber_jobs.arg_properties(argline))
+    environment = cucumber_jobs.apply_environment_rules(worktree, paths, cucumber_jobs.arg_properties(argline),
+                                                        cucumber_jobs.client_imports(client_root))
     print(f"[CUCUMBER INIT] Règles et services externes (build de référence n° {reference.get('numero') or '?'}) : "
           + (f"{len(environment['notes'])} changement(s)" if environment["notes"] else "aucun changement"))
     for note in environment["notes"]:
@@ -3654,7 +3691,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         # Jobs KIS absents chez le client (« Pas d'élément correspondant à l'attendu {} pour KisJob ») : correction
         # déterministe de l'init (0 token), puis init rejouée seule sur Jenkins, avant toute autre correction
         jobs_code = fix_init_jobs(args, args.fix_init_from_import, cucumber_repo_dir, local_client_repo,
-                                  local_std_repo, local_cucumber_std_repo, odatio_version)
+                                  STD_READER[0] or local_std_repo, local_cucumber_std_repo, odatio_version)
         if jobs_code is not None:
             return jobs_code
         return fix_init_from_import(args, args.fix_init_from_import, local_cucumber_std_repo, odatio_version,

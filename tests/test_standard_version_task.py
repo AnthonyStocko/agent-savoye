@@ -54,9 +54,9 @@ def test_fast_sources_first_then_code_confirms(env):
     assert log.index("Jenkins") < log.index("odatio-app/pom.xml")
 
 
-def test_conflict_between_code_and_jenkins(env):
+def test_code_version_kept_when_jenkins_differs(env):
     state = task.run(CLIENT, env["client"], env["std"], builds_reader=builds("v26.21"))
-    assert state["statut"] == "conflit"
+    assert state["statut"] == "ok" and state["resultat"]["version"] == "26.22" and state["resultat"]["ecart"]
 
 
 def test_no_source_gives_precise_causes(env, tmp_path):
