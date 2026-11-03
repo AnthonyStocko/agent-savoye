@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import cucumber_init_fix, cucumber_modules, standard_version, standard_version_task
+from tools import cucumber_delivery, cucumber_init_fix, cucumber_modules, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1372,6 +1372,7 @@ def render_project_settings(ctx: dict) -> None:
                        f"**{cucumber_tools.work_id(ctx['client'])}**")
             render_standard_version(ctx["client"])
             render_tested_modules(ctx)
+            render_delivery_settings(ctx)
         st.text_input("Schéma de la config client (base client) :", key="cucumber_source_schema",
                       help="Schéma de la base client (connexion CLIENT_SOURCE_DB_*, à défaut DB_*) dont la "
                            "configuration est recopiée dans le schéma des tests Cucumber par le bouton « Recopier la "
@@ -1383,6 +1384,69 @@ def render_project_settings(ctx: dict) -> None:
         last = st.session_state.get("cucumber_std_ref") or {}
         if last.get("repo") == std_input and last.get("ref"):
             st.caption(f"Référence Git utilisée lors de la dernière exécution : **{last['ref']}**")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def token_scope_cached() -> dict:
+    """Droits d'écriture du jeton Bitbucket, vérifiés au plus une fois par heure (cucumber_delivery.token_scope)."""
+    return cucumber_delivery.token_scope()
+
+
+def render_write_pause() -> None:
+    """
+    En tête de l'onglet : bouton « Pause » qui stoppe immédiatement toute écriture de l'agent (push, promotion,
+    annulation), et alerte si le jeton Bitbucket peut écrire ailleurs que dans les dépôts *-cucumber.
+    """
+    pause = cucumber_delivery.paused()
+    user = (auth_tools.identity(st.user) or {}).get("nom", "") if auth_tools.enabled() else ""
+    columns = st.columns([4, 1])
+    if pause:
+        columns[0].error(f"Écritures en pause depuis le {pause.get('date', '')[:16].replace('T', ' ')} (par "
+                         f"{pause.get('par')}) : l'agent ne pousse plus rien.", icon=":material/pause_circle:")
+        if columns[1].button("Reprendre", key="cucumber_write_resume", icon=":material/play_arrow:"):
+            cucumber_delivery.set_pause(False, user)
+            st.rerun()
+    elif columns[1].button("Pause", key="cucumber_write_pause", icon=":material/pause:", type="secondary",
+                           help="Stoppe immédiatement toute écriture de l'agent dans les dépôts (push, promotion, "
+                                "annulation), pour tous les clients, jusqu'à « Reprendre »."):
+        cucumber_delivery.set_pause(True, user)
+        st.rerun()
+    scope = token_scope_cached()
+    if scope.get("ok") is False:
+        st.warning(cucumber_delivery.token_scope_line(scope), icon=":material/key:")
+
+
+def render_delivery_settings(ctx: dict) -> None:
+    """Livraison autonome du client (profil) : coche (désactivée par défaut), branche de travail, branche cible."""
+    client = ctx["client"]
+    document = cucumber_profile.load_profile(client)
+    profile = cucumber_profile.effective_profile(document)
+    st.markdown("**Livraison autonome**")
+    with st.form(f"cucumber_delivery_{client}", border=False):
+        enabled = st.checkbox("L'agent pousse et promeut lui-même ses corrections", value=bool(
+            profile.get("livraison_autonome")), help="Désactivée par défaut. Seul le dépôt Cucumber du client est "
+                                                      "écrit ; promotion par fusion rapide seulement sans régression.")
+        columns = st.columns(2)
+        work = columns[0].text_input("Branche de travail de l'agent", value=profile.get("verify_branch") or "")
+        target = columns[1].text_input("Branche cible (lue par le job)", value=profile.get("branche_cible") or "",
+                                       placeholder="ex. integration")
+        if st.form_submit_button("Enregistrer la livraison"):
+            saisi = document.setdefault("saisi", {})
+            for key, value in (("livraison_autonome", enabled), ("verify_branch", work.strip()),
+                               ("branche_cible", target.strip())):
+                if value:
+                    saisi[key] = value
+                else:
+                    saisi.pop(key, None)
+            cucumber_profile._write_json(cucumber_profile.profile_path(client), document)
+            st.rerun()
+    if profile.get("cucumber_repo_url"):
+        st.caption(f"Seul dépôt autorisé en écriture : {cucumber_delivery.normalize_url(profile['cucumber_repo_url'])}")
+    last = cucumber_delivery.events(client, ("push", "promotion", "non_promu", "annulation", "refus"), 1)
+    if last:
+        event = last[-1]
+        st.caption(f"Dernière écriture : {event['date'][:16].replace('T', ' ')} — {event['type']}"
+                   + (f" — {event['motif'][:160]}" if event.get("motif") else ""))
 
 
 def render_tested_modules(ctx: dict) -> None:
@@ -3222,6 +3286,7 @@ with tab_cucumber:
                "tests écrits sont livrés comme des modifications à télécharger : rien n'est envoyé.")
     if cucumber_verify.unverified_warning():
         st.warning(cucumber_verify.unverified_warning(), icon=":material/gpp_maybe:")
+    render_write_pause()
     cucumber_ctx = cucumber_header()
     cucumber_client = cucumber_ctx["client"]
     render_cucumber_detection(cucumber_ctx)

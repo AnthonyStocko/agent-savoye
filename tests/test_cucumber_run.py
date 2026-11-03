@@ -61,6 +61,9 @@ def jenkins(tmp_path, repo, monkeypatch):
                        for n, depot in ((41, "client-cucumber"), (40, f"{CLIENT}-cucumber"))]
     monkeypatch.setattr(jenkins_tools, "recent_builds", lambda job, count=20: calls["builds"])
     monkeypatch.setattr(jenkins_tools, "trigger_job", lambda job, params: calls["params"].append(params) or "q/1")
+    # Builds en cours : simulés (jamais le Jenkins réel, dont un build en cours bloquerait le test)
+    monkeypatch.setattr(jenkins_tools, "busy_builds", lambda jobs: [])
+    monkeypatch.setattr(jenkins_tools, "LOCK_FILE", str(tmp_path / "jenkins_cucumber.lock"))
     monkeypatch.setattr(jenkins_tools, "wait_build_result",
                         lambda queue, timeout, *a, **k: {"url": "https://jenkins/job/x/7", "result": "UNSTABLE",
                                                 "artifacts": []})
@@ -133,7 +136,8 @@ def test_preflight_lists_what_is_missing(jenkins, monkeypatch):
 
 def test_launch_pushes_checks_the_commit_runs_one_feature_and_checks_the_count(jenkins):
     repo, remote, calls = jenkins
-    write(os.path.join(repo, "b.txt"), "b\n")                    # modification non commitée : commitée et poussée
+    # Modification non commitée (donnée de test, fichier autorisé par la garde d'écriture) : commitée et poussée
+    write(os.path.join(repo, "src", "test", "resources", "b.txt"), "b\n")
     run = cr.launch(CLIENT, repo, PROFILE, "@feature_a", log=lambda line: None, repository="client-cucumber",
                     base_branch="integration")
     head = git(repo, "rev-parse", "HEAD")

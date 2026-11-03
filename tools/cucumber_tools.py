@@ -2462,6 +2462,8 @@ def snapshot(repo_dir: str, path: str, ref: str) -> str:
                                 capture_output=True, text=True, encoding="utf-8", errors="replace")
         if cloned.returncode != 0:
             raise RuntimeError(f"Copie de lecture de {repo_dir} impossible : {cloned.stderr.strip()[:300]}")
+        # Copie de lecture : aucune adresse d'envoi (cucumber_delivery)
+        _git(path, "config", "remote.origin.pushurl", "lecture-seule://envoi-desactive")
     checkout = _git(path, "checkout", "-q", "--force", "--detach", commit)
     if checkout.returncode != 0:
         raise RuntimeError(f"Extraction de {ref} impossible : {checkout.stderr.strip()[:300]}")
@@ -2469,18 +2471,19 @@ def snapshot(repo_dir: str, path: str, ref: str) -> str:
     return commit
 
 
-def commit_lot(worktree: str, client_name: str, lot_number: int, forced: list = ()) -> bool:
+def commit_lot(worktree: str, client_name: str, lot_number: int, forced: list = (), message: str = "") -> bool:
     """
     Commite les fichiers écrits par le lot (hors sorties Maven), plus `forced` : fichiers de test ignorés par le
-    .gitignore du client, ajoutés de force pour être livrés. Renvoie True si un commit a été créé.
+    .gitignore du client, ajoutés de force pour être livrés. `message` : message du commit (lot de correction :
+    cucumber_delivery.commit_message). Renvoie True si un commit a été créé.
     """
     _git(worktree, "add", "-A", "--", ".", ":(exclude)target", ":(exclude)**/target/**")
     if forced:
         _git(worktree, "add", "-f", "--", *forced)
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return False
-    return _git(worktree, "commit", "-m", f"Cucumber coverage of {client_name} specifics - lot {lot_number}"
-                ).returncode == 0
+    return _git(worktree, "commit", "-m", message or f"Cucumber coverage of {client_name} specifics - lot "
+                                                   f"{lot_number}").returncode == 0
 
 
 def discard_lot(worktree: str) -> None:

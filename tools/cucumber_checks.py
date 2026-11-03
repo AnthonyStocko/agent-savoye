@@ -594,12 +594,15 @@ def drop_case_duplicates(worktree: str) -> list:
     return dropped
 
 
-def push_for_verification(worktree: str, branch: str, message: str) -> tuple:
+def push_for_verification(worktree: str, branch: str, message: str, decision: bool = True) -> tuple:
     """
     Commite le worktree (hors sorties Maven, fichiers de test ignorés par le .gitignore ajoutés de force) puis le
     pousse sur `branch` (origin), sans forcer. Renvoie (erreur d'arrêt ou '', commit créé) ; un push refusé (branche
-    distante divergente, droits) arrête la vérification.
+    distante divergente, droits) arrête la vérification. Avant l'appel à Git, la garde d'écriture
+    (cucumber_delivery.check_push : pause, dépôt du profil client, fichiers autorisés) peut le refuser ; `decision`
+    faux (livraison autonome) : pom.xml, init globale et suppression de scénario refusés.
     """
+    from tools import cucumber_delivery
     for path in drop_case_duplicates(worktree):
         print(f"[CUCUMBER] ⚠️ Chemin en double par la casse retiré de l'espace de l'agent (un seul fichier sous ce "
               f"système) : {path}")
@@ -609,11 +612,16 @@ def push_for_verification(worktree: str, branch: str, message: str) -> tuple:
         _git(worktree, "add", "-f", "--", *forced)
     committed = (_git(worktree, "diff", "--cached", "--quiet").returncode != 0
                  and _git(worktree, "commit", "-m", message).returncode == 0)
+    refused = cucumber_delivery.check_push(worktree, branch, decision=decision)
+    if refused:
+        return f"push sur {branch} refusé par la garde d'écriture : {refused}", committed
     push = _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
     if push.returncode != 0:
         detail = " ".join((push.stderr.strip().splitlines() or ["?"])[-1].split())[:200]
         return (f"push sur {branch} refusé ({detail}) : le job exécuterait une ancienne version — intègre la branche "
                 f"distante ou corrige les droits, puis relance"), committed
+    cucumber_delivery.log_event(cucumber_delivery.client_of(worktree), "push", branche=branch,
+                                commit=_git(worktree, "rev-parse", "HEAD").stdout.strip(), message=message[:200])
     return verify_branch_error(worktree, branch), committed
 
 

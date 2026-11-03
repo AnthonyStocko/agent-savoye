@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, cucumber_delivery, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -972,6 +972,8 @@ def ensure_cucumber_std_repo(repo_url: str, odatio_version: str) -> tuple:
             print(f"❌ Échec du clonage Cucumber Standard : {res.stderr.strip()}")
             return "", ""
 
+    # Cucumber Standard : copie de lecture, aucune adresse d'envoi
+    cucumber_delivery.disable_push(target_dir)
     ref = checkout_cucumber_std_ref(target_dir, odatio_version)
     if not ref:
         print("❌ Aucune référence distante exploitable (version Odatio, dev, main, master) dans le Cucumber Standard.")
@@ -1115,6 +1117,9 @@ def ensure_local_repo(repo_input: str, repo_label: str, only: list = None) -> st
                     print(f"     ✅ {repo_name} cloné avec succès.")
                 else:
                     print(f"     ❌ Échec clonage {repo_name} : {res_clone.stderr.strip()}")
+            if repo_label == "std" or "cucumber" not in repo_name.lower():
+                # Copie de lecture (code client, Standard, Studio) : aucune adresse d'envoi
+                cucumber_delivery.disable_push(repo_dir)
 
         if skipped:
             print(f"[GIT REPO] {len(skipped)} dépôt(s) du Standard récupéré(s) il y a moins de {std_fetch_max_age():g} "
@@ -1142,6 +1147,8 @@ def ensure_local_repo(repo_input: str, repo_label: str, only: list = None) -> st
             else:
                 print(f"❌ Erreur lors du clonage de {repo_input} :\n{res_clone.stderr.strip()}")
                 return repo_input
+        if repo_label == "std" or "cucumber" not in clean_name.lower():
+            cucumber_delivery.disable_push(target_dir)
         return target_dir
 
 
@@ -1520,6 +1527,17 @@ def main():
                   f"créé automatiquement : créez-le dans Bitbucket ou passez --cucumber-repo.")
             sys.exit(2)
         print(f"[CUCUMBER] Dépôt Cucumber client : {args.cucumber_repo} ({cucumber_repo_dir})")
+        # Seul dépôt autorisé en écriture : celui du profil client (adresse relevée sur son clone, sauf saisie)
+        allowed = cucumber_delivery.register_repo(client_name, cucumber_repo_dir)
+        if allowed:
+            print(f"[LIVRAISON] Seul dépôt autorisé en écriture : {cucumber_delivery.normalize_url(allowed)}")
+        # Droits du jeton : lecture seule partout, écriture seulement sur les dépôts *-cucumber
+        scope = cucumber_delivery.token_scope()
+        if scope.get("ok") is not True:
+            print(f"[LIVRAISON] {cucumber_delivery.token_scope_line(scope)}")
+        if cucumber_delivery.apply_identity():
+            print(f"[LIVRAISON] Commits de l'agent au nom du compte technique {os.getenv('AGENT_GIT_NAME')}"
+                  + (f", lancés par {cucumber_delivery.launched_by()}" if cucumber_delivery.launched_by() else ""))
         # Pré-calculs en Python puis génération par lots : un appel Claude neuf par lot
         sys.exit(run_cucumber_client(args, target_issue, local_client_repo, local_std_repo, local_cucumber_std_repo,
                                      odatio_version, cucumber_repo_dir, token_saving_rules, python_exe,
@@ -2899,6 +2917,8 @@ def run_cucumber_import(client: str, paths: list, build_url: str = "", project: 
             print(f"[CUCUMBER IMPORT] ⚠️ Espace de travail non synchronisé avec {state['base']} : {problem}")
     analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client), worktree)
     print_import(analysis)
+    # Livraison autonome : run de la branche cible après une promotion de l'agent, annulée si elle régresse
+    check_promoted_regression(client, analysis)
     # Bilan (défauts en tête, corrigés, désactivés, doutes, corrections manuelles, prochaine action) : IHM,
     # A_REVOIR.md du worktree et répertoire partagé
     bilan = cucumber_bilan.after_import(client, analysis, cucumber_tools.load_state(client),
@@ -3658,6 +3678,122 @@ def launch_full_run(client: str, profile: dict, worktree: str, repository: str =
     return analysis
 
 
+def latest_full_run(client: str) -> dict:
+    """Analyse du dernier import d'un run complet de la suite active ({} si aucun)."""
+    for entry in sorted(cucumber_import.load_index(client).get("imports") or [], key=lambda e: -e["numero"]):
+        analysis = cucumber_import.load_analysis(client, entry["numero"])
+        if analysis.get("run_complet") and not analysis.get("non_analyse"):
+            return analysis
+    return {}
+
+
+def autonomous_delivery(client: str, state: dict, worktree: str, profile: dict, guarded: dict = None,
+                        repository: str = "", base_branch: str = "", client_root: str = "", project: str = "",
+                        launch=None, promote=None) -> dict:
+    """
+    Livraison autonome (profil « livraison_autonome », désactivée par défaut) : commits de la branche de travail
+    (verify_branch) poussés par la garde d'écriture sans décision humaine, run(s) complet(s) sur cette branche, puis
+    promotion par fusion rapide vers la branche cible (« branche_cible », à défaut `base_branch`) SEULEMENT si
+    cucumber_delivery.promotion_verdict l'accepte. Sinon la branche de travail reste en l'état. Résultat dans
+    l'état (« livraisons »), le journal d'écriture, le bilan et les connaissances partagées. `launch` / `promote` :
+    remplaçables (tests). Renvoie le résultat ({} si la livraison autonome est désactivée).
+    """
+    if not profile.get("livraison_autonome"):
+        return {}
+    launch = launch or (lambda: launch_full_run(client, profile, worktree, repository, base_branch, client_root))
+    promote = promote or cucumber_delivery.promote
+    work, target = (profile.get("verify_branch") or "").strip(), (profile.get("branche_cible") or base_branch or "")
+    result = {"date": datetime.now().isoformat(timespec="seconds"), "branche_travail": work, "cible": target,
+              "ok": False, "promu": False, "motif": "", "runs": [], "commit": "", "par": cucumber_delivery.launched_by()}
+    pause = cucumber_delivery.paused()
+    if pause:
+        result["motif"] = f"écriture en pause (par {pause.get('par')})"
+    elif not work or not target or work == target:
+        result["motif"] = "branche de travail ou branche cible non renseignée (ou identiques) dans le profil client"
+    elif guarded and not guarded.get("ok"):
+        result["motif"] = f"garde-fou de non-régression : {guarded.get('motif')}"
+    else:
+        error, _ = cucumber_checks.push_for_verification(worktree, work, f"Cucumber {client} : livraison autonome",
+                                                         decision=False)
+        if error:
+            result["motif"] = error
+        else:
+            result["commit"] = cucumber_tools.rev_parse(worktree, "HEAD")
+            reference = (cucumber_import.load_analysis(client, guarded["reference"])
+                         if guarded and guarded.get("reference") else latest_full_run(client))
+            runs = [cucumber_import.load_analysis(client, r["import"]) for r in (guarded or {}).get("runs") or []
+                    if r.get("import")]
+            needed = 2 if not cucumber_delivery.failing(reference) else 1
+            while len(runs) < needed:
+                print(f"[LIVRAISON] Run complet {len(runs) + 1}/{needed} sur {work}…")
+                run = launch() or {"erreur": "aucun résultat"}
+                runs.append(run)
+                if run.get("erreur") or run.get("non_analyse"):
+                    break
+            result["runs"] = [{"import": r.get("numero"), "build": r.get("build", ""),
+                               "echecs": len(cucumber_delivery.failing(r)), "erreur": r.get("erreur", "")}
+                              for r in runs]
+            result["reference"] = reference.get("numero")
+            verdict = cucumber_delivery.promotion_verdict(reference, runs)
+            result["motif"] = verdict["motif"]
+            if verdict["ok"]:
+                promoted = promote(worktree, target, client)
+                result.update(ok=promoted["ok"], promu=promoted["ok"], avant=promoted.get("avant", ""),
+                              motif=promoted["motif"] if not promoted["ok"] else f"{verdict['motif']} — "
+                                                                                  f"{promoted['motif']}")
+    builds = [r["build"] for r in result["runs"] if r.get("build")]
+    cucumber_delivery.log_event(client, "promotion" if result["promu"] else "non_promu", cible=target,
+                                branche=work, commit=result["commit"], avant=result.get("avant", ""),
+                                motif=result["motif"], builds=builds,
+                                run_branche=(result["runs"][-1] or {}).get("import") if result["runs"] else None)
+    print(f"[LIVRAISON] {'✅ Promu vers ' + target if result['promu'] else '⏸ Pas de promotion'} : {result['motif']}"
+          + (f" — {builds[-1]}" if builds else ""))
+    state.setdefault("livraisons", []).append(result)
+    cucumber_tools.save_state(client, state)
+    share_knowledge(cucumber_bilan.delivery_markdown([result]), project, "cucumber-livraison",
+                    f"Livraison Cucumber {client}", client=client, tags=["cucumber", "livraison"])
+    return result
+
+
+def check_promoted_regression(client: str, analysis: dict, build_params: dict = None, revert=None) -> dict:
+    """
+    Run importé sur la branche cible après une promotion de l'agent : échecs nouveaux (face au dernier run de la
+    branche de travail promue) dans une feature touchée par les commits promus → commit d'annulation (git revert)
+    poussé sans forcer. Une promotion n'est contrôlée qu'une fois. Renvoie {revert, motif} ({} si rien à contrôler).
+    """
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    checked = {e.get("commit") for e in cucumber_delivery.events(client, ("controle_promotion",))}
+    promotion = next((e for e in reversed(cucumber_delivery.events(client, ("promotion",)))
+                      if e.get("commit") not in checked), None)
+    if not profile.get("livraison_autonome") or not promotion or analysis.get("non_analyse"):
+        return {}
+    target = promotion.get("cible", "")
+    params = build_params if build_params is not None else jenkins_tools.build_parameters(analysis.get("build", ""))
+    values = {str(v).strip() for v in (params or {}).values()}
+    if target not in values or promotion.get("branche") in values:
+        return {}
+    worktree = cucumber_tools.worktree_dir(client)
+    previous = cucumber_import.load_analysis(client, promotion.get("run_branche")) if promotion.get("run_branche") \
+        else {}
+    touched = cucumber_delivery.touched_files(worktree, promotion.get("avant", ""), promotion.get("commit", ""))
+    verdict = cucumber_delivery.regression_to_revert(previous, analysis, promotion, touched)
+    out = {"revert": verdict["revert"], "motif": verdict["motif"]}
+    if verdict["revert"]:
+        revert = revert or (lambda: cucumber_delivery.revert_on_target(
+            cucumber_tools.add_worktree(worktree, os.path.join(cucumber_tools.cache_dir(client), "worktree_livraison"),
+                                        f"cucumber_{client}_livraison", f"origin/{target}", reset=True),
+            target, promotion["avant"], promotion["commit"], verdict["motif"], client))
+        done = revert()
+        out.update(ok=done["ok"], commit=done.get("commit", ""), motif=f"{verdict['motif']} — {done['motif']}")
+        cucumber_delivery.log_event(client, "annulation" if done["ok"] else "annulation_impossible", cible=target,
+                                    commit=done.get("commit", ""), annule=promotion["commit"], motif=out["motif"],
+                                    builds=[analysis.get("build", "")])
+        print(f"[LIVRAISON] {'↩️ Promotion annulée' if done['ok'] else '⛔ Annulation impossible'} : {out['motif']}")
+    cucumber_delivery.log_event(client, "controle_promotion", commit=promotion["commit"], motif=out["motif"],
+                                builds=[analysis.get("build", "")])
+    return out
+
+
 def guard_corrections(client: str, state: dict, worktree: str, profile: dict, repository: str = "",
                       base_branch: str = "", client_root: str = "") -> dict:
     """
@@ -4287,7 +4423,12 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         forced = cucumber_checks.ignored_test_files(worktree)
         for rel in forced:
             print(f"[LOT {label}] ⚠️ Fichier ignoré par le .gitignore du dépôt client, ajouté de force au commit : {rel}")
-        committed = cucumber_tools.commit_lot(worktree, client, lot["numero"], forced)
+        # Lot de correction : message structuré (cause, correction, run d'origine, tâches, lancé par)
+        message = cucumber_delivery.commit_message(
+            lot, cucumber_import.load_analysis(client, lot["import"]),
+            {i: (specifics.get(i) or {}).get("libelle", "") for i in [lot.get("spec_correction"), *lot["ids"]] if i},
+            client) if lot.get("type") == "correction" and lot.get("import") else ""
+        committed = cucumber_tools.commit_lot(worktree, client, lot["numero"], forced, message)
         outside = cucumber_checks.uncommitted_files(worktree)
         if outside:
             print(f"[LOT {label}] ❌ {len(outside)} fichier(s) hors du commit (absents du patch) : "
@@ -4404,6 +4545,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             exit_code = 1
     else:
         print("\n[CUCUMBER] Aucun test écrit : pas de patch.")
+    if exit_code == 0 and os.path.exists(patch_file):
+        # Livraison autonome (profil) : push de la branche de travail, run complet, promotion si non-régression
+        autonomous_delivery(client, state, worktree, profile, guarded, args.cucumber_repo, args.cucumber_base_branch,
+                            local_client_repo, project)
     coverage_file = cucumber_tools.write_coverage_summary(client, inventory, state)
     print(f"[CUCUMBER] Récapitulatif : {coverage_file}")
     # Connaissances partagées : un document de couverture par génération (pas par lot) et l'A_REVOIR.md livré

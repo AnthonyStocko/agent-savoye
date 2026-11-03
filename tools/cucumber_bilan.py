@@ -18,7 +18,7 @@ connaissances partagées (share_bilan).
 import os
 from datetime import datetime
 
-from tools import cucumber_decisions, cucumber_diagnostic, cucumber_import, knowledge_tools
+from tools import cucumber_decisions, cucumber_delivery, cucumber_diagnostic, cucumber_import, knowledge_tools
 from tools.cucumber_a_revoir import A_REVOIR_FILE, CAUSES, UNPROVEN
 from tools.cucumber_tools import (CONSTAT_TYPES, _git, _read_json, _write_json, _write_text, cache_dir, patch_path,
                                   worktree_dir,
@@ -210,7 +210,10 @@ def build_bilan(client_name: str, analysis: dict, state: dict) -> dict:
              "a_prouver": analysis.get("a_prouver") or [], "diagnostics": analysis.get("diagnostics") or {},
              "decisions": cucumber_decisions.summary_lines(cucumber_decisions.load_decisions(client_name)),
              "decisions_en_attente": len(cucumber_decisions.pending(client_name)),
-             "garde_fou": (state.get("garde_fou") or [])[-1:]}
+             "garde_fou": (state.get("garde_fou") or [])[-1:],
+             "livraisons": (state.get("livraisons") or [])[-3:],
+             "ecritures": [e for e in cucumber_delivery.events(client_name, ("push", "promotion", "annulation",
+                                                                             "annulation_impossible", "refus"), 10)]}
     bilan["prochaine_action"] = next_action(analysis, bilan)
     return bilan
 
@@ -227,6 +230,24 @@ def _defect_lines(defect: dict) -> list:
         f"  - Preuve d'exécution : aucune — {UNPROVEN}"]
     lines += [f"  - Correction suggérée : {defect['correction']}"] if defect["correction"] else []
     return lines
+
+
+EVENT_LABELS = {"push": "commit poussé sur", "promotion": "promotion vers", "annulation": "annulation (revert) sur",
+                "annulation_impossible": "annulation impossible sur", "refus": "écriture refusée"}
+
+
+def delivery_markdown(deliveries: list) -> str:
+    """Livraisons autonomes : décision (promu ou non, pourquoi), runs Jenkins (liens), commit, auteur."""
+    lines = []
+    for item in deliveries:
+        lines.append(f"- {item['date'][:16]} · {'✅ promu' if item.get('promu') else '⏸ non promu'} "
+                     f"{item.get('branche_travail')} → {item.get('cible')}"
+                     + (f" @ {item['commit'][:8]}" if item.get("commit") else "") + f" — {item.get('motif')}"
+                     + (f" (lancé par {item['par']})" if item.get("par") else ""))
+        lines += [f"  - run : import n° {r.get('import') or '?'}, {r.get('echecs')} échec(s)"
+                  + (f" — {r['build']}" if r.get("build") else "") + (f" — {r['erreur']}" if r.get("erreur") else "")
+                  for r in item.get("runs") or []]
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def bilan_markdown(bilan: dict, level: int = 2) -> str:
@@ -252,6 +273,15 @@ def bilan_markdown(bilan: dict, level: int = 2) -> str:
                   for n, r in enumerate(guard.get("runs") or [], 1)]
         if guard.get("annules"):
             lines.append(f"- Fichiers remis à leur état d'avant les corrections : {', '.join(guard['annules'][:10])}")
+    if bilan.get("livraisons") or bilan.get("ecritures"):
+        lines += ["", f"{section} Livraison autonome", ""]
+        lines += delivery_markdown(bilan.get("livraisons") or []).splitlines()
+        lines += [f"- {e['date'][:16]} · {EVENT_LABELS.get(e['type'], e['type'])}"
+                  + (f" {e.get('branche') or e.get('cible') or ''}" if e.get("branche") or e.get("cible") else "")
+                  + (f" @ {e['commit'][:8]}" if e.get("commit") else "")
+                  + (f" — {e['motif'][:200]}" if e.get("motif") else "")
+                  + (f" — {', '.join(b for b in e.get('builds') or [] if b)}" if e.get("builds") else "")
+                  + (f" (lancé par {e['par']})" if e.get("par") else "") for e in bilan.get("ecritures") or []]
     lines += ["", f"{section} Défauts détectés dans le code spécifique ou le Studio : {len(bilan['defauts'])}", ""]
     for defect in bilan["defauts"]:
         lines += _defect_lines(defect)

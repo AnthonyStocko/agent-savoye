@@ -294,6 +294,20 @@ def build_info(build_url: str) -> dict:
         return {}
 
 
+def build_parameters(build_url: str) -> dict:
+    """Paramètres d'un build ({nom: valeur}) ; {} si illisible ou sans adresse."""
+    if not build_url:
+        return {}
+    try:
+        response = _get(f"{same_base(build_url)}/api/json", 20, params={"tree": "actions[parameters[name,value]]"})
+        if response.status_code != 200:
+            return {}
+        return {p.get("name"): p.get("value") for action in response.json().get("actions") or [] if action
+                for p in action.get("parameters") or [] if p.get("name")}
+    except (requests.RequestException, ValueError):
+        return {}
+
+
 def build_bytes(build_url: str, relative: str) -> bytes:
     """Contenu d'un fichier d'un build (consoleText, artifact/<chemin>), en mémoire seulement ; b'' si absent."""
     build_url = same_base(build_url)
