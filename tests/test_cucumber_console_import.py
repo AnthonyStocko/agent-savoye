@@ -90,3 +90,26 @@ def test_failed_agent_test_gets_a_correction_from_the_console(project):
     assert any("1 test en échec au dernier résultat importé peut être corrigé automatiquement" in m.value
                for m in at.markdown)
     assert [b for b in at.button if b.label == "Corriger"]
+
+
+def test_console_saved_with_doubled_line_breaks_keeps_every_failure_under_its_feature(tmp_path):
+    # Deux features de même nom (#1, #2) aux scénarios de même titre ; console enregistrée en « \r\r\n » : chaque ligne
+    # de la trace est suivie d'une ligne vide, la ligne « at ✽ » qui situe l'échec est au-delà de 40 lignes brutes
+    tms, wms = (f"src/test/resources/cucumber/features/{CLIENT}/{d}/Init.feature" for d in ("TMS", "WMS"))
+    trace = "".join(f"\tat org.example.Frame{i}.call(Frame.java:{i})\n" for i in range(25))
+    out = [f"Scenario: Intégration des données # {tms}:4", f"Scenario: Intégration des données # {wms}:4",
+           f"Scenario: Règles # {wms}:80"]
+    for number, path, title, kind, error in ((1, tms, "Intégration des données", "FAILURE", "java.lang.AssertionError: x"),
+                                              (2, wms, "Intégration des données", "FAILURE", "java.lang.AssertionError: y"),
+                                              (2, wms, "Règles", "ERROR", "java.lang.NullPointerException")):
+        out += [f"[ERROR] Init #{number}.{title} -- Time elapsed: 1 s <<< {kind}!", error, trace.rstrip("\n"),
+                f"\tat ✽.KIS- Step(file:///w/spec/{path}:{6 if title != 'Règles' else 87})", ""]
+    out += ["[ERROR] Tests run: 3, Failures: 2, Errors: 1, Skipped: 0", "[INFO]"]
+    text = "\r\r\n".join(STAMP + line for line in "\n".join(out).split("\n"))
+    with open(tmp_path / "console.txt", "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    with open(tmp_path / "console.txt", encoding="utf-8") as f:
+        results = ci.console_results(f.read())
+    failed = {k: r["exception"] for k, r in results.items() if r["statut"] == "echoue"}
+    assert failed == {(tms, "Intégration des données"): "AssertionError", (wms, "Intégration des données"): "AssertionError",
+                      (wms, "Règles"): "NullPointerException"}

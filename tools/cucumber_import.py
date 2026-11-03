@@ -105,10 +105,13 @@ def console_results(text: str) -> dict:
             continue
         name = failure.group(1)
         block = []
-        for following in lines[index + 1:index + 40]:
-            if _SUREFIRE_FAILURE.search(following) or following.startswith("[INFO]"):
+        # 40 lignes utiles : les lignes vides (console enregistrée en « \r\r\n », doublée à la lecture) ne comptent
+        # pas, sinon la ligne « at ✽.<step>(…) » sort de la fenêtre et l'échec est rangé sous le mauvais scénario
+        for following in lines[index + 1:]:
+            if _SUREFIRE_FAILURE.search(following) or following.startswith("[INFO]") or len(block) >= 40:
                 break
-            block.append(following)
+            if following.strip():
+                block.append(following)
         error = "\n".join(b for b in block if b.strip())
         step_match = next((m for m in map(_STEP_AT.search, block) if m), None)
         path = step_match.group(2) if step_match else ""

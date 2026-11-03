@@ -3216,6 +3216,14 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
                                            cucumber_init.init_branch(client), base, reset=True)
     paths = [p for p in profile.get("init_features") or [] if p.endswith(".feature")]
     result = init_jobs_checker(client, client_root, std_root, version)(worktree, paths)
+    # Désactivation par job inopérante avec la bibliothèque du client : steps du projet (suspension de tous les
+    # jobs autour de la purge, comme le Standard aligné ; attente tolérante pour les autres usages)
+    project_steps = cucumber_jobs.apply_project_steps(worktree, paths, client, cucumber_std_dir)
+    print(f"[CUCUMBER INIT] Steps de jobs : {project_steps['raison']}"
+          + (f" — {len(project_steps['notes'])} step(s) passé(s) aux steps du projet" if project_steps["notes"] else ""))
+    for note in project_steps["notes"]:
+        print(f"    {note}")
+    result["fichiers"] = list(dict.fromkeys(result["fichiers"] + project_steps["fichiers"]))
     if not result["fichiers"]:
         print("[CUCUMBER INIT] Tous les jobs de l'init sont prouvés présents chez le client : la cause est ailleurs.")
         return None
@@ -3274,13 +3282,10 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
               + (f" — {out.get('build')}" if out.get("build") else ""))
         return {**out, "pousse": True}
 
-    outcome = replay("Cucumber : jobs de l'init absents chez le client")
-    if outcome["ok"] or not outcome.get("pousse") or "KisJob" not in outcome.get("message", ""):
-        return 0 if outcome["ok"] else 1
-    # Échec persistant sur un job : diagnostic temporaire (liste des jobs de l'environnement avant la
-    # désactivation), un seul run, puis retiré de la branche
-    print("[CUCUMBER INIT] Échec persistant sur un job : diagnostic temporaire « "
-          f"{cucumber_jobs.DIAGNOSTIC_STEP} » ajouté pour un run, puis retiré.")
+    # Diagnostic temporaire (liste des jobs de l'environnement avant la désactivation) : gardé à chaque run tant
+    # que l'init échoue, retiré de la branche dès qu'elle passe
+    print("[CUCUMBER INIT] Diagnostic temporaire « "
+          f"{cucumber_jobs.DIAGNOSTIC_STEP} » gardé jusqu'à ce que l'init passe.")
     java = cucumber_jobs.diagnostic_java_path(client)
     with open(os.path.join(worktree, *java.split("/")), "w", encoding="utf-8", newline=chr(10)) as f:
         f.write(cucumber_jobs.diagnostic_java(client))
@@ -3302,13 +3307,17 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
     if listed:
         absent = [n for n in wanted if n not in on_env]
         print("[CUCUMBER INIT] Jobs de l'init absents de l'environnement : " + (", ".join(absent) or "aucun"))
-    # Diagnostic retiré : la branche revient à la correction seule
+    if not diagnostic["ok"]:
+        print("[CUCUMBER INIT] Init toujours en échec : diagnostic gardé sur la branche de travail pour le prochain "
+              "run.")
+        return 1
+    # Init passée : diagnostic retiré, la branche revient à la correction seule
     cucumber_tools._git(worktree, "revert", "--no-edit", "HEAD")
     error = cucumber_checks.push_for_verification(worktree, profile["verify_branch"],
                                                   "Retrait du diagnostic temporaire des jobs")[0]
-    print("[CUCUMBER INIT] Diagnostic retiré de la branche de travail." if not error else
+    print("[CUCUMBER INIT] Init passée : diagnostic retiré de la branche de travail." if not error else
           f"[CUCUMBER INIT] ⚠️ Retrait du diagnostic non poussé : {error}")
-    return 1
+    return 0
 
 
 def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio_version: str,

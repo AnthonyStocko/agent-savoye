@@ -144,3 +144,85 @@ def test_references_must_be_created_before_or_proven():
     found = cj.reference_order({"init.feature": ORDER}, {"01-ExcPartnerDraft.xlsm": "code PART_FICHIER"})
     assert [(r["code"], r["ligne"]) for r in found] == [("PART_INCONNU", 11)]
     assert cj.reference_order({"init.feature": ORDER}, {}, {"PART_FICHIER": "base", "PART_INCONNU": "base"}) == []
+
+
+SUSPEND = """@INIT_CLIENTX_WMS
+Feature: Init
+
+  Scenario: Intégration des données
+    Given KIS- Désactivation du job
+      | name              |
+      # TODO-JOB: job « absent » : aucune définition chez le client
+      # | absent            |
+      | clean-up-tmp      |
+    And INIT- Purge de l'environnement par le clear "wms/all"
+    And KIS- Activation du job
+      | name              |
+      | clean-up-tmp      |
+    # TODO-VERSION: step absent de la bibliothèque du client (bibliothèque 26.16) : défini dans le Standard aligné
+    # And KIS- Désactivation de tous les jobs
+    And INIT- Initialisation globale par fichiers via l'écran
+
+  Scenario: Purge des fichiers d'intégration
+    # TODO-VERSION: step absent de la bibliothèque du client (bibliothèque 26.16) : défini dans le Standard aligné
+    # Given KIS- Activation de tous les jobs
+    And KIS- Lancement du job
+      | name         |
+      | clean-up-tmp |
+    And KIS- Désactivation du job
+      | name              |
+      | Job précubing     |
+"""
+
+
+def test_job_steps_switch_to_project_steps_when_library_lacks_all_jobs():
+    steps = cj.project_job_steps(CLIENT)
+    prefix = steps[cj.ALL_OFF].split("- ", 1)[0]
+    assert prefix.isupper() and prefix != "KIS" and all(s.startswith(prefix + "- ") for s in steps.values())
+    text, notes = cj.use_project_job_steps(SUSPEND, CLIENT, "26.16")
+    lines = text.splitlines()
+    # Désactivation / activation par job autour de la purge : suspension / réactivation de tous les jobs
+    assert f"    Given {steps[cj.ALL_OFF]}" == lines[5] and f"    And {steps[cj.ALL_ON]}" in lines
+    assert "      # | clean-up-tmp      |" in lines and "      # | absent            |" in lines
+    # « tous les jobs » commenté TODO-VERSION : rétabli en step du projet, une seule note TODO-VERSION au-dessus
+    index = lines.index(f"    And {steps[cj.ALL_OFF]}")
+    assert "POST jobs/suspend" in lines[index - 1] and "TODO-VERSION" not in lines[index - 2]
+    assert f"    Given {steps[cj.ALL_ON]}" in lines
+    # Désactivation isolée : step du projet par job, table active conservée
+    last = lines.index(f"    And {steps[cj.ONE_OFF]}")
+    assert lines[last + 2] == "      | Job précubing     |"
+    assert not any(line.strip().startswith(("Given KIS- D", "And KIS- D", "And KIS- A")) for line in lines)
+    assert len(notes) == 5
+    # Jobs toujours contrôlés sous le step du projet ; texte inchangé au second passage pour les steps du projet
+    assert [u["nom"] for u in cj.usages(text)] == ["clean-up-tmp", "Job précubing"]
+    java = cj.jobs_java(CLIENT, "26.16")
+    assert all(f'@Given("{s}")' in java for s in steps.values())
+    assert 'sendPostRest(URL_JOBS + "/suspend")' in java and 'sendPostRest(URL_JOBS + "/unsuspend")' in java
+
+
+def test_library_with_all_jobs_steps_is_left_unchanged(tmp_path):
+    std = str(tmp_path / "std")
+    os.makedirs(std)
+    git(std, "init", "-q", "-b", "development")
+    git(std, "config", "user.name", "t")
+    git(std, "config", "user.email", "t@example.com")
+    step = os.path.join(std, "src", "test", "java", "cucumber", "features", "kis", "KISJobStep.java")
+    write(step, '@When("KIS- Désactivation du job")')
+    git(std, "add", "-A")
+    git(std, "commit", "-qm", "26.16")
+    git(std, "tag", "v26.16")
+    write(step, f'@Given("{cj.ALL_OFF}")')
+    git(std, "commit", "-qam", "26.22")
+    git(std, "tag", "v26.22")
+    assert not cj.library_has_all_jobs(std, "refs/tags/v26.16") and cj.library_has_all_jobs(std, "refs/tags/v26.22")
+    worktree = str(tmp_path / "wt")
+    rel = "src/test/resources/cucumber/features/x/Init.feature"
+    for version, changed in (("26.22", False), ("26.16", True)):
+        write(os.path.join(worktree, "pom.xml"), "<project><dependencies><dependency><groupId>a-sis</groupId>"
+              f"<artifactId>Cucumber</artifactId><version>{version}</version><type>test-jar</type></dependency>"
+              "</dependencies></project>")
+        write(os.path.join(worktree, *rel.split("/")), SUSPEND)
+        out = cj.apply_project_steps(worktree, [rel], CLIENT, std)
+        assert bool(out["fichiers"]) is changed, out
+    assert out["fichiers"] == [rel, cj.jobs_java_path(CLIENT)]
+    assert os.path.exists(os.path.join(worktree, *cj.jobs_java_path(CLIENT).split("/")))

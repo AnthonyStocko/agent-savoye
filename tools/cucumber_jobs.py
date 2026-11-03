@@ -26,12 +26,22 @@ TODO_MARKER = "TODO-JOB:"
 # Step -> ce qui doit être prouvé : le nom du job (il doit exister) ou sa classe (job créé)
 STEPS = {"KIS- Désactivation du job": "nom", "KIS- Activation du job": "nom", "KIS- Modification du job": "nom",
          "KIS- Lancement du job": "nom", "KIS- Création du job": "classe"}
+ONE_OFF, ONE_ON = "KIS- Désactivation du job", "KIS- Activation du job"
+ALL_OFF, ALL_ON = "KIS- Désactivation de tous les jobs", "KIS- Activation de tous les jobs"
 _STEP = re.compile(r"^(\s*)(Given|When|Then|And|But|\*)\s+(.+?)\s*$")
 JOB_TABLE = "kis_qrtz_job_details"
 
 
 def _cells(line: str) -> list:
     return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def step_key(step: str) -> str:
+    """Step de STEPS correspondant : « <CLIENT>- Désactivation du job » (step du projet) contrôlé comme celui du KIS."""
+    if step in STEPS:
+        return step
+    other = re.sub(r"^[A-Z][A-Z0-9_]*- ", "KIS- ", step)
+    return other if other in (ONE_OFF, ONE_ON) else step
 
 
 def usages(text: str) -> list:
@@ -43,9 +53,9 @@ def usages(text: str) -> list:
     while i < len(lines):
         match = _STEP.match(lines[i])
         i += 1
-        if not match or lines[i - 1].lstrip().startswith("#") or match.group(3) not in STEPS:
+        if not match or lines[i - 1].lstrip().startswith("#") or step_key(match.group(3)) not in STEPS:
             continue
-        step = match.group(3)
+        step = step_key(match.group(3))
         header = None
         while i < len(lines) and lines[i].strip().startswith(("|", "#")):
             if lines[i].strip().startswith("|"):
@@ -475,6 +485,267 @@ def diagnostic_lines(console: str) -> list:
     """Lignes du diagnostic lues dans la console Jenkins (horodatage retiré)."""
     return [line.split(DIAGNOSTIC_PREFIX, 1)[1].strip() for line in (console or "").splitlines()
             if DIAGNOSTIC_PREFIX in line]
+
+
+# ---------------------------------------------------------------------------
+# Désactivation des jobs : steps du projet quand la bibliothèque du client est défaillante
+# ---------------------------------------------------------------------------
+# Bibliothèque ≤ 26.16 : « KIS- Désactivation du job » envoie POST jobs/{nom}/inactive puis attend
+# triggers[0].active == false avec une assertion DANS la condition d'attente (KISEndPoints.jobActivityIs) : si le
+# premier contrôle voit encore le job actif, l'assertion « Pas d'élément correspondant à l'attendu {} pour KisJob »
+# interrompt l'attente au lieu de la prolonger (identique en 26.22). Le Standard aligné sur le serveur 26.22
+# (commit f5fd6da1b « Pb Jobs et clear full ») suspend et réactive tous les jobs (POST jobs/suspend, /unsuspend)
+# autour de l'intégration ; la bibliothèque 26.16 n'a pas ces steps. Steps du projet, de nom unique, sans toucher
+# à la bibliothèque partagée ; marqués TODO-VERSION, à remplacer par ceux du Standard à la montée de bibliothèque.
+
+SUSPEND_COMMIT = "f5fd6da1b"
+JOBS_NOTE = "[JOBS]"
+
+
+def library_has_all_jobs(cucumber_std_dir: str, ref: str) -> bool:
+    """La bibliothèque à `ref` du dépôt Standard définit « KIS- Désactivation de tous les jobs »."""
+    shown = _git(cucumber_std_dir, "show", f"{ref}:src/test/java/cucumber/features/kis/KISJobStep.java")
+    return shown.returncode == 0 and f'"{ALL_OFF}"' in shown.stdout
+
+
+def project_job_steps(client_name: str) -> dict:
+    """{step de la bibliothèque : step du projet} — préfixe du client (ex. « CANSON- »), nom unique."""
+    from tools.cucumber_tools import java_class_suffix
+    prefix = re.sub(r"[^A-Z0-9]", "", java_class_suffix(client_name).upper())
+    return {k: k.replace("KIS- ", f"{prefix}- ", 1) for k in (ALL_OFF, ALL_ON, ONE_OFF, ONE_ON)}
+
+
+def jobs_java_path(client_name: str) -> str:
+    from tools.cucumber_tools import java_class_suffix, java_package_segment
+    return (f"src/test/java/cucumber/features/{java_package_segment(client_name)}/"
+            f"Jobs{java_class_suffix(client_name)}Steps.java")
+
+
+def jobs_java(client_name: str, library_version: str) -> str:
+    """
+    Steps du projet (API de la bibliothèque 26.16 : EndPoints.sendPostRest, sendGetRestToDisplayList, kisJobs,
+    ConstantConfig.TIME_MAX_JOB) : suspension / réactivation de tous les jobs comme le Standard f5fd6da1b, et
+    (dés)activation par job dont l'attente relit l'état sans assertion avant la fin du délai, puis échoue avec
+    l'état réellement lu de chaque job.
+    """
+    from tools.cucumber_tools import java_class_suffix, java_package_segment
+    steps = project_job_steps(client_name)
+    name = f"Jobs{java_class_suffix(client_name)}Steps"
+    return f"""package cucumber.features.{java_package_segment(client_name)};
+
+import cucumber.endPoints.EndPoints;
+import cucumber.features.BaseStep;
+import cucumber.pojo.response.KIS.kisJob.KisJob;
+import cucumber.util.constant.config.ConstantConfig;
+import cucumber.util.context.TestContext;
+import io.cucumber.datatable.DataTable;
+import io.cucumber.java.en.Given;
+import org.junit.Assert;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * TODO-VERSION : bibliothèque {library_version} sans « {ALL_OFF} » / « {ALL_ON} » (Standard
+ * {SUSPEND_COMMIT}, aligné sur le serveur 26.22) et dont « {ONE_OFF} » échoue au premier contrôle de son attente
+ * (assertion dans la condition). Steps du projet, à remplacer par ceux du Standard à la montée de bibliothèque.
+ */
+public class {name} extends BaseStep {{
+
+    private static final String URL_JOBS = "jobs";
+
+    public {name}(TestContext testContext) {{
+        super(testContext);
+    }}
+
+    @Given("{steps[ALL_OFF]}")
+    public void desactivationDeTousLesJobs() {{
+        EndPoints.sendPostRest(URL_JOBS + "/suspend");
+        EndPoints.kisJobs = null;
+        System.out.println("{JOBS_NOTE} Tous les jobs suspendus (POST jobs/suspend)");
+    }}
+
+    @Given("{steps[ALL_ON]}")
+    public void activationDeTousLesJobs() {{
+        EndPoints.sendPostRest(URL_JOBS + "/unsuspend");
+        EndPoints.kisJobs = null;
+        System.out.println("{JOBS_NOTE} Tous les jobs réactivés (POST jobs/unsuspend)");
+    }}
+
+    @Given("{steps[ONE_OFF]}")
+    public void desactivationDuJob(DataTable jobList) throws Exception {{
+        changeActivity(jobList, false);
+    }}
+
+    @Given("{steps[ONE_ON]}")
+    public void activationDuJob(DataTable jobList) throws Exception {{
+        changeActivity(jobList, true);
+    }}
+
+    private static void changeActivity(DataTable jobList, boolean active) throws Exception {{
+        List<String> names = jobList.asMaps(String.class, String.class).stream().map(m -> m.get("name"))
+                .collect(Collectors.toList());
+        List<KisJob> existing = EndPoints.sendGetRestToDisplayList(URL_JOBS, KisJob.class);
+        for (String name : names) {{
+            if (existing.stream().noneMatch(j -> name.equals(j.getName()))) {{
+                Assert.fail("Job [" + name + "] absent de l'environnement");
+            }}
+            EndPoints.sendPostRest(URL_JOBS + "/" + name + (active ? "/active" : "/inactive"));
+        }}
+        long deadline = System.currentTimeMillis() + ConstantConfig.TIME_UNIT.toMillis(ConstantConfig.TIME_MAX_JOB);
+        List<String> pending = new ArrayList<>(names);
+        while (true) {{
+            List<KisJob> jobs = EndPoints.sendGetRestToDisplayList(URL_JOBS, KisJob.class);
+            pending.removeIf(name -> jobs.stream().anyMatch(j -> name.equals(j.getName())
+                    && (j.getTriggers() == null || j.getTriggers().isEmpty()
+                    || Boolean.valueOf(active).equals(j.getTriggers().get(0).getActive()))));
+            if (pending.isEmpty()) {{
+                break;
+            }}
+            if (System.currentTimeMillis() > deadline) {{
+                String states = jobs.stream().filter(j -> pending.contains(j.getName()))
+                        .map(j -> j.getName() + " : active=" + j.getTriggers().get(0).getActive())
+                        .collect(Collectors.joining(", "));
+                Assert.fail("Jobs non " + (active ? "activés" : "désactivés") + " après "
+                        + ConstantConfig.TIME_MAX_JOB + " " + ConstantConfig.TIME_UNIT + " : " + states);
+            }}
+            Thread.sleep(1000);
+        }}
+        EndPoints.kisJobs = null;
+        System.out.println("{JOBS_NOTE} " + names.size() + " job(s) " + (active ? "activé(s)" : "désactivé(s)")
+                + " : " + String.join(", ", names));
+    }}
+}}
+"""
+
+
+def _blocks(lines: list) -> list:
+    """Steps actifs ou commentés d'une feature : [(début, fin exclue, scénario, step, commenté)], table comprise."""
+    out, scenario, i = [], -1, 0
+    while i < len(lines):
+        raw = lines[i].lstrip()
+        if raw.startswith(("Scenario", "Background")):
+            scenario += 1
+        body = raw[1:].lstrip() if raw.startswith("#") else raw
+        match = _STEP.match("  " + body.rstrip("\r\n"))
+        if match and not body.startswith("|"):
+            j = i + 1
+            while j < len(lines) and (lines[j].strip().lstrip("#").strip().startswith("|")
+                                      or lines[j].strip().startswith(f"# {TODO_MARKER}")):
+                j += 1
+            out.append((i, j, scenario, match.group(3), raw.startswith("#")))
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def use_project_job_steps(text: str, client_name: str, library_version: str) -> tuple:
+    """
+    Feature d'init : steps de jobs remplacés par ceux du projet (project_job_steps), table conservée.
+      - « tous les jobs » commenté TODO-VERSION (absent de la bibliothèque) ou actif : rétabli en step du projet ;
+      - désactivation par job suivie, dans le même scénario, d'une activation par job (désactivation autour de la
+        purge) : suspension puis réactivation de tous les jobs, tables gardées en commentaire ;
+      - autre (dés)activation par job : step du projet à attente tolérante, même table.
+    Renvoie (texte, [notes]). Rien n'est supprimé.
+    """
+    steps = project_job_steps(client_name)
+    lines = text.splitlines(keepends=True)
+    blocks = _blocks(lines)
+    by_start = {b[0]: b for b in blocks}
+    paired = {}
+    for n, (start, _, scenario, step, commented) in enumerate(blocks):
+        if commented or step != ONE_OFF:
+            continue
+        on = next((b for b in blocks[n + 1:] if b[2] == scenario and not b[4] and b[3] in (ONE_OFF, ONE_ON)), None)
+        if on and on[3] == ONE_ON:
+            paired[start], paired[on[0]] = ALL_OFF, ALL_ON
+    out, notes, i = [], [], 0
+    while i < len(lines):
+        block = by_start.get(i)
+        if not block or block[3] not in (ALL_OFF, ALL_ON, ONE_OFF, ONE_ON) or (block[4] and block[3] in (ONE_OFF,
+                                                                                                          ONE_ON)):
+            out.append(lines[i])
+            i += 1
+            continue
+        start, end, _, step, commented = block
+        line = lines[start]
+        eol = "\r\n" if line.endswith("\r\n") else "\n"
+        indent = line[:len(line) - len(line.lstrip())]
+        keyword = _STEP.match("  " + line.lstrip().lstrip("#").strip()).group(2)
+        if out and cucumber_todo_version(out[-1]) and step in (ALL_OFF, ALL_ON):
+            out.pop()
+        if step in (ALL_OFF, ALL_ON):
+            target = steps[step]
+            api = "jobs/suspend" if step == ALL_OFF else "jobs/unsuspend"
+            out.append(f"{indent}# TODO-VERSION: « {step} » absent de la bibliothèque {library_version} : step du "
+                       f"projet (POST {api}, Standard {SUSPEND_COMMIT}), à remplacer à la montée de bibliothèque{eol}")
+            out.append(f"{indent}{keyword} {target}{eol}")
+            notes.append(f"l. {start + 1} : « {step} » → « {target} »")
+            i = end
+        elif start in paired:
+            target = steps[paired[start]]
+            out.append(f"{indent}# TODO-VERSION: « {step} » inopérant avec la bibliothèque {library_version} (attente "
+                       f"interrompue au premier contrôle) : {'suspension' if step == ONE_OFF else 'réactivation'} de "
+                       f"tous les jobs (Standard {SUSPEND_COMMIT}), liste d'origine en commentaire{eol}")
+            out.append(f"{indent}{keyword} {target}{eol}")
+            for row in lines[start + 1:end]:
+                row_indent = row[:len(row) - len(row.lstrip())]
+                out.append(row if row.lstrip().startswith("#") else f"{row_indent}# {row.lstrip()}")
+            notes.append(f"l. {start + 1} : « {step} » (par job, autour de la purge) → « {target} »")
+            i = end
+        else:
+            target = steps[step]
+            out.append(f"{indent}# TODO-VERSION: « {step} » inopérant avec la bibliothèque {library_version} (attente "
+                       f"interrompue au premier contrôle) : step du projet, attente sans assertion avant le délai{eol}")
+            out.append(f"{indent}{keyword} {target}{eol}")
+            out.extend(lines[start + 1:end])
+            notes.append(f"l. {start + 1} : « {step} » → « {target} »")
+            i = end
+    return "".join(out), notes
+
+
+def apply_project_steps(worktree: str, paths: list, client_name: str, cucumber_std_dir: str) -> dict:
+    """
+    Bibliothèque du client (pom.xml du worktree) sans « tous les jobs » : features d'init `paths` passées aux steps
+    du projet (use_project_job_steps) et classe Java écrite (jobs_java_path). Bibliothèque qui les a, ou
+    introuvable dans le dépôt Standard : rien n'est changé (raison donnée). Renvoie {fichiers, notes, raison}.
+    """
+    import os
+
+    from tools import cucumber_checks, cucumber_versions
+    version = cucumber_checks.library_version(worktree)
+    ref = cucumber_versions.library_ref(cucumber_std_dir, version)
+    if not ref:
+        return {"fichiers": [], "notes": [], "raison": f"bibliothèque {version or '?'} introuvable dans le Standard"}
+    if library_has_all_jobs(cucumber_std_dir, ref):
+        return {"fichiers": [], "notes": [], "raison": f"bibliothèque {version} : « {ALL_OFF} » disponible"}
+    changed, notes = [], []
+    for rel in paths:
+        full = os.path.join(worktree, *rel.split("/"))
+        if not os.path.exists(full):
+            continue
+        with open(full, encoding="utf-8", newline="") as f:
+            text = f.read()
+        new, found = use_project_job_steps(text, client_name, version)
+        if new != text:
+            with open(full, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+            changed.append(rel)
+            notes += [f"{rel.rsplit('/', 2)[-2]}/{rel.rsplit('/', 1)[-1]} {n}" for n in found]
+    if changed:
+        java = jobs_java_path(client_name)
+        os.makedirs(os.path.join(worktree, *java.split("/")[:-1]), exist_ok=True)
+        with open(os.path.join(worktree, *java.split("/")), "w", encoding="utf-8", newline="\n") as f:
+            f.write(jobs_java(client_name, version))
+        changed.append(java)
+    return {"fichiers": changed, "notes": notes, "raison": f"bibliothèque {version} sans « {ALL_OFF} »"}
+
+
+def cucumber_todo_version(line: str) -> bool:
+    return line.lstrip().startswith("# TODO-VERSION:")
 
 
 # ---------------------------------------------------------------------------
