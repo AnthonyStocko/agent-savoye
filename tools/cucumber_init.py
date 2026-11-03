@@ -376,10 +376,10 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
                     text, notes = mark_version_gaps(text, library, aligned, version)
                     result["todo_version"] += [f"{target_rel} : {n}" for n in notes]
                 if out_of_scope:
-                    # Module exclu du périmètre (profil) : son clear et sa configuration commentés ici aussi
-                    from tools.cucumber_jobs import drop_steps_of_absent_modules
-                    text, notes = drop_steps_of_absent_modules(text, set(), out_of_scope)
-                    result["avertissements"] += [f"{target_rel} {n}" for n in notes]
+                    # Module décoché (profil) : son clear, sa configuration et ses fichiers retirés, sans trace
+                    text, removed = cucumber_modules.strip_excluded_steps(text, profile, out_of_scope)
+                    result["avertissements"] += [f"{target_rel} l. {r['ligne']} retirée (module {r['module']} "
+                                                 f"décoché) : {r['lignes'][0].strip()[:100]}" for r in removed]
                 with open(target, "w", encoding="utf-8", newline="") as f:
                     f.write(text)
             else:

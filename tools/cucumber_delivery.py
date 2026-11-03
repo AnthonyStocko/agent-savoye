@@ -226,7 +226,10 @@ def file_errors(worktree: str, base: str, head: str, protected=(), decision: boo
         allowed = (path in ROOT_FILES or (path.startswith(TEST_SOURCES) and path.endswith(CODE_EXTENSIONS))
                    or path.startswith(DATA_ROOT))
         if name == "pom.xml":
-            if not decision:
+            # Exception explicite : seule la version de la bibliothèque Cucumber (montée alignée sur le client)
+            from tools.cucumber_library_upgrade import only_version_changed
+            if not decision and not (path == "pom.xml" and only_version_changed(
+                    _show(worktree, base, path), _show(worktree, head, path))):
                 errors.append(f"{path} : pom.xml modifié sans décision humaine")
             continue
         if not allowed:
@@ -272,10 +275,18 @@ def check_push(worktree: str, branch: str, client: str = "", decision: bool = Tr
         if normalize_url(target) != normalize_url(allowed):
             return refuse(f"{normalize_url(target)} n'est pas le dépôt Cucumber du profil de {client} "
                           f"({normalize_url(allowed)}) : push refusé")
-    if protected is None and client:
-        from tools import cucumber_profile
-        protected = cucumber_profile.effective_profile(cucumber_profile.load_profile(client)).get(
-            "protected_files") or []
+    if client:
+        from tools import cucumber_modules, cucumber_profile
+        profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+        if protected is None:
+            protected = profile.get("protected_files") or []
+        # Aucune feature active ne référence un clear, un tag d'init ou un step d'un module décoché
+        found = cucumber_modules.traces(cucumber_modules.worktree_features(worktree), profile) \
+            if head == "HEAD" else []
+        if found:
+            return refuse(f"{len(found)} trace(s) d'un module décoché dans des features actives ("
+                          + " ; ".join(found[:3]) + ") : appliquez d'abord le nettoyage du module (« Données du "
+                          "projet », Modules testés)")
     base, tip = outgoing_range(worktree) if head == "HEAD" else (None, head)
     if base is not None:
         errors = file_errors(worktree, base, tip, protected or (), decision)
@@ -292,7 +303,7 @@ def failing(analysis: dict) -> set:
     return {i for i, r in ((analysis or {}).get("resultats") or {}).items() if r.get("statut") != "passe"}
 
 
-def promotion_verdict(reference: dict, runs: list) -> dict:
+def promotion_verdict(reference: dict, runs: list, allow_equal: bool = False) -> dict:
     """
     Promotion de la branche de travail : {ok, motif}. Chaque run complet sur la branche de travail : init verte,
     aucun nouvel échec face au run de référence, moins d'échecs que lui ; suite de référence entièrement verte (ou
@@ -314,6 +325,11 @@ def promotion_verdict(reference: dict, runs: list) -> dict:
             return {"ok": False, "motif": f"run {number} : {len(new)} nouvel(s) échec(s) : "
                                           + ", ".join(i.split("::", 1)[-1] for i in new[:5])}
     last = runs[-1]
+    if allow_equal:
+        # Montée de version : pas plus d'échecs qu'avant (init verte, aucun nouvel échec, vérifiés ci-dessus)
+        if len(failing(last)) > len(before):
+            return {"ok": False, "motif": f"plus d'échecs qu'avant : {len(failing(last))} pour {len(before)}"}
+        return {"ok": True, "motif": f"{len(before)} → {len(failing(last))} échec(s), aucun nouvel échec, init verte"}
     if green_suite or not reference:
         greens = [r for r in runs if not failing(r)]
         if len(runs) < 2 or len(greens) < 2 or failing(runs[-1]) or failing(runs[-2]):
@@ -326,7 +342,7 @@ def promotion_verdict(reference: dict, runs: list) -> dict:
     return {"ok": True, "motif": f"{len(before)} → {len(failing(last))} échec(s), aucun nouvel échec, init verte"}
 
 
-def promote(worktree: str, target: str, client: str = "") -> dict:
+def promote(worktree: str, target: str, client: str = "", decision: bool = False) -> dict:
     """
     Fusion rapide de HEAD (branche de travail, déjà poussée) vers `target` : push sans forcer, seulement si la cible
     distante est un ancêtre de HEAD. Renvoie {ok, motif, commit, avant}.
@@ -341,8 +357,8 @@ def promote(worktree: str, target: str, client: str = "") -> dict:
         return {"ok": False, "motif": f"fusion rapide impossible : {target} a avancé depuis la branche de travail "
                                       f"(à intégrer d'abord, jamais de push forcé)", "commit": head, "avant": before}
     # Commits promus : déjà envoyés sur la branche de travail, seule la cible change (fichiers contrôlés à nouveau)
-    error = check_push(worktree, target, client, decision=False, head=head) or _promotion_files(
-        worktree, before, head, client)
+    error = check_push(worktree, target, client, decision=decision, head=head) or _promotion_files(
+        worktree, before, head, client, decision)
     if error:
         return {"ok": False, "motif": error, "commit": head, "avant": before}
     pushed = _git(worktree, "push", "origin", f"{head}:refs/heads/{target}")
@@ -353,11 +369,11 @@ def promote(worktree: str, target: str, client: str = "") -> dict:
             "avant": before}
 
 
-def _promotion_files(worktree: str, before: str, head: str, client: str) -> str:
+def _promotion_files(worktree: str, before: str, head: str, client: str, decision: bool = False) -> str:
     from tools import cucumber_profile
     protected = cucumber_profile.effective_profile(cucumber_profile.load_profile(client)).get(
         "protected_files") if client else []
-    errors = file_errors(worktree, before, head, protected or [], decision=False)
+    errors = file_errors(worktree, before, head, protected or [], decision=decision)
     if errors:
         motif = "fichiers refusés : " + " ; ".join(errors[:5])
         log_event(client, "refus", motif=motif, branche="promotion")

@@ -106,7 +106,7 @@ def test_modules_detected_from_features_and_inventory_without_hard_list(cache, c
     assert cm.std_codes(std_dir) == {"WMS": "@WMS", "TMS": "@TMS", "OMS": "@OMS"}
 
 
-def test_excluded_module_has_no_init_and_its_clear_is_commented(cache, client_repo, std_dir):
+def test_excluded_module_has_no_init_and_no_trace_in_other_inits(cache, client_repo, std_dir):
     profile = _profile(cache, client_repo, std_dir)
     assert profile["init_features"] == [INIT_WMS_PATH]
     assert profile["init_tags"] == "@INIT_CLIENTX_WMS"
@@ -114,15 +114,58 @@ def test_excluded_module_has_no_init_and_its_clear_is_commented(cache, client_re
     result = ci.build_client_init(client_repo, std_dir, CLIENT, "integration", {"WMS", "TMS"}, profile)
     assert result["modules"] == ["WMS"] and result["exclus"] == ["TMS"] and not result["absents"]
     assert not any("/TMS/" in p for p in result["fichiers"])
-    text = open(os.path.join(ci.init_worktree_dir(CLIENT), *ci.client_path(
-        f"{RES}/features/WMS/01-Contexte/01-Initialisation.feature", CLIENT).split("/")), encoding="utf-8").read()
-    assert '# And INIT- Purge de l\'environnement par le clear "tms/all"' in text
-    assert "# And INIT- Configuration TMS :" in text and "# | a   | b      |" in text
-    assert "TMS exclu du périmètre testé" in text
-    # Correction de l'init : mêmes règles (apply_environment_rules), sans bundle.list lisible
-    again, notes = cjobs.drop_steps_of_absent_modules(STD_INIT.format(m="WMS"), set(), {"TMS"})
-    assert len(notes) == 2 and "# And INIT- Configuration TMS" in again
-    assert cjobs.drop_steps_of_absent_modules(STD_INIT.format(m="WMS"), set(), set())[1] == []
+    rel = ci.client_path(f"{RES}/features/WMS/01-Contexte/01-Initialisation.feature", CLIENT)
+    text = open(os.path.join(ci.init_worktree_dir(CLIENT), *rel.split("/")), encoding="utf-8").read()
+    # Retirés, pas commentés : plus aucune trace du module décoché
+    assert "tms/all" not in text and "Configuration TMS" not in text and "| a   | b      |" not in text
+    assert "INIT- Initialisation globale par fichiers via l'écran" in text
+    assert any("retirée (module TMS décoché)" in w for w in result["avertissements"])
+    assert cm.traces({rel: text}, profile) == []
+    # Correction de l'init (apply_environment_rules) : mêmes règles
+    write(os.path.join(client_repo, "init", "WMS", "x.feature"), STD_INIT.format(m="WMS"))
+    changed = cjobs.apply_environment_rules(client_repo, ["init/WMS/x.feature"], {}, profile=profile)
+    assert changed["fichiers"] == ["init/WMS/x.feature"] and "tms/all" not in open(
+        os.path.join(client_repo, "init", "WMS", "x.feature"), encoding="utf-8").read()
+
+
+def test_clear_of_a_module_recognized_by_name_and_by_the_profile_mapping(cache, client_repo, std_dir):
+    profile = {**_profile(cache, client_repo, std_dir),
+               "clears_application": {"init-data-rest-clear-main-tms": ["odatio-clientx/bundle.list"]}}
+    assert cm.module_clears(profile) == {"TMS": {"init-data-rest-clear-main-tms"}}
+    purge = "INIT- Purge de l'environnement par le clear"
+    assert cm.step_modules(f'    And {purge} "tms/all"', profile) == {"TMS"}
+    assert cm.step_modules(f'    And {purge} "init-data-rest-clear-main-tms"', profile) == {"TMS"}
+    assert cm.step_modules(f'    Given {purge} "{CLEAR}"', profile) == set()
+    assert cm.step_modules(f'    # And {purge} "tms/all"', profile) == set()
+
+
+def test_existing_init_cleaned_when_unchecked_and_restored_when_rechecked(cache, client_repo, std_dir):
+    """Init existante (écrite à la main) : clear TMS retiré de l'init WMS, init TMS désactivée ; recoché : remis."""
+    wms_init = INIT_WMS + ("\n  Scenario: Init\n    Given INIT- Purge de l'environnement\n"
+                           "    And INIT- Purge de l'environnement par le clear \"tms/all\"\n"
+                           "    And INIT- Initialisation globale par fichiers via l'écran\n")
+    write(os.path.join(client_repo, *INIT_WMS_PATH.split("/")), wms_init)
+    git(client_repo, "commit", "-qam", "init à la main")
+    profile = _profile(cache, client_repo, std_dir)
+    assert len(cm.traces(cm.worktree_features(client_repo), profile)) == 2   # clear dans l'init WMS, tag d'init TMS
+    plan = {p["fichier"]: p for p in cm.retag_plan(client_repo, profile, "TMS")}
+    assert plan[INIT_WMS_PATH]["raison"] == "module TMS décoché"
+    assert [line.strip() for line in plan[INIT_WMS_PATH]["avant"]] == [
+        "And INIT- Purge de l'environnement par le clear \"tms/all\""]
+    result = cm.apply_retag(client_repo, CLIENT, "integration", profile, "TMS")
+    cm.record_retag(CLIENT, "TMS", False, result)
+    git(client_repo, "am", "-q", result["patch"])
+    assert cm.traces(cm.worktree_features(client_repo), profile) == []
+    assert "tms/all" not in open(os.path.join(client_repo, *INIT_WMS_PATH.split("/")), encoding="utf-8").read()
+    # Recoché : steps et tag client remis, à l'identique
+    cm.save_excluded(CLIENT, [])
+    active = cp.effective_profile(cp.load_profile(CLIENT))
+    back = cm.apply_retag(client_repo, CLIENT, "integration", active, "TMS", restore=True)
+    git(client_repo, "am", "-q", back["patch"])
+    for rel, text in ((INIT_WMS_PATH, wms_init), (INIT_TMS_PATH, INIT_TMS), (TMS_FEATURE, CLIENT_TMS)):
+        assert open(os.path.join(client_repo, *rel.split("/")), encoding="utf-8").read() == text
+    cm.record_retag(CLIENT, "TMS", True, back)
+    assert cm.retag_state(cp.load_profile(CLIENT), "TMS")["retires"] == []
 
 
 def test_init_facts_ignore_the_excluded_module(cache, client_repo, std_dir):

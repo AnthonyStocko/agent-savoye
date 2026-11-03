@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import cucumber_delivery, cucumber_init_fix, cucumber_modules, standard_version, standard_version_task
+from tools import cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1430,8 +1430,16 @@ def render_delivery_settings(ctx: dict) -> None:
         work = columns[0].text_input("Branche de travail de l'agent", value=profile.get("verify_branch") or "")
         target = columns[1].text_input("Branche cible (lue par le job)", value=profile.get("branche_cible") or "",
                                        placeholder="ex. integration")
+        library = st.checkbox("Mise à jour automatique de la bibliothèque Cucumber", value=cucumber_library_upgrade.enabled(
+            profile), help="Activée par défaut : à chaque écart entre la version du pom et celle du client (Jenkins, à "
+                           "défaut l'application), l'agent monte la bibliothèque, corrige la compilation, puis la "
+                           "livre si les runs ne régressent pas.")
         if st.form_submit_button("Enregistrer la livraison"):
             saisi = document.setdefault("saisi", {})
+            if library:
+                saisi.pop("maj_bibliotheque", None)
+            else:
+                saisi["maj_bibliotheque"] = "non"
             for key, value in (("livraison_autonome", enabled), ("verify_branch", work.strip()),
                                ("branche_cible", target.strip())):
                 if value:
@@ -1442,6 +1450,9 @@ def render_delivery_settings(ctx: dict) -> None:
             st.rerun()
     if profile.get("cucumber_repo_url"):
         st.caption(f"Seul dépôt autorisé en écriture : {cucumber_delivery.normalize_url(profile['cucumber_repo_url'])}")
+    upgrade = (cucumber_tools.load_state(client).get("bibliotheque") or [])[-1:]
+    if upgrade:
+        st.caption("Bibliothèque : " + cucumber_library_upgrade.bilan_lines(upgrade)[0].lstrip("- "))
     last = cucumber_delivery.events(client, ("push", "promotion", "non_promu", "annulation", "refus"), 1)
     if last:
         event = last[-1]
@@ -1496,30 +1507,35 @@ def render_tested_modules(ctx: dict) -> None:
         restore = code not in out
         if restore and state.get("etat") != "retire":
             continue
-        plan = cucumber_modules.retag_plan(worktree, profile, code, restore) if os.path.isdir(worktree) else []
+        plan = cucumber_modules.retag_plan(worktree, profile, code, restore, state.get("retires") or [])             if os.path.isdir(worktree) else []
         tag = profile.get("tag_client") or "tag client"
         if not plan:
             if not restore:
-                st.caption(f"{code} : aucune feature du module ne porte {tag} dans le dépôt" +
+                st.caption(f"{code} : aucune trace du module dans les features du dépôt" +
                            (f" (patch d'exclusion produit le {state['date'][:10]} : à appliquer)" if state.get("patch")
                             else "") + ".")
             continue
-        label = (f"Remettre {tag} sur les {len(plan)} feature(s) {code}" if restore else
-                 f"Retirer {tag} des {len(plan)} feature(s) {code}")
-        with st.expander(label + (" (réactivation)" if restore else " (runs Jenkins lancés à la main)"),
-                         icon=":material/label_off:" if not restore else ":material/label:"):
-            st.caption(f"Le job Jenkins filtre par {tag} : sans ce retrait, ses runs lancés à la main exécutent "
-                       f"encore les features {code}. Le tag est remplacé par {cucumber_modules.EXCLUDED_TAG} à la même "
-                       f"place (réversible à la réactivation)." if not restore else
-                       f"Module {code} réactivé : {cucumber_modules.EXCLUDED_TAG} redevient {tag} à la même place.")
+        removed = sum(len(p["retires"]) for p in plan)
+        label = (f"Remettre {code} : {len(plan)} feature(s) à rétablir" if restore else
+                 f"Nettoyer {code} : {len(plan)} feature(s), dont {removed} step(s) d'init retiré(s)")
+        with st.expander(label, icon=":material/label_off:" if not restore else ":material/label:"):
+            st.caption(f"Module décoché : ses features (son init comprise) passent de {tag} à "
+                       f"{cucumber_modules.EXCLUDED_TAG} (plus exécutées, même par les runs Jenkins lancés à la main) "
+                       f"et ses steps (clear, configuration, fichiers) sont retirés des inits des autres modules. "
+                       f"Réversible : l'historique des lignes retirées est gardé dans le profil." if not restore else
+                       f"Module {code} recoché : {cucumber_modules.EXCLUDED_TAG} redevient {tag} et les steps retirés "
+                       f"sont remis à leur place.")
             for item in plan[:30]:
-                st.markdown(f"- `{item['fichier']}` ({item['tags']} tag(s))")
+                st.markdown(f"- `{item['fichier']}` — {item['raison']}"
+                            + (f", {len(item['retires'])} ligne(s) retirée(s)" if item["retires"] else ""))
                 st.code("\n".join(f"- {b}" for b in item["avant"]) + "\n" +
                         "\n".join(f"+ {a}" for a in item["apres"]), language="diff")
             if len(plan) > 30:
                 st.caption(f"… et {len(plan) - 30} autre(s) feature(s).")
-            if st.button("Produire le patch", key=f"cucumber_module_tag_{client}_{code}", disabled=not ctx["ready"],
-                         type="primary"):
+            if st.button("Appliquer et livrer" if profile.get("livraison_autonome") else "Produire le patch",
+                         key=f"cucumber_module_tag_{client}_{code}", disabled=not ctx["ready"], type="primary",
+                         help="Livraison autonome : poussé sur la branche de travail, runs, promotion si sans "
+                              "régression ; sinon patch à appliquer."):
                 code_rc = run_main_step(ctx["cmd"] + ["--module-tag", code]
                                         + (["--module-tag-restore"] if restore else []))
                 path = cucumber_modules.retag_patch_path(client, code, restore)

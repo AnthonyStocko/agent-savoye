@@ -212,6 +212,7 @@ def build_bilan(client_name: str, analysis: dict, state: dict) -> dict:
              "decisions_en_attente": len(cucumber_decisions.pending(client_name)),
              "garde_fou": (state.get("garde_fou") or [])[-1:],
              "livraisons": (state.get("livraisons") or [])[-3:],
+             "bibliotheque": (state.get("bibliotheque") or [])[-2:],
              "ecritures": [e for e in cucumber_delivery.events(client_name, ("push", "promotion", "annulation",
                                                                              "annulation_impossible", "refus"), 10)]}
     bilan["prochaine_action"] = next_action(analysis, bilan)
@@ -273,6 +274,10 @@ def bilan_markdown(bilan: dict, level: int = 2) -> str:
                   for n, r in enumerate(guard.get("runs") or [], 1)]
         if guard.get("annules"):
             lines.append(f"- Fichiers remis à leur état d'avant les corrections : {', '.join(guard['annules'][:10])}")
+    if bilan.get("bibliotheque"):
+        from tools.cucumber_library_upgrade import bilan_lines
+        lines += ["", f"{section} Bibliothèque Cucumber alignée sur la version du client", ""]
+        lines += bilan_lines(bilan["bibliotheque"])
     if bilan.get("livraisons") or bilan.get("ecritures"):
         lines += ["", f"{section} Livraison autonome", ""]
         lines += delivery_markdown(bilan.get("livraisons") or []).splitlines()

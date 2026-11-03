@@ -31,17 +31,21 @@ FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_na
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
           "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
           "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
-          "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible")
+          "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible",
+          "maj_bibliotheque")
 # Champs dont l'absence est normale : vides sans avertissement
 OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
                    "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
-                   "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible")
+                   "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible",
+          "maj_bibliotheque")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
 LABELS = {"cucumber_repo_url": "dépôt Cucumber du client (seul dépôt où l'agent peut écrire)",
           "livraison_autonome": "livraison autonome : l'agent pousse et promeut lui-même ses corrections",
           "branche_cible": "branche lue par le job, cible de la promotion (ex. integration)",
+          "maj_bibliotheque": "mise à jour automatique de la bibliothèque Cucumber (vide ou auto : activée, non : "
+                              "désactivée)",
           "modules": "modules du client (tag @<X> d'une feature sous un dossier <X>, tâches de l'inventaire)",
           "modules_exclus": "modules exclus du périmètre testé (décochés dans « Données du projet »)",
           "features_root": "racine des features", "tag_client": "tag client", "init_features": "features d'init",
@@ -89,7 +93,8 @@ def empty_profile() -> dict:
             "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
             "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": [], "job_roles": {},
             "job_params": [], "run_tags_target": "", "modules": [], "modules_exclus": [],
-            "cucumber_repo_url": "", "livraison_autonome": False, "branche_cible": ""}
+            "cucumber_repo_url": "", "livraison_autonome": False, "branche_cible": "",
+            "maj_bibliotheque": ""}
 
 
 def is_empty(value) -> bool:

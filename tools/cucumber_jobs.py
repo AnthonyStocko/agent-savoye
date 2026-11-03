@@ -934,9 +934,9 @@ drop_clears_of_absent_modules = drop_steps_of_absent_modules
 
 
 def apply_environment_rules(worktree: str, paths: list, properties: dict, imports: set = frozenset(),
-                            excluded=()) -> dict:
+                            excluded=(), profile: dict = None) -> dict:
     """Règles sans dossier, clears de modules non déployés et jobs reliés à un service fourni par le job Jenkins,
-    sur les features `paths`."""
+    sur les features `paths`. `profile` : steps des modules décochés retirés (cucumber_modules), sans trace."""
     import os
     changed, notes = [], []
     for rel in paths:
@@ -948,6 +948,11 @@ def apply_environment_rules(worktree: str, paths: list, properties: dict, import
         new, found = drop_rules_without_folder(text, rel, worktree)
         new, cleared = drop_steps_of_absent_modules(new, set(imports), excluded)
         found += cleared
+        if profile:
+            from tools import cucumber_modules
+            new, removed = cucumber_modules.strip_excluded_steps(new, profile)
+            found += [f"l. {r['ligne']} retirée (module {r['module']} décoché) : {r['lignes'][0].strip()[:100]}"
+                      for r in removed]
         new, kept = keep_connected_jobs_active(new, properties)
         if new != text:
             with open(full, "w", encoding="utf-8", newline="") as f:

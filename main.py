@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, cucumber_delivery, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1243,6 +1243,7 @@ def main():
     parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : lot d'initialisation des données, en patch séparé, selon l'état détecté de l'init : absente, copie des Init_<MODULE> du Cucumber Standard pour ses modules ; incomplète, compléments seuls dans une nouvelle feature (jamais de réécriture ni de fichier protégé modifié) ; complète, rien. Sans appel à Claude, sauf steps du projet à écrire")
     parser.add_argument("--profile-only", action="store_true", help="generate-cucumber-client : détecte le profil client (racine et tag des features, init, clear, fichiers du module spécifique, runner, codes de référence, version de la bibliothèque) dans le dépôt <client>-cucumber, sans appel à Claude")
     parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
+    parser.add_argument("--align-library", action="store_true", help="generate-cucumber-client : bibliothèque Cucumber du pom.xml alignée sur la version du Standard du client (Jenkins, à défaut l'application) : seule la version change dans le pom, compilation corrigée dans les steps du projet, dry-run, puis (livraison autonome) runs de l'init et complet, promotion sans régression")
     parser.add_argument("--module-tag", default="", help="generate-cucumber-client : module exclu du périmètre testé (ex. TMS) : son tag client est remplacé par @MODULE_EXCLU dans ses features (runs Jenkins lancés à la main), commit dédié et patch <client>-cucumber-module-<mod>-exclu.patch, sans appel à Claude")
     parser.add_argument("--module-tag-restore", action="store_true", help="avec --module-tag : opération inverse à la réactivation du module (@MODULE_EXCLU -> tag client), patch <client>-cucumber-module-<mod>-reactive.patch")
     parser.add_argument("--fix-client-tags", action="store_true", help="generate-cucumber-client : règle rétroactive « tag client » : ajoute le tag client au-dessus des scénarios actifs qui ne l'ont pas (scénarios désactivés exclus), commite dans le worktree, contrôle de nouveau et régénère le patch, sans appel à Claude")
@@ -2277,8 +2278,12 @@ def retag_module(client: str, cucumber_repo_dir: str, base: str, code: str, rest
     if not restore and code not in cucumber_modules.excluded(profile):
         print(f"[CUCUMBER MODULES] ❌ Le module {code} n'est pas exclu du périmètre testé : décochez-le d'abord.")
         return 2
+    # Livraison autonome : le nettoyage part de la branche de travail de l'agent (sinon de la base)
+    work = (profile.get("verify_branch") or "").strip() if profile.get("livraison_autonome") else ""
+    start = f"origin/{work}" if work and cucumber_tools._git(cucumber_repo_dir, "rev-parse", "--verify", "-q",
+                                                             f"origin/{work}").returncode == 0 else base
     try:
-        result = cucumber_modules.apply_retag(cucumber_repo_dir, client, base, profile, code, restore)
+        result = cucumber_modules.apply_retag(cucumber_repo_dir, client, start, profile, code, restore)
     except RuntimeError as e:
         print(f"[CUCUMBER MODULES] ❌ {e}")
         return 1
@@ -2289,7 +2294,17 @@ def retag_module(client: str, cucumber_repo_dir: str, base: str, code: str, rest
     print(f"[CUCUMBER MODULES] {result['message']} : {len(result['fichiers'])} feature(s)")
     for path in result["fichiers"]:
         print(f"    {path}")
-    print(f"[CUCUMBER MODULES] Patch : {result['patch']} — à appliquer à la branche lue par le job Jenkins.")
+    for item in result.get("retires") or []:
+        print(f"    - {item['fichier']} l. {item['ligne']} retirée ({item['module']} décoché) : "
+              f"{item['lignes'][0].strip()[:120]}")
+    print(f"[CUCUMBER MODULES] Patch : {result['patch']}")
+    if work:
+        # Action lancée par une personne : livrée selon les règles de livraison (push, runs, promotion)
+        delivered = autonomous_delivery(client, {}, result["worktree"], profile, decision=True)
+        print(f"[CUCUMBER MODULES] Livraison : {'promue' if delivered.get('promu') else 'non promue'} — "
+              f"{delivered.get('motif', '')}")
+    else:
+        print("[CUCUMBER MODULES] Livraison autonome désactivée : patch à appliquer à la branche lue par le job.")
     return 0
 
 
@@ -3357,7 +3372,7 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
     argline = " ".join(str(v) for k, v in (reference.get("parametres") or {}).items() if "ARGLINE" in k.upper())
     environment = cucumber_jobs.apply_environment_rules(worktree, paths, cucumber_jobs.arg_properties(argline),
                                                         cucumber_jobs.client_imports(client_root),
-                                                        cucumber_modules.excluded(profile))
+                                                        profile=profile)
     print(f"[CUCUMBER INIT] Règles et services externes (build de référence n° {reference.get('numero') or '?'}) : "
           + (f"{len(environment['notes'])} changement(s)" if environment["notes"] else "aucun changement"))
     for note in environment["notes"]:
@@ -3659,12 +3674,13 @@ def check_delivery(client: str, worktree: str, state: dict, profile: dict, cucum
 
 
 def launch_full_run(client: str, profile: dict, worktree: str, repository: str = "", base_branch: str = "",
-                    client_root: str = "") -> dict:
+                    client_root: str = "", tags: str = None) -> dict:
     """
-    Run complet de la suite active lancé par l'agent (worktree poussé, filtre = tag client seul), importé et analysé
-    avec son bilan. Renvoie l'analyse, {"erreur"} si rien n'a abouti.
+    Run complet de la suite active lancé par l'agent (worktree poussé, filtre = tag client seul ; `tags` : autre
+    filtre, ex. l'init seule), importé et analysé avec son bilan. Renvoie l'analyse, {"erreur"} si rien n'a abouti.
     """
-    run = cucumber_run.launch(client, worktree, profile, profile.get("tag_client", ""), repository=repository,
+    run = cucumber_run.launch(client, worktree, profile, profile.get("tag_client", "") if tags is None else tags,
+                              repository=repository,
                               base_branch=base_branch, inventory=cucumber_tools.load_inventory(client),
                               client_root=client_root)
     print(f"[RUN JENKINS] {'✅' if run['ok'] else '⛔'} {run['message']}" + (f" — {run['build']}" if run["build"] else ""))
@@ -3689,14 +3705,17 @@ def latest_full_run(client: str) -> dict:
 
 def autonomous_delivery(client: str, state: dict, worktree: str, profile: dict, guarded: dict = None,
                         repository: str = "", base_branch: str = "", client_root: str = "", project: str = "",
-                        launch=None, promote=None) -> dict:
+                        launch=None, promote=None, decision: bool = False, init_run=None,
+                        allow_equal: bool = False, label: str = "livraison autonome") -> dict:
     """
     Livraison autonome (profil « livraison_autonome », désactivée par défaut) : commits de la branche de travail
     (verify_branch) poussés par la garde d'écriture sans décision humaine, run(s) complet(s) sur cette branche, puis
     promotion par fusion rapide vers la branche cible (« branche_cible », à défaut `base_branch`) SEULEMENT si
     cucumber_delivery.promotion_verdict l'accepte. Sinon la branche de travail reste en l'état. Résultat dans
     l'état (« livraisons »), le journal d'écriture, le bilan et les connaissances partagées. `launch` / `promote` :
-    remplaçables (tests). Renvoie le résultat ({} si la livraison autonome est désactivée).
+    remplaçables (tests). `decision` : action lancée par une personne (ex. nettoyage d'un module décoché, qui
+    touche l'init globale). `init_run()` : run de l'init avant le run complet (montée de version) ; `allow_equal` :
+    pas plus d'échecs qu'avant suffit. Renvoie le résultat ({} si la livraison autonome est désactivée).
     """
     if not profile.get("livraison_autonome"):
         return {}
@@ -3713,8 +3732,8 @@ def autonomous_delivery(client: str, state: dict, worktree: str, profile: dict, 
     elif guarded and not guarded.get("ok"):
         result["motif"] = f"garde-fou de non-régression : {guarded.get('motif')}"
     else:
-        error, _ = cucumber_checks.push_for_verification(worktree, work, f"Cucumber {client} : livraison autonome",
-                                                         decision=False)
+        error, _ = cucumber_checks.push_for_verification(worktree, work, f"Cucumber {client} : {label}",
+                                                         decision=decision)
         if error:
             result["motif"] = error
         else:
@@ -3723,21 +3742,35 @@ def autonomous_delivery(client: str, state: dict, worktree: str, profile: dict, 
                          if guarded and guarded.get("reference") else latest_full_run(client))
             runs = [cucumber_import.load_analysis(client, r["import"]) for r in (guarded or {}).get("runs") or []
                     if r.get("import")]
-            needed = 2 if not cucumber_delivery.failing(reference) else 1
-            while len(runs) < needed:
+            needed = 2 if not cucumber_delivery.failing(reference) and not allow_equal else 1
+            init = init_run() if init_run else None
+            if init is not None:
+                init = {**init, "run_complet": True}
+                print(f"[LIVRAISON] Init sur {work} : " + ("en échec" if init.get("init_en_echec") or
+                      cucumber_delivery.failing(init) or init.get("erreur") else "verte"))
+            while init is None or not (init.get("erreur") or init.get("init_en_echec")
+                                       or cucumber_delivery.failing(init)):
+                if len(runs) >= needed:
+                    break
                 print(f"[LIVRAISON] Run complet {len(runs) + 1}/{needed} sur {work}…")
                 run = launch() or {"erreur": "aucun résultat"}
                 runs.append(run)
                 if run.get("erreur") or run.get("non_analyse"):
                     break
-            result["runs"] = [{"import": r.get("numero"), "build": r.get("build", ""),
-                               "echecs": len(cucumber_delivery.failing(r)), "erreur": r.get("erreur", "")}
-                              for r in runs]
+            result["runs"] = [{"type": "init", "import": init.get("numero"), "build": init.get("build", ""),
+                               "echecs": len(cucumber_delivery.failing(init)), "erreur": init.get("erreur", "")}
+                              ] if init is not None else []
+            result["runs"] += [{"type": "complet", "import": r.get("numero"), "build": r.get("build", ""),
+                                "echecs": len(cucumber_delivery.failing(r)), "erreur": r.get("erreur", "")}
+                               for r in runs]
             result["reference"] = reference.get("numero")
-            verdict = cucumber_delivery.promotion_verdict(reference, runs)
+            if init is not None and (init.get("erreur") or init.get("init_en_echec") or cucumber_delivery.failing(init)):
+                runs = [{**init, "init_en_echec": init.get("init_en_echec") or {"id": "init"}}]
+            result["casse"] = sorted(cucumber_delivery.failing(runs[-1]) - cucumber_delivery.failing(reference))                 if runs else []
+            verdict = cucumber_delivery.promotion_verdict(reference, runs, allow_equal)
             result["motif"] = verdict["motif"]
             if verdict["ok"]:
-                promoted = promote(worktree, target, client)
+                promoted = promote(worktree, target, client, decision=decision)
                 result.update(ok=promoted["ok"], promu=promoted["ok"], avant=promoted.get("avant", ""),
                               motif=promoted["motif"] if not promoted["ok"] else f"{verdict['motif']} — "
                                                                                   f"{promoted['motif']}")
@@ -3753,6 +3786,161 @@ def autonomous_delivery(client: str, state: dict, worktree: str, profile: dict, 
     share_knowledge(cucumber_bilan.delivery_markdown([result]), project, "cucumber-livraison",
                     f"Livraison Cucumber {client}", client=client, tags=["cucumber", "livraison"])
     return result
+
+
+def library_compile_check(client: str, worktree: str, cucumber_std_dir: str, dry_run: bool = False) -> list:
+    """Erreurs de compilation (mvn test-compile) du worktree, puis du dry-run strict de toutes ses features."""
+    compile_cmd = cucumber_tools.delivery_compile_cmd()
+    features = list(cucumber_modules.worktree_features(worktree)) if dry_run else None
+    try:
+        build = cucumber_tools.verify_build(cucumber_tools.build_dir(client, worktree, cucumber_std_dir), compile_cmd,
+                                            features, cucumber_tools.DEFAULT_DRY_RUN_CMD if dry_run else "")
+    except RuntimeError as e:
+        return [f"compilation impossible : {e}"]
+    return [] if build["ok"] else ([f"{build['etape']} : {e}" for e in build["erreurs"]] or [build["etape"]])
+
+
+def library_fix(client: str, worktree: str, errors: list, old: str, new: str, cucumber_std_dir: str,
+                attempt: int, attempts: int) -> list:
+    """Appel Claude borné : erreurs de compilation corrigées dans les steps et classes du projet. Corrections."""
+    compile_cmd = cucumber_tools.delivery_compile_cmd()
+    cucumber_compile.write_context(client, worktree, cucumber_std_dir, compile_cmd)
+    model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
+    prompt = render_prompt("cucumber_bibliotheque", client_name=client, ancienne=old, nouvelle=new,
+                           erreurs="\n".join(f"- {e}" for e in errors[:30]), worktree=worktree, tentative=attempt,
+                           tentatives=attempts, token_saving_rules="")
+    returncode, output, usage, _ = run_cucumber_claude(prompt, model, CUCUMBER_TOOLS,
+                                                       str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 3),
+                                                       cucumber_tools.cache_dir(client), cucumber_fix_effort())
+    report_token_usage(f"{client}-bibliotheque", "bibliotheque", model, usage, len(prompt), returncode,
+                       cucumber_fix_effort())
+    return list(cucumber_diagnostic.parse_fix_result(output).get("corrections") or [])
+
+
+def align_library(client: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str, repository: str = "",
+                  client_root: str = "", project: str = "", force: bool = False, versions=None, check=None,
+                  fix=None, launch=None, init_launch=None, promote=None) -> dict:
+    """
+    Bibliothèque Cucumber du pom.xml alignée sur la version du Standard du client (cucumber_library_upgrade) :
+    version cible (Jenkins, à défaut l'application), version publiée retenue, SEULE la version changée dans le pom,
+    compilation corrigée dans les steps et classes du projet, contournements TODO-VERSION devenus inutiles
+    proposés, dry-run strict ; puis, livraison autonome activée : push de la branche de travail, run de l'init, run
+    complet, promotion seulement si init verte, aucun nouvel échec et pas plus d'échecs qu'avant. Sinon patch.
+    `versions`, `check`, `fix`, `launch`, `init_launch`, `promote` : remplaçables (tests). Renvoie le résultat.
+    """
+    document = cucumber_profile.load_profile(client)
+    profile = cucumber_profile.effective_profile(document)
+    state = cucumber_tools.load_state(client)
+    target = cucumber_library_upgrade.target_version(document)
+    result = {"cible": target["version"], "source": target["source"], "avertissement": target["avertissement"],
+              "ancienne": "", "nouvelle": "", "livree": False, "motif": "", "corrections": [], "contournements": [],
+              "runs": [], "casse": []}
+
+    def done(motif: str, keep: bool = True) -> dict:
+        result["motif"] = motif
+        print(f"[BIBLIOTHÈQUE] {'✅' if result['livree'] else '⏸'} {motif}")
+        if keep:
+            saved = cucumber_tools.load_state(client)
+            cucumber_library_upgrade.record(saved, result)
+            cucumber_tools.save_state(client, saved)
+        return result
+    if target["avertissement"]:
+        print(f"[BIBLIOTHÈQUE] ⚠️ {target['avertissement']}")
+    if not target["version"]:
+        return done("version du Standard du client non détectée : rien n'est changé")
+    work = (profile.get("verify_branch") or "").strip()
+    start = f"origin/{work}" if work and cucumber_tools._git(cucumber_repo_dir, "rev-parse", "--verify", "-q",
+                                                             f"origin/{work}").returncode == 0 else base
+    worktree = cucumber_tools.add_worktree(cucumber_repo_dir, os.path.join(cucumber_tools.cache_dir(client),
+                                                                           "worktree_bibliotheque"),
+                                           f"cucumber_{client}_bibliotheque", start, reset=True)
+    pom_path = os.path.join(worktree, "pom.xml")
+    pom = _read_text(pom_path)
+    result["ancienne"] = cucumber_library.pom_library_version(pom)
+    if not force and not cucumber_library_upgrade.gap(result["ancienne"], target["version"]):
+        return done(f"bibliothèque {result['ancienne']} déjà sur la ligne de la cible {target['version']}", keep=False)
+    available = versions() if versions else cucumber_library_upgrade.available_versions()
+    if available.get("erreur"):
+        return done(f"versions publiées illisibles ({available['erreur']}) : rien n'est changé")
+    chosen = cucumber_library_upgrade.choose_version(available["versions"], target["version"])
+    if not chosen["version"]:
+        return done(f"{chosen['motif']} : rien n'est changé")
+    if chosen["version"] == result["ancienne"]:
+        return done(f"déjà à la version publiée retenue {chosen['version']} ({chosen['motif']})", keep=False)
+    result["nouvelle"] = chosen["version"]
+    print(f"[BIBLIOTHÈQUE] {result['ancienne']} → {chosen['version']} ({chosen['motif']}, cible {target['version']} "
+          f"d'après {target['source']} : {target['detail']})")
+    new_pom, _ = cucumber_library_upgrade.set_pom_version(pom, chosen["version"])
+    with open(pom_path, "w", encoding="utf-8", newline="") as f:
+        f.write(new_pom)
+    check = check or (lambda dry=False: library_compile_check(client, worktree, cucumber_std_dir, dry))
+    fix = fix or (lambda errors, attempt, attempts: library_fix(client, worktree, errors, result["ancienne"],
+                                                                 chosen["version"], cucumber_std_dir, attempt,
+                                                                 attempts))
+    errors, attempts = check(), _env_int("CUCUMBER_FIX_ATTEMPTS", 2)
+    for attempt in range(1, attempts + 1):
+        if not errors:
+            break
+        result["corrections"] += fix(errors, attempt, attempts)
+        # Seuls les steps et classes du projet peuvent changer (pom : la version seule)
+        status = cucumber_tools._git(worktree, "status", "--porcelain", "-uall").stdout.splitlines()
+        outside = [line[3:] for line in status if not line[3:].startswith("src/test/java/") and line[3:] != "pom.xml"]
+        for path in outside:
+            cucumber_tools._git(worktree, "checkout", "--", path)
+            cucumber_tools._git(worktree, "clean", "-fq", "--", path)
+        if outside:
+            print(f"[BIBLIOTHÈQUE] ⚠️ Fichier(s) hors des steps du projet annulé(s) : {', '.join(outside)}")
+        if _read_text(pom_path) != new_pom:
+            with open(pom_path, "w", encoding="utf-8", newline="") as f:
+                f.write(new_pom)
+        errors = check()
+    if not errors:
+        errors = check(True)
+    if errors:
+        result["casse"] = errors[:20]
+        return done(f"montée {result['ancienne']} → {chosen['version']} non livrée : {len(errors)} erreur(s) de "
+                    f"compilation ou de dry-run restante(s)")
+    cucumber_tools._git(worktree, "add", "-A", "--", "pom.xml", "src/test/java")
+    message = (f"Cucumber {client} : bibliothèque Cucumber {result['ancienne']} → {chosen['version']}\n\n"
+               f"Cible {target['version']} ({target['source']} : {target['detail']}) ; {chosen['motif']}.\n"
+               + "".join(f"- {c}\n" for c in result["corrections"])
+               + (f"\nLancé-par: {cucumber_delivery.launched_by()}\n" if cucumber_delivery.launched_by() else ""))
+    cucumber_tools._git(worktree, "commit", "-q", "-m", message)
+    # Contournements TODO-VERSION que la nouvelle version rend inutiles : proposés, jamais retirés seuls
+    ref = cucumber_versions.library_ref(cucumber_std_dir, chosen["version"]) if cucumber_std_dir else ""
+    index = cucumber_versions._step_index(cucumber_versions.std_snapshot(cucumber_std_dir, ref)) if ref else {}
+    markers = cucumber_versions.todo_markers(worktree)
+    texts = {p: _read_text(os.path.join(worktree, *p.split("/"))) for p in {m["fichier"] for m in markers}}
+    result["contournements"] = cucumber_library_upgrade.workaround_proposals(
+        markers, texts, lambda step: bool(index) and bool(cucumber_versions._definition(step, index)))
+    patch = os.path.join(cucumber_tools.WORKSPACE_DIR, f"{client}-cucumber-bibliotheque.patch")
+    cucumber_tools.format_patch(worktree, f"{start}..HEAD", patch)
+    if not profile.get("livraison_autonome"):
+        return done(f"montée prête ({patch}) ; livraison autonome désactivée : patch à appliquer, runs à lancer")
+    init_tags = profile.get("init_tags") or cucumber_verify.init_tags()
+    delivered = autonomous_delivery(
+        client, cucumber_tools.load_state(client), worktree, profile, None, repository, base, client_root, project,
+        launch=launch, promote=promote, allow_equal=True, label=f"bibliothèque {chosen['version']}",
+        init_run=init_launch or ((lambda: launch_full_run(client, profile, worktree, repository, base, client_root,
+                                                          tags=init_tags)) if init_tags else None))
+    result.update(livree=bool(delivered.get("promu")), runs=delivered.get("runs") or [],
+                  casse=delivered.get("casse") or [])
+    return done(delivered.get("motif") or "livraison non tentée")
+
+
+def maybe_align_library(client: str, cucumber_repo_dir: str, base: str, cucumber_std_dir: str,
+                        repository: str = "", client_root: str = "", project: str = "") -> dict:
+    """Déclenchement à la détection : écart pom / cible, coche activée, pas déjà tenté pour ce couple de versions."""
+    document = cucumber_profile.load_profile(client)
+    profile = cucumber_profile.effective_profile(document)
+    target = cucumber_library_upgrade.target_version(document)
+    current = profile.get("library_version", "")
+    tried = {(i.get("ancienne"), i.get("cible")) for i in cucumber_tools.load_state(client).get("bibliotheque") or []}
+    if not cucumber_library_upgrade.enabled(profile) or not cucumber_library_upgrade.gap(current, target["version"]) \
+            or (current, target["version"]) in tried:
+        return {}
+    print(f"[BIBLIOTHÈQUE] Écart détecté : pom {current}, version du client {target['version']} — montée lancée.")
+    return align_library(client, cucumber_repo_dir, base, cucumber_std_dir, repository, client_root, project)
 
 
 def check_promoted_regression(client: str, analysis: dict, build_params: dict = None, revert=None) -> dict:
@@ -3898,6 +4086,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                  odatio_version)
     if args.health_only:
         return run_cucumber_health(client, local_cucumber_std_repo, cucumber_repo_dir, base, project)
+    if args.align_library:
+        subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
+        aligned = align_library(client, cucumber_repo_dir, base, local_cucumber_std_repo, args.cucumber_repo,
+                                local_client_repo, project, force=True)
+        return 0 if aligned.get("livree") or not aligned.get("casse") else 1
     if args.module_tag.strip():
         subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
         return retag_module(client, cucumber_repo_dir, base, args.module_tag.strip().upper(), args.module_tag_restore)
@@ -4021,6 +4214,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         if cucumber_tools.load_state(client).get("lots"):
             retro = cucumber_testability.retro(client, index=index, profile=profile)
             print(f"[CUCUMBER TESTABILITÉ] {cucumber_testability.retro_line(retro)}")
+        # Bibliothèque Cucumber du pom en retard sur la version du client : montée (coche activée par défaut)
+        maybe_align_library(client, cucumber_repo_dir, base, local_cucumber_std_repo, args.cucumber_repo,
+                            local_client_repo, project)
         return 0
     if args.inventory_only:
         detect_cucumber_profile(client, cucumber_repo_dir, base, local_cucumber_std_repo, odatio_version,
@@ -4526,6 +4722,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"\n[CUCUMBER] ⛔ Patch non produit : {len(protected['erreurs'])} fichier(s) de l'init globale "
               f"modifié(s).")
         print("\n".join(f"    {e}" for e in protected["erreurs"]))
+        exit_code = 1
+    elif module_traces := cucumber_modules.traces(cucumber_modules.worktree_features(worktree), profile):
+        # Module décoché : aucune feature active ne doit plus le référencer (clear, tag d'init, step)
+        if os.path.exists(patch_file):
+            os.remove(patch_file)
+        print(f"\n[CUCUMBER] ⛔ Patch non produit : {len(module_traces)} trace(s) d'un module décoché dans des "
+              f"features actives — appliquez le nettoyage du module (« Données du projet », Modules testés) :")
+        print("\n".join(f"    {e}" for e in module_traces[:30]))
         exit_code = 1
     elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile) is not None and (
             blocking := check_delivery(client, worktree, state, profile, local_cucumber_std_repo)):
