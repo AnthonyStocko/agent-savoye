@@ -1000,6 +1000,20 @@ def update_clone(repo_dir: str, name: str, git_cmd_extra: list = (), git_env: di
     return True, f"{name} mis à jour (fetch){backup}."
 
 
+def fetch_age_minutes(repo_dir: str):
+    """Minutes depuis le dernier fetch du clone (date de .git/FETCH_HEAD), None s'il n'a jamais été récupéré."""
+    head = os.path.join(repo_dir, ".git", "FETCH_HEAD")
+    return (time.time() - os.path.getmtime(head)) / 60 if os.path.exists(head) else None
+
+
+def std_fetch_max_age() -> float:
+    """Âge maximal (minutes) d'un fetch du Standard réutilisé sans nouveau fetch : STD_FETCH_MAX_AGE_MINUTES (60)."""
+    try:
+        return max(0.0, float(os.getenv("STD_FETCH_MAX_AGE_MINUTES", "60")))
+    except ValueError:
+        return 60.0
+
+
 def ensure_local_repo(repo_input: str, repo_label: str) -> str:
     """
     Si repo_input est une URL de projet Bitbucket, interroge l'API REST 
@@ -1068,11 +1082,17 @@ def ensure_local_repo(repo_input: str, repo_label: str) -> str:
         print(f"[GIT REPO] Dossier cible local : {target_dir}")
         print(f"==================================================\n")
 
+        skipped = []
         for idx, repo_name in enumerate(repos_to_clone, 1):
             repo_dir = os.path.join(target_dir, repo_name)
             clone_url = f"{bitbucket_url}/scm/{project_key}/{repo_name}.git"
 
             if os.path.exists(os.path.join(repo_dir, ".git")):
+                age = fetch_age_minutes(repo_dir)
+                if repo_label == "std" and age is not None and age < std_fetch_max_age():
+                    # Standard récupéré récemment : pas de nouveau fetch (STD_FETCH_MAX_AGE_MINUTES, 0 = toujours)
+                    skipped.append(repo_name)
+                    continue
                 print(f"[{idx}/{len(repos_to_clone)}] 🔄 Mettre à jour {repo_name} dans {repo_dir}...")
                 ok, message = update_clone(repo_dir, repo_name, git_cmd_extra, git_env)
                 print(f"     {'✅' if ok else '⚠️'} {message}")
@@ -1085,6 +1105,9 @@ def ensure_local_repo(repo_input: str, repo_label: str) -> str:
                 else:
                     print(f"     ❌ Échec clonage {repo_name} : {res_clone.stderr.strip()}")
 
+        if skipped:
+            print(f"[GIT REPO] {len(skipped)} dépôt(s) du Standard récupéré(s) il y a moins de {std_fetch_max_age():g} "
+                  f"min : fetch sauté (STD_FETCH_MAX_AGE_MINUTES=0 pour toujours récupérer).")
         print(f"\n[GIT COMPLETE] Traitement terminé pour le projet {project_key}.\n")
         return target_dir
 
@@ -3216,6 +3239,11 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
                                            cucumber_init.init_branch(client), base, reset=True)
     paths = [p for p in profile.get("init_features") or [] if p.endswith(".feature")]
     result = init_jobs_checker(client, client_root, std_root, version)(worktree, paths)
+    if result.get("indetermines"):
+        # Recherche de preuve en erreur (réseau, Bitbucket) : rien n'est commenté sur une absence non établie
+        print(f"[CUCUMBER INIT] ❌ {len(result['indetermines'])} usage(s) de job indéterminé(s) (recherche de preuve en "
+              f"erreur) : correction arrêtée, rien n'est modifié ni poussé. Relancez quand Bitbucket répond.")
+        return 1
     # Désactivation par job inopérante avec la bibliothèque du client : steps du projet (suspension de tous les
     # jobs autour de la purge, comme le Standard aligné ; attente tolérante pour les autres usages)
     project_steps = cucumber_jobs.apply_project_steps(worktree, paths, client, cucumber_std_dir)
@@ -3223,7 +3251,21 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
           + (f" — {len(project_steps['notes'])} step(s) passé(s) aux steps du projet" if project_steps["notes"] else ""))
     for note in project_steps["notes"]:
         print(f"    {note}")
-    result["fichiers"] = list(dict.fromkeys(result["fichiers"] + project_steps["fichiers"]))
+    # Règles importées avant l'init (pas de dossier de règles) ; jobs reliés à un service dont la connexion est
+    # fournie par le job Jenkins (ADDITIONAL_ARGLINE du dernier build du client) : laissés actifs
+    reference = cucumber_job.reference_parameters(cucumber_verify.verification_job(profile), args.cucumber_repo,
+                                                  agent_branch=profile.get("verify_branch", ""))
+    if not reference:
+        print("[CUCUMBER INIT] ❌ Paramètres du dernier build du client illisibles sur Jenkins (injoignable, ou aucun "
+              "build du client) : connexions ADDITIONAL_ARGLINE inconnues, correction arrêtée, rien n'est poussé.")
+        return 1
+    argline = " ".join(str(v) for k, v in (reference.get("parametres") or {}).items() if "ARGLINE" in k.upper())
+    environment = cucumber_jobs.apply_environment_rules(worktree, paths, cucumber_jobs.arg_properties(argline))
+    print(f"[CUCUMBER INIT] Règles et services externes (build de référence n° {reference.get('numero') or '?'}) : "
+          + (f"{len(environment['notes'])} changement(s)" if environment["notes"] else "aucun changement"))
+    for note in environment["notes"]:
+        print(f"    {note}")
+    result["fichiers"] = list(dict.fromkeys(result["fichiers"] + project_steps["fichiers"] + environment["fichiers"]))
     if not result["fichiers"]:
         print("[CUCUMBER INIT] Tous les jobs de l'init sont prouvés présents chez le client : la cause est ailleurs.")
         return None

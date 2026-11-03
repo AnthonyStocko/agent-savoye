@@ -234,10 +234,15 @@ def names_in_standard(std_root: str, version: str, names: list, deployed: set = 
 KIS_PROJECT = "KIS"
 
 
-def names_in_kis(names: list, search=None) -> dict:
+class SearchUnavailable(RuntimeError):
+    """Recherche de code Bitbucket en erreur (réseau, droits, adresse) : ni preuve, ni absence."""
+
+
+def names_in_kis(names: list, search=None, errors: list = None) -> dict:
     """
     Noms de jobs définis dans le socle KIS (recherche de code Bitbucket du projet KIS, branche indexée par
-    Bitbucket) : {nom: source}. `search(requête) -> [(dépôt, fichier)]` remplaçable (tests).
+    Bitbucket) : {nom: source}. `search(requête) -> [(dépôt, fichier)]` remplaçable (tests). Une recherche en erreur
+    ne vaut jamais absence : le nom est ajouté à `errors` ({nom, erreur}), à traiter comme indéterminé.
     """
     if search is None:
         search = _bitbucket_code_search
@@ -245,8 +250,10 @@ def names_in_kis(names: list, search=None) -> dict:
     for name in [n for n in names if n]:
         try:
             hits = search(f'"{name}" project:{KIS_PROJECT}')
-        except Exception:  # noqa: BLE001 - recherche indisponible : aucune preuve, jamais devinée
-            hits = []
+        except Exception as exc:  # noqa: BLE001 - recherche indisponible : ni preuve ni absence
+            if errors is not None:
+                errors.append({"nom": name, "erreur": " ".join(str(exc).split())[:200]})
+            continue
         java = [h for h in hits if h[1].endswith(".java")] or hits
         if java:
             found[name] = f"socle KIS {java[0][0]} : {java[0][1]}"
@@ -260,12 +267,15 @@ def _bitbucket_code_search(query: str) -> list:
     base = os.getenv("BITBUCKET_URL", "").strip().rstrip("/")
     token = os.getenv("BITBUCKET_HTTP_TOKEN", "").strip()
     if not base:
-        return []
-    response = requests.post(f"{base}/rest/search/latest/search", timeout=30,
-                             headers={"Authorization": f"Bearer {token}"} if token else {},
-                             json={"query": query, "entities": {"code": {"start": 0, "limit": 10}}})
+        raise SearchUnavailable("BITBUCKET_URL non renseignée")
+    try:
+        response = requests.post(f"{base}/rest/search/latest/search", timeout=30,
+                                 headers={"Authorization": f"Bearer {token}"} if token else {},
+                                 json={"query": query, "entities": {"code": {"start": 0, "limit": 10}}})
+    except requests.RequestException as exc:
+        raise SearchUnavailable(f"recherche de code Bitbucket injoignable : {exc}") from exc
     if response.status_code != 200:
-        return []
+        raise SearchUnavailable(f"recherche de code Bitbucket : HTTP {response.status_code}")
     return [(v["repository"]["slug"], v["file"]) for v in (response.json().get("code") or {}).get("values") or []]
 
 
@@ -314,7 +324,7 @@ def comment_unproven(text: str, missing: list) -> str:
     out, i = [], 0
     while i < len(lines):
         match = _STEP.match(lines[i])
-        if not match or lines[i].lstrip().startswith("#") or match.group(3) not in STEPS:
+        if not match or lines[i].lstrip().startswith("#") or step_key(match.group(3)) not in STEPS:
             out.append(lines[i])
             i += 1
             continue
@@ -360,17 +370,23 @@ def check_init(texts: dict, client_root: str, schemas: list, std_root: str = "",
     deployed = deployed_modules(client_root, std_root, version) if std_root and client_root and left else set()
     standard_names, not_deployed = names_in_standard(std_root, version, left, deployed or None)         if std_root and left else ({}, {})
     left = [n for n in left if n not in standard_names]
-    kis = names_in_kis(left, kis_search) if left else {}
+    search_errors = []
+    kis = names_in_kis(left, kis_search, search_errors) if left else {}
     standard = from_standard(std_root, version, [c for c in classes if c not in code["classes"]]) if std_root else {}
     known = {"noms": {**kis, **standard_names, **code["noms"]}, "classes": {**standard, **code["classes"]}}
     ok, missing = proven(items, known)
+    # Recherche en erreur : le job n'est ni prouvé ni absent — jamais commenté, la correction doit s'arrêter
+    failed = {e["nom"]: e["erreur"] for e in search_errors}
+    undetermined = [{**m, "raison": f"job « {m['nom']} » indéterminé : {failed[m['nom']]}"} for m in missing
+                    if m["nom"] in failed and "avant sa création" not in m["raison"]]
+    missing = [m for m in missing if not (m["nom"] in failed and "avant sa création" not in m["raison"])]
     for item in ok + missing:
         item["en_base"] = item["nom"] in database["noms"]
     for item in missing:
         if item["nom"] in not_deployed and "avant sa création" not in item["raison"]:
             item["raison"] += f" ; défini seulement dans {not_deployed[item['nom']]}, module non déployé chez le client"
-    return {"prouves": ok, "non_prouves": missing, "base": database["source"], "erreur_base": database["erreur"],
-            "modules_deployes": len(deployed)}
+    return {"prouves": ok, "non_prouves": missing, "indetermines": undetermined, "base": database["source"],
+            "erreur_base": database["erreur"], "modules_deployes": len(deployed)}
 
 
 def apply(worktree: str, paths: list, client_root: str, schemas: list, std_root: str = "", version: str = "",
@@ -388,6 +404,9 @@ def apply(worktree: str, paths: list, client_root: str, schemas: list, std_root:
                 texts[path] = f.read()
     result = check_init(texts, client_root, schemas, std_root, version, kis_search)
     result["fichiers"] = []
+    if result["indetermines"]:
+        # Preuve indisponible (recherche en erreur) : aucun fichier réécrit, la correction ne se fait pas à moitié
+        return result
     for path, text in texts.items():
         missing = [m for m in result["non_prouves"] if m["fichier"] == path]
         if missing:
@@ -408,6 +427,8 @@ def summary(result: dict) -> list:
               f"{m['nom']} — prouvé par {m['source']}" for m in result["prouves"] if m["preuve"] == "nom"]
     lines += [f"{m['fichier'].rsplit('/', 2)[-2]}/{m['fichier'].rsplit('/', 1)[-1]} l. {m['ligne']} — {m['step']} : "
               f"{m['raison']}" for m in result["non_prouves"]]
+    lines += [f"{m['fichier'].rsplit('/', 2)[-2]}/{m['fichier'].rsplit('/', 1)[-1]} l. {m['ligne']} — {m['step']} : "
+              f"{m['raison']}" for m in result.get("indetermines") or []]
     return lines
 
 
@@ -742,6 +763,102 @@ def apply_project_steps(worktree: str, paths: list, client_name: str, cucumber_s
             f.write(jobs_java(client_name, version))
         changed.append(java)
     return {"fichiers": changed, "notes": notes, "raison": f"bibliothèque {version} sans « {ALL_OFF} »"}
+
+
+# ---------------------------------------------------------------------------
+# Jobs reliés à un service externe : connexion fournie par le job Jenkins (ADDITIONAL_ARGLINE)
+# ---------------------------------------------------------------------------
+# Job -> (propriété système qui porte l'adresse du service, step d'init qui configure la connexion, service).
+# « INIT- Configuration du colisage » (QAConfigurationStep) appelle RefParameterEndPoints.updateCubingConfiguration :
+# configuration SaaS « CUBING » mise à jour avec urlCubing / userCubing / passwordCubing du job Jenkins.
+CONNECTED_JOBS = {"Schedule preparation orders precubing": ("urlCubing", "INIT- Configuration du colisage", "cubing")}
+
+
+def arg_properties(argline: str) -> dict:
+    """Propriétés système -Dnom=valeur (valeur entre quotes ou non) d'une ligne d'arguments Maven."""
+    return {m.group(1): next((g for g in m.group(2, 3, 4) if g is not None), "")
+            for m in re.finditer(r"-D([\w.]+)=(?:'([^']*)'|\"([^\"]*)\"|(\S*))", argline or "")}
+
+
+def keep_connected_jobs_active(text: str, properties: dict) -> tuple:
+    """
+    Désactivation (par job) d'un job de CONNECTED_JOBS alors que le job Jenkins fournit la connexion au service
+    (propriété non vide dans `properties`) et que l'init la configure plus haut (step actif) : la ligne est
+    commentée sous TODO-JOB, le job reste actif. Renvoie (texte, [raisons]).
+    """
+    lines = text.splitlines()
+    missing = []
+    for item in usages(text):
+        if item["step"] != ONE_OFF or item["nom"] not in CONNECTED_JOBS:
+            continue
+        prop, config, service = CONNECTED_JOBS[item["nom"]]
+        configured = next((n for n, line in enumerate(lines[:item["ligne"]], 1) if not line.lstrip().startswith("#")
+                           and (_STEP.match(line) or [None] * 4)[3] == config), 0)
+        if not (properties or {}).get(prop) or not configured:
+            continue
+        missing.append({**item, "raison": f"job « {item['nom']} » laissé actif : connexion {service} fournie par le "
+                                          f"job Jenkins (-D{prop}, ADDITIONAL_ARGLINE), configurée par « {config} » "
+                                          f"l. {configured}"})
+    return comment_unproven(text, missing), [m["raison"] for m in missing]
+
+
+# ---------------------------------------------------------------------------
+# Règles importées avant l'init
+# ---------------------------------------------------------------------------
+RULES_STEP = "INIT- Initialisation globale des règles"
+FEATURES_ROOT, RULES_ROOT = "src/test/resources/cucumber/features/", "src/test/resources/cucumber/rules/"
+INIT_MARKER = "TODO-INIT:"
+
+
+def rules_folder(feature_rel: str) -> str:
+    """Dossier lu par « INIT- Initialisation globale des règles » (QARuleStep : RULE_PATH + dossier du scénario)."""
+    directory = feature_rel.split(FEATURES_ROOT, 1)[-1].rsplit("/", 1)[0]
+    return RULES_ROOT + directory + "/"
+
+
+def drop_rules_without_folder(text: str, feature_rel: str, worktree: str) -> tuple:
+    """
+    « INIT- Initialisation globale des règles » sans dossier de règles dans le dépôt (règles importées avant l'init) :
+    le step est commenté sous « # TODO-INIT: » (sans dossier, listFiles() renvoie null : NullPointerException).
+    Renvoie (texte, [raisons]).
+    """
+    import os
+    folder = rules_folder(feature_rel)
+    if os.path.isdir(os.path.join(worktree, *folder.strip("/").split("/"))):
+        return text, []
+    out, notes = [], []
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        match = _STEP.match(line.rstrip("\r\n"))
+        if match and not line.lstrip().startswith("#") and match.group(3) == RULES_STEP:
+            eol = "\r\n" if line.endswith("\r\n") else "\n"
+            reason = (f"règles importées avant l'init, aucun dossier {folder} dans le dépôt : step sans objet "
+                      f"(NullPointerException sinon)")
+            out += [f"{match.group(1)}# {INIT_MARKER} {reason}{eol}", f"{match.group(1)}# {line.lstrip()}"]
+            notes.append(f"l. {number} : « {RULES_STEP} » commenté — {reason}")
+            continue
+        out.append(line)
+    return "".join(out), notes
+
+
+def apply_environment_rules(worktree: str, paths: list, properties: dict) -> dict:
+    """Règles sans dossier et jobs reliés à un service fourni par le job Jenkins, sur les features `paths`."""
+    import os
+    changed, notes = [], []
+    for rel in paths:
+        full = os.path.join(worktree, *rel.split("/"))
+        if not os.path.exists(full):
+            continue
+        with open(full, encoding="utf-8", newline="") as f:
+            text = f.read()
+        new, found = drop_rules_without_folder(text, rel, worktree)
+        new, kept = keep_connected_jobs_active(new, properties)
+        if new != text:
+            with open(full, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+            changed.append(rel)
+            name = f"{rel.rsplit('/', 2)[-2]}/{rel.rsplit('/', 1)[-1]}"
+            notes += [f"{name} {n}" for n in found] + [f"{name} {k}" for k in kept]
+    return {"fichiers": changed, "notes": notes}
 
 
 def cucumber_todo_version(line: str) -> bool:

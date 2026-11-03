@@ -105,6 +105,9 @@ def job_parameters(job_name: str) -> dict:
     return {name: d["type"] for name, d in job_definitions(job_name).items()}
 
 
+TRIGGER_ATTEMPTS, TRIGGER_RETRY_SECONDS = 3, 20
+
+
 def trigger_job(job_name: str, parameters: dict) -> str:
     """
     Déclenche un job avec des paramètres texte. Renvoie l'URL de l'élément de file d'attente Jenkins ('' en cas
@@ -114,15 +117,33 @@ def trigger_job(job_name: str, parameters: dict) -> str:
     if not jenkins_url or not job_name.strip():
         print("[JENKINS] JENKINS_URL ou nom du job non renseigné (onglet Configuration).")
         return ""
-    try:
-        response = requests.post(f"{jenkins_url}/{_job_path(job_name)}/buildWithParameters", auth=auth,
-                                 data=parameters, timeout=60)
-        if response.status_code in (200, 201) and response.headers.get("Location"):
-            print(f"[JENKINS] Job {job_name} lancé.")
-            return same_base(response.headers["Location"])
-        print(f"[JENKINS] Erreur lancement job ({response.status_code}) : {response.text[:300]}")
-    except requests.RequestException as e:
-        print(f"[JENKINS] Impossible de lancer le job {job_name} : {e}")
+    for attempt in range(1, TRIGGER_ATTEMPTS + 1):
+        try:
+            response = requests.post(f"{jenkins_url}/{_job_path(job_name)}/buildWithParameters", auth=auth,
+                                     data=parameters, timeout=60)
+            if response.status_code in (200, 201) and response.headers.get("Location"):
+                print(f"[JENKINS] Job {job_name} lancé.")
+                return same_base(response.headers["Location"])
+            print(f"[JENKINS] Erreur lancement job ({response.status_code}) : {response.text[:300]}")
+            return ""
+        except requests.ConnectionError as e:  # dont ConnectTimeout
+            if not (isinstance(e, requests.exceptions.ConnectTimeout) or any(
+                    marker in str(e) for marker in ("NameResolutionError", "NewConnectionError",
+                                                    "Failed to establish a new connection"))):
+                # Connexion coupée après l'envoi : Jenkins a pu recevoir la requête, jamais relancée
+                print(f"[JENKINS] Impossible de lancer le job {job_name} (connexion interrompue, non relancé) : {e}")
+                return ""
+            # Connexion non établie (DNS, réseau) : la requête n'a pas atteint Jenkins, nouvelle tentative sans risque
+            print(f"[JENKINS] Jenkins injoignable (tentative {attempt}/{TRIGGER_ATTEMPTS}) : {e}")
+            if attempt < TRIGGER_ATTEMPTS:
+                time.sleep(TRIGGER_RETRY_SECONDS * attempt)
+        except requests.exceptions.Timeout as e:
+            # Requête peut-être reçue : jamais relancée (un second build serait lancé)
+            print(f"[JENKINS] Impossible de lancer le job {job_name} (délai dépassé, non relancé) : {e}")
+            return ""
+        except requests.RequestException as e:
+            print(f"[JENKINS] Impossible de lancer le job {job_name} : {e}")
+            return ""
     return ""
 
 

@@ -226,3 +226,75 @@ def test_library_with_all_jobs_steps_is_left_unchanged(tmp_path):
         assert bool(out["fichiers"]) is changed, out
     assert out["fichiers"] == [rel, cj.jobs_java_path(CLIENT)]
     assert os.path.exists(os.path.join(worktree, *cj.jobs_java_path(CLIENT).split("/")))
+
+
+CONNECTED = """@INIT_CLIENTX_WMS
+Feature: Init
+
+  Scenario: Initialisation du paramètrage
+    Given INIT- Initialisation globale des règles
+    And INIT- Configuration du colisage
+
+  Scenario: Purge des fichiers d'intégration
+    And CLIENTX- Désactivation du job
+      | name                                  |
+      | Schedule preparation orders precubing |
+"""
+
+
+def test_rules_step_dropped_without_rules_folder_and_connected_job_kept_active(tmp_path):
+    rel = f"src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/01-Initialisation.feature"
+    assert cj.rules_folder(rel) == f"src/test/resources/cucumber/rules/{CLIENT}/01-Contexte/WMS/"
+    props = cj.arg_properties("-DuserCubing='ZGV2' -DpasswordCubing=x -DurlCubing='https://cubing' -Dk=\"v w\"")
+    assert props == {"userCubing": "ZGV2", "passwordCubing": "x", "urlCubing": "https://cubing", "k": "v w"}
+    text, notes = cj.drop_rules_without_folder(CONNECTED, rel, str(tmp_path))
+    assert "    # Given INIT- Initialisation globale des règles" in text.splitlines() and len(notes) == 1
+    # Dossier de règles présent : le step est gardé
+    os.makedirs(tmp_path / "src/test/resources/cucumber/rules" / CLIENT / "01-Contexte" / "WMS")
+    assert cj.drop_rules_without_folder(CONNECTED, rel, str(tmp_path)) == (CONNECTED, [])
+    # Connexion cubing fournie par le job Jenkins et configurée plus haut : précubing laissé actif
+    kept, reasons = cj.keep_connected_jobs_active(CONNECTED, props)
+    assert "    # And CLIENTX- Désactivation du job" in kept.splitlines() and "-DurlCubing" in reasons[0]
+    assert not cj.usages(kept)
+    # Sans connexion (propriété absente ou vide) : la désactivation reste
+    assert cj.keep_connected_jobs_active(CONNECTED, {"urlCubing": ""}) == (CONNECTED, [])
+
+
+def test_failed_proof_search_is_undetermined_never_absent(tmp_path):
+    def down(query):
+        raise cj.SearchUnavailable("recherche de code Bitbucket injoignable : Max retries exceeded")
+    errors = []
+    assert cj.names_in_kis(["clean-up-tmp"], search=down, errors=errors) == {}
+    assert errors == [{"nom": "clean-up-tmp", "erreur": "recherche de code Bitbucket injoignable : Max retries exceeded"}]
+    rel = "src/test/resources/cucumber/features/x/Init.feature"
+    write(os.path.join(str(tmp_path), *rel.split("/")), INIT)
+    result = cj.apply(str(tmp_path), [rel], "", [], kis_search=down)
+    # Aucun fichier réécrit : un job dont la preuve n'a pas pu être cherchée n'est jamais commenté
+    assert result["fichiers"] == [] and {m["nom"] for m in result["indetermines"]} >= {"clean-up-tmp"}
+    with open(os.path.join(str(tmp_path), *rel.split("/")), encoding="utf-8") as f:
+        assert f.read() == INIT
+
+
+def test_recent_standard_fetch_is_reused(tmp_path, monkeypatch):
+    import importlib
+    import io
+    import sys
+    import time
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        main = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    assert main.fetch_age_minutes(str(repo)) is None
+    (repo / ".git" / "FETCH_HEAD").write_text("x")
+    assert main.fetch_age_minutes(str(repo)) < 1
+    old = time.time() - 2 * 3600
+    os.utime(repo / ".git" / "FETCH_HEAD", (old, old))
+    assert 119 < main.fetch_age_minutes(str(repo)) < 121
+    monkeypatch.setenv("STD_FETCH_MAX_AGE_MINUTES", "0")
+    assert main.std_fetch_max_age() == 0
+    monkeypatch.setenv("STD_FETCH_MAX_AGE_MINUTES", "abc")
+    assert main.std_fetch_max_age() == 60
