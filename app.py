@@ -1339,6 +1339,8 @@ def cucumber_header() -> dict:
         "--application", application,
         "--db-schema", schema,
         "--cucumber-std-repo", std_input,
+        # Modules décochés dans « Données du projet » : transmis à main.py, affichés en tête du journal
+        *cucumber_modules.cli_args(client),
     ]
     ctx = {"client": client, "cmd": cucumber_cmd, "ready": ready, "capture": capture_std_ref,
            "reglages_affiches": not ready or st.session_state["cucumber_project"] == NEW_PROJECT}

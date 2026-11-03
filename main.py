@@ -1253,6 +1253,7 @@ def main():
     parser.add_argument("--import-url", default="", help="generate-cucumber-client : import d'un build Jenkins (console et rapports Cucumber JSON lus en mémoire), analysé sans appel à Claude")
     parser.add_argument("--patch-only", action="store_true", help="generate-cucumber-client : régénère seulement le patch <client>-cucumber.patch depuis l'espace de travail de l'agent (un commit, écart net avec la branche d'intégration actuelle), sans appel à Claude")
     parser.add_argument("--fix-init-from-import", type=int, default=0, help="generate-cucumber-client : l'init du run importé n° N échoue dans les compléments écrits par l'agent : il corrige ces fichiers seuls (contrôlés), puis rejoue l'init si CUCUMBER_AGENT_JENKINS=1, sinon livre <client>-cucumber-init-correction.patch")
+    parser.add_argument("--modules-exclus", default=None, help="generate-cucumber-client : modules exclus du périmètre testé (codes séparés par des virgules, ex. TMS ; vide : aucun), transmis par l'IHM depuis le profil client ; enregistrés dans le profil s'ils en diffèrent, affichés en tête du journal")
     parser.add_argument("--from-import", type=int, default=0, help="generate-cucumber-client --complete : lots « correction » des échecs « test » des scénarios de l'agent de l'import n° N")
     parser.add_argument("--run-jenkins", action="store_true", help="generate-cucumber-client : pousse le worktree sur la branche lue par le job (profil), contrôle le commit, lance le job Jenkins du client, suit le build puis importe sa console et ses rapports (bilan)")
     parser.add_argument("--run-dry", action="store_true", help="generate-cucumber-client --run-jenkins : aperçu sans push ni lancement (0 token) — job, branche, rôles des paramètres, paramètres envoyés (secrets masqués) et nombre de tests attendus pour --run-tags")
@@ -1312,6 +1313,7 @@ def main():
         args.issue = args.issue or cucumber_tools.work_id(args.client_name)
         args.project = args.project or args.client_name.upper()
         args.generate_cucumber = True
+        apply_excluded_modules(args.client_name, args.modules_exclus)
     elif not (args.issue.strip() and args.project.strip()):
         parser.error("--issue et --project sont obligatoires pour cette étape")
 
@@ -3169,7 +3171,7 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
 def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_tags: str, verify_sources: dict,
                  profile: dict, state: dict, cucumber_std_dir: str, std_java: dict, step_code: dict,
                  token_saving_rules: str, python_exe: str, workspace_dir: str, work_key: str,
-                 console: str = "") -> dict:
+                 console: str = "", extra_files: list = None) -> dict:
     """
     Correction autonome des compléments d'init de l'agent (cucumber_init_fix) : seulement si l'init échoue dans ses
     propres compléments. Chaque tentative : un appel Claude borné aux fichiers autorisés, contrôles Python
@@ -3177,11 +3179,15 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
     tag retiré, compilation), commit dédié, push sur la branche de travail, init rejouée seule. Renvoie le dernier
     résultat de l'init ; state["init_corrigee"] : fichiers corrigés (livrés dans le patch, à relire en premier).
     """
-    files = cucumber_init_fix.own_files(worktree, client)
+    files = list(dict.fromkeys(cucumber_init_fix.own_files(worktree, client) + list(extra_files or [])))
     if not (cucumber_init_fix.enabled() and cucumber_init_fix.fixable(init.get("echecs") or [], files)):
-        if init.get("echecs") and cucumber_init_fix.enabled():
-            print("[CUCUMBER INIT] Échec hors des compléments écrits par l'agent : init du client à corriger à la main.")
-        return init
+        failed = ", ".join(sorted({f.get("fichier") or "?" for f in init.get("echecs") or []})) or "aucun échec"
+        reason = ("correction autonome de l'init désactivée (CUCUMBER_INIT_SELF_FIX=0)"
+                  if not cucumber_init_fix.enabled() else
+                  f"échec dans {failed}, hors des fichiers que l'agent peut corriger ({', '.join(files) or 'aucun'})")
+        if init.get("echecs"):
+            print(f"[CUCUMBER INIT] {reason}.")
+        return {**init, "ok": False, "message": init.get("message") or reason, "action": reason}
     run_dir = cucumber_tools.cache_dir(client)
     model = os.getenv("CLAUDE_MODEL_CUCUMBER", "").strip() or "sonnet"
     effort = claude_effort("CLAUDE_EFFORT_CUCUMBER")
@@ -3280,7 +3286,8 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
                         run_dir, work_key, turns)
             return init
         if not cucumber_init_fix.fixable(init.get("echecs") or [], files):
-            print("[CUCUMBER INIT] L'échec restant est hors des compléments de l'agent : init à corriger à la main.")
+            print(f"[CUCUMBER INIT] L'échec restant est hors des fichiers que l'agent peut corriger "
+                  f"({', '.join(files)}) : {init.get('message')}")
             break
         errors = [f"l'init échoue encore : {init['message']}"]
     return init
@@ -3474,6 +3481,177 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
     return 0
 
 
+def apply_excluded_modules(client: str, value) -> set:
+    """
+    Modules exclus du périmètre testé au démarrage : `value` (--modules-exclus, transmis par l'IHM) enregistré dans
+    le profil client s'il en diffère ; sans argument, ceux du profil. Affichés en tête du journal. Renvoie les codes.
+    """
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    current = cucumber_modules.excluded(profile)
+    if value is not None:
+        wanted = cucumber_modules.parse_cli(value)
+        if wanted != current:
+            cucumber_modules.save_excluded(client, wanted)
+            print(f"[MODULES] Profil de {client} mis à jour depuis l'IHM : "
+                  f"{cucumber_modules.excluded_line(current)} → {', '.join(sorted(wanted)) or 'aucun'}")
+        current = wanted
+    print(f"[MODULES] {cucumber_modules.excluded_line(current)}")
+    return current
+
+
+def remote_branch_head(repo_dir: str, branch: str) -> str:
+    """Commit de `branch` sur origin lu par git ls-remote ('' si absente ou dépôt injoignable)."""
+    if not branch:
+        return ""
+    out = cucumber_tools._git(repo_dir, "ls-remote", "origin", f"refs/heads/{branch}")
+    return out.stdout.split()[0] if out.returncode == 0 and out.stdout.strip() else ""
+
+
+def reference_import(client: str, numero: int) -> int:
+    """Run de référence de la correction de l'init : le DERNIER import (un import plus ancien n'est pas rejoué)."""
+    latest = max((e["numero"] for e in cucumber_import.load_index(client).get("imports") or []), default=0)
+    if latest > numero:
+        print(f"[CUCUMBER INIT] Import n° {numero} demandé, mais l'import n° {latest} est plus récent : la correction "
+              f"s'appuie sur le dernier import (n° {latest}).")
+        return latest
+    return numero
+
+
+def _build_number(build: str) -> str:
+    match = re.search(r"/(\d+)/?$", build or "")
+    return f"#{match.group(1)}" if match else (build or "?")
+
+
+def init_failure_line(init: dict, action: str) -> str:
+    """Bilan d'une init en échec, jamais vide : fichier, step, message, action faite."""
+    rel = (init.get("id") or init.get("fichier") or "").split("::", 1)[0]
+    short = "/".join(rel.split("/")[-3:]) or "init"
+    return (f"{short} — step « {init.get('step') or 'inconnu'} » — "
+            f"{(init.get('message') or 'message absent du rapport')[:300]} — action : {action or 'aucune'}")
+
+
+def run_init_and_import(client: str, profile: dict, worktree: str, repository: str, mode: str) -> dict:
+    """
+    Init du profil (tags d'init, modules exclus écartés par run_expression) lancée sur la branche de travail de
+    l'agent, à sa tête, puis build importé et analysé : le prochain essai s'appuie sur ce run. Renvoie
+    {ok, message, build, numero, init_en_echec}.
+    """
+    work = profile["verify_branch"]
+    head = cucumber_tools.rev_parse(worktree, "HEAD")
+    tags = profile.get("init_tags") or cucumber_verify.init_tags()
+    sources = {**cucumber_verify.branch_sources(profile, repository), "CUCUMBER_SPEC_COMMIT": head,
+               profile.get("verify_branch_param") or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM: work}
+    print(f"[CUCUMBER INIT] Run Jenkins de l'init {tags} sur {work} @ {head[:8]}…")
+    out = cucumber_verify.run_init(mode, worktree, head, lambda: worktree, tags, sources)
+    result = {**out, "numero": 0, "init_en_echec": {}}
+    if out.get("build"):
+        try:
+            imported = cucumber_import.import_files(client, cucumber_import.build_files(out["build"]), out["build"])
+        except Exception as e:  # noqa: BLE001 - build injoignable : le bilan garde le résultat du run
+            imported = {"numero": 0, "messages": [str(e)]}
+        if imported.get("numero"):
+            analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client),
+                                               cucumber_tools.worktree_dir(client))
+            result["numero"] = imported["numero"]
+            result["init_en_echec"] = analysis.get("init_en_echec") or {}
+    return result
+
+
+def fix_init_excluded_modules(args, numero: int, cucumber_repo_dir: str) -> object:
+    """
+    Avant toute analyse de l'échec : steps d'init d'un module exclu (clear « tms/all », configuration, init et jobs du
+    module), actifs ou commentés, retirés des inits des autres modules — sans correction à la main. L'espace d'init
+    repart de la branche de travail de l'agent (à défaut de la base) ; la correction y est poussée (contrôlée par
+    git ls-remote), puis l'init du profil est rejouée sur Jenkins et son build importé. Renvoie None si aucun module
+    n'est exclu ou si rien ne le concerne (l'analyse continue), sinon le code de sortie.
+    """
+    client = args.client_name
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    out = cucumber_modules.excluded(profile)
+    if not out:
+        return None
+    init = cucumber_import.load_analysis(client, numero).get("init_en_echec") or {}
+    step_out = cucumber_modules.is_out(cucumber_modules.step_modules(f"    Given {init.get('step') or ''}", profile),
+                                       out)
+    work = (profile.get("verify_branch") or "").strip()
+    cucumber_tools._git(cucumber_repo_dir, "fetch", "-q", "origin")
+    base = cucumber_tools.base_ref(cucumber_repo_dir, args.cucumber_base_branch)
+    start = f"origin/{work}" if work and cucumber_tools._git(cucumber_repo_dir, "rev-parse", "--verify", "-q",
+                                                             f"origin/{work}").returncode == 0 else base
+    worktree = cucumber_tools.add_worktree(cucumber_repo_dir, cucumber_init.init_worktree_dir(client),
+                                           cucumber_init.init_branch(client), start, reset=True)
+    state = cucumber_tools.load_state(client)
+    # Jobs définis seulement dans un module exclu : constats de la preuve des jobs (bilans, notes TODO-JOB)
+    findings = [str(c) for t in (state.get("init_corrigee") or {}).get("tentatives") or []
+                for c in t.get("corrections") or []]
+    jobs = cucumber_modules.module_jobs(findings + list(cucumber_modules.worktree_features(worktree).values()),
+                                        profile)
+    changed, removed = [], []
+    for code in sorted(out):
+        for item in cucumber_modules.retag_plan(worktree, profile, code, jobs=jobs):
+            with open(os.path.join(worktree, *item["fichier"].split("/")), "w", encoding="utf-8", newline="") as f:
+                f.write(item["texte"])
+            changed.append(item["fichier"])
+            removed += item["retires"]
+            cucumber_modules.add_retired(client, code, item["retires"])
+    changed = list(dict.fromkeys(changed))
+    if not changed and not step_out:
+        return None
+    print(f"[CUCUMBER INIT] {cucumber_modules.excluded_line(out)} — init de {start}")
+    if not changed:
+        print(f"[CUCUMBER INIT] Le step en échec « {init.get('step')} » concerne un module exclu mais n'est plus dans "
+              f"l'init de {start} : l'import n° {numero} est antérieur à son retrait — init rejouée pour un résultat "
+              f"à jour.")
+    for item in removed:
+        print(f"    - {item['fichier']} l. {item['ligne']} retirée ({item['module']} décoché) : "
+              f"{item['lignes'][-1].strip()[:120]}")
+    if changed:
+        cucumber_tools._git(worktree, "add", "--", *changed)
+        message = (f"Cucumber : steps d'init des modules exclus ({', '.join(sorted(out))}) retirés des inits de "
+                   f"{client}")
+        commit = cucumber_tools._git(worktree, "commit", "-q", "-m", message)
+        if commit.returncode != 0:
+            reason = f"commit du retrait impossible : {commit.stderr.strip()[:200]}"
+            print(f"[CUCUMBER INIT] ⛔ {init_failure_line(init, reason)}")
+            return 1
+    patch = os.path.join(cucumber_tools.WORKSPACE_DIR, f"{client}-cucumber-init-correction.patch")
+    if changed:
+        cucumber_tools.format_patch(worktree, f"{start}..HEAD", patch)
+    action = (f"{len(removed)} step(s) du module exclu retiré(s) de {', '.join(changed)}" if changed else
+              "aucun retrait (déjà fait)")
+    mode, why = cucumber_verify.execution_mode(profile, args.cucumber_base_branch)
+    if mode != "branche" or not work:
+        why = why or "branche de travail de l'agent absente du profil (verify_branch)"
+        print(f"[CUCUMBER INIT] Correction non poussée ({why})"
+              + (f" : patch {patch}" if changed else ""))
+        print(f"[CUCUMBER INIT] Bilan : {init_failure_line(init, action + ', non vérifiée sur Jenkins')}")
+        return 0 if changed else 1
+    head = cucumber_tools.rev_parse(worktree, "HEAD")
+    if changed:
+        error = cucumber_checks.push_for_verification(worktree, work, message)[0]
+        remote = remote_branch_head(worktree, work)
+        if error or remote != head:
+            reason = error or f"{work} est à {remote[:8] or 'absente'} sur origin (git ls-remote), attendu {head[:8]}"
+            print(f"[CUCUMBER INIT] ⛔ {init_failure_line(init, f'{action} ; push refusé : {reason}')}")
+            return 1
+        print(f"[CUCUMBER INIT] ✅ Poussé sur {args.cucumber_repo or 'le dépôt Cucumber du client'} : {work} @ "
+              f"{head[:8]} (vérifié par git ls-remote)")
+    run = run_init_and_import(client, profile, worktree, args.cucumber_repo, mode)
+    after = run.get("init_en_echec") or {}
+    print(f"[CUCUMBER INIT] Bilan : build {_build_number(run.get('build'))} "
+          f"({run.get('build') or 'non lancé'}) — " + ("✅ init verte" if run.get("ok") else
+                                                        f"❌ {run.get('message') or 'init en échec'}")
+          + (f" — import n° {run['numero']}" if run.get("numero") else ""))
+    print(f"[CUCUMBER INIT] Action faite : {action}")
+    if not run.get("ok"):
+        if after:
+            follow = (f"nouvel échec à analyser : relancez « Corriger l'initialisation » (référence : import "
+                      f"n° {run.get('numero')})")
+            print(f"[CUCUMBER INIT] ⛔ Init toujours en échec : {init_failure_line(after, follow)}")
+        return 1
+    return 0
+
+
 def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio_version: str,
                          token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
     """
@@ -3512,6 +3690,22 @@ def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio
         log = _git_out(worktree, "log", "--format=%H %s", f"{base}..HEAD" if base else "-20")
         return [c for c in log.splitlines() if "compléments d'initialisation" in c and "par l'agent" in c]
     files = cucumber_init_fix.own_files(worktree, client)
+    # Init du client (hors compléments) : corrigeable par l'agent sauf si elle est PROUVÉE écrite à la main ; dans ce
+    # cas la correction est proposée en diff (patch), rien n'est poussé
+    extra = []
+    if rel.endswith(".feature") and not cucumber_init_fix.is_complements(rel) and \
+            os.path.exists(os.path.join(worktree, *rel.split("/"))):
+        author = cucumber_init_fix.init_author(worktree, rel)
+        extra = [rel]
+        if author["auteur"] == "main":
+            mode = ""
+            print(f"[CUCUMBER INIT] {rel} : init écrite à la main (créée par {author['commit'][:8]} « "
+                  f"{author['message'][:80]} ») — correction proposée en diff, rien n'est poussé.")
+        else:
+            print(f"[CUCUMBER INIT] {rel} : init " + (
+                f"générée par l'agent ({author['commit'][:8]} « {author['message'][:80]} »)"
+                if author["auteur"] == "agent" else "d'auteur non prouvé (historique absent)")
+                  + " — l'agent la corrige.")
     # Correction déjà faite (tentative précédente non poussée) et conforme : patch seulement, sans nouvel appel
     already = agent_commits() and not cucumber_init_fix.check_correction(
         worktree, client, files, cucumber_init_fix.snapshot(worktree, files))
@@ -3521,15 +3715,16 @@ def fix_init_from_import(args, numero: int, local_cucumber_std_repo: str, odatio
                        profile.get("init_tags") or cucumber_verify.init_tags(),
                        cucumber_verify.branch_sources(profile, args.cucumber_repo), profile, state,
                        local_cucumber_std_repo, std_java, step_code, token_saving_rules, python_exe, workspace_dir,
-                       cucumber_tools.work_id(client), os.path.join(folder, consoles[0]) if consoles else "")
+                       cucumber_tools.work_id(client), os.path.join(folder, consoles[0]) if consoles else "",
+                       extra_files=extra)
     # Import traité (écran minimal : la correction n'est plus proposée pour ce run)
     state.setdefault("init_corrigee", {"fichiers": [], "tentatives": []})["import"] = numero
     cucumber_tools.save_state(client, state)
     if out.get("ok") is False and not out.get("corrige"):
-        if not (state.get("init_corrigee") or {}).get("tentatives"):
-            return 2
-        print(f"[CUCUMBER INIT] ⛔ Init toujours en échec : {out.get('message')}")
-        return 1
+        last = (out.get("echecs") or [failure])[0]
+        action = out.get("action") or "correction tentée par l'agent, init rejouée"
+        print(f"[CUCUMBER INIT] ⛔ Init toujours en échec : {init_failure_line({**last, 'step': last.get('step') or failure['step'], 'message': last.get('message') or out.get('message') or failure['message']}, action)}")
+        return 1 if (state.get("init_corrigee") or {}).get("tentatives") else 2
     patch = os.path.join(cucumber_tools.WORKSPACE_DIR, f"{client}-cucumber-init-correction.patch")
     commits = agent_commits()
     if commits and cucumber_tools.format_patch(worktree, f"{commits[-1].split()[0]}~1..{commits[0].split()[0]}",
@@ -4052,14 +4247,40 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"[CUCUMBER] Rien à livrer par rapport à {base}.")
         return 2
     if args.fix_init_from_import:
-        # Jobs KIS absents chez le client (« Pas d'élément correspondant à l'attendu {} pour KisJob ») : correction
-        # déterministe de l'init (0 token), puis init rejouée seule sur Jenkins, avant toute autre correction
-        jobs_code = fix_init_jobs(args, args.fix_init_from_import, cucumber_repo_dir, local_client_repo,
-                                  STD_READER[0] or local_std_repo, local_cucumber_std_repo, odatio_version)
-        if jobs_code is not None:
-            return jobs_code
-        return fix_init_from_import(args, args.fix_init_from_import, local_cucumber_std_repo, odatio_version,
-                                    token_saving_rules, python_exe, workspace_dir)
+        # Run de référence : le dernier import ; essai identique au précédent (même import, même branche de
+        # travail, mêmes modules exclus) : dit, sans refaire la même analyse
+        args.fix_init_from_import = reference_import(client, args.fix_init_from_import)
+        code = fix_init_excluded_modules(args, args.fix_init_from_import, cucumber_repo_dir)
+        if code is not None:
+            return code
+        profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+        work = (profile.get("verify_branch") or "").strip()
+        key = {"import": args.fix_init_from_import, "branche": work,
+               "commit": remote_branch_head(cucumber_repo_dir, work),
+               "espace": cucumber_tools.rev_parse(cucumber_tools.worktree_dir(client), "HEAD")
+               if os.path.isdir(cucumber_tools.worktree_dir(client)) else "",
+               "exclus": sorted(cucumber_modules.excluded(profile))}
+        state = cucumber_tools.load_state(client)
+        last = state.get("essai_init") or {}
+        if last.get("cle") == key and last.get("code") not in (0, None):
+            init = cucumber_import.load_analysis(client, key["import"]).get("init_en_echec") or {}
+            print(f"[CUCUMBER INIT] Aucune modification depuis le dernier essai ({last.get('date', '')[:16]}) : même "
+                  f"import n° {key['import']}, même branche {work or '—'} @ {key['commit'][:8] or '—'}, mêmes modules "
+                  f"exclus — même analyse non refaite.")
+            print(f"[CUCUMBER INIT] ⛔ {init_failure_line(init, last.get('action') or 'aucune nouvelle action')}. "
+                  f"Importez un nouveau run ou modifiez l'init avant de relancer.")
+            return 1
+        # Jobs KIS absents chez le client (« … pour KisJob ») : correction déterministe (0 token) avant toute autre
+        code = fix_init_jobs(args, args.fix_init_from_import, cucumber_repo_dir, local_client_repo,
+                             STD_READER[0] or local_std_repo, local_cucumber_std_repo, odatio_version)
+        if code is None:
+            code = fix_init_from_import(args, args.fix_init_from_import, local_cucumber_std_repo, odatio_version,
+                                        token_saving_rules, python_exe, workspace_dir)
+        state = cucumber_tools.load_state(client)
+        state["essai_init"] = {"cle": key, "code": code, "date": datetime.now().isoformat(timespec="seconds"),
+                               "action": "analyse de l'échec et correction tentée"}
+        cucumber_tools.save_state(client, state)
+        return code
     if args.run_jenkins and args.run_dry:
         return preview_cucumber_jenkins(client, args.run_tags, args.cucumber_repo, args.cucumber_base_branch,
                                         not args.run_no_push, args.run_branch)

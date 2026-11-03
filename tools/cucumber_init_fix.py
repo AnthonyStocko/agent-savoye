@@ -48,6 +48,22 @@ def own_files(worktree: str, client_name: str) -> list:
     return files
 
 
+def init_author(worktree: str, path: str, ref: str = "HEAD") -> dict:
+    """
+    Auteur d'une feature d'init d'après l'historique du dépôt client : {"auteur": "agent" | "main" | "inconnu",
+    "commit", "message"}. « agent » : créée par le commit d'init de l'agent (INIT_COMMIT_PREFIX) ou par un commit
+    « Cucumber … » de l'agent ; « main » : création PROUVÉE par un autre commit ; « inconnu » : historique absent
+    (clone superficiel, fichier non suivi) — jamais traité comme écrit à la main.
+    """
+    from tools.cucumber_init import INIT_COMMIT_PREFIX
+    log = _git(worktree, "log", "--diff-filter=A", "--format=%H%x09%s", ref, "--", path).stdout.strip().splitlines()
+    if not log:
+        return {"auteur": "inconnu", "commit": "", "message": ""}
+    sha, _, subject = log[-1].partition("\t")
+    agent = subject.startswith(INIT_COMMIT_PREFIX) or subject.startswith("Cucumber ")
+    return {"auteur": "agent" if agent else "main", "commit": sha, "message": subject}
+
+
 def fixable(failures: list, files: list) -> bool:
     """L'init échoue, et uniquement dans des scénarios des compléments de l'agent."""
     owned = {f for f in files if f.endswith(".feature")}

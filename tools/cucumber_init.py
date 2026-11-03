@@ -34,6 +34,8 @@ STD_PURGE_STEP = "INIT- Purge de l'environnement"
 CLEAR_STEP = "INIT- Purge de l'environnement par le clear"
 GLOBAL_INIT_STEP = "INIT- Initialisation globale par fichiers via l'écran"
 SPEC_STEP = "INIT- Intégration des fichiers via l'écran"
+# Message du commit de l'init générée par l'agent (preuve de l'auteur : cucumber_init_fix.init_author)
+INIT_COMMIT_PREFIX = "Cucumber initialisation of "
 # Intégration sans attente du statut des fichiers -> équivalent qui échoue sur INTEGRATED_WITH_ERROR
 NON_CHECKING_STEPS = {"INIT- Demande d'intégration des fichiers via l'écran": SPEC_STEP}
 # Écarts de version qui empêchent le step de s'exécuter avec la bibliothèque du client : step commenté
@@ -413,7 +415,7 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java, *extra_java)
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return result
-    commit = _git(worktree, "commit", "-m", f"Cucumber initialisation of {client_name} ({', '.join(kept)})")
+    commit = _git(worktree, "commit", "-m", f"{INIT_COMMIT_PREFIX}{client_name} ({', '.join(kept)})")
     if commit.returncode != 0:
         raise RuntimeError(f"Commit de l'initialisation impossible : {commit.stderr.strip()[:300]}")
     if format_patch(worktree, f"{base}..HEAD", output):

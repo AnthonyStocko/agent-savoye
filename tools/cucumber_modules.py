@@ -236,6 +236,26 @@ def run_expression(tags: str, profile: dict, client_name: str = "") -> str:
     return " and ".join(([head] if head else []) + [f"not {n}" for n in negations])
 
 
+CLI_OPTION = "--modules-exclus"
+
+
+def cli_args(client_name: str) -> list:
+    """Arguments de main.py transmettant les modules exclus du profil client (toujours présents, vide : aucun)."""
+    from tools import cucumber_profile
+    out = excluded(cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name))) \
+        if client_name else set()
+    return [CLI_OPTION, ",".join(sorted(out))]
+
+
+def parse_cli(value: str) -> set:
+    return {c.strip().upper() for c in re.split(r"[,;\s]+", value or "") if c.strip()}
+
+
+def excluded_line(out) -> str:
+    """« Modules exclus : TMS » ; « Modules exclus : aucun »."""
+    return "Modules exclus : " + (", ".join(sorted(out)) or "aucun")
+
+
 def summary_line(profile: dict) -> str:
     """« Modules testés : WMS — TMS exclu » ; '' sans module détecté ni exclu."""
     out = excluded(profile)
@@ -323,39 +343,117 @@ def step_modules(line: str, profile: dict) -> set:
     return found
 
 
-def strip_excluded_steps(text: str, profile: dict, out: set = None) -> tuple:
+_NOTE = re.compile(r"^\s*#\s*TODO-[A-Z]+\s*:")
+_JOB_DEFINED = re.compile(r"job « ([^»]+) »(?:(?!job «)[^\n])*?défini seulement dans ([^\s,;'\"]+)")
+
+
+def _uncomment(line: str) -> str:
+    """Ligne sans son « # » de tête (indentation gardée) ; inchangée si elle n'est pas commentée."""
+    body = line.lstrip()
+    if not body.startswith("#"):
+        return line
+    return line[:len(line) - len(body)] + body[1:].lstrip()
+
+
+def module_jobs(texts, profile: dict) -> dict:
     """
-    Steps des modules exclus (`out`, à défaut ceux du profil) retirés de `text`, table ou docstring comprise :
-    (texte, retirés [{ligne, lignes, precedente, module}]) — l'historique permet de les remettre (restore_steps).
+    {nom du job: module} des jobs définis seulement dans un dépôt d'un module exclu, d'après les constats de la
+    preuve des jobs (« job « X » … défini seulement dans tms-tariff-workflow/… », cucumber_jobs.check_init) lus dans
+    `texts` (notes TODO-JOB, bilans de correction). Aucun nom de job en dur.
+    """
+    out = excluded(profile)
+    found = {}
+    for text in texts or []:
+        for name, path in _JOB_DEFINED.findall(str(text or "")):
+            codes_found = _tokens(path.split("/", 1)[0]) & out
+            if codes_found:
+                found.setdefault(name.strip(), sorted(codes_found)[0])
+    return found
+
+
+def _job_hits(plain: str, jobs: dict) -> set:
+    """Modules des jobs `jobs` cités par une ligne (ligne de table « | nom | » ou step entre guillemets)."""
+    if not jobs:
+        return set()
+    body = plain.strip()
+    if body.startswith("|"):
+        return {jobs[c.strip()] for c in body.strip("|").split("|") if c.strip() in jobs}
+    if _STEP_KEYWORD.match(plain):
+        return {jobs[q] for q in _QUOTED.findall(plain) if q in jobs}
+    return set()
+
+
+def _note_of(line: str, found: set, names) -> bool:
+    """Note TODO-… qui accompagne un step retiré : elle nomme son module ou le job retiré."""
+    if not _NOTE.match(line):
+        return False
+    return any(re.search(rf"\b{re.escape(c)}\b", line) for c in found) or any(f"« {n} »" in line for n in names)
+
+
+def strip_excluded_steps(text: str, profile: dict, out: set = None, jobs: dict = None) -> tuple:
+    """
+    Steps des modules exclus (`out`, à défaut ceux du profil) retirés de `text`, table ou docstring comprise, qu'ils
+    soient actifs ou déjà commentés (« # And … "tms/all" » : une trace reste une trace), avec la note TODO-… qui les
+    précède quand elle nomme le module. `jobs` {nom: module} (module_jobs) : lignes de ces jobs retirées aussi.
+    Renvoie (texte, retirés [{ligne, lignes, precedente, module}]) — l'historique permet de les remettre
+    (restore_steps).
     """
     out = excluded(profile) if out is None else {c.upper() for c in out}
+    jobs = {n: c for n, c in (jobs or {}).items() if c in out}
     lines = (text or "").splitlines(keepends=True)
     kept, removed, i = [], [], 0
     while i < len(lines):
-        found = step_modules(lines[i], profile) if out else set()
+        plain = _uncomment(lines[i])
+        commented = plain != lines[i]
+        found = step_modules(plain, profile) if out else set()
+        names = set()
+        if out and not is_out(found, out):
+            hits = _job_hits(plain, jobs)
+            if hits:
+                found = hits
+                names = {n for n in jobs if n in plain}
         if not is_out(found, out):
             kept.append(lines[i])
             i += 1
             continue
         block, start = [lines[i]], i
         i += 1
-        while i < len(lines) and lines[i].strip().startswith(("|", '"""')):
-            block.append(lines[i])
-            i += 1
-        previous = next((k.rstrip("\r\n") for k in reversed(kept) if k.strip()), "")
-        removed.append({"ligne": start + 1, "lignes": block, "precedente": previous, "module": sorted(found)[0]})
+        if not plain.strip().startswith("|"):
+            while i < len(lines) and _uncomment(lines[i]).strip().startswith(("|", '"""')) and (
+                    (_uncomment(lines[i]) != lines[i]) == commented):
+                block.append(lines[i])
+                i += 1
+        notes = []
+        while kept and _note_of(kept[-1], found, names):
+            notes.insert(0, kept.pop())
+        # Ligne précédente dans le texte d'origine (blocs retirés à la suite : remis dans leur ordre)
+        previous = next((k.rstrip("\r\n") for k in reversed(lines[:start - len(notes)]) if k.strip()), "")
+        removed.append({"ligne": start + 1 - len(notes), "lignes": notes + block, "precedente": previous,
+                        "module": sorted(found)[0]})
     return "".join(kept), removed
 
 
 def restore_steps(text: str, removed: list) -> tuple:
-    """Steps retirés remis après leur ligne précédente (à défaut à leur ancienne ligne) ; déjà présents : ignorés."""
+    """
+    Steps retirés remis, dans l'ordre d'origine : à leur ancienne ligne si la ligne précédente est toujours celle
+    d'origine, sinon après la première occurrence de cette ligne précédente ; déjà présents à cet endroit : ignorés.
+    """
     lines = (text or "").splitlines(keepends=True)
     count = 0
+
+    def strip(line: str) -> str:
+        return line.rstrip("\r\n")
+
+    def previous(position: int) -> str:
+        return next((strip(k) for k in reversed(lines[:position]) if k.strip()), "")
     for item in sorted(removed or [], key=lambda r: r["ligne"]):
-        if any(line.rstrip("\r\n") == item["lignes"][0].rstrip("\r\n") for line in lines):
+        position = min(item["ligne"] - 1, len(lines))
+        if previous(position) != item["precedente"]:
+            anchor = next((n for n, line in enumerate(lines) if strip(line) == item["precedente"]), None)
+            if anchor is not None:
+                position = anchor + 1
+        if [strip(k) for k in lines[position:position + len(item["lignes"])]] == [strip(k) for k in item["lignes"]]:
             continue
-        anchor = next((n for n, line in enumerate(lines) if line.rstrip("\r\n") == item["precedente"]), None)
-        position = anchor + 1 if anchor is not None else min(item["ligne"] - 1, len(lines))
         # La ligne précédente a pu perdre sa fin de ligne (dernière ligne du fichier)
         if position and not lines[position - 1].endswith(("\n", "\r")):
             lines[position - 1] += "\n"
@@ -418,7 +516,8 @@ def module_features(worktree: str, profile: dict, code: str) -> dict:
     return out
 
 
-def retag_plan(worktree: str, profile: dict, code: str, restore: bool = False, history: list = None) -> list:
+def retag_plan(worktree: str, profile: dict, code: str, restore: bool = False, history: list = None,
+               jobs: dict = None) -> list:
     """
     Aperçu du nettoyage du module `code` : [{"fichier", "tags", "avant", "apres", "texte", "retires", "raison"}].
     - features du module (son init comprise) : tag client remplacé par EXCLUDED_TAG (désactivées pour les runs) ;
@@ -436,7 +535,7 @@ def retag_plan(worktree: str, profile: dict, code: str, restore: bool = False, h
         elif restore:
             new, put_back = restore_steps(text, [h for h in history or [] if h.get("fichier") == rel])
         else:
-            new, removed = strip_excluded_steps(text, profile, out)
+            new, removed = strip_excluded_steps(text, profile, out, jobs)
         if new == text:
             continue
         before = [line.rstrip("\r\n") for _, line in tag_lines(text)]
@@ -534,6 +633,19 @@ def record_retag(client_name: str, code: str, restore: bool, result: dict) -> di
                             "retires": [] if restore else (result.get("retires") or previous.get("retires") or [])}
     cucumber_profile._write_json(cucumber_profile.profile_path(client_name), document)
     return document
+
+
+def add_retired(client_name: str, code: str, removed: list) -> None:
+    """Steps retirés hors du nettoyage de l'IHM (correction de l'init) ajoutés à l'historique du module (remis au
+    recochage)."""
+    from tools import cucumber_profile
+    if not removed:
+        return
+    document = cucumber_profile.load_profile(client_name)
+    entry = document.setdefault("retrait_tag", {}).setdefault(code.upper(), {"etat": "retire", "fichiers": []})
+    entry["retires"] = list(entry.get("retires") or []) + list(removed)
+    entry["date"] = datetime.now().isoformat(timespec="seconds")
+    cucumber_profile._write_json(cucumber_profile.profile_path(client_name), document)
 
 
 def retag_state(document: dict, code: str) -> dict:
