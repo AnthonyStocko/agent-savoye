@@ -19,7 +19,7 @@ import os
 import re
 from datetime import datetime
 
-from tools import cucumber_checks, cucumber_init_data, cucumber_initializers, cucumber_versions
+from tools import cucumber_checks, cucumber_init_data, cucumber_initializers, cucumber_modules, cucumber_versions
 from tools.cucumber_tools import (CLIENT_REFS, _git, _read_json, _read_text_file, _runners, _test_java_files,
                                   _write_json,
                                   cache_dir, depends_on_std_test_jar, git_repos, java_classes, java_package_segment,
@@ -30,14 +30,18 @@ REFERENCE_CATEGORIES = ("sites", "donneurs_ordres", "secteurs", "partenaires")
 FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_name", "spec_files", "protected_files",
           "runner", "reference_codes", "library_version", "server_version", "server_initialized_data",
           "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-          "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target")
+          "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
+          "modules_exclus")
 # Champs dont l'absence est normale : vides sans avertissement
 OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
-                   "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target")
+                   "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
+                   "modules_exclus")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
-LABELS = {"features_root": "racine des features", "tag_client": "tag client", "init_features": "features d'init",
+LABELS = {"modules": "modules du client (tag @<X> d'une feature sous un dossier <X>, tâches de l'inventaire)",
+          "modules_exclus": "modules exclus du périmètre testé (décochés dans « Données du projet »)",
+          "features_root": "racine des features", "tag_client": "tag client", "init_features": "features d'init",
           "init_tags": "tags d'init", "clear_name": "clear de l'environnement",
           "spec_files": "fichiers du module spécifique", "protected_files": "fichiers protégés de l'init globale",
           "runner": "runner",
@@ -81,7 +85,7 @@ def empty_profile() -> dict:
             "reference_codes": {k: [] for k in REFERENCE_CATEGORIES}, "library_version": "", "server_version": "",
             "server_initialized_data": [], "initializers_survive_clear": "", "workarounds": [], "verify_branch": "",
             "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": [], "job_roles": {},
-            "job_params": [], "run_tags_target": ""}
+            "job_params": [], "run_tags_target": "", "modules": [], "modules_exclus": []}
 
 
 def is_empty(value) -> bool:
@@ -225,6 +229,8 @@ def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
                    library_version=cucumber_checks.library_version(worktree),
                    server_version=server_version if re.match(r"^\d{2}\.\d+", server_version or "") else "")
     profile["workarounds"] = cucumber_versions.todo_markers(worktree, ref)
+    # Modules du client (aucune liste en dur : tags des features rangées sous un dossier du même nom, inventaire)
+    profile["modules"] = cucumber_modules.detect_in_worktree(worktree, client_name, cucumber_std_dir, tag)
     inventory = load_inventory(client_name)
     if "initialiseurs" in inventory:
         profile["server_initialized_data"] = cucumber_initializers.initialized_data(inventory["initialiseurs"])
@@ -304,7 +310,10 @@ def effective_profile(document: dict) -> dict:
                  if is_empty(profile[k]) and k not in OPTIONAL_FIELDS]
     # Clears déclarés par l'application du client (None : application non analysée)
     clears = ((document or {}).get("suggestions") or {}).get("clears_application")
-    return {**profile, "sources": sources, "avertissements": warnings, "clears_application": clears}
+    # Modules exclus (saisie) : leurs features et tags d'init retirés du profil appliqué, partout
+    detected_tags = (((document or {}).get("detecte") or {}).get("init_tags") or "")
+    return cucumber_modules.scope_profile({**profile, "sources": sources, "avertissements": warnings,
+                                           "clears_application": clears, "init_tags_detectes": detected_tags})
 
 
 def save_user_fields(client_name: str, fields: dict) -> dict:

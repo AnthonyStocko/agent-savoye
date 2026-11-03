@@ -26,7 +26,8 @@ import time
 import zipfile
 from datetime import datetime
 
-from tools import cucumber_environment, cucumber_init_data, cucumber_profile, cucumber_recreation, cucumber_versions
+from tools import (cucumber_environment, cucumber_init_data, cucumber_modules, cucumber_profile, cucumber_recreation,
+                   cucumber_versions)
 from tools.cucumber_tools import (CLIENT_REFS, _git, _read_json, _read_text_file, _write_json, cache_dir, git_repos,
                                   pick_ref)
 
@@ -254,6 +255,9 @@ def init_facts(worktree: str, client_name: str, profile: dict, inventory: dict) 
     usages des champs personnalisés et des données d'initializers par les tests et les processus.
     """
     init = cucumber_init_data.client_init(worktree, client_name, os.getenv("CUCUMBER_INIT_TAGS", ""))
+    # Init d'un module exclu du périmètre testé (profil) : ni vérifiée ni complétée
+    init["features"] = [f for f in init.get("features") or []
+                        if not cucumber_modules.path_excluded(f["chemin"], profile)]
     paths = cucumber_init_data.init_paths(init)
     features = [feature_facts(p, _read_text_file(os.path.join(worktree, *p.split("/")))) for p in paths]
     # Feature hors init qui purge ou intègre globalement : trace d'une init existante mal rangée

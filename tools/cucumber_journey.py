@@ -6,7 +6,7 @@ import os
 import re
 
 from tools import (cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_decisions,
-                   cucumber_import, cucumber_profile, cucumber_run)
+                   cucumber_import, cucumber_modules, cucumber_profile, cucumber_run)
 from tools.cucumber_tools import (_read_json, completable_specifics, init_patch_path, patch_path, pending_lots,
                                   worktree_dir)
 
@@ -235,9 +235,15 @@ def overview_line(client_name: str, init_label: str, rows: list, analysis: dict)
     """
     groups = cucumber_coverage.summary_groups(rows)
     tested = len(groups["test"])
+    scoped = len(cucumber_coverage.in_scope(rows))
     parts = [client_name.capitalize(), init_label,
-             f"{tested} tâche{'s' if tested > 1 else ''} avec un test sur {len(rows)}" if rows else
+             f"{tested} tâche{'s' if tested > 1 else ''} avec un test sur {scoped}" if rows else
              "aucune tâche inventoriée"]
+    # Modules testés et exclus du profil client (« Modules testés : WMS — TMS exclu »)
+    modules = cucumber_modules.summary_line(cucumber_profile.effective_profile(
+        cucumber_profile.load_profile(client_name))) if client_name else ""
+    if modules:
+        parts.insert(1, modules)
     if not analysis:
         parts.append("aucun run importé : couverture réelle non mesurée")
     elif analysis.get("non_analyse"):

@@ -24,8 +24,8 @@ import os
 import re
 from datetime import datetime
 
-from tools import (cucumber_audit, cucumber_import, cucumber_job, cucumber_links, cucumber_profile, cucumber_studio,
-                   cucumber_testability)
+from tools import (cucumber_audit, cucumber_import, cucumber_job, cucumber_links, cucumber_modules, cucumber_profile,
+                   cucumber_studio, cucumber_testability)
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _write_json, a_revoir_tag, cache_dir,
                                   git_repos, latest_results, load_state, studio_dependencies, worktree_dir)
 from tools.cucumber_verify import NOT_TEST_STATUSES, all_verified, failure_category, scenario_id
@@ -44,6 +44,7 @@ STATES = {
     "a_confirmer": ("testable, informations à confirmer", "🟡", "orange"),
     "non_testable": ("non testable aujourd'hui", "⚫", "gray"),
     "sans_objet": ("sans objet", "▫️", "gray"),
+    "hors_perimetre": ("hors périmètre (module exclu)", "🚫", "gray"),
 }
 WRITTEN_STATES = ("vert", "echec", "desactive", "non_execute")
 SELECTABLE_STATES = ("non_couvert", "partiel", "a_confirmer", "non_testable", "sans_objet")
@@ -592,7 +593,19 @@ def coverage_rows(client_name: str, inventory: dict, state: dict = None, sources
             "couvert_par": "", "chaine": [], "chaine_titre": "",
             "generation": (state.get("generations") or {}).get(spec["id"]) or {}}
     propagate(rows, coverage_links(specifics, results))
+    # Module exclu du périmètre testé (profil) : hors des taux et du nombre de tâches à tester, jamais proposé
+    for spec_id, row in rows.items():
+        module = cucumber_modules.task_excluded(specifics[spec_id], profile)
+        if module:
+            row.update(etat="hors_perimetre", cause=f"module {module} exclu du périmètre testé", couvert_par="",
+                       relance_inutile={}, module_exclu=module,
+                       phrase=f"Hors périmètre : le module {module} est exclu des tests de ce client.")
     return selection_order(list(rows.values()))
+
+
+def in_scope(rows: list) -> list:
+    """Lignes du périmètre testé (hors tâches d'un module exclu)."""
+    return [r for r in rows if r["etat"] != "hors_perimetre"]
 
 
 def useless_relaunch(spec: dict, result: dict, lot: int, profile: dict) -> dict:
@@ -693,14 +706,14 @@ def selection_order(rows: list) -> list:
 
 GROUPS = {"test": "ont un test", "partiel": "sont partielles", "indirect": "sont couvertes par une autre tâche",
           "a_couvrir": "restent à couvrir", "non_testable": "ne sont pas testables aujourd'hui",
-          "sans_objet": "sont sans objet"}
+          "sans_objet": "sont sans objet", "hors_perimetre": "sont hors périmètre (module exclu)"}
 
 
 def group_of(row: dict) -> str:
     """Groupe du résumé, un seul par tâche : test propre, partielle, couverte par une autre, à couvrir, etc."""
     if row["etat"] == "partiel":
         return "partiel"
-    if row["etat"] in ("non_testable", "sans_objet"):
+    if row["etat"] in ("non_testable", "sans_objet", "hors_perimetre"):
         return row["etat"]
     if row["scenarios"] and row["etat"] in WRITTEN_STATES:
         return "test"
@@ -732,7 +745,8 @@ def summary_sentence(rows: list, run: dict) -> list:
     à couvrir. »
     """
     groups = summary_groups(rows)
-    parts = [(f"{len(rows)} tâche{'s' if len(rows) > 1 else ''}.", "")]
+    total = len(in_scope(rows))
+    parts = [(f"{total} tâche{'s' if total > 1 else ''}.", "")]
     tested = [r for r in rows if r["id"] in set(groups["test"])]
     green = sum(1 for r in tested if r["etat"] == "vert")
     detail = (f" (dont {green} vert{'s' if green > 1 else ''} au run du {run['date'][8:10]}/{run['date'][5:7]})"
@@ -740,6 +754,9 @@ def summary_sentence(rows: list, run: dict) -> list:
     for key, label in GROUPS.items():
         count = len(groups[key])
         if count or key in ("test", "a_couvrir"):
+            if key == "hors_perimetre":
+                parts.append((f"{count} hors périmètre (module exclu), non comptée{'s' if count > 1 else ''}.", key))
+                continue
             parts.append((f"{count} {label}" + (detail if key == "test" and count else "") + ".", key))
     return parts
 
@@ -747,12 +764,13 @@ def summary_sentence(rows: list, run: dict) -> list:
 # Filtres de la liste « À tester », un par nombre du résumé « Où en est-on »
 FILTERS = {"test": "ont un test", "vert": "vérifiées vertes", "echec": "en échec",
            "indirect": "couvertes par une autre", "a_tester": "restent à tester", "reponses": "attendent une réponse",
-           "non_testable": "ne sont pas testables aujourd'hui", "sans_objet": "sont sans objet"}
+           "non_testable": "ne sont pas testables aujourd'hui", "sans_objet": "sont sans objet",
+           "hors_perimetre": "sont hors périmètre (module exclu)"}
 # État d'une fonctionnalité en une icône et un ou deux mots (liste « À tester »)
 SHORT_STATES = {"vert": "✅ vérifié, vert", "echec": "❌ en échec", "desactive": "⏸ désactivé",
                 "non_execute": "✍ test écrit", "partiel": "🟣 partiel", "non_couvert": "⚪ à tester",
                 "a_confirmer": "⚪ à tester", "en_attente": "🔗 couvert par une autre", "non_testable": "⛔ bloqué",
-                "sans_objet": "— sans objet"}
+                "sans_objet": "— sans objet", "hors_perimetre": "🚫 hors périmètre (module exclu)"}
 
 
 def short_state(row: dict) -> str:
@@ -773,7 +791,8 @@ def in_filter(row: dict, key: str) -> bool:
             "echec": group == "test" and row["etat"] == "echec", "indirect": group == "indirect",
             "a_tester": group in ("a_couvrir", "partiel"),
             "reponses": bool((row.get("evaluation") or {}).get("attendues")) and row["etat"] == "a_confirmer",
-            "non_testable": group == "non_testable", "sans_objet": group == "sans_objet"}.get(key, True)
+            "non_testable": group == "non_testable", "sans_objet": group == "sans_objet",
+            "hors_perimetre": group == "hors_perimetre"}.get(key, True)
 
 
 def status_sentences(rows: list, run: dict) -> list:
@@ -789,7 +808,8 @@ def status_sentences(rows: list, run: dict) -> list:
     green = sum(1 for r in tested if r["etat"] == "vert")
     failed = sum(1 for r in tested if r["etat"] == "echec")
     plural = lambda n, word: f"{n} {word}{'s' if n > 1 else ''}"
-    parts = [(f"{plural(len(rows), 'fonctionnalité')} spécifique{'s' if len(rows) > 1 else ''}.", "")]
+    total = len(in_scope(rows))
+    parts = [(f"{plural(total, 'fonctionnalité')} spécifique{'s' if total > 1 else ''}.", "")]
     if not tested:
         parts.append(("Aucune n'a encore de test.", ""))
     elif not run:
@@ -812,11 +832,20 @@ def status_sentences(rows: list, run: dict) -> list:
                       f"testable{'s' if len(groups['non_testable']) > 1 else ''} aujourd'hui.", "non_testable"))
     if groups["sans_objet"]:
         parts.append((f"{len(groups['sans_objet'])} sans objet.", "sans_objet"))
+    if groups["hors_perimetre"]:
+        count = len(groups["hors_perimetre"])
+        parts.append((f"{count} hors périmètre (module exclu), non comptée{'s' if count > 1 else ''}.",
+                      "hors_perimetre"))
     return parts
 
 
 def rates(rows: list) -> dict:
-    """Couverture RÉELLE (actifs et verts) et ÉCRITE (actifs et désactivés), en % des tâches, et partielles."""
+    """
+    Couverture RÉELLE (actifs et verts) et ÉCRITE (actifs et désactivés), en % des tâches du périmètre testé (hors
+    module exclu, compté à part : « hors_perimetre »), et partielles.
+    """
+    out_of_scope = len(rows) - len(in_scope(rows))
+    rows = in_scope(rows)
     total = len(rows)
     count = {key: sum(1 for r in rows if r["etat"] == key) for key in STATES}
 
@@ -824,7 +853,7 @@ def rates(rows: list) -> dict:
         return round(100 * n / total) if total else 0
     return {"total": total, "par_etat": count, "reelle": pct(count["vert"]),
             "ecrite": pct(sum(count[k] for k in WRITTEN_STATES)), "partielles": count["partiel"],
-            "couvertes": count["vert"]}
+            "couvertes": count["vert"], "hors_perimetre": out_of_scope}
 
 
 def state_label(row: dict) -> str:
@@ -857,7 +886,8 @@ def summary_line(rows: list) -> str:
     if not r["total"]:
         return "aucune tâche inventoriée"
     return (f"{r['couvertes']} tâche(s) couverte(s) et vertes sur {r['total']} (réelle {r['reelle']} %, écrite "
-            f"{r['ecrite']} %), {r['partielles']} partielle(s)")
+            f"{r['ecrite']} %), {r['partielles']} partielle(s)"
+            + (f", {r['hors_perimetre']} hors périmètre (module exclu)" if r["hors_perimetre"] else ""))
 
 
 def failing_test_causes(rows: list) -> int:

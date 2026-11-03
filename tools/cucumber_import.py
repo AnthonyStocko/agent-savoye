@@ -815,8 +815,13 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         durations = scenario_durations(report, console)
         out["durees"] = {**slow_scenarios(durations, results),
                          "par_scenario": {i: round(d, 1) for i, d in durations.items()}}
-        out["init_en_echec"] = init_failure(report, results, *init_markers(client_name)) if report else \
-            console_init_failure(results, *init_markers(client_name))
+        # Features d'un module exclu du périmètre testé (profil) : échecs « hors périmètre », ni init ni correction
+        scope = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name))
+        out_of_scope = scope_checker(scope, worktree)
+        out["hors_perimetre"] = sorted(i for i in failures if out_of_scope(i.split("::", 1)[0]))
+        judged = {i: r for i, r in results.items() if i not in set(out["hors_perimetre"])}
+        out["init_en_echec"] = init_failure(report, judged, *init_markers(client_name)) if report else \
+            console_init_failure(judged, *init_markers(client_name))
         out["avertissements"] = log_warnings([(f["nom"], f["texte"]) for f in files if f["type"] == "logs"],
                                              failures)
         # Contrôle automatique : chaque échec compté par la console a son résultat dans l'analyse
@@ -864,19 +869,32 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
                   for i in failures}
         # Un résultat explicite par échec (cucumber_failures) ; ceux déjà traités par une correction sont gardés
         out["echecs"] = failure_results(client_name, numero, results, out["init_en_echec"], state, worktree,
-                                        contexts)
+                                        contexts, out_of_scope)
         if not out["init_en_echec"]:
             out["propositions"], out["a_prouver"] = correction_proposals(
-                failures, state, extras, db_tools.is_db_configured("cucumber"),
-                {e["id"] for e in cucumber_failures.pending(out)})
+                {i: r for i, r in failures.items() if i not in set(out["hors_perimetre"])}, state, extras,
+                db_tools.is_db_configured("cucumber"), {e["id"] for e in cucumber_failures.pending(out)})
     folder = os.path.join(imports_dir(client_name), str(numero))
     _write_json(os.path.join(folder, "analyse.json"), out)
     _write_text(os.path.join(folder, "analyse.md"), analysis_markdown(out))
     return out
 
 
+def scope_checker(profile: dict, worktree: str = ""):
+    """fichier -> module exclu du périmètre testé de la feature (dossiers, puis tags lus dans `worktree`), ''."""
+    from tools import cucumber_modules
+    if not cucumber_modules.excluded(profile):
+        return lambda fichier: ""
+
+    def check(fichier: str) -> str:
+        full = os.path.join(worktree, *fichier.split("/")) if worktree and fichier else ""
+        text = _read_text_file(full) if full and os.path.exists(full) else ""
+        return cucumber_modules.path_excluded(fichier, profile, text)
+    return check
+
+
 def failure_results(client_name: str, numero: int, results: dict, init: dict, state: dict, worktree: str,
-                    contexts: dict = None) -> list:
+                    contexts: dict = None, out_of_scope=None) -> list:
     """
     Résultat explicite de chaque échec du run (cucumber_failures.failure_results) : propriétaire jugé sur le
     worktree et la branche de base, désactivation proposée (patch) pour un défaut du produit, résultats déjà
@@ -885,7 +903,8 @@ def failure_results(client_name: str, numero: int, results: dict, init: dict, st
     base = state.get("base", "")
     is_owned = (lambda rel: cucumber_failures.owned(worktree, base, rel)) if worktree and os.path.isdir(worktree) \
         else None
-    items = cucumber_failures.failure_results(results, init, is_owned, contexts=contexts)
+    items = cucumber_failures.failure_results(results, init, is_owned, contexts=contexts,
+                                              out_of_scope=out_of_scope)
     previous = {e["id"]: e for e in (_read_json(cucumber_failures.analysis_path(imports_dir(client_name), numero),
                                                 {}) or {}).get("echecs") or [] if e.get("statut") == "traite"}
     folder = os.path.join(imports_dir(client_name), str(numero))

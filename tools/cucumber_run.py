@@ -21,7 +21,7 @@ job (identifiants) n'y sont jamais écrits.
 import os
 from datetime import datetime
 
-from tools import cucumber_checks, cucumber_job, cucumber_profile, jenkins_tools
+from tools import cucumber_checks, cucumber_job, cucumber_modules, cucumber_profile, jenkins_tools
 from tools.cucumber_tools import _git, java_package_segment, load_state, rev_parse, save_state
 
 DEFAULT_TIMEOUT = 3600
@@ -140,11 +140,17 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     de tests, est importable). `push` faux : rien n'est commité ni poussé, le job exécute la branche (`branch`, à
     défaut celle du profil) telle qu'elle est sur le dépôt client — lecture seule, branche d'intégration permise.
     """
-    tags = (tags or "").strip()
+    asked = (tags or "").strip()
+    # Modules exclus du périmètre testé (profil) : « and not @<TAG> », sans leurs tags d'init
+    tags = cucumber_modules.run_expression(asked, profile, client_name)
     check = preflight(profile, worktree, client_name, "" if not push else base_branch)
     if not push and branch:
         check["branche"] = branch.strip()
         check["erreurs"] = [e for e in check["erreurs"] if "branche de travail" not in e]
+    if asked and not tags:
+        check["erreurs"].append(f"« {asked} » ne sélectionne que l'init de modules exclus du périmètre testé")
+    elif tags != asked:
+        log(f"[RUN JENKINS] Modules exclus du périmètre : expression de tags « {tags} »")
     run = {"date": datetime.now().isoformat(timespec="seconds"), "job": check["job"], "branche": check["branche"],
            "tags": tags, "commit": "", "build": "", "resultat": "", "ok": False, "message": "", "parametres": {},
            "selection": "", "version_testee": ""}
@@ -234,7 +240,7 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
     "parametres", "attendus"} ; ok faux si le run serait refusé.
     """
     from tools.cucumber_verify import a_revoir_tag, expected_count, feature_texts
-    tags = (tags or "").strip()
+    tags = cucumber_modules.run_expression((tags or "").strip(), profile, client_name)
     check = preflight(profile, worktree, client_name, "" if not push else base_branch)
     if not push and branch:
         check["branche"] = branch.strip()

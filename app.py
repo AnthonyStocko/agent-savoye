@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import cucumber_init_fix, standard_version, standard_version_task
+from tools import cucumber_init_fix, cucumber_modules, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1371,6 +1371,7 @@ def render_project_settings(ctx: dict) -> None:
             st.caption(f"Dépôt cible : **{ctx['client']}-cucumber** · identifiant de travail "
                        f"**{cucumber_tools.work_id(ctx['client'])}**")
             render_standard_version(ctx["client"])
+            render_tested_modules(ctx)
         st.text_input("Schéma de la config client (base client) :", key="cucumber_source_schema",
                       help="Schéma de la base client (connexion CLIENT_SOURCE_DB_*, à défaut DB_*) dont la "
                            "configuration est recopiée dans le schéma des tests Cucumber par le bouton « Recopier la "
@@ -1382,6 +1383,91 @@ def render_project_settings(ctx: dict) -> None:
         last = st.session_state.get("cucumber_std_ref") or {}
         if last.get("repo") == std_input and last.get("ref"):
             st.caption(f"Référence Git utilisée lors de la dernière exécution : **{last['ref']}**")
+
+
+def render_tested_modules(ctx: dict) -> None:
+    """
+    « Modules testés » : une coche par module détecté chez le client (tags des features rangées sous un dossier du
+    même nom, tâches de l'inventaire ; aucune liste en dur). Décocher un module l'exclut partout (init, génération,
+    couverture, runs de l'agent, import) ; pour les runs lancés à la main, retrait du tag client de ses features
+    proposé (aperçu des fichiers touchés, patch), réversible à la réactivation.
+    """
+    client = ctx["client"]
+    document = cucumber_profile.load_profile(client)
+    profile = cucumber_profile.effective_profile(document)
+    detected = cucumber_modules.modules(profile)
+    if not detected and os.path.isdir(cucumber_profile.base_worktree_dir(client)):
+        # Profil détecté avant les modules (détection en cache, commits inchangés) : lus dans la copie du dépôt
+        detected = cucumber_modules.detect_in_worktree(cucumber_profile.base_worktree_dir(client), client, "",
+                                                       profile.get("tag_client", ""))
+        profile = {**profile, "modules": detected}
+        if detected:
+            document.setdefault("detecte", {})["modules"] = detected
+            cucumber_profile._write_json(cucumber_profile.profile_path(client), document)
+    out = cucumber_modules.excluded(profile)
+    known = {m["code"]: m for m in detected}
+    for code in sorted(out - set(known)):
+        known[code] = {"code": code, "tag": f"@{code}", "sources": ["exclu, plus détecté"]}
+    if not known:
+        st.caption("Modules testés : détection à venir (analyse du projet).")
+        return
+    st.markdown("**Modules testés**")
+    columns = st.columns(min(len(known), 6))
+    chosen = set()
+    for index, code in enumerate(sorted(known)):
+        module = known[code]
+        if columns[index % len(columns)].checkbox(
+                code, value=code not in out, key=f"cucumber_module_{client}_{code}",
+                help=f"Tag {module['tag']} — " + ", ".join(module["sources"]) + ". Décoché : exclu de l'init, de la "
+                     "génération, de la couverture, des runs lancés par l'agent et des corrections."):
+            continue
+        chosen.add(code)
+    if chosen != out:
+        cucumber_modules.save_excluded(client, chosen)
+        st.rerun()
+    st.caption(cucumber_modules.summary_line(profile))
+    worktree = cucumber_profile.base_worktree_dir(client)
+    for code in sorted(set(known)):
+        state = cucumber_modules.retag_state(document, code)
+        restore = code not in out
+        if restore and state.get("etat") != "retire":
+            continue
+        plan = cucumber_modules.retag_plan(worktree, profile, code, restore) if os.path.isdir(worktree) else []
+        tag = profile.get("tag_client") or "tag client"
+        if not plan:
+            if not restore:
+                st.caption(f"{code} : aucune feature du module ne porte {tag} dans le dépôt" +
+                           (f" (patch d'exclusion produit le {state['date'][:10]} : à appliquer)" if state.get("patch")
+                            else "") + ".")
+            continue
+        label = (f"Remettre {tag} sur les {len(plan)} feature(s) {code}" if restore else
+                 f"Retirer {tag} des {len(plan)} feature(s) {code}")
+        with st.expander(label + (" (réactivation)" if restore else " (runs Jenkins lancés à la main)"),
+                         icon=":material/label_off:" if not restore else ":material/label:"):
+            st.caption(f"Le job Jenkins filtre par {tag} : sans ce retrait, ses runs lancés à la main exécutent "
+                       f"encore les features {code}. Le tag est remplacé par {cucumber_modules.EXCLUDED_TAG} à la même "
+                       f"place (réversible à la réactivation)." if not restore else
+                       f"Module {code} réactivé : {cucumber_modules.EXCLUDED_TAG} redevient {tag} à la même place.")
+            for item in plan[:30]:
+                st.markdown(f"- `{item['fichier']}` ({item['tags']} tag(s))")
+                st.code("\n".join(f"- {b}" for b in item["avant"]) + "\n" +
+                        "\n".join(f"+ {a}" for a in item["apres"]), language="diff")
+            if len(plan) > 30:
+                st.caption(f"… et {len(plan) - 30} autre(s) feature(s).")
+            if st.button("Produire le patch", key=f"cucumber_module_tag_{client}_{code}", disabled=not ctx["ready"],
+                         type="primary"):
+                code_rc = run_main_step(ctx["cmd"] + ["--module-tag", code]
+                                        + (["--module-tag-restore"] if restore else []))
+                path = cucumber_modules.retag_patch_path(client, code, restore)
+                if code_rc == 0 and os.path.exists(path):
+                    st.success(f"Patch produit : {path} — à appliquer à la branche lue par le job.")
+                    with open(path, "rb") as f:
+                        st.download_button("Télécharger le patch", f.read(), file_name=os.path.basename(path),
+                                           key=f"cucumber_module_patch_{client}_{code}")
+                else:
+                    (st.info if code_rc == 0 else st.error)(
+                        "Rien à changer sur la branche de base." if code_rc == 0 else
+                        f"Patch non produit : {interruption_cause(code_rc)}.")
 
 
 def render_standard_version(client: str) -> None:
@@ -1601,7 +1687,8 @@ def render_cucumber_profile(ctx: dict, profile_doc: dict, detection: dict, statu
         if not st.session_state.get(editing_key):
             return
         depot = profile_doc.get("depot") or {}
-        editable = [k for k in cucumber_profile.FIELDS if k not in depot and k not in ("workarounds", "reponses")]
+        editable = [k for k in cucumber_profile.FIELDS if k not in depot
+                    and k not in ("workarounds", "reponses", "modules", "modules_exclus")]
         extra = st.multiselect("Autres champs faux à corriger", [k for k in editable if k not in indicator["manquants"]],
                                format_func=cucumber_profile.LABELS.get, key=f"cucumber_profile_extra_{client}")
         fields = [k for k in editable if k in indicator["manquants"] or k in extra]
@@ -1618,7 +1705,8 @@ def render_cucumber_profile(ctx: dict, profile_doc: dict, detection: dict, statu
                         st.error("Runner : JSON invalide, profil non enregistré.")
                         return
                 # Saisie complète : champs non affichés repris du profil appliqué (la détection est filtrée)
-                current = {k: profile[k] for k in editable + ["reponses"]}
+                # (features et tags d'init d'avant le retrait des modules exclus : la saisie garde tout le client)
+                current = {k: profile.get(f"{k}_tous", profile[k]) for k in editable + ["reponses"]}
                 cucumber_profile.save_user_fields(client, {**current, **values})
                 cucumber_detection.start(client, ctx["cmd"], force=True)
                 st.session_state[editing_key] = False

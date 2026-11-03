@@ -8,7 +8,8 @@ Chaque échec reçoit, à l'analyse de l'import, UN résultat parmi :
   prochain run ;
 - environnement : la cause prouvée et l'action à faire, en une phrase ;
 - produit : défaut du produit, avec sa preuve et la désactivation proposée (patch téléchargeable) ;
-- hors_depot : le scénario n'appartient pas au dépôt de l'agent, avec la façon de l'y intégrer.
+- hors_depot : le scénario n'appartient pas au dépôt de l'agent, avec la façon de l'y intégrer ;
+- hors_perimetre : la feature est d'un module exclu du périmètre testé (profil client), rien à corriger.
 « Rien à faire » n'existe que pour un run entièrement vert : un import avec au moins un échec et zéro résultat est
 une erreur de l'agent (missing). Tous les scénarios du dépôt sont ceux de l'agent, tagués par lui ou non : la
 correction d'un scénario écrit à la main ou par un autre outil lui ajoute le tag de son lot de correction.
@@ -23,8 +24,9 @@ from tools.cucumber_verify import failure_kind, parse_scenarios
 
 CATEGORIES = {"correction": "Correction proposée", "diagnostic": "Diagnostic nécessaire",
               "environnement": "Environnement", "produit": "Défaut du produit",
-              "hors_depot": "Hors du dépôt de l'agent"}
-ICONS = {"correction": "🛠", "diagnostic": "🔎", "environnement": "🌐", "produit": "🐞", "hors_depot": "📦"}
+              "hors_depot": "Hors du dépôt de l'agent", "hors_perimetre": "Hors périmètre (module exclu)"}
+ICONS = {"correction": "🛠", "diagnostic": "🔎", "environnement": "🌐", "produit": "🐞", "hors_depot": "📦",
+         "hors_perimetre": "🚫"}
 # Catégories traitées par « Corriger » (lot « correction » de l'import)
 TO_WRITE = ("correction", "diagnostic")
 
@@ -244,12 +246,12 @@ def owned(worktree: str, base: str, fichier: str) -> bool:
 
 
 def failure_results(results: dict, init_failure: dict = None, is_owned=None, repo_label: str = "",
-                    contexts: dict = None) -> list:
+                    contexts: dict = None, out_of_scope=None) -> list:
     """
     Résultats de chaque scénario en échec ({id: résultat} de l'analyse), dans l'ordre du run : classement,
     initialisation en échec (tout relève de l'environnement), cascades (catégorie de l'échec qui les cause),
     scénarios hors du dépôt de l'agent. `contexts` : {id: contexte du run} lu par classify (dépendance entre
-    tests, données partagées).
+    tests, données partagées). `out_of_scope(fichier)` : module exclu du périmètre testé de la feature ('' sinon).
     """
     failures = [(i, r) for i, r in results.items() if r.get("statut") != "passe"]
     out, by_file = [], {}
@@ -258,7 +260,13 @@ def failure_results(results: dict, init_failure: dict = None, is_owned=None, rep
         item = {"id": identifier, "fichier": fichier, "titre": titre, "step": result.get("step", ""),
                 "message": _sentence(result.get("message", ""), 300), "statut": "a_traiter", "patch": "",
                 "lot": None, "preuve": _sentence(result.get("message", ""), 300)}
-        if is_owned is not None and fichier and not is_owned(fichier):
+        module = out_of_scope(fichier) if out_of_scope and fichier else ""
+        if module:
+            item.update(categorie="hors_perimetre", nature="hors_perimetre", statut="hors_perimetre",
+                        cause=f"La feature {fichier} est du module {module}, exclu du périmètre testé du client.",
+                        action=f"Rien à corriger. Pour ne plus l'exécuter dans les runs lancés à la main, retirez le "
+                               f"tag client des features {module} (« Données du projet », Modules testés).")
+        elif is_owned is not None and fichier and not is_owned(fichier):
             item.update(categorie="hors_depot", nature="hors_depot",
                         cause=f"La feature {fichier} n'est pas dans " + (f"le dépôt {repo_label}." if repo_label
                                                                          else "le dépôt de l'agent."),

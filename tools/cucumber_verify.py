@@ -1077,6 +1077,13 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
     `tags` (selection_gap) : non analysé (ok faux, ecart_selection). Renvoie {ok, message, build, resultats}.
     """
     started = time.time()
+    # Modules exclus du périmètre testé (profil du job) : « and not @<TAG> », sans leurs tags d'init
+    from tools.cucumber_modules import run_expression
+    scoped = run_expression(tags, (sources or {}).get("profil") or {}) if tags else tags
+    if tags and not scoped:
+        return {"ok": False, "message": f"non lancé : « {tags} » ne sélectionne que l'init de modules exclus du "
+                                        f"périmètre testé", "build": "", "resultats": {}}
+    tags = scoped
     if mode == "branche":
         return run_on_branch(worktree, tags, env, overrides, label, sources or {})
     if mode == "local":

@@ -17,7 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
 from tools.jira_tools import (
@@ -1142,7 +1142,6 @@ def ensure_local_repo(repo_input: str, repo_label: str, only: list = None) -> st
             else:
                 print(f"❌ Erreur lors du clonage de {repo_input} :\n{res_clone.stderr.strip()}")
                 return repo_input
-
         return target_dir
 
 
@@ -1237,6 +1236,8 @@ def main():
     parser.add_argument("--init-only", action="store_true", help="generate-cucumber-client : lot d'initialisation des données, en patch séparé, selon l'état détecté de l'init : absente, copie des Init_<MODULE> du Cucumber Standard pour ses modules ; incomplète, compléments seuls dans une nouvelle feature (jamais de réécriture ni de fichier protégé modifié) ; complète, rien. Sans appel à Claude, sauf steps du projet à écrire")
     parser.add_argument("--profile-only", action="store_true", help="generate-cucumber-client : détecte le profil client (racine et tag des features, init, clear, fichiers du module spécifique, runner, codes de référence, version de la bibliothèque) dans le dépôt <client>-cucumber, sans appel à Claude")
     parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
+    parser.add_argument("--module-tag", default="", help="generate-cucumber-client : module exclu du périmètre testé (ex. TMS) : son tag client est remplacé par @MODULE_EXCLU dans ses features (runs Jenkins lancés à la main), commit dédié et patch <client>-cucumber-module-<mod>-exclu.patch, sans appel à Claude")
+    parser.add_argument("--module-tag-restore", action="store_true", help="avec --module-tag : opération inverse à la réactivation du module (@MODULE_EXCLU -> tag client), patch <client>-cucumber-module-<mod>-reactive.patch")
     parser.add_argument("--fix-client-tags", action="store_true", help="generate-cucumber-client : règle rétroactive « tag client » : ajoute le tag client au-dessus des scénarios actifs qui ne l'ont pas (scénarios désactivés exclus), commite dans le worktree, contrôle de nouveau et régénère le patch, sans appel à Claude")
     parser.add_argument("--detect-force", action="store_true", help="generate-cucumber-client --detect-only : détection refaite même si l'empreinte des commits n'a pas changé (profil corrigé)")
     parser.add_argument("--health-only", action="store_true", help="generate-cucumber-client : bilan de santé du dépôt <client>-cucumber avant génération (emplacement et tags des features, fichiers de données manquants, compilation et dry-run de toutes ses features), sans appel à Claude")
@@ -2246,6 +2247,34 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
 CUCUMBER_ENV_PREFIX = "[CUCUMBER ENVIRONNEMENT] ❌"
 
 
+def retag_module(client: str, cucumber_repo_dir: str, base: str, code: str, restore: bool = False) -> int:
+    """
+    Module `code` exclu du périmètre testé : tag client de ses features remplacé par @MODULE_EXCLU (`restore` :
+    remis), dans un espace dédié qui repart de `base`, un commit, un patch à appliquer au dépôt client. 0 token.
+    """
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    if not profile.get("tag_client"):
+        print("[CUCUMBER MODULES] ❌ Tag client absent du profil : rien n'est modifié.")
+        return 2
+    if not restore and code not in cucumber_modules.excluded(profile):
+        print(f"[CUCUMBER MODULES] ❌ Le module {code} n'est pas exclu du périmètre testé : décochez-le d'abord.")
+        return 2
+    try:
+        result = cucumber_modules.apply_retag(cucumber_repo_dir, client, base, profile, code, restore)
+    except RuntimeError as e:
+        print(f"[CUCUMBER MODULES] ❌ {e}")
+        return 1
+    cucumber_modules.record_retag(client, code, restore, result)
+    if not result["patch"]:
+        print(f"[CUCUMBER MODULES] {result['message']}.")
+        return 0
+    print(f"[CUCUMBER MODULES] {result['message']} : {len(result['fichiers'])} feature(s)")
+    for path in result["fichiers"]:
+        print(f"    {path}")
+    print(f"[CUCUMBER MODULES] Patch : {result['patch']} — à appliquer à la branche lue par le job Jenkins.")
+    return 0
+
+
 def fix_client_tags(client: str, local_cucumber_std_repo: str) -> int:
     """
     Règle rétroactive « tag client » : ajoute le tag client au-dessus des scénarios actifs qui ne l'ont pas
@@ -2713,15 +2742,25 @@ def _run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: st
                                                  cucumber_repo_dir, base, facts, status)
     if args.init_modules.strip():
         modules = {m.strip().upper() for m in args.init_modules.split(",") if m.strip()}
-        unknown = modules - set(cucumber_init.INIT_MODULES)
+        known = set(cucumber_init.std_init_files(local_cucumber_std_repo)) or set(cucumber_init.INIT_MODULES)
+        unknown = modules - known
         if unknown:
             print(f"❌ Module(s) inconnu(s) : {', '.join(sorted(unknown))} (attendus : "
-                  f"{', '.join(cucumber_init.INIT_MODULES)}).")
+                  f"{', '.join(sorted(known))}).")
             return 2
         print(f"[CUCUMBER INIT] Modules choisis : {', '.join(sorted(modules))}")
     else:
-        modules = cucumber_init.client_modules(local_client_repo, cucumber_tools.load_inventory(client))
+        modules = cucumber_init.client_modules(local_client_repo, cucumber_tools.load_inventory(client),
+                                               set(cucumber_init.std_init_files(local_cucumber_std_repo))
+                                               or cucumber_init.INIT_MODULES)
         print(f"[CUCUMBER INIT] Modules détectés : {', '.join(sorted(modules)) or 'aucun'}")
+    # Modules décochés dans « Données du projet » : ni init générée, ni corrigée, ni vérifiée
+    out_of_scope = sorted(m for m in modules if m in cucumber_modules.excluded(
+        cucumber_profile.effective_profile(cucumber_profile.load_profile(client))))
+    if out_of_scope:
+        modules = {m for m in modules if m not in out_of_scope}
+        print(f"[CUCUMBER INIT] Module(s) exclu(s) du périmètre testé (profil client) : {', '.join(out_of_scope)} — "
+              f"aucune init générée pour eux, leurs clears commentés dans les autres inits.")
     if not modules:
         print("[CUCUMBER INIT] ❌ Aucun module WMS, TMS ou OMS : cochez les modules du client. Aucun patch produit.")
         return 2
@@ -3297,7 +3336,8 @@ def fix_init_jobs(args, numero: int, cucumber_repo_dir: str, client_root: str, s
         return 1
     argline = " ".join(str(v) for k, v in (reference.get("parametres") or {}).items() if "ARGLINE" in k.upper())
     environment = cucumber_jobs.apply_environment_rules(worktree, paths, cucumber_jobs.arg_properties(argline),
-                                                        cucumber_jobs.client_imports(client_root))
+                                                        cucumber_jobs.client_imports(client_root),
+                                                        cucumber_modules.excluded(profile))
     print(f"[CUCUMBER INIT] Règles et services externes (build de référence n° {reference.get('numero') or '?'}) : "
           + (f"{len(environment['notes'])} changement(s)" if environment["notes"] else "aucun changement"))
     for note in environment["notes"]:
@@ -3722,6 +3762,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                  odatio_version)
     if args.health_only:
         return run_cucumber_health(client, local_cucumber_std_repo, cucumber_repo_dir, base, project)
+    if args.module_tag.strip():
+        subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
+        return retag_module(client, cucumber_repo_dir, base, args.module_tag.strip().upper(), args.module_tag_restore)
     if args.profile_only:
         subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
         return 0 if detect_cucumber_profile(client, cucumber_repo_dir, base, local_cucumber_std_repo,
@@ -3790,6 +3833,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         inventory, _env_int("CUCUMBER_INLINE_STUDIO_LINES", cucumber_tools.DEFAULT_INLINE_STUDIO_LINES))
     cucumber_tools.save_inventory(client, inventory)
     specifics = {s["id"]: s for s in inventory["specifiques"]}
+    # Tâches d'un module exclu du périmètre testé (« Données du projet ») : ni proposées, ni générées, ni corrigées
+    scope = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    out_of_scope = {i: cucumber_modules.task_excluded(s, scope) for i, s in specifics.items()}
+    out_of_scope = {i: m for i, m in out_of_scope.items() if m}
+    if out_of_scope:
+        specifics = {i: s for i, s in specifics.items() if i not in out_of_scope}
+        print(f"[CUCUMBER] {len(out_of_scope)} tâche(s) hors périmètre (module exclu : "
+              f"{', '.join(sorted(set(out_of_scope.values())))}) écartée(s) de la génération et de la correction.")
     counts = {}
     for spec in specifics.values():
         counts[spec["couverture"]] = counts.get(spec["couverture"], 0) + 1

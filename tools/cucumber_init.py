@@ -21,8 +21,8 @@ import posixpath
 import re
 import shutil
 
-from tools import (cucumber_environment, cucumber_isolation, cucumber_library, cucumber_recreation,
-                   cucumber_versions)
+from tools import (cucumber_environment, cucumber_isolation, cucumber_library, cucumber_modules,
+                   cucumber_recreation, cucumber_versions)
 from tools.cucumber_tools import (_git, add_worktree, cache_dir, format_patch, git_repos, init_patch_path,
                                   java_class_suffix, java_package_segment)
 from tools.cucumber_verify import _STEP_LINE
@@ -49,12 +49,12 @@ def init_branch(client_name: str) -> str:
     return f"cucumber_{client_name}_init"
 
 
-def _modules_in(name: str) -> set:
+def _modules_in(name: str, codes=INIT_MODULES) -> set:
     """Modules nommés par un segment de `name` (ex. client-tms-provider -> TMS, wms_content -> WMS)."""
-    return {t.upper() for t in _MODULE_TOKEN.split(name.lower()) if t.upper() in INIT_MODULES}
+    return {t.upper() for t in _MODULE_TOKEN.split(name.lower()) if t.upper() in codes}
 
 
-def client_modules(client_root: str, inventory: dict) -> set:
+def client_modules(client_root: str, inventory: dict, codes=INIT_MODULES) -> set:
     """
     Modules du client parmi WMS, TMS, OMS : segments des noms de ses dépôts, puis des dépôts et dossiers de premier
     niveau des fichiers de ses spécifiques (inventaire). Les noms de dépôts seuls ne suffisent pas : un module
@@ -66,7 +66,7 @@ def client_modules(client_root: str, inventory: dict) -> set:
         for item in spec.get("fichiers") or []:
             names.append(item.get("repo") or "")
             names.append((item.get("path") or "").split("/", 1)[0])
-    return set().union(*map(_modules_in, names)) if names else set()
+    return set().union(*(_modules_in(n, set(codes)) for n in names)) if names else set()
 
 
 def std_init_files(cucumber_std_dir: str) -> dict:
@@ -75,8 +75,12 @@ def std_init_files(cucumber_std_dir: str) -> dict:
     données. Seuls les modules dont la feature porte le tag @INIT_<MOD> sont retenus.
     """
     result = {}
-    for module in INIT_MODULES:
-        features = os.path.join(cucumber_std_dir, *RESOURCES_DIR.split("/"), "features", module, INIT_DIR)
+    root = os.path.join(cucumber_std_dir or "", *RESOURCES_DIR.split("/"), "features")
+    # Modules : dossiers de premier niveau du Standard (aucune liste en dur), retenus si leur init porte @INIT_<MOD>
+    folders = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))) \
+        if cucumber_std_dir and os.path.isdir(root) else []
+    for module in folders:
+        features = os.path.join(root, module, INIT_DIR)
         found = [f for f in sorted(os.listdir(features)) if f.endswith(".feature")
                  and f"@INIT_{module}" in _read_text(os.path.join(features, f)).split()] \
             if os.path.isdir(features) else []
@@ -335,8 +339,9 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     client_tag = (profile or {}).get("tag_client", "")
     spec_files = list((profile or {}).get("spec_files") or [])
     std = std_init_files(cucumber_std_dir)
-    kept = sorted(m for m in modules if m in std)
-    result = {"modules": kept, "fichiers": [], "patch": "", "absents": sorted(set(modules) - set(std)),
+    out_of_scope = cucumber_modules.excluded(profile)
+    kept = sorted(m for m in modules if m in std and m.upper() not in out_of_scope)
+    result = {"modules": kept, "exclus": sorted(m for m in modules if m.upper() in out_of_scope), "fichiers": [], "patch": "", "absents": sorted(set(modules) - set(std) - out_of_scope),
               "avertissements": ([] if spec_files else [
                   "aucun fichier du module spécifique dans le profil client : après le clear, les données propres au "
                   "client (documents, statuts, partenaires…) ne seront pas recréées"]) + initializer_limits(profile),
@@ -370,6 +375,11 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
                 if library:
                     text, notes = mark_version_gaps(text, library, aligned, version)
                     result["todo_version"] += [f"{target_rel} : {n}" for n in notes]
+                if out_of_scope:
+                    # Module exclu du périmètre (profil) : son clear et sa configuration commentés ici aussi
+                    from tools.cucumber_jobs import drop_steps_of_absent_modules
+                    text, notes = drop_steps_of_absent_modules(text, set(), out_of_scope)
+                    result["avertissements"] += [f"{target_rel} {n}" for n in notes]
                 with open(target, "w", encoding="utf-8", newline="") as f:
                     f.write(text)
             else:

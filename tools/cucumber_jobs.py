@@ -879,7 +879,7 @@ def client_imports(client_root: str) -> set:
 # Steps propres à un module (produit) : son clear, sa configuration (« INIT- Configuration TMS : "…" »)
 _MODULE_STEPS = (
     (re.compile(r"INIT- Purge de l'environnement par le clear \"([a-z]+)/"), "clear « {m}/… »"),
-    (re.compile(r"INIT- Configuration (TMS|WMS|OMS|WES)\s*:"), "configuration {M}"),
+    (re.compile(r"INIT- Configuration ([A-Z]{2,6})\s*:"), "configuration {M}"),
 )
 
 
@@ -892,14 +892,16 @@ def _module_of(line: str) -> tuple:
     return "", ""
 
 
-def drop_steps_of_absent_modules(text: str, imports: set) -> tuple:
+def drop_steps_of_absent_modules(text: str, imports: set, excluded=()) -> tuple:
     """
     Steps d'un module que l'application du client n'importe plus (aucune contrib « <module>-contrib-* » dans ses
     bundle.list, ex. TMS désactivé) — son clear, sa configuration — : routes absentes (404 - No route found), step
-    commenté sous TODO-INIT, table comprise. `imports` vide (bundle.list illisible) : rien n'est changé.
+    commenté sous TODO-INIT, table comprise. `imports` vide (bundle.list illisible) : rien n'est changé pour ce
+    motif. `excluded` : modules exclus du périmètre testé (profil client, cucumber_modules), commentés de même.
     Renvoie (texte, [raisons]).
     """
-    if not imports:
+    excluded = {m.lower() for m in excluded or ()}
+    if not imports and not excluded:
         return text, []
     lines = text.splitlines(keepends=True)
     out, notes, i = [], [], 0
@@ -907,13 +909,16 @@ def drop_steps_of_absent_modules(text: str, imports: set) -> tuple:
         line = lines[i]
         module, label = _module_of(line) if not line.lstrip().startswith("#") and _STEP.match(line.rstrip("\r\n")) \
             else ("", "")
-        if not module or any(a.startswith(f"{module}-contrib") for a in imports):
+        absent = bool(imports) and not any(a.startswith(f"{module}-contrib") for a in imports)
+        if not module or not (module in excluded or absent):
             out.append(line)
             i += 1
             continue
         indent = line[:len(line) - len(line.lstrip())]
         eol = "\r\n" if line.endswith("\r\n") else "\n"
-        reason = (f"module {module.upper()} non déployé chez le client (aucune contrib {module}-contrib importée "
+        reason = (f"module {module.upper()} exclu du périmètre testé (profil client, « Modules testés »)"
+                  if module in excluded else
+                  f"module {module.upper()} non déployé chez le client (aucune contrib {module}-contrib importée "
                   f"par ses bundle.list) : route absente (404 - No route found)")
         out += [f"{indent}# {INIT_MARKER} {reason}{eol}", f"{indent}# {line.lstrip()}"]
         notes.append(f"l. {i + 1} : {label} commenté — {reason}")
@@ -928,7 +933,8 @@ def drop_steps_of_absent_modules(text: str, imports: set) -> tuple:
 drop_clears_of_absent_modules = drop_steps_of_absent_modules
 
 
-def apply_environment_rules(worktree: str, paths: list, properties: dict, imports: set = frozenset()) -> dict:
+def apply_environment_rules(worktree: str, paths: list, properties: dict, imports: set = frozenset(),
+                            excluded=()) -> dict:
     """Règles sans dossier, clears de modules non déployés et jobs reliés à un service fourni par le job Jenkins,
     sur les features `paths`."""
     import os
@@ -940,7 +946,7 @@ def apply_environment_rules(worktree: str, paths: list, properties: dict, import
         with open(full, encoding="utf-8", newline="") as f:
             text = f.read()
         new, found = drop_rules_without_folder(text, rel, worktree)
-        new, cleared = drop_steps_of_absent_modules(new, set(imports))
+        new, cleared = drop_steps_of_absent_modules(new, set(imports), excluded)
         found += cleared
         new, kept = keep_connected_jobs_active(new, properties)
         if new != text:
