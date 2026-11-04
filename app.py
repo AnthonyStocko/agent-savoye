@@ -31,6 +31,7 @@ from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
     find_similar_tickets, get_project_lessons, load_ticket_memory, record_manual_edit,
+    restore_cadrage_file, should_open_revision,
     get_all_memories, clear_memory, delete_ticket_memory, import_existing_deliverables,
 )
 
@@ -500,7 +501,15 @@ with tab_execution:
         epic_tasks = [t for t in epic_manifest_tasks if t.get("key")]
         # Découpage rédigé mais tâches pas (toutes) créées dans Jira : on les crée sans relancer l'agent
         epic_pending = len(epic_manifest_tasks) - len(epic_tasks)
-        has_existing_cadrage = bool(epic_tasks) and not epic_pending if is_epic else os.path.exists(cadrage_file)
+        # Analyse déjà faite : fichier du workspace, sinon dernière version mémorisée par l'agent (restaurée)
+        has_existing_cadrage = (bool(epic_tasks) and not epic_pending if is_epic
+                                else restore_cadrage_file(selected_ticket, cadrage_file))
+        # Analyse existante d'une tâche : la saisie de révision s'ouvre directement, sans relancer l'analyse
+        if should_open_revision(is_epic, has_existing_cadrage, st.session_state.get("workflow_step"),
+                                st.session_state.get("current_ticket", ""), selected_ticket):
+            st.session_state["workflow_step"] = "REVIEW_ANALYSIS"
+            st.session_state["current_ticket"] = selected_ticket
+            st.session_state["current_client_repo"] = client_repo_path.strip()
 
         if is_epic:
             if epic_pending:
@@ -513,7 +522,8 @@ with tab_execution:
                 st.info("ℹ️ Épopée : l'analyse crée la ou les tâches enfants nécessaires (une seule si un découpage "
                         "n'est pas utile), avec leur analyse fonctionnelle et technique en description.")
         elif has_existing_cadrage:
-            st.success(f"💡 Une analyse préalable existe déjà pour {format_ticket_option(selected_ticket)} (`{cadrage_file}`).")
+            st.success(f"💡 Une analyse existe déjà pour {format_ticket_option(selected_ticket)} : "
+                       "elle est affichée ci-dessous pour révision.")
 
         col_cadrage, col_direct_patch, col_next = st.columns([2, 2, 1])
 
@@ -523,8 +533,11 @@ with tab_execution:
             elif is_epic:
                 btn_cadrage_label = "📝 Relire les analyses des tâches" if has_existing_cadrage else "⚡ 1. Analyser l'épopée & créer les tâches"
             else:
-                btn_cadrage_label = "🔄 Revoir l'analyse" if has_existing_cadrage else "⚡ 1. Lancer l'analyse"
-            run_cadrage_btn = st.button(btn_cadrage_label, use_container_width=True)
+                btn_cadrage_label = "♻️ Refaire l'analyse complète" if has_existing_cadrage else "⚡ 1. Lancer l'analyse"
+            run_cadrage_btn = st.button(btn_cadrage_label, use_container_width=True,
+                                        help="Remplace l'analyse existante par une nouvelle analyse complète. Pour "
+                                             "l'ajuster, utilisez plutôt la révision ci-dessous." if (
+                                                 has_existing_cadrage and not is_epic) else None)
 
         with col_direct_patch:
             if is_epic:

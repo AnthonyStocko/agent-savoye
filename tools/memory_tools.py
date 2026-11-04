@@ -454,3 +454,24 @@ def import_existing_deliverables(workspace_dir: str) -> int:
             save_patch_memory(issue_key, patches, agent_output="Importé depuis l'historique local", final_cadrage=cadrage)
         imported += 1
     return imported
+
+
+def restore_cadrage_file(issue_key: str, cadrage_path: str) -> bool:
+    """Analyse déjà faite pour ce ticket : vrai si le fichier existe, ou s'il a pu être restauré depuis la
+    dernière version mémorisée par l'agent (« final_cadrage »)."""
+    if os.path.exists(cadrage_path):
+        return True
+    remembered = (load_ticket_memory(issue_key).get("final_cadrage") or "").strip()
+    if not remembered:
+        return False
+    with open(cadrage_path, "w", encoding="utf-8") as f:
+        f.write(remembered)
+    return True
+
+
+def should_open_revision(is_epic: bool, has_cadrage: bool, workflow_step: str, current_ticket: str,
+                         selected_ticket: str) -> bool:
+    """La saisie de révision s'ouvre d'elle-même quand une analyse existe pour la tâche sélectionnée,
+    sauf si l'utilisateur est déjà en cours de travail sur ce même ticket."""
+    return (not is_epic and has_cadrage
+            and (workflow_step == "INIT" or current_ticket != selected_ticket))
