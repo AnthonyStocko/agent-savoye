@@ -4864,22 +4864,36 @@ def _std_init_usable(texts: dict, decision: dict, profile: dict, excluded: set, 
 
 
 def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version: str, tested: list,
-                      excluded: set, profile: dict, decision: dict, force_copy=()) -> dict:
+                      excluded: set, profile: dict, decision: dict, force_copy=(), version_ref: str = "",
+                      std_files=None, copy_files=()) -> dict:
     """
     Plan de l'étape 4 sur le worktree de l'agent (branche de la version + ses commits) : {"present" {rel: texte} des
     inits des modules testés, "complements" {rel: texte} (99-Complements-initialisation*, à part), "standard"
     {module: {tags, textes}} (init du Standard utilisée telle quelle, sans copie), "changes" {rel: texte},
     "binaries" {rel: source}, "reasons", "remarks", "gaps"}. `force_copy` : modules dont l'init du Standard ne peut
-    pas être lancée par le job (copie adaptée à la place).
+    pas être lancée par le job (copie adaptée à la place). `version_ref` : branche de la version (origin/<v>) ; une
+    init écrite par l'agent (absente de cette branche) est régénérée, ses fichiers devenus inutiles retirés
+    (« deletions »). `std_files()` : step du projet qui charge les fichiers de données du Standard ({"chemin",
+    "texte"} ou {"erreur"}) : la copie adaptée n'embarque alors AUCUN fichier de données ; `copy_files` : modules
+    dont les fichiers du Standard sont illisibles à l'exécution (copiés, comme avant).
     """
     library = cucumber_checks.library_version(worktree)
     std = cucumber_init.std_init_files(cucumber_std_dir) if cucumber_std_dir else {}
-    present, complements = {}, {}
+    added = set(cucumber_tools._git(worktree, "diff", "--name-only", "--diff-filter=A", version_ref, "HEAD", "--")
+                .stdout.splitlines()) if version_ref else set()
+    present, complements, owned = {}, {}, {}
     for feature in cucumber_init_data.client_init(worktree, client)["features"]:
         text = _read_text(os.path.join(worktree, *feature["chemin"].split("/")))
         if _module_of_init(feature["chemin"], text, set(tested) | set(excluded)) in tested:
-            (complements if cucumber_init_fix.is_complements(feature["chemin"]) else present)[feature["chemin"]] = text
+            if cucumber_init_fix.is_complements(feature["chemin"]):
+                complements[feature["chemin"]] = text
+            elif feature["chemin"] in added:
+                owned[feature["chemin"]] = text            # init de l'agent, pas encore sur la branche de la version
+            else:
+                present[feature["chemin"]] = text
     modules_present = {_module_of_init(rel, text, set(tested)) for rel, text in present.items()}
+    deletions = []
+    std_step = {}
     standard = {}
     tag = profile.get("tag_client", "")
     std_texts = {m: {cucumber_init.client_path(r, client): cucumber_simple_init.client_feature(
@@ -4896,13 +4910,33 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
                    for rel in std[module] if rel.endswith(".feature")}
             why = ("le job n'exécute pas l'init du Standard (aucun scénario au dernier run)" if module in force_copy
                    else _std_init_usable(raw, decision, profile, excluded, snapshots))
+            segment = cucumber_tools.java_package_segment(client)
+            folders = tuple(f"{cucumber_init.RESOURCES_DIR}/{kind}/{segment}/{cucumber_init.INIT_DIR}/{module}/"
+                            for kind in ("features", "files"))
             if not why:
-                # L'init du Standard suffit : lancée telle quelle, aucune copie dans le dépôt du client
+                # L'init du Standard suffit : lancée telle quelle, aucune copie dans le dépôt du client (une copie
+                # écrite plus tôt par l'agent est retirée)
                 standard[module] = {"tags": cucumber_simple_init.init_tags(raw, excluded), "textes": raw}
                 remarks.append(f"{module} : init du Standard {version} utilisée telle quelle "
                                f"({standard[module]['tags']}) — aucune copie dans le dépôt du client")
+                stale = sorted(p for p in added if p.startswith(folders) and not cucumber_init_fix.is_complements(p))
+                if stale:
+                    deletions += stale
+                    reasons.append(f"init {module} : copie écrite par l'agent retirée ({len(stale)} fichier(s)), "
+                                   f"init du Standard utilisée telle quelle")
                 continue
-            # Init absente et Standard insuffisant : celle du Standard adaptée (écarts du client seulement)
+            # Init absente et Standard insuffisant : celle du Standard adaptée (écarts du client seulement) ; ses
+            # fichiers de données sont lus dans le Standard par un step du projet, sinon copiés
+            if module not in copy_files and std_files is not None and not std_step:
+                std_step.update(std_files())
+            use_std = module not in copy_files and bool(std_step.get("texte"))
+            if module not in copy_files and std_step.get("erreur"):
+                remarks.append(f"{module} : fichiers de données copiés (step des fichiers du Standard non écrit : "
+                               f"{std_step['erreur'][:200]})")
+            elif module in copy_files:
+                remarks.append(f"{module} : fichiers de données copiés (ceux du Standard sont illisibles à "
+                               f"l'exécution, dernier run)")
+            wanted = set()
             for rel in std[module]:
                 target = cucumber_init.client_path(rel, client)
                 if rel.endswith(".feature"):
@@ -4910,10 +4944,27 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
                     if snapshots[0]:
                         text, notes = cucumber_init.mark_version_gaps(text, *snapshots)
                         remarks += [f"{target.rsplit('/', 2)[-2]} : {n}" for n in notes]
-                    changes[target] = text
-                elif not os.path.exists(os.path.join(worktree, *target.split("/"))):
-                    binaries[target] = os.path.join(cucumber_std_dir, *rel.split("/"))
-            reasons.append(f"init {module} absente : celle du Standard {version} adaptée au client ({why})")
+                    if use_std:
+                        text = cucumber_simple_init.use_standard_files(text, module)
+                    wanted.add(target)
+                    if _read_text(os.path.join(worktree, *target.split("/"))) != text:
+                        changes[target] = text
+                elif not use_std:
+                    wanted.add(target)
+                    if not os.path.exists(os.path.join(worktree, *target.split("/"))):
+                        binaries[target] = os.path.join(cucumber_std_dir, *rel.split("/"))
+            if use_std and _read_text(os.path.join(worktree, *std_step["chemin"].split("/"))) != std_step["texte"]:
+                changes[std_step["chemin"]] = std_step["texte"]
+            # Fichiers de l'init écrits par l'agent et devenus inutiles (copies des données du Standard) : retirés
+            stale = sorted(p for p in added if p.startswith(folders) and p not in wanted
+                           and not cucumber_init_fix.is_complements(p))
+            deletions += stale
+            if changes or binaries or stale:
+                state_label = "de l'agent régénérée" if any(p in owned for p in wanted) else "absente"
+                reasons.append(f"init {module} {state_label} : celle du "
+                               f"Standard {version} adaptée au client ({why})"
+                               + (" ; fichiers de données lus dans le Standard, aucune copie" if use_std else "")
+                               + (f" ; {len(stale)} copie(s) de fichiers du Standard retirée(s)" if stale else ""))
             continue
         for rel, text in present.items():
             if _module_of_init(rel, text, set(tested)) != module:
@@ -4947,8 +4998,11 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
                 reasons.append(f"{path.rsplit('/', 1)[-1]} : routes {', '.join(missing)} ajoutées")
             elif missing:
                 remarks.append(f"{path} définit le step de purge sans accepter {', '.join(missing)} : à corriger")
-    return {"present": present, "complements": complements, "standard": standard, "changes": changes,
-            "binaries": binaries, "reasons": reasons, "remarks": remarks, "gaps": gaps, "library": library}
+    # Init de l'agent : lancée comme celle du client (mêmes tags)
+    present_all = {**present, **{rel: text for rel, text in owned.items() if rel not in deletions}}
+    return {"present": present_all, "complements": complements, "standard": standard, "changes": changes,
+            "binaries": binaries, "deletions": deletions, "reasons": reasons, "remarks": remarks, "gaps": gaps,
+            "library": library}
 
 
 SIMPLE_INIT_DELIVERABLE_FINDINGS = ("initializer", "controle_environnement", "champ_personnalise")
@@ -4963,6 +5017,48 @@ def simple_init_branch(profile: dict, branch: str) -> str:
 def simple_init_patch_path(client: str, branch: str) -> str:
     """Livrable de l'étape 4 : patch à appliquer sur la branche de la version (par l'utilisateur)."""
     return os.path.join(cucumber_tools.cache_dir(client), f"{client}-cucumber-init-{branch.replace('/', '-')}.patch")
+
+
+def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str, profile: dict, version: str) -> dict:
+    """
+    Step du projet qui charge les fichiers de données de l'init du Standard sans les copier (appel Claude borné qui
+    lit la définition du step du Standard, contrôlé en Python puis compilé), gardé en cache par version du
+    Standard. {"chemin", "texte"} ; {"erreur"} si impossible (les fichiers sont alors copiés). Le worktree est
+    laissé tel quel : la classe est livrée par le plan, après validation du diff.
+    """
+    rel = cucumber_simple_init.std_files_java_path(client)
+    cache = os.path.join(cucumber_tools.cache_dir(client), "fichiers_standard_step.json")
+    saved = cucumber_tools._read_json(cache, {}) or {}
+    if saved.get("version") == version and saved.get("texte") and \
+            not cucumber_simple_init.check_std_files_java(saved["texte"]):
+        return {"chemin": rel, "texte": saved["texte"]}
+    if not cucumber_std_dir:
+        return {"erreur": "Cucumber Standard local introuvable"}
+    path = os.path.join(worktree, *rel.split("/"))
+    before = _read_text(path) if os.path.exists(path) else None
+    std_java = cucumber_tools.standard_java_catalogue(cucumber_std_dir, profile.get("server_version", ""))
+    clear_java = os.path.join(worktree, *cucumber_init.clear_step_path(client).split("/"))
+    values = {"client_name": client, "worktree": worktree, "java_path": path,
+              "package": f"cucumber.features.{cucumber_tools.java_package_segment(client)}",
+              "clear_step_java": clear_java if os.path.exists(clear_java) else "aucun",
+              "java_std": std_java["java_std"], "std_step": cucumber_simple_init.GLOBAL_INIT_STEP,
+              "expression": cucumber_simple_init.STD_FILES_EXPRESSION}
+    label = "Step des fichiers du Standard"
+    errors = write_init_steps(client, worktree, "cucumber_init_fichiers_standard", values,
+                              lambda: cucumber_simple_init.check_std_files_java(_read_text(path)
+                                                                                if os.path.exists(path) else ""),
+                              init_features(worktree), cucumber_std_dir, label, "cucumber-init-fichiers-standard")
+    text = _read_text(path) if os.path.exists(path) else ""
+    if before is None:
+        if os.path.exists(path):
+            os.remove(path)
+    else:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(before)
+    if errors:
+        return {"erreur": "; ".join((INIT_REMAINING.get(label) or [])[:1] or errors[:1])}
+    cucumber_tools._write_json(cache, {"version": version, "texte": text})
+    return {"chemin": rel, "texte": text}
 
 
 def simple_init_complement_findings(client: str, worktree: str, plan: dict, profile: dict) -> list:
@@ -5056,9 +5152,12 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     patch_path = simple_init_patch_path(client, branch)
     last = (cucumber_tools.load_state(client).get("simple") or {}).get("init") or {}
     force_copy = set((last.get("detail") or {}).get("standard_indisponible") or [])
+    copy_files = set((last.get("detail") or {}).get("fichiers_copies") or [])
     detail = {"branche": branch, "branche_agent": work}
     if force_copy:
         detail["standard_indisponible"] = sorted(force_copy)
+    if copy_files:
+        detail["fichiers_copies"] = sorted(copy_files)
     decision = h["clear"]() if "clear" in h else simple_clear_decision(client_root, std_root, version, tested)
     if decision.get("erreur"):
         simple_record(client, "init", "echec", f"Clear non déterminé : {decision['erreur']}. Rien n'est généré sans "
@@ -5085,8 +5184,18 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                                                    f"(conflit) : appliquez d'abord le patch de l'init sur {branch}.",
                           detail)
             return 1
-    plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
-                             force_copy)
+    step_cache = {}
+
+    def std_files() -> dict:
+        if not step_cache:
+            step_cache.update(h["std_files"](worktree) if "std_files" in h else
+                              simple_init_std_files_step(client, worktree, cucumber_std_dir, profile, version))
+        return step_cache
+
+    def make_plan() -> dict:
+        return _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
+                                 force_copy, f"origin/{branch}", std_files, copy_files)
+    plan = make_plan()
     detail.update(bibliotheque=plan["library"], remarques=plan["remarks"][:30], ecarts_standard=plan["gaps"][:10])
 
     def write_patch() -> None:
@@ -5096,7 +5205,17 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                 os.remove(patch_path)
             detail.pop("patch", None)
             return
-        cucumber_tools.format_patch(worktree, f"origin/{branch}..HEAD", patch_path)
+        # Un seul commit, état net par rapport à la branche de la version (pas la série de l'agent : une copie
+        # ajoutée puis retirée n'apparaît pas)
+        cucumber_delivery.apply_identity()
+        squashed = cucumber_tools._git(worktree, "commit-tree", "HEAD^{tree}", "-p", f"origin/{branch}", "-m",
+                                       f"Cucumber {client} : init de la version {branch}").stdout.strip()
+        if not squashed or cucumber_tools._git(worktree, "diff", "--quiet", f"origin/{branch}", squashed).returncode == 0:
+            if os.path.exists(patch_path):
+                os.remove(patch_path)
+            detail.pop("patch", None)
+            return
+        cucumber_tools.format_patch(worktree, f"origin/{branch}..{squashed}", patch_path)
         detail["patch"] = patch_path
 
     pushed = {"branche": has_work}
@@ -5120,7 +5239,7 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
         return "" if done.returncode == 0 else f"push refusé : {(done.stderr.strip().splitlines() or ['?'])[-1][:200]}"
 
-    def deliver(changes: dict, binaries: dict, message: str) -> str:
+    def deliver(changes: dict, binaries: dict, message: str, deletions: list = ()) -> str:
         for rel, text in changes.items():
             path = os.path.join(worktree, *rel.split("/"))
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -5131,7 +5250,10 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             os.makedirs(os.path.dirname(path), exist_ok=True)
             shutil.copyfile(source, path)
         cucumber_delivery.apply_identity()
-        cucumber_tools._git(worktree, "add", "--", *changes, *binaries)
+        if deletions:
+            cucumber_tools._git(worktree, "rm", "-q", "--", *deletions)
+        if changes or binaries:
+            cucumber_tools._git(worktree, "add", "--", *changes, *binaries)
         if cucumber_tools._git(worktree, "commit", "-q", "-m", message).returncode != 0:
             return "commit impossible"
         return push()
@@ -5148,18 +5270,20 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         return (f"{cucumber_tools.rev_parse(worktree, 'HEAD')[:10]} poussé sur {work} (branche de l'agent) ; patch "
                 f"à appliquer sur {branch} : {patch_path}")
 
-    if plan["changes"] or plan["binaries"]:
+    if plan["changes"] or plan["binaries"] or plan["deletions"]:
         if action != "appliquer":
-            diff = "".join(cucumber_repo_setup._diff(rel, plan["present"].get(rel) or _read_text(
-                os.path.join(worktree, *rel.split("/"))), text) for rel, text in plan["changes"].items())
-            listed = "".join(f"+ {rel} (fichier de données du Standard)\n" for rel in plan["binaries"])
+            diff = "".join(cucumber_repo_setup._diff(rel, _read_text(os.path.join(worktree, *rel.split("/"))), text)
+                           for rel, text in plan["changes"].items())
+            listed = "".join(f"+ {rel} (fichier de données du Standard)\n" for rel in plan["binaries"]) + "".join(
+                f"- {rel} (retiré : copie écrite par l'agent, devenue inutile)\n" for rel in plan["deletions"])
             simple_record(client, "init", "a_faire", f"Init de {branch} : à mettre à jour ("
                           + " ; ".join(plan["reasons"]) + f"). Relisez le diff puis validez : il sera poussé sur la "
                           f"branche de l'agent {work}, et un patch vous sera livré pour {branch}.",
                           {**detail, "plan": {"action": "appliquer", "diff": diff + listed}})
             return 0
         refused = deliver(plan["changes"], plan["binaries"],
-                          f"Cucumber {client} : init de la version — " + " ; ".join(plan["reasons"])[:300])
+                          f"Cucumber {client} : init de la version — " + " ; ".join(plan["reasons"])[:300],
+                          plan["deletions"])
         if refused:
             simple_record(client, "init", "echec", f"Init non livrée : {refused}.", detail)
             return 1
@@ -5167,8 +5291,7 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             return 1
         write_patch()
         detail["commit"] = pushed_line()
-        plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
-                                 force_copy)
+        plan = make_plan()
     # Compléments validés (diff relu) : appliqués tels quels, poussés sur la branche de l'agent
     if action == "completer":
         stored = ((last.get("detail") or {}).get("plan") or {}).get("complements") or ""
@@ -5190,8 +5313,7 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             return 1
         write_patch()
         detail["commit"] = pushed_line()
-        plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
-                                 force_copy)
+        plan = make_plan()
     # Sujets propres au client non couverts par l'init : compléments à part (jamais dans l'init), diff à valider
     elif action == "verifier":
         findings = (h["complements"]("constats", worktree, plan) if "complements" in h
@@ -5289,6 +5411,16 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         message = failure.get("message") or ""
         detail["erreur"] = (f"{label} — {failure.get('fichier', '')} — {failure.get('step', '')} — {message}"[:600]
                             if failure else f"{label} — {message_run}")
+        if (failure.get("step") or "").startswith(cucumber_simple_init.STD_FILES_STEP):
+            # Fichiers du Standard illisibles à l'exécution : copie des fichiers proposée à la place
+            modules = sorted({m for rel, text in plan["present"].items() if cucumber_simple_init.uses_standard_files(text)
+                              for m in [_module_of_init(rel, text, set(tested))] if m})
+            simple_record(client, "init", "a_faire", f"Les fichiers de données du Standard ne sont pas lisibles "
+                                                     f"pendant le run ({message[:200]}) : la copie des fichiers va être "
+                                                     f"proposée à la place. Revérifiez.",
+                          {**detail, "fichiers_copies": sorted(copy_files | set(modules)),
+                           "plan": {"action": "verifier"}})
+            return 1
         own_files = {**plan["present"], **plan["complements"]}
         if label != "init du Standard" and cucumber_wait_steps.is_library_timeout(message) and \
                 cucumber_wait_steps.known_step(failure.get("step")):

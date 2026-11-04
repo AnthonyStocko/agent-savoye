@@ -201,6 +201,11 @@ def init_workspace(tmp_path, monkeypatch, main_module):
 
 
 AGENT_BRANCH = "feature/agent-cucumber-init-v1.3"
+NO_STEP = lambda worktree: {"erreur": "test : step non écrit"}  # noqa: E731
+STD_FILES_JAVA = ("package cucumber.features.clientx;\npublic class InitClientxFichiersStandardSteps {\n"
+                  "    @Given(\"INIT- Initialisation globale par fichiers du Standard {string}\")\n"
+                  "    public void init(String module) { fileIntegration.integrateStandard(module); }\n}\n")
+STD_FILES_STEP = lambda worktree: {"chemin": si.std_files_java_path(CLIENT), "texte": STD_FILES_JAVA}  # noqa: E731
 
 
 def _push(worktree, branch):
@@ -222,7 +227,7 @@ def test_init_generated_validated_pushed_then_run(init_workspace, main_module):
         return {"ok": True, "message": "initialisation : 2 scénario(s) OK", "build": "https://jenkins/job/1/"}
     helpers = {"clear": lambda: {"mode": "client", "routes": ["wms/all"], "motif": "m", "preuves": ["wms : p"],
                                  "erreur": ""},
-               "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push, "run": run}
+               "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push, "run": run, "std_files": NO_STEP}
     call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
                                                       helpers)
     assert call("verifier") == 0
@@ -255,7 +260,7 @@ def test_init_failure_proposes_known_correction(init_workspace, main_module):
                        "echecs": [{"fichier": "", "step": "INIT- Initialisation globale par fichiers via l'écran",
                                    "message": timeout}]}}
     helpers = {"clear": lambda: {"mode": "client", "routes": ["wms/all"], "motif": "m", "preuves": [], "erreur": ""},
-               "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push, "std_files": NO_STEP,
                "run": lambda profile, worktree: outcome["run"]}
     call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
                                                       helpers)
@@ -298,7 +303,7 @@ def test_standard_init_not_run_by_the_job_falls_back_to_adapted_copy(init_worksp
     outcome = {"run": {"ok": False, "message": "environnement non initialisé (@INIT_WMS) : aucun scénario pour "
                                                "@INIT_WMS", "build": "b"}}
     helpers = {"clear": lambda: STANDARD_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
-               "run": lambda profile, worktree: outcome["run"]}
+               "run": lambda profile, worktree: outcome["run"], "std_files": NO_STEP}
     call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
                                                       helpers)
     assert call("lancer") == 1
@@ -374,6 +379,77 @@ def test_complements_with_standard_init_get_their_own_tag(init_workspace, main_m
     assert seen["anchors"] == [f"src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/01-Initialisation.feature"]
     text = open(built["patch"], encoding="utf-8").read()
     assert f"+@INIT_{CLIENT.upper()}_WMS_COMPLEMENT" in text and f"+@INIT_{CLIENT.upper()}\n" not in text
+
+
+CLIENT_CLEAR = {"mode": "client", "routes": ["wms/all"], "motif": "m", "preuves": ["wms : p"], "erreur": ""}
+DATA = f"src/test/resources/cucumber/files/{CLIENT}/01-Contexte/WMS/01-Data.csv"
+FEATURE = f"src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/01-Initialisation.feature"
+
+
+def test_data_files_read_from_the_standard_not_copied(init_workspace, main_module):
+    """Init adaptée (clear du client) : fichiers de données lus dans le Standard par un step du projet, aucune copie."""
+    w = init_workspace
+    runs = []
+    helpers = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "std_files": STD_FILES_STEP,
+               "run": lambda profile, worktree: runs.append(profile["init_tags"]) or {"ok": True, "message": "OK",
+                                                                                     "build": "b"}}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("verifier") == 0
+    diff = _init_record()["detail"]["plan"]["diff"]
+    assert 'INIT- Initialisation globale par fichiers du Standard "WMS"' in diff and "01-Data.csv" not in diff
+    assert "FichiersStandardSteps.java" in diff
+    assert call("appliquer") == 0
+    pushed = git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)
+    assert FEATURE in pushed and DATA not in pushed and si.std_files_java_path(CLIENT) in pushed
+    patch = open(_init_record()["detail"]["patch"], encoding="utf-8").read()
+    assert "01-Data.csv" not in patch and "fichiers du Standard" in patch
+    assert call("lancer") == 0 and runs == [f"@INIT_{CLIENT.upper()}_WMS"]
+
+
+def test_agent_copy_replaced_by_standard_files_without_force(init_workspace, main_module):
+    """Copie déjà poussée par l'agent (pas sur la branche de la version) : régénérée, copies retirées, sans forcer."""
+    w = init_workspace
+    base = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push}
+    call = lambda action, extra: main_module.run_simple_init(  # noqa: E731
+        CLIENT, w["root"], w["std"], None, "26.22", action, {**base, **extra})
+    assert call("appliquer", {"std_files": NO_STEP}) == 0                       # ancienne version : copie
+    assert DATA in git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)
+    first = git(w["origin"], "rev-parse", AGENT_BRANCH).strip()
+    assert call("verifier", {"std_files": STD_FILES_STEP}) == 0
+    record = _init_record()
+    assert record["detail"]["plan"]["action"] == "appliquer" and f"- {DATA} (retiré" in record["detail"]["plan"]["diff"]
+    assert call("appliquer", {"std_files": STD_FILES_STEP}) == 0
+    pushed = git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)
+    assert DATA not in pushed and FEATURE in pushed
+    assert git(w["origin"], "merge-base", "--is-ancestor", first, AGENT_BRANCH) == ""     # historique conservé
+    patch = open(_init_record()["detail"]["patch"], encoding="utf-8").read()
+    assert "01-Data.csv" not in patch                                                       # patch net vs v1.3
+
+
+def test_standard_files_unreadable_at_runtime_fall_back_to_copy(init_workspace, main_module):
+    w = init_workspace
+    outcome = {"run": {"ok": False, "message": "environnement non initialisé", "build": "b",
+                       "echecs": [{"fichier": FEATURE, "step": 'INIT- Initialisation globale par fichiers du Standard "WMS"',
+                                   "message": "dossier files/WMS/01-Contexte introuvable"}]}}
+    helpers = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "std_files": STD_FILES_STEP, "run": lambda profile, worktree: outcome["run"]}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("appliquer") == 0 and call("lancer") == 1
+    assert _init_record()["detail"]["fichiers_copies"] == ["WMS"]
+    assert call("verifier") == 0
+    diff = _init_record()["detail"]["plan"]["diff"]
+    assert "01-Data.csv (fichier de données du Standard)" in diff
+    assert "+    And INIT- Initialisation globale par fichiers via l'écran" in diff
+
+
+def test_std_files_java_checks():
+    assert si.check_std_files_java(STD_FILES_JAVA) == []
+    assert si.check_std_files_java("") and si.check_std_files_java(STD_FILES_JAVA.replace(
+        "fileIntegration.integrateStandard(module);", "Files.copy(a, b);"))
+    assert si.check_std_files_java(STD_FILES_JAVA.replace("{ fileIntegration.integrateStandard(module); }", "{ }"))
 
 
 def test_init_stops_without_proven_clear(init_workspace, main_module):

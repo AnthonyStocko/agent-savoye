@@ -27,6 +27,10 @@ CLEAR_STEP = cucumber_init.CLEAR_STEP
 MODULE_ORDER = ("WMS", "TMS", "OMS")
 STANDARD_ROUTE = "full/all"
 INIT_MARKER = "TODO-INIT:"
+GLOBAL_INIT_STEP = cucumber_init.GLOBAL_INIT_STEP
+# Step du projet : initialisation globale par les fichiers de données du Standard (aucune copie dans le dépôt client)
+STD_FILES_STEP = "INIT- Initialisation globale par fichiers du Standard"
+STD_FILES_EXPRESSION = STD_FILES_STEP + " {string}"
 
 _BUNDLE = re.compile(r"^[ \t]*(runtime|import)[ \t]*:[ \t]*[\w.-]+/([\w.-]+)@", re.M)
 _DELETE = re.compile(r'@DELETE\(\s*"/?clear/([A-Za-z0-9_-]+/[A-Za-z0-9_-]+)"\s*\)')
@@ -316,3 +320,44 @@ def summary(gaps: dict) -> str:
     if gaps.get("client_seulement"):
         parts.append(f"{len(gaps['client_seulement'])} step(s) propre(s) au client")
     return ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Fichiers de données de l'init lus dans le Standard (aucune copie)
+# ---------------------------------------------------------------------------
+
+def std_files_java_path(client_name: str) -> str:
+    """Classe du step des fichiers du Standard, à côté du step de purge du client."""
+    folder = cucumber_init.clear_step_path(client_name).rsplit("/", 1)[0]
+    return f"{folder}/Init{cucumber_init.java_class_suffix(client_name)}FichiersStandardSteps.java"
+
+
+def use_standard_files(text: str, module: str) -> str:
+    """Feature d'init : l'initialisation globale par fichiers lit le dossier de données du Standard du module."""
+    out = []
+    for line in (text or "").splitlines(keepends=True):
+        match = _STEP.match(line.rstrip("\r\n"))
+        if match and not line.lstrip().startswith("#") and match.group(3) == GLOBAL_INIT_STEP:
+            eol = "\r\n" if line.endswith("\r\n") else "\n"
+            line = f'{match.group(1)}{match.group(2)} {STD_FILES_STEP} "{module.upper()}"{eol}'
+        out.append(line)
+    return "".join(out)
+
+
+def uses_standard_files(text: str) -> bool:
+    return any((m := _STEP.match(line)) and not line.lstrip().startswith("#") and m.group(3).startswith(STD_FILES_STEP)
+               for line in (text or "").splitlines())
+
+
+def check_std_files_java(text: str) -> list:
+    """Contrôles Python du step écrit : expression exacte, aucune copie de fichier, aucune méthode vide."""
+    errors = []
+    if not text:
+        return ["classe du step des fichiers du Standard non écrite"]
+    if f'"{STD_FILES_EXPRESSION}"' not in text:
+        errors.append(f"expression « {STD_FILES_EXPRESSION} » absente de l'annotation")
+    if re.search(r"Files\.(copy|write|move)|FileUtils\.copy|Files\.newOutputStream", text):
+        errors.append("le step copie ou écrit des fichiers : interdit")
+    if "PendingException" in text or re.search(r"\)\s*(throws [\w., ]+)?\{\s*\}", text):
+        errors.append("méthode vide ou PendingException")
+    return errors
