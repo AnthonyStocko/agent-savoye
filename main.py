@@ -5029,11 +5029,18 @@ def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str
     rel = cucumber_simple_init.std_files_java_path(client)
     cache = os.path.join(cucumber_tools.cache_dir(client), "fichiers_standard_step.json")
     saved = cucumber_tools._read_json(cache, {}) or {}
-    if saved.get("version") == version and saved.get("texte") and \
+    key = f"{version}/{cucumber_simple_init.STD_FILES_PROMPT_VERSION}"
+    if saved.get("version") == key and saved.get("texte") and \
             not cucumber_simple_init.check_std_files_java(saved["texte"]):
         return {"chemin": rel, "texte": saved["texte"]}
     if not cucumber_std_dir:
         return {"erreur": "Cucumber Standard local introuvable"}
+    # Les fichiers seront lus dans la bibliothèque (test-jar) pendant le run : elle doit les embarquer
+    library = cucumber_checks.library_version(worktree)
+    jar = cucumber_simple_init.library_jar(library) if library else ""
+    if jar and not any(cucumber_simple_init.jar_has_data(jar, m) for m in ("WMS", "TMS", "OMS")):
+        return {"erreur": f"la bibliothèque {os.path.basename(jar)} n'embarque pas les fichiers de données de l'init "
+                          f"du Standard (cucumber/files/<MOD>/01-Contexte/)"}
     path = os.path.join(worktree, *rel.split("/"))
     before = _read_text(path) if os.path.exists(path) else None
     std_java = cucumber_tools.standard_java_catalogue(cucumber_std_dir, profile.get("server_version", ""))
@@ -5057,7 +5064,7 @@ def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str
             f.write(before)
     if errors:
         return {"erreur": "; ".join((INIT_REMAINING.get(label) or [])[:1] or errors[:1])}
-    cucumber_tools._write_json(cache, {"version": version, "texte": text})
+    cucumber_tools._write_json(cache, {"version": key, "texte": text})
     return {"chemin": rel, "texte": text}
 
 
@@ -5152,7 +5159,15 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     patch_path = simple_init_patch_path(client, branch)
     last = (cucumber_tools.load_state(client).get("simple") or {}).get("init") or {}
     force_copy = set((last.get("detail") or {}).get("standard_indisponible") or [])
-    copy_files = set((last.get("detail") or {}).get("fichiers_copies") or [])
+    # Repli sur la copie : seulement pour le step qui a échoué ; un step réécrit (consigne plus récente) est réessayé
+    cached_step = (cucumber_tools._read_json(os.path.join(cucumber_tools.cache_dir(client),
+                                                          "fichiers_standard_step.json"), {}) or {})
+    failed_step = (last.get("detail") or {}).get("step_en_echec") or ""
+    copy_files = set((last.get("detail") or {}).get("fichiers_copies") or []) if failed_step and (
+        str(cached_step.get("version", "")).endswith(cucumber_simple_init.STD_FILES_PROMPT_VERSION)
+        and cucumber_simple_init.step_signature(cached_step.get("texte", "")) == failed_step) else set()
+    if "std_files" in h:
+        copy_files = set((last.get("detail") or {}).get("fichiers_copies") or [])
     detail = {"branche": branch, "branche_agent": work}
     if force_copy:
         detail["standard_indisponible"] = sorted(force_copy)
@@ -5419,6 +5434,8 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                                                      f"pendant le run ({message[:200]}) : la copie des fichiers va être "
                                                      f"proposée à la place. Revérifiez.",
                           {**detail, "fichiers_copies": sorted(copy_files | set(modules)),
+                           "step_en_echec": cucumber_simple_init.step_signature(std_files().get("texte", "")
+                                                                                if "std_files" not in h else ""),
                            "plan": {"action": "verifier"}})
             return 1
         own_files = {**plan["present"], **plan["complements"]}

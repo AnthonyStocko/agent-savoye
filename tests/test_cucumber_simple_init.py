@@ -449,7 +449,23 @@ def test_std_files_java_checks():
     assert si.check_std_files_java(STD_FILES_JAVA) == []
     assert si.check_std_files_java("") and si.check_std_files_java(STD_FILES_JAVA.replace(
         "fileIntegration.integrateStandard(module);", "Files.copy(a, b);"))
+    extract = STD_FILES_JAVA.replace("fileIntegration.integrateStandard(module);",
+                                     'Path d = Paths.get("target", "fichiers-standard"); Files.copy(in, d.resolve(n));')
+    assert si.check_std_files_java(extract) == []                      # extraction temporaire sous target/ permise
+    assert si.check_std_files_java(extract.replace("Path d =", 'Files.write(Paths.get("src/test/resources/x"), b); Path d ='))
     assert si.check_std_files_java(STD_FILES_JAVA.replace("{ fileIntegration.integrateStandard(module); }", "{ }"))
+
+
+def test_library_jar_must_embed_the_standard_data(tmp_path):
+    import zipfile
+    folder = tmp_path / "a-sis" / "Cucumber" / "26.22"
+    folder.mkdir(parents=True)
+    jar = folder / "Cucumber-26.22-tests.jar"
+    with zipfile.ZipFile(jar, "w") as archive:
+        archive.writestr("cucumber/files/WMS/01-Contexte/01-RefSiteDraft.xlsm", b"x")
+    assert si.library_jar("26.22", str(tmp_path)) == str(jar)
+    assert si.jar_has_data(str(jar), "wms") and not si.jar_has_data(str(jar), "TMS")
+    assert si.library_jar("26.24", str(tmp_path)) == ""
 
 
 def test_init_stops_without_proven_clear(init_workspace, main_module):
