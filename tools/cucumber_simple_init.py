@@ -31,6 +31,8 @@ GLOBAL_INIT_STEP = cucumber_init.GLOBAL_INIT_STEP
 # Step du projet : initialisation globale par les fichiers de données du Standard (aucune copie dans le dépôt client)
 STD_FILES_STEP = "INIT- Initialisation globale par fichiers du Standard"
 STD_FILES_EXPRESSION = STD_FILES_STEP + " {string}"
+# Version de la consigne d'écriture du step (un step écrit avec une consigne plus ancienne est réécrit)
+STD_FILES_PROMPT_VERSION = "2-classpath"
 
 _BUNDLE = re.compile(r"^[ \t]*(runtime|import)[ \t]*:[ \t]*[\w.-]+/([\w.-]+)@", re.M)
 _DELETE = re.compile(r'@DELETE\(\s*"/?clear/([A-Za-z0-9_-]+/[A-Za-z0-9_-]+)"\s*\)')
@@ -349,6 +351,12 @@ def uses_standard_files(text: str) -> bool:
                for line in (text or "").splitlines())
 
 
+def step_signature(text: str) -> str:
+    """Empreinte d'un step écrit (le repli sur la copie ne vaut que pour CE step)."""
+    import hashlib
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:12]
+
+
 def check_std_files_java(text: str) -> list:
     """Contrôles Python du step écrit : expression exacte, aucune copie de fichier, aucune méthode vide."""
     errors = []
@@ -356,8 +364,33 @@ def check_std_files_java(text: str) -> list:
         return ["classe du step des fichiers du Standard non écrite"]
     if f'"{STD_FILES_EXPRESSION}"' not in text:
         errors.append(f"expression « {STD_FILES_EXPRESSION} » absente de l'annotation")
-    if re.search(r"Files\.(copy|write|move)|FileUtils\.copy|Files\.newOutputStream", text):
-        errors.append("le step copie ou écrit des fichiers : interdit")
+    writes = re.search(r"Files\.(copy|write|move|newOutputStream)|FileUtils\.copy|FileOutputStream", text)
+    if writes and not re.search(r'"target[/"]|createTempDirectory|java\.io\.tmpdir', text):
+        errors.append("le step écrit des fichiers ailleurs que dans un dossier temporaire sous target/ : interdit")
+    if re.search(r"(Files\.(copy|write|move)|FileOutputStream)[^;]*src/test/resources", text):
+        errors.append("le step écrit dans src/test/resources : interdit")
     if "PendingException" in text or re.search(r"\)\s*(throws [\w., ]+)?\{\s*\}", text):
         errors.append("méthode vide ou PendingException")
     return errors
+
+
+def library_jar(version: str, m2: str = "") -> str:
+    """test-jar de la bibliothèque Cucumber (a-sis:Cucumber) dans le dépôt Maven local ; '' s'il n'y est pas."""
+    import glob
+    import os
+    from tools.cucumber_library import LIBRARY_ARTIFACT, LIBRARY_GROUP, maven_repository
+    root = m2 or maven_repository()
+    folder = os.path.join(root, *LIBRARY_GROUP.split("."), LIBRARY_ARTIFACT, version)
+    found = sorted(glob.glob(os.path.join(folder, f"{LIBRARY_ARTIFACT}-{version}-tests.jar")))
+    return found[0] if found else ""
+
+
+def jar_has_data(jar: str, module: str) -> bool:
+    """La bibliothèque embarque-t-elle les fichiers de données de l'init du module (cucumber/files/<MOD>/01-Contexte/) ?"""
+    import zipfile
+    prefix = f"cucumber/files/{module.upper()}/01-Contexte/"
+    try:
+        with zipfile.ZipFile(jar) as archive:
+            return any(n.startswith(prefix) and not n.endswith("/") for n in archive.namelist())
+    except (OSError, zipfile.BadZipFile):
+        return False
