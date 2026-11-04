@@ -9,5 +9,5 @@ ${integration_block}
    - Ne modifie pas ce que les réponses ne concernent pas. N'ajoute aucune information absente du cadrage, du besoin reformulé ou des réponses.
 3. Conserve STRICTEMENT la structure : titre « # Cadrage ${target_issue} », Partie 1 : Analyse Fonctionnelle, Partie 2 : Analyse Technique. Rédaction synthétique.
 
-STOP : modifie UNIQUEMENT '${cadrage_file}'. Ne mets PAS à jour Jira (la description est mise à jour automatiquement à partir du fichier), ne lis ni ne modifie aucun code source, ne génère aucun patch.
+STOP : modifie UNIQUEMENT '${cadrage_file}'. N'écris rien dans Jira : la publication dans Jira est faite par l'agent après validation de l'utilisateur. Ne lis ni ne modifie aucun code source, ne génère aucun patch.
 Réponse finale : 5 lignes maximum (ce qui a changé dans le cadrage).

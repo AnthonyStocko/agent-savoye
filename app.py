@@ -20,10 +20,10 @@ from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_c
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
                    cucumber_links, cucumber_results, cucumber_studio, cucumber_testability, cucumber_tools,
                    cucumber_verify, integration_tools, jenkins_tools, knowledge_tools)
-from tools.epic_tools import load_epic_manifest
+from tools import analysis_publication
+from tools.epic_tools import draft_tasks, load_epic_manifest, task_file
 from tools.jira_tools import (
-    JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary,
-    set_jira_description_markdown, std_only_projects,
+    JiraSearchError, fetch_tickets_data, fetch_tickets_with_epic_context, get_jira_issue_summary, std_only_projects,
 )
 from tools.db_tools import DB_TYPES, test_connection
 from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant, db_restore, skills
@@ -198,6 +198,32 @@ def interruption_cause(returncode: int) -> str:
     errors = [e for e in errors if e and not e.startswith(("Traceback", "File "))]
     return (errors[-1][:240] if errors else
             f"le traitement s'est arrêté avant la fin (code retour {returncode}), voir le journal technique")
+
+
+def show_publication_status(issue_key: str, text: str = None) -> None:
+    """Statut de l'analyse : brouillon local ou publiée dans Jira (redevient brouillon si révisée après)."""
+    state = analysis_publication.status(issue_key, text)
+    if state["publiee"]:
+        st.markdown(f":green[:material/cloud_done: {state['libelle']}]")
+    else:
+        st.markdown(f":orange[:material/edit_note: {state['libelle']}] — publiée dans Jira seulement à la validation.")
+
+
+def validate_epic_split(epic_key: str, project: str, client_repo: str, db_schema: str) -> bool:
+    """Validation du découpage : crée les tâches manquantes dans Jira et publie les analyses modifiées (epic-sync)."""
+    st.info(f"Validation du découpage de {epic_key} : création des tâches et publication des analyses dans Jira...")
+    returncode = run_main_step([
+        sys.executable, "main.py",
+        "--issue", epic_key,
+        "--project", project,
+        "--client-repo", client_repo,
+        "--step", "epic-sync",
+        "--db-schema", db_schema
+    ])
+    if returncode != 0:
+        st.error("La création des tâches a échoué : consultez le journal technique (en haut de l'onglet). Les tâches "
+                 "déjà créées sont conservées et réutilisées à la relance.")
+    return returncode == 0
 
 
 def render_technical_journal() -> None:
@@ -499,10 +525,10 @@ with tab_execution:
         is_epic = bool(ticket_ctx.get("is_epic"))
         epic_manifest_tasks = load_epic_manifest(selected_ticket).get("tasks", []) if is_epic else []
         epic_tasks = [t for t in epic_manifest_tasks if t.get("key")]
-        # Découpage rédigé mais tâches pas (toutes) créées dans Jira : on les crée sans relancer l'agent
+        # Découpage rédigé : ses tâches ne sont créées dans Jira qu'à la validation du découpage par l'utilisateur
         epic_pending = len(epic_manifest_tasks) - len(epic_tasks)
         # Analyse déjà faite : fichier du workspace, sinon dernière version mémorisée par l'agent (restaurée)
-        has_existing_cadrage = (bool(epic_tasks) and not epic_pending if is_epic
+        has_existing_cadrage = (bool(epic_manifest_tasks) if is_epic
                                 else restore_cadrage_file(selected_ticket, cadrage_file))
         # Analyse existante d'une tâche : la saisie de révision s'ouvre directement, sans relancer l'analyse
         if should_open_revision(is_epic, has_existing_cadrage, st.session_state.get("workflow_step"),
@@ -513,25 +539,26 @@ with tab_execution:
 
         if is_epic:
             if epic_pending:
-                st.warning(f"Le découpage de {selected_ticket} est rédigé ({len(epic_manifest_tasks)} tâche(s)) mais "
-                           f"{epic_pending} tâche(s) ne sont pas encore créées dans Jira.")
+                st.warning(f"Le découpage de {selected_ticket} est rédigé ({len(epic_manifest_tasks)} tâche(s)) : "
+                           f"brouillon non validé, {epic_pending} tâche(s) pas encore créées dans Jira. Relisez-le, "
+                           f"puis validez le découpage pour créer les tâches.")
             elif epic_tasks:
                 st.success(f"💡 {format_ticket_option(selected_ticket)} est déjà découpée en {len(epic_tasks)} tâche(s) : "
                            + ", ".join(t["key"] for t in epic_tasks) + ".")
             else:
-                st.info("ℹ️ Épopée : l'analyse crée la ou les tâches enfants nécessaires (une seule si un découpage "
-                        "n'est pas utile), avec leur analyse fonctionnelle et technique en description.")
+                st.info("ℹ️ Épopée : l'analyse propose la ou les tâches enfants nécessaires (une seule si un découpage "
+                        "n'est pas utile), avec leur analyse fonctionnelle et technique. Les tâches ne sont créées dans "
+                        "Jira qu'après validation du découpage.")
         elif has_existing_cadrage:
             st.success(f"💡 Une analyse existe déjà pour {format_ticket_option(selected_ticket)} : "
                        "elle est affichée ci-dessous pour révision.")
+            show_publication_status(selected_ticket)
 
         col_cadrage, col_direct_patch, col_next = st.columns([2, 2, 1])
 
         with col_cadrage:
-            if is_epic and epic_pending:
-                btn_cadrage_label = "📌 Créer les tâches dans Jira (analyse prête)"
-            elif is_epic:
-                btn_cadrage_label = "📝 Relire les analyses des tâches" if has_existing_cadrage else "⚡ 1. Analyser l'épopée & créer les tâches"
+            if is_epic:
+                btn_cadrage_label = "📝 Relire le découpage" if has_existing_cadrage else "⚡ 1. Analyser l'épopée"
             else:
                 btn_cadrage_label = "♻️ Refaire l'analyse complète" if has_existing_cadrage else "⚡ 1. Lancer l'analyse"
             run_cadrage_btn = st.button(btn_cadrage_label, use_container_width=True,
@@ -545,7 +572,9 @@ with tab_execution:
             else:
                 btn_patch_label = "🛠️ Générer le Patch (Analyse prête)" if has_existing_cadrage else "🚀 Générer le Patch directement"
             run_direct_patch_btn = st.button(btn_patch_label, type="primary", use_container_width=True,
-                                             disabled=is_epic and not has_existing_cadrage)
+                                             disabled=is_epic and (not epic_tasks or bool(epic_pending)),
+                                             help="Découpage à valider d'abord (création des tâches)." if (
+                                                 is_epic and (not epic_tasks or epic_pending)) else None)
 
         with col_next:
             has_next = st.session_state["selected_index"] < len(tickets) - 1
@@ -567,14 +596,14 @@ with tab_execution:
             else:
                 returncode = 0
                 if not has_existing_cadrage:
-                    st.info(f"Création des tâches enfants de {selected_ticket} dans Jira..." if epic_pending
-                            else f"Analyse de l'épopée {selected_ticket} et création des tâches enfants en cours...")
+                    st.info(f"Analyse de l'épopée {selected_ticket} en cours (découpage en brouillon : rien n'est "
+                            f"créé dans Jira avant votre validation)...")
                     returncode = run_main_step([
                         sys.executable, "main.py",
                         "--issue", selected_ticket,
                         "--project", current_project,
                         "--client-repo", client_repo_path.strip(),
-                        "--step", "epic-sync" if epic_pending else "epic-cadrage",
+                        "--step", "epic-cadrage",
                         "--db-schema", db_schema_input
                     ])
                 if returncode == 0:
@@ -583,8 +612,8 @@ with tab_execution:
                     st.session_state["current_client_repo"] = client_repo_path.strip()
                     st.rerun()
                 else:
-                    st.error("Une erreur est survenue lors de l'analyse de l'épopée : consultez le journal technique (en haut de l'onglet) "
-                             "(les tâches déjà créées sont conservées et réutilisées à la relance).")
+                    st.error("Une erreur est survenue lors de l'analyse de l'épopée : consultez le journal technique "
+                             "(en haut de l'onglet).")
             run_cadrage_btn = run_direct_patch_btn = False
 
         # Option A : Lancer ou revoir l'analyse
@@ -655,6 +684,11 @@ with tab_execution:
             with open(cadrage_file, "r", encoding="utf-8") as f:
                 cadrage_content = f.read()
 
+        flash = st.session_state.pop("publication_flash", None)
+        if flash and flash[0] == active_ticket:
+            st.success(flash[1])
+        show_publication_status(active_ticket, cadrage_content)
+
         user_analysis = st.text_area(
             "Analyse enregistrée (Modifiable directement avant de générer le patch) :",
             value=cadrage_content,
@@ -666,7 +700,7 @@ with tab_execution:
             placeholder="Ex: Préciser l'impact sur les retours, ajuster le composant..."
         )
 
-        col_review, col_validate = st.columns(2)
+        col_review, col_publish, col_validate = st.columns(3)
 
         with col_review:
             if st.button("🔄 Demander une révision à l'agent", use_container_width=True):
@@ -675,8 +709,7 @@ with tab_execution:
                 if record_manual_edit(active_ticket, cadrage_content, user_analysis):
                     st.toast("Vos corrections manuelles ont été mémorisées.", icon=":material/edit_note:")
 
-                with open(cadrage_file, "w", encoding="utf-8") as f:
-                    f.write(user_analysis)
+                analysis_publication.save_draft(active_ticket, user_analysis)
 
                 cmd_refine = [
                     sys.executable, "main.py",
@@ -691,21 +724,36 @@ with tab_execution:
                 returncode = run_main_step(cmd_refine)
 
                 if returncode == 0:
-                    st.toast("Analyse révisée et mise à jour !", icon=":material/check_circle:")
+                    st.toast("Analyse révisée (brouillon, non publiée dans Jira).", icon=":material/check_circle:")
                     st.rerun()
                 else:
                     # Pas de rerun : les logs restent affichés pour diagnostiquer l'échec
                     st.error(f"La révision a échoué (code {returncode}). Rien n'a été enregistré en mémoire : consultez le journal technique (en haut de l'onglet).")
 
+        with col_publish:
+            if st.button("📤 Valider l'analyse et la publier dans Jira", use_container_width=True,
+                         help="Publie l'analyse validée dans la description Jira, sans générer le patch."):
+                if record_manual_edit(active_ticket, cadrage_content, user_analysis):
+                    st.toast("Vos corrections manuelles ont été mémorisées.", icon=":material/edit_note:")
+                try:
+                    state = analysis_publication.validate(active_ticket, user_analysis)
+                    st.session_state["publication_flash"] = (active_ticket, f"Analyse validée. {state['libelle']}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Analyse enregistrée localement, mais non publiée dans Jira : {e}")
+
         with col_validate:
             if st.button("✅ Valider l'analyse & Générer le Patch", type="primary", use_container_width=True):
-                st.info("Génération du patch Git et envoi sur Jira...")
-
                 if record_manual_edit(active_ticket, cadrage_content, user_analysis):
                     st.toast("Vos corrections manuelles ont été mémorisées.", icon=":material/edit_note:")
 
-                with open(cadrage_file, "w", encoding="utf-8") as f:
-                    f.write(user_analysis)
+                # Validation : publication de l'analyse dans Jira, puis patch
+                try:
+                    published = analysis_publication.validate(active_ticket, user_analysis)
+                except Exception as e:
+                    st.error(f"Analyse enregistrée localement, mais non publiée dans Jira : {e}. Patch non généré.")
+                    st.stop()
+                st.info(f"{published['libelle']}. Génération du patch Git et envoi sur Jira...")
 
                 cmd_val_patch = [
                     sys.executable, "main.py",
@@ -735,38 +783,47 @@ with tab_execution:
         active_project = st.session_state.get("selected_jira_project", os.getenv("JIRA_PROJECT_KEY", ""))
         active_schema = st.session_state.get("db_schema_input", "").strip()
         epic_manifest = load_epic_manifest(active_epic)
-        review_tasks = [t for t in epic_manifest.get("tasks", []) if t.get("key")]
+        review_tasks = epic_manifest.get("tasks", [])
+        pending_tasks = draft_tasks(epic_manifest)
 
         st.markdown("---")
-        st.subheader(f"📝 Relecture des tâches de l'épopée ({active_epic})")
+        st.subheader(f"📝 Relecture du découpage de l'épopée ({active_epic})")
         if epic_manifest.get("justification"):
             st.caption(f"Découpage en {len(review_tasks)} tâche(s) — {epic_manifest['justification']}")
+        if pending_tasks:
+            st.markdown(f":orange[:material/edit_note: Découpage non validé (brouillon) : {len(pending_tasks)} "
+                        f"tâche(s) pas encore créées dans Jira.]")
 
         task_edits = {}
-        for task in review_tasks:
-            task_file = f"{task['key']}-cadrage.md"
+        for index, task in enumerate(review_tasks, 1):
+            path = task_file(task)
             task_content = ""
-            if os.path.exists(task_file):
-                with open(task_file, "r", encoding="utf-8") as f:
+            if path and os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
                     task_content = f.read()
-            with st.expander(f"{task['key']} — {task.get('summary', '')}", expanded=len(review_tasks) == 1):
-                task_edits[task["key"]] = (task_file, task_content, st.text_area(
-                    f"Analyse de {task['key']} (Modifiable directement avant de générer les patchs) :",
+            label = task.get("key") or f"Tâche {index} (à créer)"
+            with st.expander(f"{label} — {task.get('summary', '')}", expanded=len(review_tasks) == 1):
+                if task.get("key"):
+                    show_publication_status(task["key"], task_content)
+                else:
+                    st.markdown(":orange[:material/edit_note: Brouillon : tâche créée dans Jira à la validation "
+                                "du découpage.]")
+                task_edits[path] = (task.get("key", ""), task_content, st.text_area(
+                    f"Analyse de {label} (Modifiable directement avant validation) :",
                     value=task_content,
                     height=300
                 ))
 
         def save_task_edits():
-            """Enregistre les corrections manuelles (fichier local, mémoire, description Jira de la tâche)."""
-            for task_key, (task_file, before, after) in task_edits.items():
-                with open(task_file, "w", encoding="utf-8") as f:
+            """Corrections manuelles enregistrées localement (fichier, mémoire) ; publiées à la validation."""
+            for path, (task_key, before, after) in task_edits.items():
+                if not path:
+                    continue
+                with open(path, "w", encoding="utf-8") as f:
                     f.write(after)
-                if record_manual_edit(task_key, before, after):
-                    st.toast(f"Vos corrections sur {task_key} ont été mémorisées.", icon=":material/edit_note:")
-                    try:
-                        set_jira_description_markdown(task_key, after)
-                    except Exception as e:
-                        st.warning(f"Description Jira de {task_key} non mise à jour : {e}")
+                if task_key and record_manual_edit(task_key, before, after):
+                    st.toast(f"Vos corrections sur {task_key} ont été mémorisées (publiées à la validation).",
+                             icon=":material/edit_note:")
 
         epic_feedback = st.text_input(
             "Consignes de révision pour l'agent (Optionnel) :",
@@ -774,7 +831,7 @@ with tab_execution:
             key="epic_feedback"
         )
 
-        col_epic_review, col_epic_validate = st.columns(2)
+        col_epic_review, col_epic_split, col_epic_validate = st.columns(3)
 
         with col_epic_review:
             if st.button("🔄 Demander une révision à l'agent", use_container_width=True, key="epic_refine_btn"):
@@ -790,16 +847,28 @@ with tab_execution:
                     "--db-schema", active_schema
                 ])
                 if returncode == 0:
-                    st.toast("Analyses révisées et tâches Jira mises à jour !", icon=":material/check_circle:")
+                    st.toast("Découpage révisé (brouillon, rien n'est publié dans Jira).", icon=":material/check_circle:")
                     st.rerun()
                 else:
                     st.error(f"La révision a échoué (code {returncode}) : consultez le journal technique (en haut de l'onglet).")
 
+        with col_epic_split:
+            if st.button("📌 Valider le découpage et créer les tâches", use_container_width=True,
+                         key="epic_split_btn", disabled=not review_tasks,
+                         help="Crée dans Jira les tâches du découpage et publie les analyses modifiées, "
+                              "sans générer les patchs."):
+                save_task_edits()
+                if validate_epic_split(active_epic, active_project, active_repo, active_schema):
+                    st.toast("Découpage validé : tâches créées et analyses publiées dans Jira.",
+                             icon=":material/check_circle:")
+                    st.rerun()
+
         with col_epic_validate:
-            if st.button("✅ Valider les analyses & Générer les Patchs", type="primary", use_container_width=True,
+            if st.button("✅ Valider le découpage & Générer les Patchs", type="primary", use_container_width=True,
                          key="epic_validate_btn", disabled=not review_tasks):
                 save_task_edits()
-                if run_epic_patches(active_epic, active_project, active_repo, active_schema):
+                if validate_epic_split(active_epic, active_project, active_repo, active_schema) and \
+                        run_epic_patches(active_epic, active_project, active_repo, active_schema):
                     st.success(f"🎉 Traitement terminé : un patch est attaché à chaque tâche de l'épopée {active_epic}.")
                     st.session_state["workflow_step"] = "EPIC_FINISHED"
 
@@ -1260,9 +1329,11 @@ with tab_integration:
             if completed and completed[0] == integ_ticket:
                 del st.session_state["integ_completed"]
                 remaining = len(questions) - len(integration_tools.answered(integ_state))
-                st.success(f"Besoin de {integ_ticket} complété avec les réponses"
-                           + (" ainsi que le cadrage" if completed[1] else "") + ", et mis à jour dans Jira. "
+                st.success(f"Besoin de {integ_ticket} complété avec les réponses et mis à jour dans Jira. "
                            + (f"{remaining} question(s) restent ouvertes." if remaining else "Plus aucune question ouverte."))
+                if completed[1]:
+                    st.info(f"Le cadrage {integ_ticket}-cadrage.md a été complété avec les réponses : brouillon à "
+                            "relire et valider dans l'onglet Lancement, il n'est publié dans Jira qu'à la validation.")
                 if completed[1] is None:
                     st.caption(f"Pas encore de cadrage pour {integ_ticket} : l'analyse lancée depuis l'onglet "
                                "Lancement tiendra compte des réponses présentes dans la description.")
@@ -3932,6 +4003,13 @@ with tab_config:
         env_values["JIRA_API_TOKEN"] = secret_input("JIRA_API_TOKEN",
                                                      help="À créer sur https://id.atlassian.com/manage-profile/security/api-tokens")
         env_values["JIRA_PROJECT_KEY"] = st.text_input("JIRA_PROJECT_KEY (Par défaut)", value=os.getenv("JIRA_PROJECT_KEY", ""))
+        with st.container(horizontal=True):
+            env_values["JIRA_READ_EMAIL"] = st.text_input(
+                "JIRA_READ_EMAIL (facultatif)", value=os.getenv("JIRA_READ_EMAIL", ""),
+                help="Compte Jira en lecture seule transmis à l'agent pendant l'analyse. Vide : l'agent n'a aucun "
+                     "jeton Jira pendant l'analyse (le contexte du ticket lui est fourni dans le prompt).")
+            env_values["JIRA_READ_API_TOKEN"] = secret_input(
+                "JIRA_READ_API_TOKEN", help="Jeton du compte JIRA_READ_EMAIL, sans droit d'écriture.")
 
         st.markdown("---")
         st.markdown("#### 🔎 Recherche Jira (valeurs par défaut de l'onglet Lancement)")

@@ -228,6 +228,10 @@ def fetch_tickets_with_epic_context(
 
 def add_jira_attachment(issue_key: str, file_path: str) -> str:
     """Attache un fichier local (ex: .patch) au ticket Jira spécifié."""
+    try:
+        ensure_jira_writable(f"Pièce jointe sur {issue_key}")
+    except JiraReadOnly as e:
+        return f"Erreur : {e}"
     domain = os.getenv("JIRA_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
     email = os.getenv("JIRA_EMAIL", "").strip()
     token = os.getenv("JIRA_API_TOKEN", "").strip()
@@ -463,6 +467,31 @@ def _markdown_to_adf_rich(markdown: str) -> dict:
     return {"type": "doc", "version": 1, "content": out or [_adf_paragraph(markdown or " ")]}
 
 
+# Sous-processus Claude des étapes d'analyse : aucune écriture Jira (cf. tools/jira_guard.py)
+READ_ONLY_ENV = "AGENT_JIRA_READ_ONLY"
+
+
+class JiraReadOnly(RuntimeError):
+    """Écriture Jira refusée : environnement en lecture seule (étape d'analyse non validée)."""
+
+
+def ensure_jira_writable(action: str) -> None:
+    """Lève JiraReadOnly si l'environnement interdit toute écriture Jira (AGENT_JIRA_READ_ONLY=1)."""
+    if os.getenv(READ_ONLY_ENV, "").strip() == "1":
+        raise JiraReadOnly(f"{action} refusée : Jira est en lecture seule pendant l'analyse. La publication est faite "
+                           f"par l'agent après validation de l'utilisateur.")
+
+
+def get_jira_description(issue_key: str):
+    """Description brute (document ADF, ou None si vide) du ticket. Lève RuntimeError si Jira ne répond pas."""
+    api, auth = _jira_connection()
+    response = requests.get(f"{api}/issue/{issue_key}?fields=description", auth=auth,
+                            headers={"Accept": "application/json"}, timeout=15)
+    if response.status_code != 200:
+        raise RuntimeError(f"Lecture de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
+    return response.json().get("fields", {}).get("description")
+
+
 def _jira_connection():
     domain = os.getenv("JIRA_DOMAIN", "").replace("https://", "").replace("http://", "").strip("/")
     email = os.getenv("JIRA_EMAIL", "").strip()
@@ -568,6 +597,7 @@ def create_jira_issue(project_key: str, summary: str, description: str, componen
     Crée un ticket via l'API REST v3 et renvoie sa clé (ex: SPEC-2045).
     La description est en Markdown (convertie en ADF). Lève RuntimeError en cas d'échec.
     """
+    ensure_jira_writable(f"Création d'un ticket dans {project_key}")
     api, auth = _jira_connection()
     fields = build_jira_issue_fields(project_key, summary, description, component, labels, issue_type, parent_key)
     response = requests.post(f"{api}/issue", auth=auth, json={"fields": fields},
@@ -579,6 +609,7 @@ def create_jira_issue(project_key: str, summary: str, description: str, componen
 
 def set_jira_description_markdown(issue_key: str, markdown: str) -> None:
     """Remplace la description d'un ticket par ce Markdown (converti en ADF). Lève RuntimeError en cas d'échec."""
+    ensure_jira_writable(f"Mise à jour de la description de {issue_key}")
     api, auth = _jira_connection()
     response = requests.put(f"{api}/issue/{issue_key}", auth=auth, timeout=30,
                             json={"fields": {"description": _markdown_to_adf_rich(markdown)}})
@@ -698,6 +729,7 @@ def update_jira_release_note(issue_key: str, paragraph: str) -> None:
     """
     if not paragraph or not paragraph.strip():
         raise ValueError("Release note vide.")
+    ensure_jira_writable(f"Mise à jour de la description de {issue_key}")
     api, auth = _jira_connection()
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     response = requests.get(f"{api}/issue/{issue_key}?fields=description", auth=auth, headers=headers, timeout=15)
@@ -804,6 +836,7 @@ def upsert_cadrage_adf(adf_doc, cadrage_markdown: str, stop_titles=()) -> dict:
 
 def _update_jira_description(issue_key: str, transform) -> None:
     """Applique `transform` (document ADF -> document ADF) à la description du ticket. Lève RuntimeError en cas d'échec."""
+    ensure_jira_writable(f"Mise à jour de la description de {issue_key}")
     api, auth = _jira_connection()
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     response = requests.get(f"{api}/issue/{issue_key}?fields=description", auth=auth, headers=headers, timeout=15)

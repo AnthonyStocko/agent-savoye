@@ -19,11 +19,15 @@ from dotenv import load_dotenv
 from tools import env_tools, secret_tools
 from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
-from tools.epic_tools import epic_manifest_path, load_epic_manifest, sync_epic_tasks
+from tools.epic_tools import (
+    _restore_keys as restore_epic_keys, draft_tasks, epic_manifest_path, load_epic_manifest, save_epic_manifest,
+    sync_epic_tasks,
+)
+from tools import analysis_publication, jira_guard
 from tools.jira_tools import (
     fetch_application_tickets, find_jira_issue_by_summary, get_epic_children, get_full_jira_issue_context,
     get_jira_issue_details,
-    get_issue_field_values, std_only_projects, update_jira_cadrage, update_jira_release_note,
+    get_issue_field_values, std_only_projects, update_jira_release_note,
 )
 from tools.memory_tools import (
     _extract_recap,
@@ -280,11 +284,13 @@ def claude_env() -> dict:
 
 
 def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
-               cwd: str = None, effort: str = "", lean: bool = False, budget_usd: str = "") -> tuple:
+               cwd: str = None, effort: str = "", lean: bool = False, budget_usd: str = "",
+               env: dict = None) -> tuple:
     """
     Exécute `claude --print` sur le prompt (envoyé sur stdin) et affiche sa réponse.
     Renvoie (code retour, texte de la réponse, usage des tokens, quota atteint) ; usage["fin"] : subtype du résultat
-    (error_max_budget_usd si le budget est atteint, cf. budget_hit).
+    (error_max_budget_usd si le budget est atteint, cf. budget_hit). `env` : environnement du sous-processus
+    (par défaut claude_env()).
     """
     cmd = claude_command(model, add_dirs, allowed_tools, extra_args, effort, lean, budget_usd)
 
@@ -299,7 +305,7 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
         errors="replace",
         shell=(os.name == "nt"),
         cwd=cwd,
-        env=claude_env(),
+        env=env if env is not None else claude_env(),
     )
 
     raw_stdout, raw_stderr = process.communicate(input=prompt)
@@ -1635,10 +1641,27 @@ def main():
 
     add_dirs = [workspace_dir] + [d for d in (local_std_repo, local_client_repo, local_cucumber_std_repo)
                                   if d and os.path.exists(d)]
+    claude_extra = knowledge_tools.read_only_args() if shared["documents"] else ()
+    claude_environment = None
+    jira_before = {}
+    jira_keys = []
+    # Analyse non validée : aucune écriture Jira possible pour l'agent, descriptions relevées avant et après
+    if jira_guard.applies(args.step):
+        claude_extra = jira_guard.claude_args(workspace_dir, claude_extra)
+        claude_environment = jira_guard.sandbox_env(claude_env())
+        jira_keys = jira_guard.watched_keys(target_issue, args.step, epic_previous_manifest)
+        jira_before = jira_guard.snapshot(jira_keys, args.step)
+        print(f"[JIRA] Lecture seule pour l'agent pendant l'étape {args.step} (aucun outil ni jeton d'écriture) ; "
+              f"descriptions relevées : {', '.join(jira_keys)}.")
+        if jira_guard.unreadable(jira_before):
+            print(f"[JIRA] ⚠️ État Jira illisible avant l'étape ({', '.join(jira_guard.unreadable(jira_before))}) : "
+                  f"contrôle impossible pour ces éléments.")
     returncode, stdout_output, token_usage, session_limit_hit = run_claude(
         prompt, claude_model, add_dirs,
         ["Read", "Write", "Edit", "Grep", "Glob", "Bash", f"Bash({python_exe}:*)", "Bash(git:*)"],
-        extra_args=knowledge_tools.read_only_args() if shared["documents"] else (), effort=claude_effort_level)
+        extra_args=claude_extra, effort=claude_effort_level, env=claude_environment)
+    if jira_before and not check_jira_untouched(args.step, jira_before, jira_keys):
+        sys.exit(1)
     report_token_usage(target_issue, args.step, claude_model, token_usage, len(prompt), returncode,
                        claude_effort_level)
 
@@ -1659,20 +1682,18 @@ def main():
             if _safe_memory(save_cadrage_memory, target_issue, target_project,
                             cadrage_text=cadrage_content, jira_context=jira_context):
                 print(f"[MÉMOIRE] Besoin initial et cadrage enregistrés pour {target_issue}.")
-            restore_integration_section(target_issue)
+            print_draft_status(target_issue)
         elif args.step == "epic-cadrage":
             manifest_file = epic_manifest_path(target_issue)
             # En révision, l'agent peut ne retoucher que les analyses : le manifeste existant reste valable
             is_revision = bool(epic_previous_manifest.get("tasks"))
             if not os.path.exists(manifest_file) or (not is_revision and os.path.getmtime(manifest_file) < run_started_at):
-                print(f"[ÉPOPÉE] ❌ L'agent n'a pas écrit le manifeste '{manifest_file}' pendant cette exécution : aucune tâche créée.")
+                print(f"[ÉPOPÉE] ❌ L'agent n'a pas écrit le manifeste '{manifest_file}' pendant cette exécution.")
                 sys.exit(1)
             if args.feedback.strip():
                 _safe_memory(save_cadrage_memory, target_issue, target_project, jira_context=jira_context)
                 _safe_memory(save_refine_feedback, target_issue, args.feedback)
-            if not sync_epic_tasks(target_issue, target_project, epic_previous_manifest,
-                                   component=args.jira_component, issue_type=args.epic_task_type,
-                                   epic_components=jira_context.get("components", [])):
+            if not finalize_epic_draft(target_issue, epic_previous_manifest):
                 sys.exit(1)
             task_keys = [t["key"] for t in load_epic_manifest(target_issue).get("tasks", []) if t.get("key")]
             share_knowledge(epic_markdown(target_issue), target_project, "decoupage-epopee", knowledge_subject,
@@ -1681,7 +1702,7 @@ def main():
             if _safe_memory(save_refine_feedback, target_issue, args.feedback,
                             previous_cadrage=cadrage_before_run, updated_cadrage=cadrage_content):
                 print(f"[MÉMOIRE] Consigne de révision et écarts enregistrés pour {target_issue}.")
-            restore_integration_section(target_issue)
+            print_draft_status(target_issue)
         elif is_cadrage_answers:
             if not finalize_cadrage_answers(target_issue, cadrage_content, cadrage_before_run):
                 sys.exit(1)
@@ -5096,32 +5117,63 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     return exit_code
 
 
-def restore_integration_section(issue_key: str) -> None:
-    """Republie la section « Intégration du besoin » (questions et réponses) si l'agent l'a réécrite ou supprimée."""
-    state = integration_tools.load_state(issue_key)
-    if not state:
-        return
-    try:
-        integration_tools.publish_state(issue_key, state)
-        print(f"[INTÉGRATION] Section « {integration_tools.SECTION_TITLE} » rétablie dans la description de {issue_key}.")
-    except (RuntimeError, requests.RequestException) as e:
-        print(f"[INTÉGRATION] ⚠️ Section « {integration_tools.SECTION_TITLE} » non rétablie : {e}")
-
-
 def finalize_cadrage_answers(issue_key: str, cadrage: str, cadrage_before: str) -> bool:
-    """Publie dans Jira le cadrage complété par l'agent (à la place de l'ancien, le reste de la description intact)."""
+    """
+    Cadrage complété par l'agent avec les réponses : il revient en relecture (brouillon local), sans publication.
+    La publication dans Jira suit la validation de l'utilisateur (onglet Lancement).
+    """
     if not cadrage.strip():
         print(f"[CADRAGE] ❌ Cadrage vide après l'exécution de l'agent.")
         return False
     if cadrage.strip() == cadrage_before.strip():
-        print("[CADRAGE] Les réponses ne changent rien au cadrage : Jira non modifié.")
-        return True
-    try:
-        update_jira_cadrage(issue_key, cadrage, stop_titles=(integration_tools.SECTION_TITLE,))
-    except (RuntimeError, requests.RequestException) as e:
-        print(f"[CADRAGE] ❌ Cadrage complété localement mais non publié dans Jira : {e}")
+        print("[CADRAGE] Les réponses ne changent rien au cadrage.")
+    else:
+        print(f"[CADRAGE] Cadrage de {issue_key} complété avec les réponses, à relire et valider dans l'onglet "
+              f"Lancement.")
+    print_draft_status(issue_key)
+    return True
+
+
+def print_draft_status(issue_key: str) -> None:
+    """Statut de publication de l'analyse : brouillon tant que l'utilisateur ne l'a pas validée."""
+    state = analysis_publication.status(issue_key)
+    print(f"[PUBLICATION] {issue_key} : {state['libelle']}."
+          + ("" if state["publiee"] else " Elle sera publiée dans Jira à la validation de l'utilisateur."))
+
+
+def check_jira_untouched(step: str, before: dict, keys: list) -> bool:
+    """Compare l'état Jira relevé avant l'étape à l'état actuel : toute modification par l'agent est une erreur."""
+    after = jira_guard.snapshot(keys, step)
+    changed = jira_guard.changes(before, after)
+    if changed:
+        print(f"[JIRA] ❌ Jira modifié pendant l'étape {step} alors que l'analyse n'est pas validée : "
+              f"{', '.join(changed)}. Vérifiez le ticket dans Jira ; l'analyse locale n'est pas enregistrée.")
         return False
-    print(f"[CADRAGE] Cadrage complété avec les réponses et mis à jour dans la description de {issue_key}.")
+    unreadable = jira_guard.unreadable(after)
+    if unreadable:
+        print(f"[JIRA] ⚠️ État Jira illisible après l'étape ({', '.join(unreadable)}) : contrôle incomplet.")
+    print("[JIRA] Contrôle : aucune modification Jira pendant l'étape.")
+    return True
+
+
+def finalize_epic_draft(epic_key: str, previous_manifest: dict) -> bool:
+    """
+    Découpage rédigé ou révisé par l'agent : il reste un brouillon local. Aucune tâche n'est créée ni mise à jour
+    dans Jira avant la validation du découpage par l'utilisateur (étape epic-sync).
+    """
+    manifest = load_epic_manifest(epic_key)
+    if not manifest.get("tasks"):
+        print(f"[ÉPOPÉE] ❌ Manifeste '{epic_manifest_path(epic_key)}' absent, illisible ou sans tâche.")
+        return False
+    # Clés des tâches déjà créées, si l'agent les a perdues en réécrivant le manifeste
+    restore_epic_keys(manifest, previous_manifest or {})
+    save_epic_manifest(epic_key, manifest)
+    drafts = draft_tasks(manifest)
+    created = [t for t in manifest["tasks"] if t.get("key")]
+    print(f"[ÉPOPÉE] Découpage de {epic_key} en brouillon : {len(manifest['tasks'])} tâche(s)"
+          + (f", dont {len(drafts)} à créer dans Jira" if drafts else "")
+          + (f" ; analyses à republier après validation : {', '.join(t['key'] for t in created)}" if created else "")
+          + ". Rien n'est créé ni publié dans Jira avant la validation du découpage.")
     return True
 
 

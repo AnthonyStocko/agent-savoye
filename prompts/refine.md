@@ -10,5 +10,5 @@ ${token_saving_rules}${capitalization_block}${knowledge_block}${db_block}
    - **Partie 1 : Analyse Fonctionnelle** (lisible et compréhensible par des consultants métier non-techniques, sans jargon).
    - **Partie 2 : Analyse Technique** (détails techniques ciblés et explication des modifications pour les développeurs).
 4. Garde une rédaction synthétique, claire et sans verbiage superflu.
-5. Mets à jour la description du ticket Jira ${target_issue} avec la nouvelle version (en conservant le texte d'origine au début).
+5. N'écris rien dans Jira : écris uniquement le fichier d'analyse. La publication dans Jira est faite par l'agent après validation de l'utilisateur.
 STOP : Ne génère AUCUN patch pour l'instant.

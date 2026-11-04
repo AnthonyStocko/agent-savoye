@@ -1,6 +1,7 @@
 """
 Analyse d'une épopée : l'agent rédige un manifeste de découpage ('<ÉPOPÉE>-decoupage.json') et un
-fichier d'analyse par tâche ; ce module crée les tâches enfants dans Jira à partir de ce manifeste.
+fichier d'analyse par tâche, qui restent des brouillons locaux. Ce module crée les tâches enfants dans Jira à partir
+de ce manifeste, uniquement quand l'utilisateur valide le découpage (étape epic-sync).
 
 Une fois créée, chaque tâche possède son '<CLÉ>-cadrage.md' : l'étape patch habituelle s'y applique telle quelle.
 """
@@ -8,6 +9,7 @@ import json
 import os
 
 from tools.jira_tools import create_jira_issue, resolve_epic_task_type, set_jira_description_markdown
+from tools import analysis_publication
 from tools.memory_tools import save_cadrage_memory
 
 
@@ -59,8 +61,9 @@ def _restore_keys(manifest: dict, previous: dict) -> None:
 def sync_epic_tasks(epic_key: str, project_key: str, previous_manifest: dict = None,
                     component: str = "", issue_type: str = "", epic_components: list = None) -> bool:
     """
-    Crée dans Jira les tâches du manifeste qui n'ont pas encore de clé (rattachées à l'épopée), met à jour
-    la description des autres, et range chaque analyse dans '<CLÉ>-cadrage.md'. Renvoie False si une tâche a échoué.
+    Validation du découpage par l'utilisateur : crée dans Jira les tâches du manifeste qui n'ont pas encore de clé
+    (rattachées à l'épopée), publie l'analyse des autres si elle a changé depuis sa dernière publication, et range
+    chaque analyse dans '<CLÉ>-cadrage.md'. Renvoie False si une tâche a échoué.
     """
     manifest = load_epic_manifest(epic_key)
     if not manifest.get("tasks"):
@@ -89,7 +92,9 @@ def sync_epic_tasks(epic_key: str, project_key: str, previous_manifest: dict = N
             ok = False
             continue
         try:
-            if task.get("key"):
+            if task.get("key") and analysis_publication.status(task["key"], analysis)["publiee"]:
+                print(f"[ÉPOPÉE] = {task['key']} déjà publiée dans cette version : {summary}")
+            elif task.get("key"):
                 set_jira_description_markdown(task["key"], analysis)
                 print(f"[ÉPOPÉE] 🔄 {task['key']} mise à jour : {summary}")
             else:
@@ -113,6 +118,7 @@ def sync_epic_tasks(epic_key: str, project_key: str, previous_manifest: dict = N
             task["file"] = cadrage_file
         # Enregistré après chaque tâche : une relance ne recrée pas celles déjà créées
         save_epic_manifest(epic_key, manifest)
+        analysis_publication.record_publication(task["key"], analysis)
         try:
             save_cadrage_memory(task["key"], project_key, cadrage_text=analysis, jira_context={
                 "summary": summary, "components": epic_components or [], "description": analysis})
@@ -122,3 +128,13 @@ def sync_epic_tasks(epic_key: str, project_key: str, previous_manifest: dict = N
     keys = [t["key"] for t in manifest["tasks"] if t.get("key")]
     print(f"EPIC_TASKS={','.join(keys)}")
     return ok
+
+
+def draft_tasks(manifest: dict) -> list:
+    """Tâches du découpage pas encore créées dans Jira (brouillons locaux)."""
+    return [t for t in manifest.get("tasks", []) if not t.get("key")]
+
+
+def task_file(task: dict) -> str:
+    """Fichier d'analyse d'une tâche : '<CLÉ>-cadrage.md' une fois créée, sinon celui du manifeste."""
+    return f"{task['key']}-cadrage.md" if task.get("key") else (task.get("file") or "")

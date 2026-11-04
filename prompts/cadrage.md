@@ -32,5 +32,5 @@ ${cucumber_instruction}
 - **Impacts & Stratégie de Test** : Points de vigilance techniques, risques de régression et stratégie de validation unitaire/Cucumber.
 ---
 
-8. Mets à jour la description du ticket Jira ${target_issue} avec ce cadrage (en conservant la description d'origine au début).
+8. N'écris rien dans Jira : écris uniquement le fichier d'analyse. La publication dans Jira est faite par l'agent après validation de l'utilisateur.
 STOP : Ne génère AUCUN patch et ne modifie aucun fichier de code source à cette étape.
