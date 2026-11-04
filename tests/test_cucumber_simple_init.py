@@ -46,7 +46,8 @@ Feature: 01 - Initialisation des données
     And INIT- Initialisation globale par fichiers via l'écran
 
   Scenario: Paramétrage
-    Given CONFIG- Choix de la langue
+    Given INIT- Initialisation globale des règles
+    And CONFIG- Choix de la langue
 """
 
 
@@ -205,7 +206,10 @@ NO_STEP = lambda worktree: {"erreur": "test : step non écrit"}  # noqa: E731
 STD_FILES_JAVA = ("package cucumber.features.clientx;\npublic class InitClientxFichiersStandardSteps {\n"
                   "    @Given(\"INIT- Initialisation globale par fichiers du Standard {string}\")\n"
                   "    public void init(String module) { fileIntegration.integrateStandard(getClass().getClassLoader()"
-                  ".getResource(\"cucumber/files/\" + module), module); }\n}\n")
+                  ".getResource(\"cucumber/files/\" + module), module); }\n"
+                  "    @Given(\"INIT- Initialisation globale des règles du Standard {string}\")\n"
+                  "    public void regles(String module) { rules.integrateAll(getClass().getClassLoader()"
+                  ".getResource(\"cucumber/rules/\" + module)); }\n}\n")
 STD_FILES_STEP = lambda worktree: {"chemin": si.std_files_java_path(CLIENT), "texte": STD_FILES_JAVA}  # noqa: E731
 
 
@@ -459,8 +463,10 @@ def test_std_files_java_checks():
                                      'fileIntegration.integrateStandard(')
     assert si.check_std_files_java(extract) == []                      # extraction temporaire sous target/ permise
     assert si.check_std_files_java(extract.replace("Path d =", 'Files.write(Paths.get("src/test/resources/x"), b); Path d ='))
-    assert si.check_std_files_java(STD_FILES_JAVA.replace(STD_FILES_JAVA[STD_FILES_JAVA.index("{ fileIntegration"):
-                                                                        STD_FILES_JAVA.rindex("}\n}")], "{ }"))
+    first = STD_FILES_JAVA.index("{ fileIntegration")
+    assert si.check_std_files_java(STD_FILES_JAVA.replace(STD_FILES_JAVA[first:STD_FILES_JAVA.index("}\n", first)], "{ "))
+    assert any("règles du Standard" in e for e in si.check_std_files_java(
+        STD_FILES_JAVA[:STD_FILES_JAVA.index("    @Given(\"INIT- Initialisation globale des règles")] + "}\n"))
     disk_only = STD_FILES_JAVA.replace("getClass().getClassLoader().getResource(", "Paths.get(")
     assert any("classpath" in e for e in si.check_std_files_java(disk_only))   # lecture sur le disque seulement
 
@@ -569,9 +575,42 @@ def test_noncompliant_std_files_step_on_the_version_branch_is_rewritten(init_wor
     assert "FichiersStandardSteps.java" in patch and "01-Initialisation.feature" not in patch
 
 
+def test_init_on_the_version_branch_gets_standard_rules(init_workspace, main_module):
+    """Cas Canson : init sur v1.3 avec les fichiers du Standard mais les règles du dossier de la feature."""
+    w = init_workspace
+    local = os.path.join(w["root"], f"{CLIENT}-cucumber")
+    git(local, "checkout", "-q", "v1.3")
+    feature = si.client_feature(STD_INIT, "WMS", CLIENT, CLIENT_CLEAR).replace(
+        "INIT- Initialisation globale par fichiers via l'écran", 'INIT- Initialisation globale par fichiers du Standard "WMS"')
+    assert si.uses_plain_rules(feature) and si.uses_standard_files(feature)
+    write(os.path.join(local, *FEATURE.split("/")), feature)
+    write(os.path.join(local, *si.std_files_java_path(CLIENT).split("/")), STD_FILES_JAVA)
+    write(os.path.join(local, *cuc_clear_path().split("/")), si.clear_java(CLIENT, ["wms/all"], ["wms : p"]))
+    git(local, "add", "-A")
+    git(local, "commit", "-qm", "init sur v1.3")
+    git(local, "push", "-q", "origin", "v1.3")
+    helpers = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "std_files": STD_FILES_STEP, "run": lambda profile, worktree: {"ok": True, "message": "OK", "build": "b"}}
+    assert main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", "verifier", helpers) == 0
+    record = _init_record()
+    assert record["detail"]["plan"]["action"] == "appliquer" and "règles lues dans le Standard" in record["resultat"]
+    assert 'règles du Standard "WMS"' in record["detail"]["plan"]["diff"]
+
+
 def cuc_clear_path():
     from tools import cucumber_init
     return cucumber_init.clear_step_path(CLIENT)
+
+
+def test_rules_read_from_the_standard_too(init_workspace, main_module):
+    """Init adaptée : fichiers ET règles lus dans le Standard (QARuleStep lit rules/<dossier de la feature>/)."""
+    w = init_workspace
+    helpers = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "std_files": STD_FILES_STEP, "run": lambda profile, worktree: {"ok": True, "message": "OK", "build": "b"}}
+    assert main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", "verifier", helpers) == 0
+    diff = _init_record()["detail"]["plan"]["diff"]
+    assert '+    Given INIT- Initialisation globale des règles du Standard "WMS"' in diff
+    assert "+    Given INIT- Initialisation globale des règles\n" not in diff
 
 
 def test_init_stops_without_proven_clear(init_workspace, main_module):

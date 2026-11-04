@@ -31,8 +31,12 @@ GLOBAL_INIT_STEP = cucumber_init.GLOBAL_INIT_STEP
 # Step du projet : initialisation globale par les fichiers de données du Standard (aucune copie dans le dépôt client)
 STD_FILES_STEP = "INIT- Initialisation globale par fichiers du Standard"
 STD_FILES_EXPRESSION = STD_FILES_STEP + " {string}"
+# Même chose pour les règles : « INIT- Initialisation globale des règles » lit rules/<dossier de la feature>/
+RULES_STEP = "INIT- Initialisation globale des règles"
+STD_RULES_STEP = "INIT- Initialisation globale des règles du Standard"
+STD_RULES_EXPRESSION = STD_RULES_STEP + " {string}"
 # Version de la consigne d'écriture du step (un step écrit avec une consigne plus ancienne est réécrit)
-STD_FILES_PROMPT_VERSION = "3-classpath-controle"
+STD_FILES_PROMPT_VERSION = "4-fichiers-et-regles"
 
 _BUNDLE = re.compile(r"^[ \t]*(runtime|import)[ \t]*:[ \t]*[\w.-]+/([\w.-]+)@", re.M)
 _DELETE = re.compile(r'@DELETE\(\s*"/?clear/([A-Za-z0-9_-]+/[A-Za-z0-9_-]+)"\s*\)')
@@ -339,11 +343,18 @@ def use_standard_files(text: str, module: str) -> str:
     out = []
     for line in (text or "").splitlines(keepends=True):
         match = _STEP.match(line.rstrip("\r\n"))
-        if match and not line.lstrip().startswith("#") and match.group(3) == GLOBAL_INIT_STEP:
+        if match and not line.lstrip().startswith("#") and match.group(3) in (GLOBAL_INIT_STEP, RULES_STEP):
             eol = "\r\n" if line.endswith("\r\n") else "\n"
-            line = f'{match.group(1)}{match.group(2)} {STD_FILES_STEP} "{module.upper()}"{eol}'
+            step = STD_FILES_STEP if match.group(3) == GLOBAL_INIT_STEP else STD_RULES_STEP
+            line = f'{match.group(1)}{match.group(2)} {step} "{module.upper()}"{eol}'
         out.append(line)
     return "".join(out)
+
+
+def uses_plain_rules(text: str) -> bool:
+    """Feature qui lit encore les règles du dossier de la feature (step du Standard non remplacé)."""
+    return any((m := _STEP.match(line)) and not line.lstrip().startswith("#") and m.group(3) == RULES_STEP
+               for line in (text or "").splitlines())
 
 
 def uses_standard_files(text: str) -> bool:
@@ -362,8 +373,9 @@ def check_std_files_java(text: str) -> list:
     errors = []
     if not text:
         return ["classe du step des fichiers du Standard non écrite"]
-    if f'"{STD_FILES_EXPRESSION}"' not in text:
-        errors.append(f"expression « {STD_FILES_EXPRESSION} » absente de l'annotation")
+    for expression in (STD_FILES_EXPRESSION, STD_RULES_EXPRESSION):
+        if f'"{expression}"' not in text:
+            errors.append(f"expression « {expression} » absente de l'annotation")
     writes = re.search(r"Files\.(copy|write|move|newOutputStream)|FileUtils\.copy|FileOutputStream", text)
     if writes and not re.search(r'"target[/"]|createTempDirectory|java\.io\.tmpdir', text):
         errors.append("le step écrit des fichiers ailleurs que dans un dossier temporaire sous target/ : interdit")
