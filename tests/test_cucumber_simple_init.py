@@ -204,7 +204,8 @@ AGENT_BRANCH = "feature/agent-cucumber-init-v1.3"
 NO_STEP = lambda worktree: {"erreur": "test : step non écrit"}  # noqa: E731
 STD_FILES_JAVA = ("package cucumber.features.clientx;\npublic class InitClientxFichiersStandardSteps {\n"
                   "    @Given(\"INIT- Initialisation globale par fichiers du Standard {string}\")\n"
-                  "    public void init(String module) { fileIntegration.integrateStandard(module); }\n}\n")
+                  "    public void init(String module) { fileIntegration.integrateStandard(getClass().getClassLoader()"
+                  ".getResource(\"cucumber/files/\" + module), module); }\n}\n")
 STD_FILES_STEP = lambda worktree: {"chemin": si.std_files_java_path(CLIENT), "texte": STD_FILES_JAVA}  # noqa: E731
 
 
@@ -452,12 +453,16 @@ def test_standard_files_unreadable_at_runtime_fall_back_to_copy(init_workspace, 
 def test_std_files_java_checks():
     assert si.check_std_files_java(STD_FILES_JAVA) == []
     assert si.check_std_files_java("") and si.check_std_files_java(STD_FILES_JAVA.replace(
-        "fileIntegration.integrateStandard(module);", "Files.copy(a, b);"))
-    extract = STD_FILES_JAVA.replace("fileIntegration.integrateStandard(module);",
-                                     'Path d = Paths.get("target", "fichiers-standard"); Files.copy(in, d.resolve(n));')
+        "fileIntegration.integrateStandard(", "Files.copy(a, b); fileIntegration.integrateStandard("))
+    extract = STD_FILES_JAVA.replace("fileIntegration.integrateStandard(",
+                                     'Path d = Paths.get("target", "fichiers-standard"); Files.copy(in, d.resolve(n)); '
+                                     'fileIntegration.integrateStandard(')
     assert si.check_std_files_java(extract) == []                      # extraction temporaire sous target/ permise
     assert si.check_std_files_java(extract.replace("Path d =", 'Files.write(Paths.get("src/test/resources/x"), b); Path d ='))
-    assert si.check_std_files_java(STD_FILES_JAVA.replace("{ fileIntegration.integrateStandard(module); }", "{ }"))
+    assert si.check_std_files_java(STD_FILES_JAVA.replace(STD_FILES_JAVA[STD_FILES_JAVA.index("{ fileIntegration"):
+                                                                        STD_FILES_JAVA.rindex("}\n}")], "{ }"))
+    disk_only = STD_FILES_JAVA.replace("getClass().getClassLoader().getResource(", "Paths.get(")
+    assert any("classpath" in e for e in si.check_std_files_java(disk_only))   # lecture sur le disque seulement
 
 
 def test_library_jar_must_embed_the_standard_data(tmp_path):
@@ -512,6 +517,28 @@ def test_complements_without_deliverable_are_not_rebuilt(init_workspace, main_mo
     assert record["detail"]["plan"]["action"] == "lancer"
     assert any("customString1" in a for a in record["detail"]["avertissements"])
     assert call("verifier") == 0 and calls == ["constats", "construire", "constats"]     # pas de nouvel appel
+
+
+def test_std_files_step_rewritten_from_scratch_with_previous_failure(init_workspace, main_module, monkeypatch,
+                                                                     tmp_path):
+    """Ancienne version présente : retirée avant l'appel (réécriture à neuf), échec Jenkins transmis, puis remise."""
+    w = init_workspace
+    local = os.path.join(w["root"], f"{CLIENT}-cucumber")
+    worktree = ct.add_worktree(local, str(tmp_path / "wt"), f"cucumber_{CLIENT}_version", "v1.3", reset=True)
+    path = os.path.join(worktree, *si.std_files_java_path(CLIENT).split("/"))
+    write(path, "ancienne version (disque seulement)")
+    seen = {}
+
+    def fake_write(client, wt, prompt_name, values, check, features, std, label, usage):
+        seen.update(present=os.path.exists(path), echec=values["echec_precedent"])
+        write(path, STD_FILES_JAVA)
+        return check()
+    monkeypatch.setattr(main_module, "write_init_steps", fake_write)
+    monkeypatch.setattr(ct, "standard_java_catalogue", lambda *a, **k: {"java_std": "/std", "steps_example": ""})
+    out = main_module.simple_init_std_files_step(CLIENT, worktree, w["std"], {}, "26.22",
+                                                 "Dossier de données du Standard introuvable : …/spec/./src/…")
+    assert seen == {"present": False, "echec": "Dossier de données du Standard introuvable : …/spec/./src/…"}
+    assert out["texte"] == STD_FILES_JAVA and open(path, encoding="utf-8").read() == "ancienne version (disque seulement)"
 
 
 def test_init_stops_without_proven_clear(init_workspace, main_module):

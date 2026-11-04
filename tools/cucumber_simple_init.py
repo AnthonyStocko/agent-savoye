@@ -32,7 +32,7 @@ GLOBAL_INIT_STEP = cucumber_init.GLOBAL_INIT_STEP
 STD_FILES_STEP = "INIT- Initialisation globale par fichiers du Standard"
 STD_FILES_EXPRESSION = STD_FILES_STEP + " {string}"
 # Version de la consigne d'écriture du step (un step écrit avec une consigne plus ancienne est réécrit)
-STD_FILES_PROMPT_VERSION = "2-classpath"
+STD_FILES_PROMPT_VERSION = "3-classpath-controle"
 
 _BUNDLE = re.compile(r"^[ \t]*(runtime|import)[ \t]*:[ \t]*[\w.-]+/([\w.-]+)@", re.M)
 _DELETE = re.compile(r'@DELETE\(\s*"/?clear/([A-Za-z0-9_-]+/[A-Za-z0-9_-]+)"\s*\)')
@@ -369,6 +369,9 @@ def check_std_files_java(text: str) -> list:
         errors.append("le step écrit des fichiers ailleurs que dans un dossier temporaire sous target/ : interdit")
     if re.search(r"(Files\.(copy|write|move)|FileOutputStream)[^;]*src/test/resources", text):
         errors.append("le step écrit dans src/test/resources : interdit")
+    if not re.search(r"getResource|getResources|getResourceAsStream|ClassLoader", text):
+        errors.append("le step ne lit pas les fichiers dans le classpath (bibliothèque test-jar) : sur Jenkins, le "
+                      "dossier du Standard n'existe pas sur le disque")
     if "PendingException" in text or re.search(r"\)\s*(throws [\w., ]+)?\{\s*\}", text):
         errors.append("méthode vide ou PendingException")
     return errors

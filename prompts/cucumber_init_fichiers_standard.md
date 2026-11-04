@@ -25,6 +25,10 @@ Donc :
 - Aucune méthode vide, aucun `throw new PendingException()`. Module inconnu ou dossier introuvable à l'exécution : échec explicite avec le chemin cherché.
 - N'utilise ni git ni Maven : compilation et contrôles sont relancés automatiquement.
 
+=== ÉCHEC DE LA VERSION PRÉCÉDENTE DU STEP SUR JENKINS ===
+${echec_precedent}
+Tu écris la classe EN ENTIER, à neuf (l'ancienne version a été retirée du worktree) : ne reprends pas une logique qui a échoué.
+
 === ERREURS DE LA TENTATIVE PRÉCÉDENTE ===
 ${erreurs}
 

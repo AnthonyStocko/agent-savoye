@@ -5020,7 +5020,8 @@ def simple_init_patch_path(client: str, branch: str) -> str:
     return os.path.join(cucumber_tools.cache_dir(client), f"{client}-cucumber-init-{branch.replace('/', '-')}.patch")
 
 
-def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str, profile: dict, version: str) -> dict:
+def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str, profile: dict, version: str,
+                               previous_failure: str = "") -> dict:
     """
     Step du projet qui charge les fichiers de données de l'init du Standard sans les copier (appel Claude borné qui
     lit la définition du step du Standard, contrôlé en Python puis compilé), gardé en cache par version du
@@ -5044,13 +5045,16 @@ def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str
                           f"du Standard (cucumber/files/<MOD>/01-Contexte/)"}
     path = os.path.join(worktree, *rel.split("/"))
     before = _read_text(path) if os.path.exists(path) else None
+    if before is not None:
+        os.remove(path)                    # réécrite à neuf : jamais l'ancienne version conservée telle quelle
     std_java = cucumber_tools.standard_java_catalogue(cucumber_std_dir, profile.get("server_version", ""))
     clear_java = os.path.join(worktree, *cucumber_init.clear_step_path(client).split("/"))
     values = {"client_name": client, "worktree": worktree, "java_path": path,
               "package": f"cucumber.features.{cucumber_tools.java_package_segment(client)}",
               "clear_step_java": clear_java if os.path.exists(clear_java) else "aucun",
               "java_std": std_java["java_std"], "std_step": cucumber_simple_init.GLOBAL_INIT_STEP,
-              "expression": cucumber_simple_init.STD_FILES_EXPRESSION}
+              "expression": cucumber_simple_init.STD_FILES_EXPRESSION,
+              "echec_precedent": previous_failure or "aucun"}
     label = "Step des fichiers du Standard"
     errors = write_init_steps(client, worktree, "cucumber_init_fichiers_standard", values,
                               lambda: cucumber_simple_init.check_std_files_java(_read_text(path)
@@ -5187,6 +5191,8 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         detail["standard_indisponible"] = sorted(force_copy)
     if copy_files:
         detail["fichiers_copies"] = sorted(copy_files)
+    if (last.get("detail") or {}).get("echec_fichiers_standard"):
+        detail["echec_fichiers_standard"] = last["detail"]["echec_fichiers_standard"]
     decision = h["clear"]() if "clear" in h else simple_clear_decision(client_root, std_root, version, tested)
     if decision.get("erreur"):
         simple_record(client, "init", "echec", f"Clear non déterminé : {decision['erreur']}. Rien n'est généré sans "
@@ -5218,7 +5224,8 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     def std_files() -> dict:
         if not step_cache:
             step_cache.update(h["std_files"](worktree) if "std_files" in h else
-                              simple_init_std_files_step(client, worktree, cucumber_std_dir, profile, version))
+                              simple_init_std_files_step(client, worktree, cucumber_std_dir, profile, version,
+                                                         (last.get("detail") or {}).get("echec_fichiers_standard", "")))
         return step_cache
 
     def make_plan() -> dict:
@@ -5469,6 +5476,7 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                                                      f"pendant le run ({message[:200]}) : la copie des fichiers va être "
                                                      f"proposée à la place. Revérifiez.",
                           {**detail, "fichiers_copies": sorted(copy_files | set(modules)),
+                           "echec_fichiers_standard": message[:500],
                            "step_en_echec": cucumber_simple_init.step_signature(std_files().get("texte", "")
                                                                                 if "std_files" not in h else ""),
                            "plan": {"action": "verifier"}})
