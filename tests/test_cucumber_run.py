@@ -109,7 +109,9 @@ def test_job_credentials_are_never_shown_nor_stored(jenkins):
     run = cr.launch(CLIENT, repo, PROFILE, "@feature_a", log=lambda line: None)
     shown = json.dumps(run) + json.dumps(ct.load_state(CLIENT)) + json.dumps(cp.load_profile(CLIENT))
     assert LOGIN not in shown and PASSWORD not in shown
-    assert run["parametres"]["ADDITIONAL_ARGLINE"] == "**** -Dcucumber.filter.tags='@feature_a'"
+    # Seuls identifiants et mots de passe masqués : le reste des arguments reste lisible
+    assert run["parametres"]["ADDITIONAL_ARGLINE"] == ("-Dapi.login=**** -Dapi.password=**** -Dlocale=fr "
+                                                      "-Dcucumber.filter.tags='@feature_a'")
     # Console du build : identifiants masqués par le masquage commun (import, verification, connaissances)
     masked = secret_tools.mask_secrets(CONSOLE.replace("-Dapi.login=", "login: "))[0]
     assert LOGIN not in masked and PASSWORD not in masked

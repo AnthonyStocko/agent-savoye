@@ -114,7 +114,7 @@ def visible_texts(at) -> list:
             texts.append(str(option))
         for child in (getattr(node, "children", None) or {}).values():
             walk(child)
-    walk(at.tabs[2] if len(at.tabs) > 2 else at.main)
+    walk(at.tabs[3] if len(at.tabs) > 3 else at.main)
     return texts
 
 

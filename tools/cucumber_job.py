@@ -262,12 +262,13 @@ def client_configuration_error(reference: dict, fixed: dict, repository: str, pr
 
 
 def visible_parameters(params: dict, roles: dict) -> dict:
-    """Paramètres montrables (journal, historique, IHM) : arguments réduits au filtre de tags, secrets masqués."""
+    """Paramètres montrables (journal, historique, IHM) : identifiants et mots de passe des arguments masqués."""
     shown = {}
     for name, value in params.items():
         if name == roles.get("arguments"):
-            tag = re.search(rf"-D{re.escape(TAG_FILTER)}=('[^']*'|\S+)", value or "")
-            value = f"{secret_tools.MASK}" + (f" -D{TAG_FILTER}={tag.group(1)}" if tag else "")
+            # Seuls les identifiants et mots de passe sont masqués : schéma, hôte, adresse, tags restent lisibles
+            value = _OPTION.sub(lambda m: f"-D{m.group(1)}={secret_tools.MASK}" if _CREDENTIAL_KEY.search(m.group(1))
+                                else m.group(0), value or "")
         shown[name] = secret_tools.mask_secrets(str(value))[0]
     return shown
 

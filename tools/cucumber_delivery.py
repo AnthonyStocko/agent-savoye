@@ -224,7 +224,9 @@ def file_errors(worktree: str, base: str, head: str, protected=(), decision: boo
     for status, path in _changes(worktree, base, head):
         name = path.rsplit("/", 1)[-1]
         allowed = (path in ROOT_FILES or (path.startswith(TEST_SOURCES) and path.endswith(CODE_EXTENSIONS))
-                   or path.startswith(DATA_ROOT))
+                   or path.startswith(DATA_ROOT)
+                   # Contenu minimal d'un dépôt créé à la demande d'une personne (onglet simplifié, étape 2)
+                   or (decision and (path == ".gitignore" or (path.startswith(TEST_SOURCES) and name == ".gitkeep"))))
         if name == "pom.xml":
             # Exception explicite : seule la version de la bibliothèque Cucumber (montée alignée sur le client)
             from tools.cucumber_library_upgrade import only_version_changed

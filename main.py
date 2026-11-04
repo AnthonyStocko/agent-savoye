@@ -24,7 +24,7 @@ from tools.epic_tools import (
     _restore_keys as restore_epic_keys, draft_tasks, epic_manifest_path, load_epic_manifest, save_epic_manifest,
     sync_epic_tasks,
 )
-from tools import analysis_publication, cucumber_java21, jira_guard
+from tools import analysis_publication, cucumber_java21, cucumber_repo_setup, cucumber_simple, jira_guard
 from tools.jira_tools import (
     fetch_application_tickets, find_jira_issue_by_summary, get_epic_children, get_full_jira_issue_context,
     get_jira_issue_details,
@@ -1261,6 +1261,7 @@ def main():
     parser.add_argument("--profile-only", action="store_true", help="generate-cucumber-client : détecte le profil client (racine et tag des features, init, clear, fichiers du module spécifique, runner, codes de référence, version de la bibliothèque) dans le dépôt <client>-cucumber, sans appel à Claude")
     parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
     parser.add_argument("--align-library", action="store_true", help="generate-cucumber-client : bibliothèque Cucumber du pom.xml alignée sur la version du Standard du client (Jenkins, à défaut l'application) : seule la version change dans le pom, compilation corrigée dans les steps du projet, dry-run, puis (livraison autonome) runs de l'init et complet, promotion sans régression")
+    parser.add_argument("--simple-depot", default="", choices=["", "verifier", "creer", "branche", "aligner"], help="generate-cucumber-client, onglet « Cucumber » simplifié, étape 2 : dépôt <client>-cucumber — constat, création (droits contrôlés), branche de la version, alignement validé de la bibliothèque et du runner, compilation")
     parser.add_argument("--java21", action="store_true", help="generate-cucumber-client : migration Java 21 du projet de tests (pom.xml seul, branche dédiée jamais fusionnée) et contrôle de non-régression : compilation et dry-run en Java 21, runs AVANT (application Java 11) et APRÈS (application Java 21), relance des écarts, rapport, PR proposée sans régression")
     parser.add_argument("--java21-avant", default="", help="--java21 : environnement AVANT confirmé, « composant_version=<v>;kis_version=<v> »")
     parser.add_argument("--java21-apres", default="", help="--java21 : environnement APRÈS confirmé, « composant_version=<v>;kis_version=<v> »")
@@ -1545,6 +1546,10 @@ def main():
         prompt = render_prompt("besoin", **prompt_values, output_file=besoin_output,
                                previous_qa_block=f"{qa_block}\n" if qa_block else "",
                                application_block=f"{app_block}\n" if app_block else "")
+    elif is_cucumber_client and args.simple_depot:
+        # Étape 2 de l'onglet simplifié : le dépôt <client>-cucumber peut ne pas encore exister
+        sys.exit(run_simple_depot(args.client_name, args.client_repo or os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""),
+                                  local_client_repo, args.simple_depot, args.cucumber_base_branch))
     elif is_cucumber_client:
         client_name = args.client_name
         if not local_client_repo:
@@ -4588,6 +4593,180 @@ def run_java21_migration(client: str, cucumber_repo_dir: str, target: str, cucum
         except Exception as e:  # noqa: BLE001 - PR non créée : la branche reste à proposer à la main
             data["pr"] = f"non créée ({e}) : proposez la branche {branch} vers {target} à la main"
     return finish()
+
+
+def simple_record(client: str, step: str, status: str, result: str, detail: dict = None) -> dict:
+    """Résultat d'une étape de l'onglet « Cucumber » simplifié, affiché et gardé dans etat.json."""
+    state = cucumber_tools.load_state(client)
+    entry = cucumber_simple.record_step(state, step, status, result, detail)
+    cucumber_tools.save_state(client, state)
+    print(f"[ÉTAPE {step.upper()}] {cucumber_simple.STATES[status]} — {result}")
+    return entry
+
+
+def run_simple_depot(client: str, client_repo_arg: str, client_root: str, action: str, base_branch: str,
+                     helpers: dict = None) -> int:
+    """
+    Étape 2 (cucumber_repo_setup) : `action` « verifier » (constat et plan), « creer » (dépôt absent : droits,
+    création, contenu minimal sur la branche de la version), « branche » (branche de la version créée depuis
+    `base_branch`), « aligner » (bibliothèque et runner, diff validé par l'utilisateur). OK quand mvn
+    test-compile passe. `helpers` (tests) : "call" (HTTP Bitbucket), "versions", "compile", "clone_url".
+    """
+    h = helpers or {}
+    call = h.get("call")
+    project = bitbucket_std.project_key(client_repo_arg)
+    slug = f"{client}-cucumber"
+    deduction = client_version.saved(client).get("deduction") or {}
+    branch = cucumber_repo_setup.version_branch(deduction.get("version_client", ""))
+    target = (deduction.get("standard") or {}).get("version", "")
+    base_branch = base_branch or "integration"
+    if not project:
+        simple_record(client, "depot", "echec", "Projet Bitbucket du client illisible : renseignez son adresse "
+                                                "(…/projects/<CLÉ>) à l'étape 1.")
+        return 1
+    if not (branch and target):
+        simple_record(client, "depot", "echec", "Version du client ou du Standard non déterminée : terminez l'étape 1.")
+        return 1
+    available = h["versions"]() if "versions" in h else cucumber_library_upgrade.available_versions()
+    chosen = cucumber_library_upgrade.choose_version(available.get("versions") or [], target)
+    if not chosen["version"]:
+        simple_record(client, "depot", "echec", f"Aucune bibliothèque Cucumber publiée pour le Standard {target} : "
+                                                f"{available.get('erreur') or chosen['motif']}.")
+        return 1
+    library = chosen["version"]
+    disabled = cucumber_verify.a_revoir_tag()
+    detail = {"projet": project, "depot": slug, "branche": branch, "bibliotheque": library,
+              "choix_bibliotheque": chosen["motif"]}
+    try:
+        exists = cucumber_repo_setup.repo_exists(project, slug, call)
+    except cucumber_repo_setup.RepoError as e:
+        simple_record(client, "depot", "echec", f"Bitbucket : {e}.", detail)
+        return 1
+    local = os.path.join(client_root, slug)
+    url = h.get("clone_url") or f"{os.getenv('BITBUCKET_URL', '').rstrip('/')}/scm/{project.lower()}/{slug}.git"
+    auth = _git_auth_args()
+
+    def compile_check(worktree: str) -> int:
+        result = h["compile"](worktree) if "compile" in h else cucumber_tools.verify_build(
+            worktree, cucumber_tools.delivery_compile_cmd())
+        if result["ok"]:
+            simple_record(client, "depot", "ok", f"Dépôt {slug}, branche {branch} : compilation réussie "
+                                                 f"(bibliothèque {library}).", detail)
+            return 0
+        simple_record(client, "depot", "echec", f"Dépôt {slug}, branche {branch} : la compilation échoue"
+                      + (" (environnement Maven)" if result.get("environnement") else "") + ".",
+                      {**detail, "erreurs": result["erreurs"][:20]})
+        return 1
+
+    def push(worktree: str, to: str = "") -> str:
+        to = to or branch
+        refused = cucumber_delivery.check_push(worktree, to, client, decision=True)
+        if refused:
+            return f"push refusé par la garde d'écriture : {refused}"
+        done = subprocess.run(["git", *auth, "-C", worktree, "push", "origin", f"HEAD:refs/heads/{to}"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return "" if done.returncode == 0 else f"push refusé : {(done.stderr.strip().splitlines() or ['?'])[-1][:200]}"
+
+    if not exists:
+        try:
+            allowed = cucumber_repo_setup.can_create(project, call)
+        except cucumber_repo_setup.RepoError as e:
+            simple_record(client, "depot", "echec", f"Droits du compte illisibles : {e}.", detail)
+            return 1
+        if not allowed:
+            simple_record(client, "depot", "echec", f"Le dépôt {slug} n'existe pas et le compte du jeton Bitbucket n'a "
+                          f"pas le droit d'en créer dans le projet {project} : demandez ce droit, ou faites créer le "
+                          f"dépôt, puis revérifiez.", detail)
+            return 1
+        if action != "creer":
+            simple_record(client, "depot", "a_faire", f"Le dépôt {slug} n'existe pas : il sera créé dans le projet "
+                          f"{project}, branche {branch}, bibliothèque {library}.", {**detail, "plan": {"action": "creer"}})
+            return 0
+        try:
+            url = cucumber_repo_setup.create_repo(project, slug, call) or url
+        except cucumber_repo_setup.RepoError as e:
+            simple_record(client, "depot", "echec", f"Création refusée : {e}.", detail)
+            return 1
+        cucumber_delivery.log_event(client, "creation_depot", depot=f"{project}/{slug}", branche=branch)
+        os.makedirs(local, exist_ok=True)
+        cucumber_tools._git(local, "init", "-q", "-b", branch)
+        cucumber_tools._git(local, "remote", "add", "origin", url)
+        for rel, text in cucumber_repo_setup.scaffold_files(client, library, disabled).items():
+            path = os.path.join(local, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        cucumber_delivery.apply_identity()
+        cucumber_tools._git(local, "add", "-A")
+        cucumber_tools._git(local, "commit", "-q", "-m", f"Cucumber {client} : contenu minimal du dépôt (bibliothèque "
+                                                         f"{library}, version client {deduction.get('version_client')})")
+        cucumber_delivery.register_repo(client, local)
+        # Branche de la version et branche d'intégration sur le même commit
+        refused = push(local) or push(local, base_branch)
+        if refused:
+            simple_record(client, "depot", "echec", f"Dépôt {slug} créé, mais {refused}.", detail)
+            return 1
+        return compile_check(local)
+    # Dépôt présent : clone ou mise à jour, branche de la version, alignement, compilation
+    if not os.path.isdir(os.path.join(local, ".git")):
+        done = subprocess.run(["git", *auth, "clone", "-q", url, local], capture_output=True, text=True)
+        if done.returncode != 0:
+            simple_record(client, "depot", "echec", f"Clone de {slug} impossible.", {**detail, "erreur": done.stderr[-300:]})
+            return 1
+    subprocess.run(["git", *auth, "-C", local, "fetch", "-q", "origin", "--prune"], capture_output=True)
+    cucumber_delivery.register_repo(client, local)
+    # Convention de nommage déjà présente dans le dépôt (ex. « 1.3 » créée à la main) : jamais deux branches
+    remote_branches = [r.split("/", 1)[1] for r in cucumber_tools._git(
+        local, "for-each-ref", "--format=%(refname:lstrip=2)", "refs/remotes/origin").stdout.split()
+        if "/" in r and not r.endswith("/HEAD")]
+    branch = detail["branche"] = cucumber_repo_setup.version_branch(deduction.get("version_client", ""),
+                                                                    remote_branches)
+    has_branch = cucumber_tools._git(local, "rev-parse", "--verify", "-q", f"origin/{branch}").returncode == 0
+    if not has_branch:
+        start = cucumber_tools.base_ref(local, base_branch)
+        if not start:
+            simple_record(client, "depot", "echec", f"Branche d'intégration {base_branch} introuvable dans {slug}.", detail)
+            return 1
+        if action != "branche":
+            simple_record(client, "depot", "a_faire", f"La branche {branch} n'existe pas dans {slug} : elle sera créée "
+                          f"depuis {base_branch}.", {**detail, "plan": {"action": "branche"}})
+            return 0
+        done = subprocess.run(["git", *auth, "-C", local, "push", "origin", f"{start}:refs/heads/{branch}"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if done.returncode != 0:
+            simple_record(client, "depot", "echec", f"Création de la branche {branch} refusée.",
+                          {**detail, "erreur": done.stderr[-300:]})
+            return 1
+        cucumber_delivery.log_event(client, "creation_branche", branche=branch, depuis=base_branch)
+        subprocess.run(["git", *auth, "-C", local, "fetch", "-q", "origin"], capture_output=True)
+    worktree = cucumber_tools.add_worktree(local, os.path.join(cucumber_tools.cache_dir(client), "worktree_version"),
+                                           f"cucumber_{client}_version", f"origin/{branch}", reset=True)
+    runners = [p for p in cucumber_tools._git(worktree, "ls-files", "*Runner*.java", "*RunnerTest*.java").stdout.splitlines() if p]
+    files = {"pom.xml": _read_text(os.path.join(worktree, "pom.xml"))}
+    files.update({p: _read_text(os.path.join(worktree, *p.split("/"))) for p in runners[:1]})
+    plan = cucumber_repo_setup.align_plan(files, library, disabled, client)
+    if plan["files"]:
+        if action != "aligner":
+            simple_record(client, "depot", "a_faire", f"Dépôt {slug}, branche {branch} : à aligner ("
+                          + " ; ".join(plan["motifs"]) + "). Relisez le diff puis validez.",
+                          {**detail, "plan": {"action": "aligner", "diff": plan["diff"]}})
+            return 0
+        for rel, text in plan["files"].items():
+            path = os.path.join(worktree, *rel.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+        cucumber_delivery.apply_identity()
+        cucumber_tools._git(worktree, "add", "--", *plan["files"])
+        cucumber_tools._git(worktree, "commit", "-q", "-m", f"Cucumber {client} : alignement validé — "
+                            + " ; ".join(plan["motifs"]))
+        refused = push(worktree)
+        if refused:
+            simple_record(client, "depot", "echec", f"Alignement non livré : {refused}.", detail)
+            return 1
+    elif plan["motifs"]:
+        detail["remarques"] = plan["motifs"]
+    return compile_check(worktree)
 
 
 def check_promoted_regression(client: str, analysis: dict, build_params: dict = None, revert=None) -> dict:

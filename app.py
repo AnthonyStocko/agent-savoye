@@ -14,7 +14,7 @@ from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
 from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, standard_version, standard_version_task
-from tools import (cucumber_a_revoir, cucumber_java21, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
+from tools import (cucumber_a_revoir, cucumber_java21, cucumber_simple, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
@@ -393,9 +393,9 @@ if env_problems:
                        f".env.bak.")
             st.rerun()
 
-(tab_integration, tab_execution, tab_cucumber, tab_review, tab_assistant, tab_knowledge,
- tab_config) = st.tabs(["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🔍 Revue de PR", "💬 Assistant",
-                        "📚 Connaissances partagées", "⚙️ Configuration (.env)"])
+(tab_integration, tab_execution, tab_cucumber_simple, tab_cucumber, tab_review, tab_assistant, tab_knowledge,
+ tab_config) = st.tabs(["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🥒 Cucumber (avancé)", "🔍 Revue de PR",
+                        "💬 Assistant", "📚 Connaissances partagées", "⚙️ Configuration (.env)"])
 
 # Initialisation de l'état
 if "workflow_step" not in st.session_state:
@@ -1546,7 +1546,7 @@ def render_delivery_settings(ctx: dict) -> None:
                    + (f" — {event['motif'][:160]}" if event.get("motif") else ""))
 
 
-def render_tested_modules(ctx: dict) -> None:
+def render_tested_modules(ctx: dict, prefix: str = "", simple: bool = False) -> None:
     """
     « Modules testés » : une coche par module détecté chez le client (tags des features rangées sous un dossier du
     même nom, tâches de l'inventaire ; aucune liste en dur). Décocher un module l'exclut partout (init, génération,
@@ -1578,7 +1578,7 @@ def render_tested_modules(ctx: dict) -> None:
     for index, code in enumerate(sorted(known)):
         module = known[code]
         if columns[index % len(columns)].checkbox(
-                code, value=code not in out, key=f"cucumber_module_{client}_{code}",
+                code, value=code not in out, key=f"{prefix}cucumber_module_{client}_{code}",
                 help=f"Tag {module['tag']} — " + ", ".join(module["sources"]) + ". Décoché : exclu de l'init, de la "
                      "génération, de la couverture, des runs lancés par l'agent et des corrections."):
             continue
@@ -1587,6 +1587,8 @@ def render_tested_modules(ctx: dict) -> None:
         cucumber_modules.save_excluded(client, chosen)
         st.rerun()
     st.caption(cucumber_modules.summary_line(profile))
+    if simple:
+        return
     worktree = cucumber_profile.base_worktree_dir(client)
     for code in sorted(set(known)):
         state = cucumber_modules.retag_state(document, code)
@@ -1647,23 +1649,24 @@ def apply_client_version(ctx: dict, entry: dict) -> None:
     """Version choisie : déduction enregistrée, détection relancée (copies de code et montée de bibliothèque)."""
     client = ctx["client"]
     with st.spinner(f"Déduction pour la version {entry.get('version')}…"):
-        client_version.choose(client, entry, (st.session_state.get("cucumber_repo") or "").strip(),
+        client_version.choose(client, entry, ctx.get("repo") or (st.session_state.get("cucumber_repo") or "").strip(),
                               os.getenv("BITBUCKET_STD_REPO_PATH", "").strip(),
-                              (st.session_state.get("cucumber_std_repo") or "").strip(),
+                              ctx.get("std_repo") or (st.session_state.get("cucumber_std_repo") or "").strip(),
                               client_version_builds(client))
     cucumber_detection.start(client, ctx["cmd"], force=True)
 
 
-def render_client_version(ctx: dict) -> None:
+def render_client_version(ctx: dict, prefix: str = "") -> None:
     """
     Version du client (branche d'intégration, branches de release, tags, versions publiées) : tout en est déduit —
     Standard, Cucumber Standard, bibliothèque Cucumber, KIS — sur une ligne, avec un avertissement par écart.
+    `prefix` : préfixe des clés de widgets (onglet « Cucumber » simplifié).
     """
     client = ctx["client"]
-    repo = (st.session_state.get("cucumber_repo") or "").strip()
+    repo = ctx.get("repo") or (st.session_state.get("cucumber_repo") or "").strip()
     current = client_version.saved(client)
     versions = current.get("versions") or []
-    refresh = st.button("Actualiser les versions", key=f"client_versions_refresh_{client}", type="tertiary",
+    refresh = st.button("Actualiser les versions", key=f"{prefix}client_versions_refresh_{client}", type="tertiary",
                         icon=":material/refresh:")
     if repo and (refresh or not current.get("versions_date")):
         with st.spinner("Lecture des versions du client (dépôts, tags, dépôt Maven)…"):
@@ -1681,13 +1684,13 @@ def render_client_version(ctx: dict) -> None:
             st.rerun()
     if not versions:
         st.caption("Version du client : aucune version lue (dépôt de l'application introuvable ou illisible).")
-        render_standard_version(client)
+        render_standard_version(client, prefix)
         return
     ids = [v["id"] for v in versions]
     chosen_id = (current.get("choix") or {}).get("id")
     picked = st.selectbox("Version du client", ids, index=ids.index(chosen_id) if chosen_id in ids else 0,
                           format_func=lambda i: next(v["libelle"] for v in versions if v["id"] == i),
-                          key=f"client_version_{client}",
+                          key=f"{prefix}client_version_{client}",
                           help="Branche d'intégration, branches de release, tags de l'application et versions "
                                "publiées dans le dépôt Maven. Le Standard, le Cucumber Standard, la bibliothèque "
                                "Cucumber et les paramètres Jenkins des runs de l'agent en sont déduits.")
@@ -1701,7 +1704,7 @@ def render_client_version(ctx: dict) -> None:
         st.warning(warning, icon=":material/warning:")
     standard = (deduction.get("standard") or {}).get("version")
     if standard and not (deduction.get("kis") or {}).get("kis"):
-        with st.form(f"client_version_kis_{client}", border=False):
+        with st.form(f"{prefix}client_version_kis_{client}", border=False):
             kis = st.text_input(f"Version KIS pour le Standard {standard}", placeholder="ex. 3.12",
                                 help="Aucun build n'a démarré d'application de cette version du Standard : la "
                                      "version KIS n'est jamais reprise d'un build d'une autre version.")
@@ -1710,7 +1713,7 @@ def render_client_version(ctx: dict) -> None:
                 st.rerun()
 
 
-def render_standard_version(client: str) -> None:
+def render_standard_version(client: str, prefix: str = "") -> None:
     """
     Version du Standard du client, détectée en arrière-plan (code, builds Jenkins, bibliothèque Cucumber) : une
     ligne ; sources divergentes : les deux avec leurs sources et le choix ; aucune source : saisie proposée.
@@ -1742,7 +1745,7 @@ def render_standard_version(client: str) -> None:
         st.warning(f"Version du Standard non détectée : {task.get('cause') or 'cause inconnue'}",
                    icon=":material/help:")
         proposal = ((task.get("resultat") or {}).get("version") or "")
-        with st.form(f"std_version_manual_{client}", border=False):
+        with st.form(f"{prefix}std_version_manual_{client}", border=False):
             picked = st.text_input("Version du Standard", value=proposal, placeholder="ex. 26.22")
             columns = st.columns(2)
             if columns[0].form_submit_button("Retenir cette version") and picked.strip():
@@ -1758,13 +1761,13 @@ def render_standard_version(client: str) -> None:
         return
     if shown["statut"] in ("ok", "choisie"):
         st.caption(shown["ligne"])
-        if shown["statut"] == "choisie" and st.button("Revenir à la détection", key=f"std_version_reset_{client}",
+        if shown["statut"] == "choisie" and st.button("Revenir à la détection", key=f"{prefix}std_version_reset_{client}",
                                                      type="tertiary"):
             standard_version.choose(client, "")
             st.rerun()
         return
     st.warning(shown["ligne"], icon=":material/help:")
-    with st.form(f"std_version_{client}", border=False):
+    with st.form(f"{prefix}std_version_{client}", border=False):
         if shown["statut"] == "conflit":
             picked = st.radio("Version du Standard à retenir", shown["versions"], horizontal=True)
         else:
@@ -1983,6 +1986,168 @@ def render_cucumber_health(ctx: dict) -> None:
             st.rerun()
         if health:
             st.markdown(health)
+
+
+SIMPLE_PROJECT_KEYS = {"client_repo": "cs_repo", "client_name": "cs_client", "application": "cs_application",
+                       "std_repo": "cs_std_repo", "source_schema": "cs_source_schema"}
+
+
+def load_simple_project() -> None:
+    """Client choisi dans l'onglet « Cucumber » : ses réglages enregistrés (mêmes que l'onglet avancé)."""
+    choice = st.session_state.get("cs_project")
+    settings = cucumber_detection.known_projects(cucumber_tools.CACHE_ROOT).get(choice) or {}
+    if choice and choice != NEW_PROJECT:
+        settings = {"client_name": choice, **{k: v for k, v in settings.items() if v}}
+    for field, key in SIMPLE_PROJECT_KEYS.items():
+        st.session_state[key] = settings.get(field) or (
+            os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "") if field == "std_repo" else "")
+
+
+def simple_context() -> dict:
+    """Contexte de l'onglet simplifié : client, dépôts, commande main.py (mêmes options que l'onglet avancé)."""
+    value = lambda key: (st.session_state.get(key) or "").strip()  # noqa: E731
+    repo, client = value("cs_repo"), value("cs_client").lower() or cucumber_tools.client_name_from_repo(value("cs_repo"))
+    cmd = [sys.executable, "main.py", "--step", "generate-cucumber-client", "--client-repo", repo,
+           "--client-name", client, "--application", value("cs_application"),
+           "--cucumber-std-repo", value("cs_std_repo"), *cucumber_modules.cli_args(client)]
+    return {"client": client, "repo": repo, "std_repo": value("cs_std_repo"), "cmd": cmd,
+            "ready": bool(repo and client), "capture": lambda line: None}
+
+
+def simple_run(ctx: dict, step: str, extra: list) -> int:
+    """Action d'une étape : main.py lancé, journal technique alimenté, état relu au passage suivant."""
+    code = run_main_step(ctx["cmd"] + extra)
+    st.session_state[f"cs_last_{step}"] = code
+    st.rerun()
+    return code
+
+
+def render_simple_project(ctx: dict, step: dict) -> None:
+    """Étape 1 : réglages du projet (repris de « Données du projet »), version du client, modules testés."""
+    with st.expander("Détail : projet Bitbucket, nom, application, schéma client, Cucumber Standard",
+                     expanded=not ctx["ready"]):
+        st.text_input("Projet Bitbucket du client", key="cs_repo",
+                      help="URL du projet Bitbucket (ex. https://git.kiscloud.io/projects/CLIENT).")
+        col_name, col_app = st.columns(2)
+        col_name.text_input("Nom du client", key="cs_client", help="Le dépôt de tests est <client>-cucumber.")
+        col_app.text_input("Projet / Application Jira", key="cs_application",
+                           disabled=not os.getenv("JIRA_APPLICATION_FIELD", "").strip())
+        st.text_input("Schéma de la base du client", key="cs_source_schema",
+                      help="Schéma de la base client (CLIENT_SOURCE_DB_*) recopié à l'étape 3.")
+        st.text_input("Dépôt du Cucumber Standard", key="cs_std_repo")
+        if st.button("Enregistrer le projet", icon=":material/save:", type="primary", key="cs_save",
+                     disabled=not ctx["ready"]):
+            cucumber_detection.save_project(ctx["client"], {
+                "client_repo": ctx["repo"], "client_name": ctx["client"], "db_schema": "",
+                "application": (st.session_state.get("cs_application") or "").strip(), "std_repo": ctx["std_repo"],
+                "source_schema": (st.session_state.get("cs_source_schema") or "").strip()})
+            st.toast("Projet enregistré.", icon=":material/check_circle:")
+            st.rerun()
+    if ctx["ready"]:
+        render_client_version(ctx, "cs_")
+        render_tested_modules(ctx, "cs_", simple=True)
+
+
+def render_simple_depot(ctx: dict, step: dict) -> None:
+    """Étape 2 : dépôt <client>-cucumber (création, branche de la version, contenu minimal, compilation)."""
+    detail = step["detail"]
+    plan = detail.get("plan") or {}
+    if plan.get("diff"):
+        st.code(plan["diff"][:20000], language="diff")
+    action = plan.get("action") or "verifier"
+    labels = {"verifier": "Vérifier le dépôt", "creer": "Créer le dépôt", "branche": "Créer la branche de la version",
+              "aligner": "Valider l'alignement (bibliothèque et runner)"}
+    if st.button(labels.get(action, "Vérifier le dépôt"), type="primary", icon=":material/play_arrow:",
+                 key=f"cs_depot_{ctx['client']}", disabled=step["etat"] == "bloquee"):
+        simple_run(ctx, "depot", ["--simple-depot", action])
+    if action != "verifier" and st.button("Revérifier", type="tertiary", key=f"cs_depot_check_{ctx['client']}"):
+        simple_run(ctx, "depot", ["--simple-depot", "verifier"])
+
+
+def render_simple_base(ctx: dict, step: dict) -> None:
+    """Étape 3 (optionnelle) : recopie de la configuration du client pour les essais locaux."""
+    target = (os.getenv("CUCUMBER_DB_SCHEMA", "") or "").strip()
+    connection = db_restore.connection("CUCUMBER_DB_", "DB_")
+    source = (st.session_state.get("cs_source_schema") or "").strip()
+    st.caption(f"Base modifiée : {connection['host']} / {connection['name'] or '?'} / schéma {target or '?'} "
+               f"(CUCUMBER_DB_*). Source : schéma {source or '?'} de la base client.")
+    confirm = st.text_input("Pour confirmer, tapez le nom du schéma recréé", key=f"cs_base_confirm_{ctx['client']}",
+                            help="Le schéma est sauvegardé avant d'être supprimé puis recréé.")
+    if st.button("Recopier la configuration du client (essais locaux)", icon=":material/database:",
+                 key=f"cs_base_{ctx['client']}", disabled=not (target and source and confirm.strip() == target)
+                 or step["etat"] == "bloquee"):
+        code = run_main_step([sys.executable, "main.py", "--step", "restore-config", "--client-name", ctx["client"],
+                              "--source-schema", source, "--target-schema", target])
+        entry = (db_restore.load_history(ctx["client"]) or [{}])[-1]
+        state = cucumber_tools.load_state(ctx["client"])
+        cucumber_simple.record_step(
+            state, "base", "ok" if code == 0 else "echec",
+            (f"Base modifiée : {connection['host']} / {connection['name']} / schéma {target}, recopié depuis "
+             f"{source} ; sauvegarde : {os.path.basename(entry.get('sauvegarde') or '') or 'aucune'}. "
+             if code == 0 else "Recopie en échec : ") + (entry.get("message") or interruption_cause(code)),
+            {"sauvegarde": entry.get("sauvegarde", ""), "message": entry.get("message", "")})
+        cucumber_tools.save_state(ctx["client"], state)
+        st.rerun()
+
+
+def render_simple_init(ctx: dict, step: dict) -> None:
+    """Étape 4 : init du Standard à la version du client, écarts du client seulement, run Jenkins de l'init."""
+    st.button("Préparer et vérifier l'init", type="primary", icon=":material/play_arrow:",
+              key=f"cs_init_{ctx['client']}", disabled=True,
+              help="En cours de développement : utilisez l'onglet « Cucumber (avancé) » en attendant.")
+
+
+def render_simple_tests(ctx: dict, step: dict) -> None:
+    """Étape 5 : fonctionnalités choisies dans une liste simple, générées et vérifiées une par une."""
+    inventory = cucumber_tools.load_inventory(ctx["client"])
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(ctx["client"]))
+    features = cucumber_simple.feature_choices(inventory, profile)
+    if not features:
+        st.caption("Les fonctionnalités du client apparaîtront ici après l'analyse du projet.")
+        return
+    st.multiselect("Fonctionnalités à tester", [f["id"] for f in features],
+                            format_func=lambda i: next(f["libelle"] for f in features if f["id"] == i),
+                            key=f"cs_features_{ctx['client']}", disabled=step["etat"] == "bloquee")
+    st.button("Générer les tests", type="primary", icon=":material/play_arrow:", key=f"cs_tests_{ctx['client']}",
+              disabled=True, help="En cours de développement : utilisez l'onglet « Cucumber (avancé) » en attendant.")
+    for line in (step["detail"].get("fonctionnalites") or []):
+        st.markdown(("✔ " if line.get("vert") else "✖ ") + f"**{line.get('libelle', '')}** — {line.get('resultat', '')}")
+
+
+SIMPLE_RENDERERS = {"projet": render_simple_project, "depot": render_simple_depot, "base": render_simple_base,
+                    "init": render_simple_init, "tests": render_simple_tests}
+
+
+def render_simple_cucumber() -> None:
+    """Onglet « Cucumber » : 5 étapes, chacune avec un état, une action et un résultat court (détail replié)."""
+    st.markdown("### Tests Cucumber d'un client")
+    st.caption("Cinq étapes, l'une après l'autre : chacune se débloque quand la précédente est OK. L'onglet "
+               "« Cucumber (avancé) » garde toutes les fonctions détaillées.")
+    projects = cucumber_detection.known_projects(cucumber_tools.CACHE_ROOT)
+    options = list(projects) + [NEW_PROJECT]
+    if st.session_state.get("cs_project") not in options:
+        st.session_state["cs_project"] = options[0]
+        load_simple_project()
+    st.selectbox("Client", options, key="cs_project", on_change=load_simple_project,
+                 format_func=lambda k: "Nouveau client…" if k == NEW_PROJECT else k.capitalize())
+    if "cs_repo" not in st.session_state:
+        load_simple_project()
+    ctx = simple_context()
+    client = ctx["client"]
+    deduction = (client_version.saved(client).get("deduction") or {}) if client else {}
+    records = (cucumber_tools.load_state(client).get("simple") or {}) if client else {}
+    for step in cucumber_simple.states(cucumber_simple.project_step(deduction, ctx["ready"]), records):
+        with st.container(border=True):
+            st.markdown(f"{cucumber_simple.ICONS[step['etat']]} **{cucumber_simple.label(step, client)}**")
+            if step["resultat"]:
+                st.caption(step["resultat"])
+            if step["etat"] == "bloquee" or (step["cle"] != "projet" and not client):
+                continue
+            SIMPLE_RENDERERS[step["cle"]](ctx, step)
+            technical = {k: v for k, v in step["detail"].items() if k not in ("plan", "fonctionnalites")}
+            if technical:
+                with st.expander("Détail technique"):
+                    st.json(technical, expanded=False)
 
 
 def render_cucumber_java21(ctx: dict) -> None:
@@ -3520,6 +3685,9 @@ def render_cucumber_review(client: str, state: dict) -> None:
 # ---------------------------------------------------------
 # ONGLET CUCUMBER : PARCOURS EN 7 ÉTAPES, DU CHOIX DES TÂCHES AU PATCH VERT
 # ---------------------------------------------------------
+with tab_cucumber_simple:
+    render_simple_cucumber()
+
 with tab_cucumber:
     st.markdown("### Tests Cucumber des fonctionnalités spécifiques")
     st.caption("Choisissez le projet : l'agent analyse le reste tout seul, sans rien modifier dans les dépôts. Les "

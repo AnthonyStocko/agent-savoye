@@ -134,7 +134,7 @@ def test_screen_shows_tests_as_covered_and_not_measured(project):
     assert "2 ont un test, pas encore vérifié." in buttons and "2 restent à tester." in buttons
     assert "Importer un résultat Jenkins" in [p.proto.popover.label for p in at.get("popover")]
     # Onglet Cucumber seul (les autres onglets affichent les tickets et la mémoire du poste) ; « 100 % » n'est pas 0 %
-    text = " ".join(m.value for m in at.tabs[2].markdown)
+    text = " ".join(m.value for m in at.tabs[3].markdown)
     assert "4 fonctionnalités spécifiques." in text
     assert not re.search(r"(?<![\d,.])0 %", " ".join(buttons) + text)
     # Liste : les tests écrits à la main apparaissent « test écrit »
