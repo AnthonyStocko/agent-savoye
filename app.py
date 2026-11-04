@@ -2100,14 +2100,25 @@ def render_simple_init(ctx: dict, step: dict) -> None:
     if plan.get("diff"):
         st.code(plan["diff"][:20000], language="diff")
     action = plan.get("action") or "verifier"
-    labels = {"verifier": "Préparer et vérifier l'init", "appliquer": "Valider et pousser l'init sur la branche",
+    labels = {"verifier": "Préparer et vérifier l'init", "appliquer": "Valider l'init (branche de l'agent)",
+              "completer": "Valider les compléments (branche de l'agent)",
               "lancer": "Lancer l'init sur Jenkins", "corriger": "Valider la correction et relancer l'init"}
     if st.button(labels.get(action, labels["verifier"]), type="primary", icon=":material/play_arrow:",
                  key=f"cs_init_{ctx['client']}", disabled=step["etat"] == "bloquee",
-                 help="Rien n'est poussé sans votre validation du diff ; le run Jenkins lit la branche de la version."):
+                 help="L'init du Standard est lancée telle quelle quand elle suffit ; les sujets propres au client "
+                      "vont dans des compléments à part. Rien n'est poussé sans votre validation du diff, et "
+                      "seulement sur la branche de l'agent : la branche de la version reçoit le patch, appliqué par "
+                      "vous."):
         simple_run(ctx, "init", ["--simple-init", action])
     if action != "verifier" and st.button("Revérifier", type="tertiary", key=f"cs_init_check_{ctx['client']}"):
         simple_run(ctx, "init", ["--simple-init", "verifier"])
+    patch = step["detail"].get("patch") or ""
+    if patch and os.path.exists(patch):
+        st.caption(f"À appliquer par vous sur {step['detail'].get('branche', 'la branche de la version')} "
+                   f"(l'agent a poussé sur {step['detail'].get('branche_agent', 'sa branche')}) :")
+        with open(patch, "rb") as f:
+            st.download_button("Télécharger le patch de l'init", f.read(), file_name=os.path.basename(patch),
+                               mime="text/x-diff", icon=":material/download:", key=f"cs_init_patch_{ctx['client']}")
 
 
 def render_simple_tests(ctx: dict, step: dict) -> None:

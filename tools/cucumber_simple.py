@@ -129,10 +129,13 @@ def feature_choices(inventory: dict, profile: dict) -> list:
 # ---------------------------------------------------------------------------
 
 DETAIL_LABELS = (
-    ("projet", "Projet Bitbucket"), ("depot", "Dépôt"), ("branche", "Branche"), ("commit", "Commit"),
+    ("projet", "Projet Bitbucket"), ("depot", "Dépôt"), ("branche", "Branche"),
+    ("branche_agent", "Branche de l'agent (seule branche où il écrit)"), ("patch", "Patch à appliquer"),
+    ("commit", "Commit"),
     ("bibliotheque", "Bibliothèque Cucumber"), ("choix_bibliotheque", "Choix de la bibliothèque"),
     ("compilation", "Compilation"), ("clear", "Clear retenu"), ("preuves_clear", "Preuves du clear"),
-    ("init", "Init"), ("tags", "Tags lancés"), ("build", "Build Jenkins"), ("scenarios", "Scénarios"),
+    ("init", "Init"), ("tags", "Tags lancés"), ("build", "Build Jenkins"), ("builds", "Builds Jenkins"),
+    ("standard_indisponible", "Init du Standard non lancée par le job (copie adaptée)"), ("scenarios", "Scénarios"),
     ("ecarts_standard", "Écarts avec l'init du Standard"), ("remarques", "Remarques"),
     ("sauvegarde", "Sauvegarde"), ("message", "Message"), ("erreur", "Erreur"), ("erreurs", "Erreurs"),
 )
