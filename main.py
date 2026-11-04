@@ -4982,6 +4982,22 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
                 gaps.append(f"{module} ({rel.rsplit('/', 1)[-1]}) : {cucumber_simple_init.summary(gap)}"
                             + "".join(f" ; − {s[:90]}" for s in gap["standard_seulement"][:3])
                             + "".join(f" ; + {s[:90]}" for s in gap["client_seulement"][:3]))
+    # Step des fichiers du Standard déjà présent (branche de la version ou de l'agent) mais non conforme (lecture du
+    # disque seulement, par exemple) alors qu'une init l'utilise : réécrit, quelle que soit la branche qui le porte
+    java_rel = cucumber_simple_init.std_files_java_path(client)
+    java_path = os.path.join(worktree, *java_rel.split("/"))
+    used = any(cucumber_simple_init.uses_standard_files(t) for t in {**present, **owned}.values())
+    if used and java_rel not in changes and os.path.exists(java_path) and std_files is not None:
+        problems = cucumber_simple_init.check_std_files_java(_read_text(java_path))
+        if problems:
+            if not std_step:
+                std_step.update(std_files())
+            if std_step.get("texte") and std_step["texte"] != _read_text(java_path):
+                changes[java_rel] = std_step["texte"]
+                reasons.append(f"{java_rel.rsplit('/', 1)[-1]} réécrit ({problems[0]})")
+            elif std_step.get("erreur"):
+                remarks.append(f"{java_rel.rsplit('/', 1)[-1]} non conforme ({problems[0]}) et non réécrit : "
+                               f"{std_step['erreur'][:200]}")
     # Step de purge par route (clear du client) : écrit s'il manque, complété s'il n'accepte pas les routes
     if decision["mode"] == "client":
         candidates = cucumber_tools._git(worktree, "grep", "-l", "-F", cucumber_simple_init.CLEAR_STEP, "--",
