@@ -200,6 +200,9 @@ def init_workspace(tmp_path, monkeypatch, main_module):
     return {"root": root, "std": std, "origin": origin}
 
 
+AGENT_BRANCH = "feature/agent-cucumber-init-v1.3"
+
+
 def _push(worktree, branch):
     done = __import__("subprocess").run(["git", "-C", worktree, "push", "-q", "origin", f"HEAD:refs/heads/{branch}"],
                                         capture_output=True, text=True)
@@ -230,13 +233,18 @@ def test_init_generated_validated_pushed_then_run(init_workspace, main_module):
     assert "InitClientxSteps.java" in diff or f"Init{CLIENT.capitalize()}Steps.java" in diff
     assert "01-Contexte" not in git(w["origin"], "ls-tree", "-r", "--name-only", "v1.3")   # rien poussé avant validation
     assert call("appliquer") == 0 and _init_record()["detail"]["plan"]["action"] == "lancer"
-    pushed = git(w["origin"], "ls-tree", "-r", "--name-only", "v1.3")
+    # L'agent n'écrit QUE sur sa branche ; la branche de la version reçoit un patch, appliqué par l'utilisateur
+    pushed = git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)
     assert f"src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/01-Initialisation.feature" in pushed
     assert f"src/test/resources/cucumber/files/{CLIENT}/01-Contexte/WMS/01-Data.csv" in pushed
+    assert "01-Contexte" not in git(w["origin"], "ls-tree", "-r", "--name-only", "v1.3")
+    patch = _init_record()["detail"]["patch"]
+    assert os.path.exists(patch) and "01-Initialisation.feature" in open(patch, encoding="utf-8").read()
     assert call("verifier") == 0 and _init_record()["detail"]["plan"]["action"] == "lancer"   # rien à refaire
     assert call("lancer") == 0 and _init_record()["etat"] == "ok"
-    assert runs[0]["verify_branch"] == "v1.3" and runs[0]["init_tags"] == f"@INIT_{CLIENT.upper()}_WMS"
+    assert runs[0]["verify_branch"] == AGENT_BRANCH and runs[0]["init_tags"] == f"@INIT_{CLIENT.upper()}_WMS"
     assert _init_record()["detail"]["build"] == "https://jenkins/job/1/"
+    assert patch in _init_record()["resultat"]
 
 
 def test_init_failure_proposes_known_correction(init_workspace, main_module):
@@ -258,9 +266,114 @@ def test_init_failure_proposes_known_correction(init_workspace, main_module):
     assert "délai" in record["resultat"]
     outcome["run"] = {"ok": True, "message": "OK", "build": "b2"}
     assert call("corriger") == 0 and _init_record()["etat"] == "ok"
-    feature = git(w["origin"], "show",
-                  f"v1.3:src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/01-Initialisation.feature")
+    feature = git(w["origin"], "show", f"{AGENT_BRANCH}:src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/"
+                                       f"01-Initialisation.feature")
     assert "avec un délai de" in feature and "TODO-VERSION" in feature
+
+
+STANDARD_CLEAR = {"mode": "standard", "routes": ["full/all"], "motif": "full déployée", "preuves": ["full : p"],
+                  "erreur": ""}
+
+
+def test_standard_init_used_as_is_without_copy(init_workspace, main_module):
+    """Purge du Standard et aucun écart pour ce client : init du Standard lancée telle quelle, aucune copie."""
+    w = init_workspace
+    runs = []
+    helpers = {"clear": lambda: STANDARD_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "run": lambda profile, worktree: runs.append(profile) or {"ok": True, "message": "OK", "build": "b1"}}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("verifier") == 0
+    record = _init_record()
+    assert record["detail"]["plan"]["action"] == "lancer" and "diff" not in record["detail"]["plan"]
+    assert any("utilisée telle quelle" in r for r in record["detail"]["remarques"])
+    assert call("lancer") == 0 and _init_record()["etat"] == "ok"
+    assert runs == [{**runs[0], "verify_branch": AGENT_BRANCH, "init_tags": "@INIT_WMS"}]
+    assert "01-Contexte" not in git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)   # aucune copie
+    assert "patch" not in _init_record()["detail"]
+
+
+def test_standard_init_not_run_by_the_job_falls_back_to_adapted_copy(init_workspace, main_module):
+    w = init_workspace
+    outcome = {"run": {"ok": False, "message": "environnement non initialisé (@INIT_WMS) : aucun scénario pour "
+                                               "@INIT_WMS", "build": "b"}}
+    helpers = {"clear": lambda: STANDARD_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "run": lambda profile, worktree: outcome["run"]}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("lancer") == 1
+    assert _init_record()["detail"]["standard_indisponible"] == ["WMS"]
+    assert call("verifier") == 0
+    record = _init_record()
+    assert record["detail"]["plan"]["action"] == "appliquer" and "le job n'exécute pas" in record["resultat"]
+    assert "Purge de l'environnement" in record["detail"]["plan"]["diff"]          # copie avec la purge du Standard
+
+
+def test_client_specifics_go_to_separate_complements(init_workspace, main_module, tmp_path):
+    """Sujets propres au client : compléments à part (patch validé), lancés après l'init du Standard."""
+    w = init_workspace
+    findings = {"constats": [{"type": "champ_personnalise", "message": "1 champ personnalisé : customBoolean1"}]}
+    runs = []
+
+    def complements(what, worktree, plan):
+        if what == "constats":
+            return findings["constats"]
+        rel = f"src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/99-Complements-initialisation.feature"
+        path = os.path.join(worktree, *rel.split("/"))
+        write(path, f"@INIT_{CLIENT.upper()}_WMS_COMPLEMENT\nFeature: Compléments\n\n  Scenario: Champ\n"
+                    f"    Given CONFIG- Choix de la langue\n")
+        git(worktree, "add", "-A")
+        git(worktree, "commit", "-qm", "complements")
+        patch = str(tmp_path / "complements.patch")
+        with open(patch, "w", encoding="utf-8") as f:
+            f.write(git(worktree, "format-patch", "-1", "--stdout"))
+        git(worktree, "reset", "-q", "--hard", "HEAD~1")
+        return {"patch": patch, "fichiers": [rel]}
+    helpers = {"clear": lambda: STANDARD_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "complements": complements,
+               "run": lambda profile, worktree: runs.append(profile["init_tags"]) or {"ok": True, "message": "OK",
+                                                                                     "build": "b"}}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("verifier") == 0
+    record = _init_record()
+    assert record["detail"]["plan"]["action"] == "completer" and "99-Complements" in record["detail"]["plan"]["diff"]
+    assert "l'init n'est pas modifiée" in record["resultat"]
+    findings["constats"] = []                                    # couverts une fois les compléments présents
+    assert call("completer") == 0 and _init_record()["detail"]["plan"]["action"] == "lancer"
+    assert "99-Complements" in git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)
+    assert call("lancer") == 0
+    assert runs == ["@INIT_WMS", f"@INIT_{CLIENT.upper()}_WMS_COMPLEMENT"]     # Standard, puis compléments
+
+
+def test_complements_with_standard_init_get_their_own_tag(init_workspace, main_module, monkeypatch, tmp_path):
+    """Chemin réel : compléments construits à côté de l'emplacement client de l'init du Standard, tag _COMPLEMENT."""
+    w = init_workspace
+    from tools import cucumber_init
+    seen = {}
+
+    def fake_build(local, std, client, base, profile, status, anchors, imports, recreate, writer):
+        seen.update(base=base, anchors=anchors)
+        wt = cucumber_init.add_worktree(local, cucumber_init.init_worktree_dir(client), cucumber_init.init_branch(client),
+                                        base, reset=True)
+        rel = anchors[0].rsplit("/", 1)[0] + "/99-Complements-initialisation.feature"
+        write(os.path.join(wt, *rel.split("/")), f"@INIT_{CLIENT.upper()}\nFeature: Compléments\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "c")
+        patch = str(tmp_path / "c.patch")
+        cucumber_init.format_patch(wt, f"{base}..HEAD", patch)
+        return {"patch": patch, "fichiers": [rel], "avertissements": []}
+    monkeypatch.setattr(cucumber_init, "build_init_complements", fake_build)
+    local = os.path.join(w["root"], f"{CLIENT}-cucumber")
+    worktree = ct.add_worktree(local, str(tmp_path / "wt"), f"cucumber_{CLIENT}_version", "v1.3", reset=True)
+    std_rel = "src/test/resources/cucumber/features/WMS/01-Contexte/01-Initialisation.feature"
+    plan = {"present": {}, "standard": {"WMS": {"tags": "@INIT_WMS", "textes": {std_rel: STD_INIT}}}}
+    built = main_module.simple_init_build_complements(CLIENT, local, worktree, w["root"], w["std"], {}, plan,
+                                                      [{"type": "champ_personnalise"}], ["WMS"])
+    assert seen["base"] == f"cucumber_{CLIENT}_version"
+    assert seen["anchors"] == [f"src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/01-Initialisation.feature"]
+    text = open(built["patch"], encoding="utf-8").read()
+    assert f"+@INIT_{CLIENT.upper()}_WMS_COMPLEMENT" in text and f"+@INIT_{CLIENT.upper()}\n" not in text
 
 
 def test_init_stops_without_proven_clear(init_workspace, main_module):

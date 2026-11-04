@@ -483,7 +483,9 @@ def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client
     present = set(_git(worktree, "ls-files").stdout.splitlines())
     target_rel = complements_path(init_features[0], present | protected)
     items = [e for e in recreation_plan(cucumber_std_dir, client_name, profile) if e["donnee"]["code"] in codes]
-    first = _read_text(os.path.join(worktree, *init_features[0].split("/")))
+    anchor = os.path.join(worktree, *init_features[0].split("/"))
+    # Ancre absente (init du Standard utilisée telle quelle) : tag par défaut, remplacé par l'appelant
+    first = _read_text(anchor) if os.path.exists(anchor) else ""
     tags = [t for t in (first.splitlines() or [""])[0].split() if t.startswith("@")] or [
         f"@INIT_{java_package_segment(client_name).upper()}"]
     target = os.path.join(worktree, *target_rel.split("/"))

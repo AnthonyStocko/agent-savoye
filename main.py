@@ -1265,7 +1265,7 @@ def main():
     parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
     parser.add_argument("--align-library", action="store_true", help="generate-cucumber-client : bibliothèque Cucumber du pom.xml alignée sur la version du Standard du client (Jenkins, à défaut l'application) : seule la version change dans le pom, compilation corrigée dans les steps du projet, dry-run, puis (livraison autonome) runs de l'init et complet, promotion sans régression")
     parser.add_argument("--simple-depot", default="", choices=["", "verifier", "creer", "branche", "aligner"], help="generate-cucumber-client, onglet « Cucumber » simplifié, étape 2 : dépôt <client>-cucumber — constat, création (droits contrôlés), branche de la version, alignement validé de la bibliothèque et du runner, compilation")
-    parser.add_argument("--simple-init", default="", choices=["", "verifier", "appliquer", "lancer", "corriger"], help="generate-cucumber-client, onglet « Cucumber » simplifié, étape 4 : init du client sur la branche de la version — clear déduit des routes de l'application à sa version, init du Standard adaptée ou init existante comparée (diff validé avant tout push), run Jenkins de l'init, correction connue proposée sur échec")
+    parser.add_argument("--simple-init", default="", choices=["", "verifier", "appliquer", "completer", "lancer", "corriger"], help="generate-cucumber-client, onglet « Cucumber » simplifié, étape 4 : init du client sur la branche de la version — clear déduit des routes de l'application à sa version, init du Standard adaptée ou init existante comparée (diff validé avant tout push), run Jenkins de l'init, correction connue proposée sur échec")
     parser.add_argument("--java21", action="store_true", help="generate-cucumber-client : migration Java 21 du projet de tests (pom.xml seul, branche dédiée jamais fusionnée) et contrôle de non-régression : compilation et dry-run en Java 21, runs AVANT (application Java 11) et APRÈS (application Java 21), relance des écarts, rapport, PR proposée sans régression")
     parser.add_argument("--java21-avant", default="", help="--java21 : environnement AVANT confirmé, « composant_version=<v>;kis_version=<v> »")
     parser.add_argument("--java21-apres", default="", help="--java21 : environnement APRÈS confirmé, « composant_version=<v>;kis_version=<v> »")
@@ -4847,20 +4847,40 @@ def _module_of_init(rel: str, text: str, codes) -> str:
     return next((c for c in sorted(codes) if any(t.startswith("@INIT_") and t.endswith(f"_{c}") for t in tags)), "")
 
 
-def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version: str, tested: list,
-                      excluded: set, profile: dict, decision: dict) -> dict:
+def _std_init_usable(texts: dict, decision: dict, profile: dict, excluded: set, snapshots: tuple) -> str:
     """
-    Plan de l'étape 4 sur le worktree de la branche de la version : {"present" {rel: texte} des inits des modules
-    testés, "changes" {rel: texte}, "binaries" {rel: source}, "reasons", "remarks", "gaps"}.
+    '' si l'init du Standard d'un module convient TELLE QUELLE au client (aucune copie) : purge du Standard
+    (clear « full/all » déployé), aucun step d'un module exclu, aucun step absent de la bibliothèque du client. Sinon
+    la raison pour laquelle une init du client est nécessaire.
+    """
+    if decision.get("mode") != "standard":
+        return f"clear propre au client ({', '.join(decision.get('routes') or [])}) au lieu de la purge du Standard"
+    for text in texts.values():
+        if cucumber_modules.strip_excluded_steps(text, profile, excluded)[1]:
+            return f"steps d'un module exclu ({', '.join(sorted(excluded))}) à retirer"
+        if snapshots[0] and cucumber_init.mark_version_gaps(text, *snapshots)[1]:
+            return "steps absents de la bibliothèque Cucumber du client"
+    return ""
+
+
+def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version: str, tested: list,
+                      excluded: set, profile: dict, decision: dict, force_copy=()) -> dict:
+    """
+    Plan de l'étape 4 sur le worktree de l'agent (branche de la version + ses commits) : {"present" {rel: texte} des
+    inits des modules testés, "complements" {rel: texte} (99-Complements-initialisation*, à part), "standard"
+    {module: {tags, textes}} (init du Standard utilisée telle quelle, sans copie), "changes" {rel: texte},
+    "binaries" {rel: source}, "reasons", "remarks", "gaps"}. `force_copy` : modules dont l'init du Standard ne peut
+    pas être lancée par le job (copie adaptée à la place).
     """
     library = cucumber_checks.library_version(worktree)
     std = cucumber_init.std_init_files(cucumber_std_dir) if cucumber_std_dir else {}
-    present = {}
+    present, complements = {}, {}
     for feature in cucumber_init_data.client_init(worktree, client)["features"]:
         text = _read_text(os.path.join(worktree, *feature["chemin"].split("/")))
         if _module_of_init(feature["chemin"], text, set(tested) | set(excluded)) in tested:
-            present[feature["chemin"]] = text
+            (complements if cucumber_init_fix.is_complements(feature["chemin"]) else present)[feature["chemin"]] = text
     modules_present = {_module_of_init(rel, text, set(tested)) for rel, text in present.items()}
+    standard = {}
     tag = profile.get("tag_client", "")
     std_texts = {m: {cucumber_init.client_path(r, client): cucumber_simple_init.client_feature(
         _read_text(os.path.join(cucumber_std_dir, *r.split("/"))), m, client, decision, tag)
@@ -4872,7 +4892,17 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
             if not std.get(module):
                 remarks.append(f"{module} : aucune init dans le Cucumber Standard {version}")
                 continue
-            # Init absente : celle du Standard à la version, adaptée (écarts du client seulement)
+            raw = {rel: _read_text(os.path.join(cucumber_std_dir, *rel.split("/")))
+                   for rel in std[module] if rel.endswith(".feature")}
+            why = ("le job n'exécute pas l'init du Standard (aucun scénario au dernier run)" if module in force_copy
+                   else _std_init_usable(raw, decision, profile, excluded, snapshots))
+            if not why:
+                # L'init du Standard suffit : lancée telle quelle, aucune copie dans le dépôt du client
+                standard[module] = {"tags": cucumber_simple_init.init_tags(raw, excluded), "textes": raw}
+                remarks.append(f"{module} : init du Standard {version} utilisée telle quelle "
+                               f"({standard[module]['tags']}) — aucune copie dans le dépôt du client")
+                continue
+            # Init absente et Standard insuffisant : celle du Standard adaptée (écarts du client seulement)
             for rel in std[module]:
                 target = cucumber_init.client_path(rel, client)
                 if rel.endswith(".feature"):
@@ -4883,7 +4913,7 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
                     changes[target] = text
                 elif not os.path.exists(os.path.join(worktree, *target.split("/"))):
                     binaries[target] = os.path.join(cucumber_std_dir, *rel.split("/"))
-            reasons.append(f"init {module} absente : celle du Standard {version} adaptée au client")
+            reasons.append(f"init {module} absente : celle du Standard {version} adaptée au client ({why})")
             continue
         for rel, text in present.items():
             if _module_of_init(rel, text, set(tested)) != module:
@@ -4917,18 +4947,97 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
                 reasons.append(f"{path.rsplit('/', 1)[-1]} : routes {', '.join(missing)} ajoutées")
             elif missing:
                 remarks.append(f"{path} définit le step de purge sans accepter {', '.join(missing)} : à corriger")
-    return {"present": present, "changes": changes, "binaries": binaries, "reasons": reasons, "remarks": remarks,
-            "gaps": gaps, "library": library}
+    return {"present": present, "complements": complements, "standard": standard, "changes": changes,
+            "binaries": binaries, "reasons": reasons, "remarks": remarks, "gaps": gaps, "library": library}
+
+
+SIMPLE_INIT_DELIVERABLE_FINDINGS = ("initializer", "controle_environnement", "champ_personnalise")
+
+
+def simple_init_branch(profile: dict, branch: str) -> str:
+    """Branche de l'agent pour l'init de la version `branch` : « <branche de travail>-init-<version> »."""
+    work = (profile.get("verify_branch") or "feature/agent-cucumber").strip().rstrip("/")
+    return f"{work}-init-{branch.replace('/', '-')}"
+
+
+def simple_init_patch_path(client: str, branch: str) -> str:
+    """Livrable de l'étape 4 : patch à appliquer sur la branche de la version (par l'utilisateur)."""
+    return os.path.join(cucumber_tools.cache_dir(client), f"{client}-cucumber-init-{branch.replace('/', '-')}.patch")
+
+
+def simple_init_complement_findings(client: str, worktree: str, plan: dict, profile: dict) -> list:
+    """
+    Sujets propres au client que l'init (celle du Standard ou celle du client) ne couvre pas, livrables en
+    compléments : données d'initializers effacées par le clear, dépendances d'environnement, champs personnalisés.
+    Les compléments déjà présents comptent. [] si rien à compléter.
+    """
+    facts = cucumber_detection.init_facts(worktree, client, profile, cucumber_tools.load_inventory(client))
+    for module, std in (plan.get("standard") or {}).items():
+        facts["features"] += [cucumber_detection.feature_facts(cucumber_init.client_path(rel, client), text)
+                              for rel, text in std["textes"].items()]
+    if not facts["features"]:
+        return []
+    status = cucumber_detection.init_status(facts, profile, client, None, cucumber_import.imports_dir(client))
+    return [f for f in status.get("constats") or [] if f["type"] in SIMPLE_INIT_DELIVERABLE_FINDINGS]
+
+
+def simple_init_build_complements(client: str, local: str, worktree: str, client_root: str, cucumber_std_dir: str,
+                                  profile: dict, plan: dict, findings: list, tested: list) -> dict:
+    """
+    Compléments des sujets propres au client, dans UNE feature à part (99-Complements-initialisation), jamais dans
+    l'init : à côté de l'init du client, taguée comme elle ; avec l'init du Standard, sous
+    features/<client>/01-Contexte/<MOD>/ avec le tag @INIT_<CLIENT>_<MOD>_COMPLEMENT (lancée après l'init du
+    Standard, dans un run séparé). Commit sur la branche locale de l'agent, rien n'est poussé. {"patch", "fichiers",
+    "avertissements"} ; patch '' si rien n'est livrable.
+    """
+    base = cucumber_tools._git(worktree, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if plan["present"]:
+        anchors = sorted(plan["present"])
+        module = ""
+    else:
+        module = next(m for m in tested if m in plan["standard"])
+        anchors = [cucumber_init.client_path(next(iter(plan["standard"][module]["textes"])), client)]
+    result = cucumber_init.build_init_complements(
+        local, cucumber_std_dir, client, base, profile, {"constats": findings}, anchors,
+        cucumber_import.imports_dir(client),
+        lambda wt, items: recreate_initializer_data(client, wt, items, client_root, cucumber_std_dir, profile),
+        lambda wt, checks, manual: write_environment_steps(client, wt, checks, manual, cucumber_std_dir, profile))
+    if not result.get("patch"):
+        return {"patch": "", "fichiers": [], "avertissements": result.get("avertissements") or []}
+    if module:
+        # Init du Standard : tag propre aux compléments (run séparé, après l'init du Standard)
+        segment = cucumber_tools.java_package_segment(client).upper()
+        tags = [f"@INIT_{segment}_{module}_COMPLEMENT"] + ([profile["tag_client"]] if profile.get("tag_client") else [])
+        init_wt = cucumber_init.init_worktree_dir(client)
+        for rel in result["fichiers"]:
+            if rel.endswith(".feature"):
+                path = os.path.join(init_wt, *rel.split("/"))
+                lines = _read_text(path).splitlines(keepends=True)
+                if lines and lines[0].lstrip().startswith("@"):
+                    lines[0] = " ".join(tags) + ("\r\n" if lines[0].endswith("\r\n") else "\n")
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write("".join(lines))
+        cucumber_tools._git(init_wt, "commit", "-q", "-a", "--amend", "--no-edit")
+        cucumber_tools.format_patch(init_wt, f"{base}..HEAD", result["patch"])
+    saved = os.path.join(cucumber_tools.cache_dir(client), "init_complements.patch")
+    shutil.copyfile(result["patch"], saved)
+    return {"patch": saved, "fichiers": result["fichiers"], "avertissements": result.get("avertissements") or []}
 
 
 def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_root, version: str, action: str,
                     helpers: dict = None) -> int:
     """
-    Étape 4 (cucumber_simple_init) sur la branche de la version (étape 2) : `action` « verifier » (clear décidé,
-    init du Standard adaptée si elle manque, init existante comparée : plan et diff), « appliquer » (diff validé
-    écrit, commité, poussé, compilé), « lancer » (run Jenkins des tags d'init, importé), « corriger » (correction
-    connue du dernier échec, validée, poussée, puis relance). Rien n'est poussé sans validation. `helpers` (tests) :
-    "clear" (décision), "run" (run de l'init), "compile", "push".
+    Étape 4 (cucumber_simple_init). L'agent n'écrit QUE sur sa branche d'init (« <branche de travail>-init-<version> »,
+    partie de la branche de la version de l'étape 2, jamais forcée) et livre un patch à appliquer par l'utilisateur
+    sur la branche de la version. `action` :
+    - « verifier » : clear décidé ; init du Standard lancée TELLE QUELLE quand elle suffit (purge du Standard, aucun
+      écart pour ce client), sinon init du Standard adaptée (diff) ; init existante comparée ; sujets propres au
+      client non couverts : compléments à part (diff) ;
+    - « appliquer » : diff de l'init validé, commité, poussé sur la branche de l'agent, compilé, patch produit ;
+    - « completer » : compléments validés, poussés, compilés, patch mis à jour ;
+    - « lancer » : runs Jenkins (init du Standard, init du client, puis compléments), importés ;
+    - « corriger » : correction connue du dernier échec, validée, poussée, puis relance.
+    Rien n'est poussé sans validation. `helpers` (tests) : "clear", "run", "compile", "push", "complements".
     """
     h = helpers or {}
     depot = (cucumber_tools.load_state(client).get("simple") or {}).get("depot") or {}
@@ -4943,7 +5052,13 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     codes = (cucumber_modules.codes(profile) - excluded) or (cucumber_init.client_modules(
         client_root, cucumber_tools.load_inventory(client), std_modules or cucumber_init.INIT_MODULES) - excluded)
     tested = cucumber_simple_init.ordered_modules(codes)
-    detail = {"branche": branch}
+    work = simple_init_branch(profile, branch)
+    patch_path = simple_init_patch_path(client, branch)
+    last = (cucumber_tools.load_state(client).get("simple") or {}).get("init") or {}
+    force_copy = set((last.get("detail") or {}).get("standard_indisponible") or [])
+    detail = {"branche": branch, "branche_agent": work}
+    if force_copy:
+        detail["standard_indisponible"] = sorted(force_copy)
     decision = h["clear"]() if "clear" in h else simple_clear_decision(client_root, std_root, version, tested)
     if decision.get("erreur"):
         simple_record(client, "init", "echec", f"Clear non déterminé : {decision['erreur']}. Rien n'est généré sans "
@@ -4956,11 +5071,54 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         simple_record(client, "init", "echec", f"Clone de {slug} absent : relancez l'étape 2.", detail)
         return 1
     subprocess.run(["git", *_git_auth_args(), "-C", local, "fetch", "-q", "origin", "--prune"], capture_output=True)
+    # Espace de l'agent : sa branche d'init si elle existe (ses commits), mise à jour avec la branche de la version
+    has_work = cucumber_tools._git(local, "rev-parse", "--verify", "-q", f"origin/{work}").returncode == 0
     worktree = cucumber_tools.add_worktree(local, os.path.join(cucumber_tools.cache_dir(client), "worktree_version"),
-                                           f"cucumber_{client}_version", f"origin/{branch}", reset=True)
-    plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision)
+                                           f"cucumber_{client}_version", f"origin/{work}" if has_work
+                                           else f"origin/{branch}", reset=True)
+    if has_work:
+        cucumber_delivery.apply_identity()
+        merged = cucumber_tools._git(worktree, "merge", "-q", "--no-edit", f"origin/{branch}")
+        if merged.returncode != 0:
+            cucumber_tools._git(worktree, "merge", "--abort")
+            simple_record(client, "init", "echec", f"La branche de l'agent {work} ne se met pas à jour avec {branch} "
+                                                   f"(conflit) : appliquez d'abord le patch de l'init sur {branch}.",
+                          detail)
+            return 1
+    plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
+                             force_copy)
     detail.update(bibliotheque=plan["library"], remarques=plan["remarks"][:30], ecarts_standard=plan["gaps"][:10])
-    last = (cucumber_tools.load_state(client).get("simple") or {}).get("init") or {}
+
+    def write_patch() -> None:
+        """Patch des commits de l'agent par rapport à la branche de la version ; supprimé s'il n'y en a plus."""
+        if cucumber_tools._git(worktree, "rev-list", "--count", f"origin/{branch}..HEAD").stdout.strip() in ("", "0"):
+            if os.path.exists(patch_path):
+                os.remove(patch_path)
+            detail.pop("patch", None)
+            return
+        cucumber_tools.format_patch(worktree, f"origin/{branch}..HEAD", patch_path)
+        detail["patch"] = patch_path
+
+    pushed = {"branche": has_work}
+
+    def push() -> str:
+        refused = _push()
+        pushed["branche"] = pushed["branche"] or not refused
+        return refused
+
+    def _push() -> str:
+        if "push" in h:
+            return h["push"](worktree, work)
+        missing_token = cucumber_repo_setup.write_token_missing(slug)
+        if missing_token:
+            return missing_token
+        refused = cucumber_delivery.check_push(worktree, work, client, decision=True)
+        if refused:
+            return f"push refusé par la garde d'écriture : {refused}"
+        done = subprocess.run(["git", *_git_auth_args(write=True), "-C", worktree, "push", "origin",
+                               f"HEAD:refs/heads/{work}"],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return "" if done.returncode == 0 else f"push refusé : {(done.stderr.strip().splitlines() or ['?'])[-1][:200]}"
 
     def deliver(changes: dict, binaries: dict, message: str) -> str:
         for rel, text in changes.items():
@@ -4976,34 +5134,28 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         cucumber_tools._git(worktree, "add", "--", *changes, *binaries)
         if cucumber_tools._git(worktree, "commit", "-q", "-m", message).returncode != 0:
             return "commit impossible"
-        if "push" in h:
-            return h["push"](worktree, branch)
-        missing_token = cucumber_repo_setup.write_token_missing(slug)
-        if missing_token:
-            return missing_token
-        refused = cucumber_delivery.check_push(worktree, branch, client, decision=True)
-        if refused:
-            return f"push refusé par la garde d'écriture : {refused}"
-        done = subprocess.run(["git", *_git_auth_args(write=True), "-C", worktree, "push", "origin",
-                               f"HEAD:refs/heads/{branch}"],
-                              capture_output=True, text=True, encoding="utf-8", errors="replace")
-        return "" if done.returncode == 0 else f"push refusé : {(done.stderr.strip().splitlines() or ['?'])[-1][:200]}"
+        return push()
 
     def compiled() -> bool:
         built = h["compile"](worktree) if "compile" in h else cucumber_tools.verify_build(
             worktree, cucumber_tools.delivery_compile_cmd())
         if not built["ok"]:
-            simple_record(client, "init", "echec", f"Init poussée sur {branch}, mais la compilation échoue.",
+            simple_record(client, "init", "echec", f"Init poussée sur {work}, mais la compilation échoue.",
                           {**detail, "erreurs": built["erreurs"][:20]})
         return built["ok"]
+
+    def pushed_line() -> str:
+        return (f"{cucumber_tools.rev_parse(worktree, 'HEAD')[:10]} poussé sur {work} (branche de l'agent) ; patch "
+                f"à appliquer sur {branch} : {patch_path}")
 
     if plan["changes"] or plan["binaries"]:
         if action != "appliquer":
             diff = "".join(cucumber_repo_setup._diff(rel, plan["present"].get(rel) or _read_text(
                 os.path.join(worktree, *rel.split("/"))), text) for rel, text in plan["changes"].items())
             listed = "".join(f"+ {rel} (fichier de données du Standard)\n" for rel in plan["binaries"])
-            simple_record(client, "init", "a_faire", f"Init sur {branch} : à mettre à jour ("
-                          + " ; ".join(plan["reasons"]) + "). Relisez le diff puis validez.",
+            simple_record(client, "init", "a_faire", f"Init de {branch} : à mettre à jour ("
+                          + " ; ".join(plan["reasons"]) + f"). Relisez le diff puis validez : il sera poussé sur la "
+                          f"branche de l'agent {work}, et un patch vous sera livré pour {branch}.",
                           {**detail, "plan": {"action": "appliquer", "diff": diff + listed}})
             return 0
         refused = deliver(plan["changes"], plan["binaries"],
@@ -5013,14 +5165,67 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             return 1
         if not compiled():
             return 1
-        detail["commit"] = f"{cucumber_tools.rev_parse(worktree, 'HEAD')[:10]} poussé sur {branch}"
-        plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision)
-    tags = cucumber_simple_init.init_tags(plan["present"], excluded)
-    detail["tags"] = tags
-    if not tags:
-        simple_record(client, "init", "echec", f"Aucune feature d'init taguée @INIT_… pour {', '.join(tested)} sur "
-                                               f"{branch}.", detail)
+        write_patch()
+        detail["commit"] = pushed_line()
+        plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
+                                 force_copy)
+    # Compléments validés (diff relu) : appliqués tels quels, poussés sur la branche de l'agent
+    if action == "completer":
+        stored = ((last.get("detail") or {}).get("plan") or {}).get("complements") or ""
+        if not (stored and os.path.exists(stored)):
+            simple_record(client, "init", "a_faire", "Compléments introuvables : revérifiez l'init.",
+                          {**detail, "plan": {"action": "verifier"}})
+            return 0
+        cucumber_delivery.apply_identity()
+        if cucumber_tools._git(worktree, "am", "-q", "--3way", stored).returncode != 0:
+            cucumber_tools._git(worktree, "am", "--abort")
+            simple_record(client, "init", "echec", "Compléments non applicables sur la branche à jour : revérifiez "
+                                                   "l'init.", {**detail, "plan": {"action": "verifier"}})
+            return 1
+        refused = push()
+        if refused:
+            simple_record(client, "init", "echec", f"Compléments non livrés : {refused}.", detail)
+            return 1
+        if not compiled():
+            return 1
+        write_patch()
+        detail["commit"] = pushed_line()
+        plan = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
+                                 force_copy)
+    # Sujets propres au client non couverts par l'init : compléments à part (jamais dans l'init), diff à valider
+    elif action == "verifier":
+        findings = (h["complements"]("constats", worktree, plan) if "complements" in h
+                    else simple_init_complement_findings(client, worktree, plan, profile))
+        if findings:
+            built = (h["complements"]("construire", worktree, plan) if "complements" in h else
+                     simple_init_build_complements(client, local, worktree, client_root, cucumber_std_dir,
+                                                   profile, plan, findings, tested))
+            if built.get("patch"):
+                diff = cucumber_tools._git(worktree, "apply", "--stat", built["patch"]).stdout + "\n" + \
+                    _read_text(built["patch"])
+                simple_record(client, "init", "a_faire", "Sujets propres au client non couverts par l'init ("
+                              + " ; ".join(f["message"] for f in findings)[:400] + "). Compléments écrits À PART "
+                              "(l'init n'est pas modifiée) : relisez le diff puis validez.",
+                              {**detail, "plan": {"action": "completer", "diff": diff[:20000],
+                                                  "complements": built["patch"]},
+                               "avertissements": built.get("avertissements", [])[:10]})
+                return 0
+            detail["avertissements"] = ([f"à traiter à la main — {f['message']}" for f in findings]
+                                        + built.get("avertissements", []))[:10]
+    # Runs, dans l'ordre : init du Standard telle quelle, init du client, puis compléments (chacun purge ou dépend de
+    # la précédente : runs séparés)
+    std_tags = " or ".join(s["tags"] for s in plan["standard"].values() if s["tags"])
+    client_tags = cucumber_simple_init.init_tags(plan["present"], excluded)   # compléments du client : même tag
+    complement_tags = " or ".join(t for t in cucumber_simple_init.init_tags(plan["complements"], excluded).split(" or ")
+                                  if t.upper().endswith("_COMPLEMENT"))
+    groups = [(label, tags) for label, tags in (("init du Standard", std_tags), ("init du client", client_tags),
+                                                 ("compléments", complement_tags)) if tags]
+    detail["tags"] = " ; ".join(f"{label} : {tags}" for label, tags in groups)
+    if not groups:
+        simple_record(client, "init", "echec", f"Aucune init (Standard ou client) taguée @INIT_… pour "
+                                               f"{', '.join(tested)} sur {branch}.", detail)
         return 1
+    write_patch()
     if action == "corriger":
         fix = (last.get("detail") or {}).get("correction") or {}
         if not fix:
@@ -5038,43 +5243,69 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             if refused:
                 simple_record(client, "init", "echec", f"Correction non livrée : {refused}.", detail)
             return 1
-        detail["commit"] = f"{cucumber_tools.rev_parse(worktree, 'HEAD')[:10]} poussé sur {branch}"
+        write_patch()
+        detail["commit"] = pushed_line()
         action = "lancer"
+    pending = f" Patch à appliquer sur {branch} : {patch_path}." if detail.get("patch") else ""
     if action != "lancer":
-        simple_record(client, "init", "a_faire", f"Init prête sur {branch} ({tags}), clear "
+        simple_record(client, "init", "a_faire", f"Init prête ({detail['tags']}), clear "
                                                  f"{', '.join(decision['routes'])} conforme aux routes de "
-                                                 f"l'application : lancez-la sur Jenkins.",
+                                                 f"l'application : lancez-la sur Jenkins.{pending}",
                       {**detail, "plan": {"action": "lancer"}})
         return 0
-    run_profile = {**profile, "verify_branch": branch, "init_tags": tags}
-    if "run" in h:
-        run = h["run"](run_profile, worktree)
-    else:
-        mode, why = cucumber_verify.execution_mode(run_profile, "")
-        if mode != "branche":
-            simple_record(client, "init", "echec", f"Run Jenkins impossible : {why}", detail)
+    if not pushed["branche"]:
+        # Init du Standard seule, rien à commiter : la branche de l'agent (lue par le job) part de celle de la version
+        refused = push()
+        if refused:
+            simple_record(client, "init", "echec", f"Branche de l'agent {work} non créée : {refused}.", detail)
             return 1
-        run = run_init_and_import(client, run_profile, worktree, slug, mode)
-    detail["build"] = run.get("build", "")
-    if run.get("ok"):
-        simple_record(client, "init", "ok", f"Init verte sur {branch} : {run['message']}.", detail)
-        return 0
-    failure = next(iter(run.get("echecs") or []), {})
-    message = failure.get("message") or ""
-    detail["erreur"] = (f"{failure.get('fichier', '')} — {failure.get('step', '')} — {message}"[:600]
-                        if failure else run.get("message", ""))
-    if cucumber_wait_steps.is_library_timeout(message) and cucumber_wait_steps.known_step(failure.get("step")):
-        files = [failure["fichier"]] if failure.get("fichier") in plan["present"] else list(plan["present"])
-        expression = cucumber_wait_steps.project_expression(client, failure["step"])
-        simple_record(client, "init", "echec", f"Init en échec : « {failure['step']} » a dépassé l'attente fixe de la "
-                                               f"bibliothèque. Correction connue proposée : « {expression} », délai "
-                                               f"paramétrable. Validez pour la pousser puis relancer l'init.",
-                      {**detail, "correction": {"fichiers": files, "message": message},
-                       "plan": {"action": "corriger"}})
+    run_profile_base = {**profile, "verify_branch": work}
+    builds = []
+    for label, tags in groups:
+        run_profile = {**run_profile_base, "init_tags": tags}
+        if "run" in h:
+            run = h["run"](run_profile, worktree)
+        else:
+            mode, why = cucumber_verify.execution_mode(run_profile, "")
+            if mode != "branche":
+                simple_record(client, "init", "echec", f"Run Jenkins impossible : {why}", detail)
+                return 1
+            run = run_init_and_import(client, run_profile, worktree, slug, mode)
+        builds.append(run.get("build", ""))
+        detail["build"] = run.get("build", "")
+        detail["builds"] = [b for b in builds if b]
+        if run.get("ok"):
+            continue
+        message_run = run.get("message", "")
+        if label == "init du Standard" and "aucun scénario" in message_run:
+            # Le job ne lance pas les features du Standard : copie adaptée proposée à la place
+            simple_record(client, "init", "a_faire", f"Le job n'a exécuté aucun scénario de l'init du Standard "
+                                                     f"({tags}) : une init du client adaptée du Standard va être "
+                                                     f"proposée. Revérifiez.",
+                          {**detail, "standard_indisponible": sorted(plan["standard"]),
+                           "plan": {"action": "verifier"}})
+            return 1
+        failure = next(iter(run.get("echecs") or []), {})
+        message = failure.get("message") or ""
+        detail["erreur"] = (f"{label} — {failure.get('fichier', '')} — {failure.get('step', '')} — {message}"[:600]
+                            if failure else f"{label} — {message_run}")
+        own_files = {**plan["present"], **plan["complements"]}
+        if label != "init du Standard" and cucumber_wait_steps.is_library_timeout(message) and \
+                cucumber_wait_steps.known_step(failure.get("step")):
+            files = [failure["fichier"]] if failure.get("fichier") in own_files else list(own_files)
+            expression = cucumber_wait_steps.project_expression(client, failure["step"])
+            simple_record(client, "init", "echec", f"Init en échec ({label}) : « {failure['step']} » a dépassé "
+                                                   f"l'attente fixe de la bibliothèque. Correction connue proposée : "
+                                                   f"« {expression} », délai paramétrable. Validez pour la pousser "
+                                                   f"puis relancer l'init.",
+                          {**detail, "correction": {"fichiers": files, "message": message},
+                           "plan": {"action": "corriger"}})
+            return 1
+        simple_record(client, "init", "echec", f"Init en échec ({label}) : {message_run}"[:500],
+                      {**detail, "plan": {"action": "lancer"}})
         return 1
-    simple_record(client, "init", "echec", f"Init en échec : {run.get('message', '')}"[:500],
-                  {**detail, "plan": {"action": "lancer"}})
-    return 1
+    simple_record(client, "init", "ok", f"Init verte sur {work} ({detail['tags']}).{pending}", detail)
+    return 0
 
 
 def check_promoted_regression(client: str, analysis: dict, build_params: dict = None, revert=None) -> dict:
