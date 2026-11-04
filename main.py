@@ -4987,6 +4987,15 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
     java_rel = cucumber_simple_init.std_files_java_path(client)
     java_path = os.path.join(worktree, *java_rel.split("/"))
     used = any(cucumber_simple_init.uses_standard_files(t) for t in {**present, **owned}.values())
+    if used:
+        # Init qui lit les fichiers du Standard mais encore les règles du dossier de la feature : règles du Standard
+        for rel, text in {**present, **owned}.items():
+            if rel in changes or rel in deletions or not cucumber_simple_init.uses_plain_rules(text):
+                continue
+            module = _module_of_init(rel, text, set(tested))
+            if module:
+                changes[rel] = cucumber_simple_init.use_standard_files(text, module)
+                reasons.append(f"{rel.rsplit('/', 1)[-1]} : règles lues dans le Standard (rules/{module}/01-Contexte)")
     if used and java_rel not in changes and os.path.exists(java_path) and std_files is not None:
         problems = cucumber_simple_init.check_std_files_java(_read_text(java_path))
         if problems:
@@ -5070,6 +5079,8 @@ def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str
               "clear_step_java": clear_java if os.path.exists(clear_java) else "aucun",
               "java_std": std_java["java_std"], "std_step": cucumber_simple_init.GLOBAL_INIT_STEP,
               "expression": cucumber_simple_init.STD_FILES_EXPRESSION,
+              "std_rules_step": cucumber_simple_init.RULES_STEP,
+              "rules_expression": cucumber_simple_init.STD_RULES_EXPRESSION,
               "echec_precedent": previous_failure or "aucun"}
     label = "Step des fichiers du Standard"
     errors = write_init_steps(client, worktree, "cucumber_init_fichiers_standard", values,
