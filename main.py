@@ -1418,9 +1418,10 @@ def main():
                                                      odatio_version)
             cucumber_tools.STD_VERSION[0] = odatio_version
         if remote_std:
-            if args.fix_init_from_import:
-                # Correction de l'init : preuves lues dans Bitbucket, aucun clone du Standard à récupérer
-                print("[STANDARD] Correction de l'init : Standard lu dans Bitbucket, aucun fetch du Standard.")
+            if args.fix_init_from_import or args.simple_init or args.simple_depot:
+                # Correction de l'init, étapes 2 et 4 de l'onglet simplifié : code du Standard lu dans Bitbucket
+                # (clear, contribs, modules déployés), aucun clone ni fetch du projet du Standard
+                print("[STANDARD] Standard lu dans Bitbucket (API REST) : aucun clone ni fetch du projet du Standard.")
             else:
                 # Génération : clones nécessaires (exploration du code), limités aux dépôts utiles au client
                 try:
