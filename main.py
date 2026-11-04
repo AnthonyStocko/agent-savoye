@@ -5107,11 +5107,11 @@ def simple_init_build_complements(client: str, local: str, worktree: str, client
         lambda wt, checks, manual: write_environment_steps(client, wt, checks, manual, cucumber_std_dir, profile))
     if not result.get("patch"):
         return {"patch": "", "fichiers": [], "avertissements": result.get("avertissements") or []}
+    init_wt = cucumber_init.init_worktree_dir(client)
     if module:
         # Init du Standard : tag propre aux compléments (run séparé, après l'init du Standard)
         segment = cucumber_tools.java_package_segment(client).upper()
         tags = [f"@INIT_{segment}_{module}_COMPLEMENT"] + ([profile["tag_client"]] if profile.get("tag_client") else [])
-        init_wt = cucumber_init.init_worktree_dir(client)
         for rel in result["fichiers"]:
             if rel.endswith(".feature"):
                 path = os.path.join(init_wt, *rel.split("/"))
@@ -5120,7 +5120,15 @@ def simple_init_build_complements(client: str, local: str, worktree: str, client
                     lines[0] = " ".join(tags) + ("\r\n" if lines[0].endswith("\r\n") else "\n")
                 with open(path, "w", encoding="utf-8", newline="") as f:
                     f.write("".join(lines))
-        cucumber_tools._git(init_wt, "commit", "-q", "-a", "--amend", "--no-edit")
+                cucumber_tools._git(init_wt, "add", "--", rel)      # seulement ce fichier (jamais commit -a)
+    # Seuls les fichiers du projet de test (src/test) sont livrés : sorties de compilation ou rapports suivis par
+    # le dépôt (target/…) retirés du commit
+    stray = [p for p in cucumber_tools._git(init_wt, "diff", "--name-only", f"{base}", "HEAD", "--").stdout.splitlines()
+             if not p.startswith("src/test/")]
+    if stray:
+        cucumber_tools._git(init_wt, "reset", "-q", base, "--", *stray)
+    if module or stray:
+        cucumber_tools._git(init_wt, "commit", "-q", "--amend", "--no-edit")
         cucumber_tools.format_patch(init_wt, f"{base}..HEAD", result["patch"])
     saved = os.path.join(cucumber_tools.cache_dir(client), "init_complements.patch")
     shutil.copyfile(result["patch"], saved)
@@ -5320,6 +5328,13 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             simple_record(client, "init", "echec", "Compléments non applicables sur la branche à jour : revérifiez "
                                                    "l'init.", {**detail, "plan": {"action": "verifier"}})
             return 1
+        outside = [p for p in cucumber_tools._git(worktree, "diff", "--name-only", "HEAD~1", "HEAD", "--")
+                   .stdout.splitlines() if not p.startswith("src/test/")]
+        if outside:
+            # Patch de compléments produit par une version antérieure (sorties de compilation embarquées) : nettoyé
+            cucumber_tools._git(worktree, "reset", "-q", "HEAD~1", "--", *outside)
+            cucumber_tools._git(worktree, "commit", "-q", "--amend", "--no-edit")
+            cucumber_tools._git(worktree, "checkout", "-q", "--", *outside)
         refused = push()
         if refused:
             simple_record(client, "init", "echec", f"Compléments non livrés : {refused}.", detail)
