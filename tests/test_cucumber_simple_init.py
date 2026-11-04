@@ -541,6 +541,39 @@ def test_std_files_step_rewritten_from_scratch_with_previous_failure(init_worksp
     assert out["texte"] == STD_FILES_JAVA and open(path, encoding="utf-8").read() == "ancienne version (disque seulement)"
 
 
+def test_noncompliant_std_files_step_on_the_version_branch_is_rewritten(init_workspace, main_module):
+    """Init et ancien step (disque seulement) déjà sur la branche de la version : le step est réécrit (patch)."""
+    w = init_workspace
+    local = os.path.join(w["root"], f"{CLIENT}-cucumber")
+    git(local, "checkout", "-q", "v1.3")
+    old_java = ("package cucumber.features.clientx;\npublic class InitClientxFichiersStandardSteps {\n"
+                "    @Given(\"INIT- Initialisation globale par fichiers du Standard {string}\")\n"
+                "    public void init(String m) { File[] f = new File(ConstantConfig.FILE_PATH + m).listFiles(); }\n}\n")
+    feature = si.use_standard_files(si.client_feature(STD_INIT, "WMS", CLIENT, CLIENT_CLEAR), "WMS")
+    write(os.path.join(local, *FEATURE.split("/")), feature)
+    write(os.path.join(local, *si.std_files_java_path(CLIENT).split("/")), old_java)
+    write(os.path.join(local, *cuc_clear_path().split("/")), si.clear_java(CLIENT, ["wms/all"], ["wms : p"]))
+    git(local, "add", "-A")
+    git(local, "commit", "-qm", "init appliquée sur v1.3")
+    git(local, "push", "-q", "origin", "v1.3")
+    helpers = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "std_files": STD_FILES_STEP, "run": lambda profile, worktree: {"ok": True, "message": "OK", "build": "b"}}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("verifier") == 0
+    record = _init_record()
+    assert record["detail"]["plan"]["action"] == "appliquer" and "réécrit" in record["resultat"]
+    assert "getClassLoader" in record["detail"]["plan"]["diff"]
+    assert call("appliquer") == 0
+    patch = open(_init_record()["detail"]["patch"], encoding="utf-8").read()
+    assert "FichiersStandardSteps.java" in patch and "01-Initialisation.feature" not in patch
+
+
+def cuc_clear_path():
+    from tools import cucumber_init
+    return cucumber_init.clear_step_path(CLIENT)
+
+
 def test_init_stops_without_proven_clear(init_workspace, main_module):
     w = init_workspace
     code = main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", "verifier",
