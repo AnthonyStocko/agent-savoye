@@ -472,6 +472,48 @@ def test_library_jar_must_embed_the_standard_data(tmp_path):
     assert si.library_jar("26.24", str(tmp_path)) == ""
 
 
+def test_complements_with_only_build_outputs_deliver_nothing(init_workspace, main_module, monkeypatch, tmp_path):
+    """Contrôle non vérifiable retiré : rien du projet de test à livrer, aucun patch (jamais les sorties de build)."""
+    w = init_workspace
+    from tools import cucumber_init
+
+    def fake_build(local, std, client, base, profile, status, anchors, imports, recreate, writer):
+        wt = cucumber_init.add_worktree(local, cucumber_init.init_worktree_dir(client), cucumber_init.init_branch(client),
+                                        base, reset=True)
+        write(os.path.join(wt, "target", "surefire-reports", "x.txt"), "rapport\n")
+        git(wt, "add", "-A", "-f")
+        git(wt, "commit", "-qm", "c")
+        patch = str(tmp_path / "c.patch")
+        cucumber_init.format_patch(wt, f"{base}..HEAD", patch)
+        return {"patch": patch, "fichiers": [], "avertissements": ["customString1 non vérifiable"]}
+    monkeypatch.setattr(cucumber_init, "build_init_complements", fake_build)
+    local = os.path.join(w["root"], f"{CLIENT}-cucumber")
+    worktree = ct.add_worktree(local, str(tmp_path / "wt"), f"cucumber_{CLIENT}_version", "v1.3", reset=True)
+    plan = {"present": {FEATURE: "x"}, "standard": {}}
+    built = main_module.simple_init_build_complements(CLIENT, local, worktree, w["root"], w["std"], {}, plan,
+                                                      [{"type": "champ_personnalise"}], ["WMS"])
+    assert built["patch"] == "" and built["avertissements"] == ["customString1 non vérifiable"]
+
+
+def test_complements_without_deliverable_are_not_rebuilt(init_workspace, main_module):
+    w = init_workspace
+    calls = []
+
+    def complements(what, worktree, plan):
+        calls.append(what)
+        return ([{"type": "champ_personnalise", "codes": ["customString1"], "message": "customString1 non déclaré"}]
+                if what == "constats" else {"patch": "", "avertissements": ["non vérifiable par l'API"]})
+    helpers = {"clear": lambda: STANDARD_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "complements": complements, "std_files": NO_STEP}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("verifier") == 0 and calls == ["constats", "construire"]
+    record = _init_record()
+    assert record["detail"]["plan"]["action"] == "lancer"
+    assert any("customString1" in a for a in record["detail"]["avertissements"])
+    assert call("verifier") == 0 and calls == ["constats", "construire", "constats"]     # pas de nouvel appel
+
+
 def test_init_stops_without_proven_clear(init_workspace, main_module):
     w = init_workspace
     code = main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", "verifier",

@@ -531,7 +531,12 @@ def build_init_complements(cucumber_repo_dir: str, cucumber_std_dir: str, client
              if os.path.exists(os.path.join(worktree, *p.split("/")))]
     result["fichiers"] += [p for p in extra if p not in present]
     _check_isolation(client_name, worktree, result["fichiers"], profile, cucumber_std_dir)
-    _git(worktree, "add", "-A", "--", *([target_rel] if target_rel in result["fichiers"] else []), *extra)
+    paths = [*([target_rel] if target_rel in result["fichiers"] else []), *extra]
+    if not paths:
+        # Plus rien à livrer (contrôles non vérifiables retirés, aucune donnée à recréer) : « git add -A -- » sans
+        # chemin ajouterait tout le dépôt (sorties de build comprises)
+        return result
+    _git(worktree, "add", "-A", "--", *paths)
     touched = set(_git(worktree, "diff", "--cached", "--name-only").stdout.splitlines())
     if touched & protected:
         _git(worktree, "reset", "-q", "--hard", base)

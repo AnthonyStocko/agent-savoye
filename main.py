@@ -5127,6 +5127,11 @@ def simple_init_build_complements(client: str, local: str, worktree: str, client
              if not p.startswith("src/test/")]
     if stray:
         cucumber_tools._git(init_wt, "reset", "-q", base, "--", *stray)
+    if not [p for p in cucumber_tools._git(init_wt, "diff", "--cached", "--name-only", base, "--").stdout.splitlines()
+            if p.startswith("src/test/")]:
+        # Rien du projet de test à livrer : aucun complément
+        cucumber_tools._git(init_wt, "reset", "-q", "--hard", base)
+        return {"patch": "", "fichiers": [], "avertissements": result.get("avertissements") or []}
     if module or stray:
         cucumber_tools._git(init_wt, "commit", "-q", "--amend", "--no-edit")
         cucumber_tools.format_patch(init_wt, f"{base}..HEAD", result["patch"])
@@ -5328,8 +5333,15 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             simple_record(client, "init", "echec", "Compléments non applicables sur la branche à jour : revérifiez "
                                                    "l'init.", {**detail, "plan": {"action": "verifier"}})
             return 1
-        outside = [p for p in cucumber_tools._git(worktree, "diff", "--name-only", "HEAD~1", "HEAD", "--")
-                   .stdout.splitlines() if not p.startswith("src/test/")]
+        touched = cucumber_tools._git(worktree, "diff", "--name-only", "HEAD~1", "HEAD", "--").stdout.splitlines()
+        outside = [p for p in touched if not p.startswith("src/test/")]
+        if outside and len(outside) == len(touched):
+            # Patch d'une version antérieure sans aucun fichier du projet de test : rien à livrer
+            cucumber_tools._git(worktree, "reset", "-q", "--hard", "HEAD~1")
+            simple_record(client, "init", "a_faire", "Aucun complément à livrer (le patch préparé ne contenait que des "
+                                                     "sorties de compilation) : revérifiez l'init.",
+                          {**detail, "plan": {"action": "verifier"}})
+            return 0
         if outside:
             # Patch de compléments produit par une version antérieure (sorties de compilation embarquées) : nettoyé
             cucumber_tools._git(worktree, "reset", "-q", "HEAD~1", "--", *outside)
@@ -5348,7 +5360,13 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     elif action == "verifier":
         findings = (h["complements"]("constats", worktree, plan) if "complements" in h
                     else simple_init_complement_findings(client, worktree, plan, profile))
-        if findings:
+        signature = cucumber_simple_init.step_signature(json.dumps(
+            sorted([f.get("type", ""), sorted(f.get("codes") or [])] for f in findings), ensure_ascii=False))
+        if findings and (last.get("detail") or {}).get("complements_sans_livrable") == signature:
+            # Mêmes sujets que la dernière fois, sans rien de livrable : pas de nouvel appel
+            detail["complements_sans_livrable"] = signature
+            detail["avertissements"] = [f"à traiter à la main — {f['message']}" for f in findings][:10]
+        elif findings:
             built = (h["complements"]("construire", worktree, plan) if "complements" in h else
                      simple_init_build_complements(client, local, worktree, client_root, cucumber_std_dir,
                                                    profile, plan, findings, tested))
@@ -5364,6 +5382,7 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                 return 0
             detail["avertissements"] = ([f"à traiter à la main — {f['message']}" for f in findings]
                                         + built.get("avertissements", []))[:10]
+            detail["complements_sans_livrable"] = signature
     # Runs, dans l'ordre : init du Standard telle quelle, init du client, puis compléments (chacun purge ou dépend de
     # la précédente : runs séparés)
     std_tags = " or ".join(s["tags"] for s in plan["standard"].values() if s["tags"])
