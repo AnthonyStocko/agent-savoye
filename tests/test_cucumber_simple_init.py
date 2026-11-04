@@ -327,7 +327,8 @@ def test_client_specifics_go_to_separate_complements(init_workspace, main_module
         path = os.path.join(worktree, *rel.split("/"))
         write(path, f"@INIT_{CLIENT.upper()}_WMS_COMPLEMENT\nFeature: Compléments\n\n  Scenario: Champ\n"
                     f"    Given CONFIG- Choix de la langue\n")
-        git(worktree, "add", "-A")
+        write(os.path.join(worktree, "target", "surefire-reports", "x.txt"), "rapport\n")   # sortie de build suivie
+        git(worktree, "add", "-A", "-f")
         git(worktree, "commit", "-qm", "complements")
         patch = str(tmp_path / "complements.patch")
         with open(patch, "w", encoding="utf-8") as f:
@@ -346,7 +347,8 @@ def test_client_specifics_go_to_separate_complements(init_workspace, main_module
     assert "l'init n'est pas modifiée" in record["resultat"]
     findings["constats"] = []                                    # couverts une fois les compléments présents
     assert call("completer") == 0 and _init_record()["detail"]["plan"]["action"] == "lancer"
-    assert "99-Complements" in git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)
+    pushed = git(w["origin"], "ls-tree", "-r", "--name-only", AGENT_BRANCH)
+    assert "99-Complements" in pushed and "target/" not in pushed                # sorties de build jamais livrées
     assert call("lancer") == 0
     assert runs == ["@INIT_WMS", f"@INIT_{CLIENT.upper()}_WMS_COMPLEMENT"]     # Standard, puis compléments
 
@@ -363,7 +365,8 @@ def test_complements_with_standard_init_get_their_own_tag(init_workspace, main_m
                                         base, reset=True)
         rel = anchors[0].rsplit("/", 1)[0] + "/99-Complements-initialisation.feature"
         write(os.path.join(wt, *rel.split("/")), f"@INIT_{CLIENT.upper()}\nFeature: Compléments\n")
-        git(wt, "add", "-A")
+        write(os.path.join(wt, "target", "maven-status", "inputFiles.lst"), "x\n")
+        git(wt, "add", "-A", "-f")
         git(wt, "commit", "-qm", "c")
         patch = str(tmp_path / "c.patch")
         cucumber_init.format_patch(wt, f"{base}..HEAD", patch)
@@ -379,6 +382,7 @@ def test_complements_with_standard_init_get_their_own_tag(init_workspace, main_m
     assert seen["anchors"] == [f"src/test/resources/cucumber/features/{CLIENT}/01-Contexte/WMS/01-Initialisation.feature"]
     text = open(built["patch"], encoding="utf-8").read()
     assert f"+@INIT_{CLIENT.upper()}_WMS_COMPLEMENT" in text and f"+@INIT_{CLIENT.upper()}\n" not in text
+    assert "target/" not in text                                               # seuls les fichiers de src/test
 
 
 CLIENT_CLEAR = {"mode": "client", "routes": ["wms/all"], "motif": "m", "preuves": ["wms : p"], "erreur": ""}
