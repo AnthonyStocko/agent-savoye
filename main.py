@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import csv
 import io
 import json
@@ -23,7 +24,7 @@ from tools.epic_tools import (
     _restore_keys as restore_epic_keys, draft_tasks, epic_manifest_path, load_epic_manifest, save_epic_manifest,
     sync_epic_tasks,
 )
-from tools import analysis_publication, jira_guard
+from tools import analysis_publication, cucumber_java21, jira_guard
 from tools.jira_tools import (
     fetch_application_tickets, find_jira_issue_by_summary, get_epic_children, get_full_jira_issue_context,
     get_jira_issue_details,
@@ -1260,6 +1261,9 @@ def main():
     parser.add_argument("--profile-only", action="store_true", help="generate-cucumber-client : détecte le profil client (racine et tag des features, init, clear, fichiers du module spécifique, runner, codes de référence, version de la bibliothèque) dans le dépôt <client>-cucumber, sans appel à Claude")
     parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
     parser.add_argument("--align-library", action="store_true", help="generate-cucumber-client : bibliothèque Cucumber du pom.xml alignée sur la version du Standard du client (Jenkins, à défaut l'application) : seule la version change dans le pom, compilation corrigée dans les steps du projet, dry-run, puis (livraison autonome) runs de l'init et complet, promotion sans régression")
+    parser.add_argument("--java21", action="store_true", help="generate-cucumber-client : migration Java 21 du projet de tests (pom.xml seul, branche dédiée jamais fusionnée) et contrôle de non-régression : compilation et dry-run en Java 21, runs AVANT (application Java 11) et APRÈS (application Java 21), relance des écarts, rapport, PR proposée sans régression")
+    parser.add_argument("--java21-avant", default="", help="--java21 : environnement AVANT confirmé, « composant_version=<v>;kis_version=<v> »")
+    parser.add_argument("--java21-apres", default="", help="--java21 : environnement APRÈS confirmé, « composant_version=<v>;kis_version=<v> »")
     parser.add_argument("--module-tag", default="", help="generate-cucumber-client : module exclu du périmètre testé (ex. TMS) : son tag client est remplacé par @MODULE_EXCLU dans ses features (runs Jenkins lancés à la main), commit dédié et patch <client>-cucumber-module-<mod>-exclu.patch, sans appel à Claude")
     parser.add_argument("--module-tag-restore", action="store_true", help="avec --module-tag : opération inverse à la réactivation du module (@MODULE_EXCLU -> tag client), patch <client>-cucumber-module-<mod>-reactive.patch")
     parser.add_argument("--fix-client-tags", action="store_true", help="generate-cucumber-client : règle rétroactive « tag client » : ajoute le tag client au-dessus des scénarios actifs qui ne l'ont pas (scénarios désactivés exclus), commite dans le worktree, contrôle de nouveau et régénère le patch, sans appel à Claude")
@@ -4258,6 +4262,334 @@ def maybe_align_library(client: str, cucumber_repo_dir: str, base: str, cucumber
     return align_library(client, cucumber_repo_dir, base, cucumber_std_dir, repository, client_root, project)
 
 
+@contextlib.contextmanager
+def java21_environment():
+    """JDK 21 des compilations locales : CUCUMBER_JAVA21_HOME (JAVA_HOME et PATH), à défaut le JDK courant."""
+    home = os.getenv("CUCUMBER_JAVA21_HOME", "").strip()
+    if not home:
+        yield
+        return
+    saved = {k: os.environ.get(k) for k in ("JAVA_HOME", "PATH")}
+    os.environ["JAVA_HOME"] = home
+    os.environ["PATH"] = os.path.join(home, "bin") + os.pathsep + (saved["PATH"] or "")
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def parse_environment(text: str) -> dict:
+    """« composant_version=1.2;kis_version=26.16 » -> {"composant_version": "1.2", "kis_version": "26.16"}."""
+    out = {}
+    for part in (text or "").split(";"):
+        key, sep, value = part.partition("=")
+        if sep and key.strip():
+            out[key.strip()] = value.strip()
+    return out
+
+
+def java21_dir(client: str) -> str:
+    return os.path.join(cucumber_tools.cache_dir(client), "java21")
+
+
+def java21_dry_run(build: str, dry_run_cmd: str, features: list) -> dict:
+    """Dry-run strict de toutes les features : {ok, signature {id: steps}, erreurs, environnement}."""
+    for old in cucumber_verify._report_files(build):
+        os.remove(old)
+    paths = ",".join(cucumber_checks.feature_dirs(features))
+    code, output = cucumber_tools.run_maven(
+        f'{dry_run_cmd} "-Dcucumber.features={paths}" -Dcucumber.execution.dry-run=true', build)
+    errors = cucumber_tools.dry_run_errors(output)
+    report = [r for path in cucumber_verify._report_files(build) for r in cucumber_verify._read_report(path)]
+    if code != 0 or errors or not report:
+        return {"ok": False, "signature": {}, "environnement": not errors,
+                "erreurs": errors or [line.strip() for line in output.strip().splitlines()[-3:]]
+                or ["aucun rapport de dry-run"]}
+    return {"ok": True, "signature": cucumber_java21.dry_run_signature(report), "erreurs": [],
+            "environnement": False}
+
+
+def java21_local_checks(client: str, worktree: str, cucumber_std_dir: str, pom_before: str, pom_path: str) -> dict:
+    """
+    Compilation et dry-run en Java 21, avant (pom d'origine) puis après (pom migré) : {"erreur", "compilation",
+    "dry_run"}. Une erreur de compilation n'est jamais corrigée : elle est rapportée pour décision humaine.
+    """
+    out = {"erreur": "", "compilation": [], "dry_run": {}}
+    features = [p for p in cucumber_tools._git(worktree, "ls-files", "*.feature").stdout.splitlines() if p]
+    compile_cmd = cucumber_tools.delivery_compile_cmd()
+    with java21_environment():
+        code, version_output = cucumber_tools.run_maven("mvn -v", worktree)
+        jdk = cucumber_java21.jdk_version(version_output)
+        if jdk < cucumber_java21.TARGET_JAVA:
+            out["erreur"] = (f"compilation locale en Java 21 impossible : Maven tourne sur Java {jdk or '?'} — "
+                             f"renseignez CUCUMBER_JAVA21_HOME (dossier d'un JDK 21, onglet Configuration)")
+            return out
+        build = cucumber_tools.build_dir(client, worktree, cucumber_std_dir)
+        migrated = _read_text(pom_path)
+        with open(pom_path, "w", encoding="utf-8", newline="") as f:
+            f.write(pom_before)
+        try:
+            before_build = cucumber_tools.verify_build(build, compile_cmd)
+            before = java21_dry_run(build, cucumber_tools.DEFAULT_DRY_RUN_CMD, features) if before_build["ok"] \
+                else {"ok": False, "erreurs": before_build["erreurs"], "environnement": before_build["environnement"]}
+        finally:
+            with open(pom_path, "w", encoding="utf-8", newline="") as f:
+                f.write(migrated)
+        if not before["ok"]:
+            out["erreur"] = ("le projet ne compile pas ou son dry-run échoue AVANT migration (pom d'origine) : "
+                             "rien n'est comparable — " + "; ".join(before["erreurs"][:3]))
+            return out
+        after_build = cucumber_tools.verify_build(build, compile_cmd)
+        if not after_build["ok"]:
+            if after_build["environnement"]:
+                out["erreur"] = "compilation Java 21 impossible (environnement Maven) : " + "; ".join(
+                    after_build["erreurs"][:3])
+            else:
+                out["compilation"] = cucumber_java21.compile_findings(after_build["erreurs"])
+                out["erreur"] = (f"{len(out['compilation'])} erreur(s) de compilation en Java 21 : non corrigées "
+                                 f"dans le code des tests, décision humaine attendue (voir le rapport)")
+            return out
+        after = java21_dry_run(build, cucumber_tools.DEFAULT_DRY_RUN_CMD, features)
+    if not after["ok"]:
+        out["erreur"] = "dry-run strict en échec après migration : " + "; ".join(after["erreurs"][:3])
+        return out
+    out["dry_run"] = cucumber_java21.compare_dry_runs(before["signature"], after["signature"])
+    if not out["dry_run"]["ok"]:
+        out["erreur"] = ("dry-run différent avant / après migration : "
+                         + "; ".join((out["dry_run"]["manquants"] + out["dry_run"]["ajoutes"]
+                                      + out["dry_run"]["steps"])[:5]))
+    return out
+
+
+def java21_push(client: str, worktree: str, branch: str) -> str:
+    """Branche de migration poussée sans forcer (garde d'écriture) ; '' si poussée ou déjà identique, sinon le motif."""
+    cucumber_tools._git(worktree, "clean", "-fdq", "-e", "target", "-e", "**/target/")
+    remote = cucumber_tools._git(worktree, "ls-remote", "origin", f"refs/heads/{branch}").stdout.split()
+    if remote:
+        cucumber_tools._git(worktree, "fetch", "-q", "origin", f"refs/heads/{branch}")
+        same = cucumber_tools._git(worktree, "diff", "--quiet", "FETCH_HEAD", "HEAD").returncode == 0
+        return "" if same else (f"la branche {branch} existe déjà sur le dépôt client avec un autre contenu : "
+                                f"supprimez-la, ou choisissez une autre branche (profil « java21_branche »)")
+    refused = cucumber_delivery.check_push(worktree, branch, client, decision=True)
+    if refused:
+        return f"push refusé par la garde d'écriture : {refused}"
+    push = cucumber_tools._git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
+    if push.returncode != 0:
+        return f"push de {branch} refusé : {' '.join((push.stderr.strip().splitlines() or ['?'])[-1].split())[:200]}"
+    cucumber_delivery.log_event(client, "push", branche=branch, commit=cucumber_tools.rev_parse(worktree, "HEAD"),
+                                message="migration Java 21 (pom.xml seul)")
+    return ""
+
+
+def java21_run(client: str, worktree: str, profile: dict, branch: str, values: dict, roles: dict,
+               repository: str = "", tags: str = None, extra_arguments: str = "") -> dict:
+    """Run Jenkins de la comparaison (branche, environnement imposé), importé et analysé ; {"erreur"} sinon."""
+    run = cucumber_run.launch(client, worktree, profile, profile.get("tag_client", "") if tags is None else tags,
+                              repository=repository, push=False, branch=branch,
+                              overrides=cucumber_java21.overrides(values, roles), extra_arguments=extra_arguments)
+    print(f"[JAVA 21] {'✅' if run['ok'] else '⛔'} {run['message']}" + (f" — {run['build']}" if run["build"] else ""))
+    if not run["ok"]:
+        return {"erreur": run["message"] or "run non lancé", "build": run.get("build", "")}
+    if tags == cucumber_java21.ESSAI_TAG:
+        return {"build": run["build"],
+                "console": jenkins_tools.build_bytes(run["build"], "consoleText").decode("utf-8", "replace")}
+    imported = cucumber_import.import_files(client, cucumber_import.build_files(run["build"]), run["build"])
+    if not imported["numero"]:
+        return {"erreur": "build sans console ni rapport importable", "build": run["build"]}
+    analysis = cucumber_import.analyse(client, imported["numero"], cucumber_tools.load_state(client), worktree)
+    analysis["build_url"] = run["build"]
+    return analysis
+
+
+def java21_reference(client: str, branch: str, avant: dict, roles: dict) -> dict:
+    """Run AVANT réutilisable (run complet vert récent, même branche, même environnement) ; {} sinon."""
+    entries = sorted(cucumber_import.load_index(client).get("imports") or [], key=lambda e: -e["numero"])[:20]
+    items = [{"entry": e, "analyse": cucumber_import.load_analysis(client, e["numero"])} for e in entries]
+    found = cucumber_java21.reference_import(
+        items, branch, avant, roles, lambda e: jenkins_tools.build_parameters(e.get("url", "")) if e.get("url")
+        else {}, cucumber_java21.reference_days())
+    if found:
+        entry = next(e for e in entries if e["numero"] == found.get("numero"))
+        found = {**found, "build_url": entry.get("url", "")}
+    return found
+
+
+def run_java21_migration(client: str, cucumber_repo_dir: str, target: str, cucumber_std_dir: str,
+                         repository: str = "", project: str = "", avant: dict = None, apres: dict = None,
+                         steps: dict = None) -> dict:
+    """
+    Migration Java 21 et contrôle de non-régression (cucumber_java21, docstring du module). `target` : branche lue
+    par le job ; `avant` / `apres` : {composant_version, kis_version} confirmés par l'utilisateur. `steps` :
+    étapes remplaçables (tests) — "prepare", "local", "push", "run", "reference", "pull_request". La branche de
+    migration n'est jamais fusionnée : sans régression, une PR est proposée pour validation humaine.
+    Renvoie le résultat (aussi dans etat.json « java21 », .tmp/cucumber/<client>/java21/java21.md).
+    """
+    steps = steps or {}
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    branch = (profile.get("java21_branche") or cucumber_java21.DEFAULT_BRANCH).strip()
+    avant, apres = avant or {}, apres or {}
+    data = {"date": datetime.now().isoformat(timespec="seconds"), "branche": branch, "cible": target, "motif": "",
+            "verdict": {}, "lignes": [], "changements": [], "compilation": [], "dry_run": {}, "pr": "",
+            "avant": avant, "apres": apres, "outillage": "non vérifié",
+            "avant_libelle": ", ".join(f"{k} {v}" for k, v in avant.items()),
+            "apres_libelle": ", ".join(f"{k} {v}" for k, v in apres.items())}
+
+    def finish(motif: str = "") -> dict:
+        data["motif"] = motif or data["motif"]
+        report = cucumber_java21.report_markdown(client, data)
+        os.makedirs(java21_dir(client), exist_ok=True)
+        with open(os.path.join(java21_dir(client), cucumber_java21.REPORT_FILE), "w", encoding="utf-8") as f:
+            f.write(report)
+        # A_REVOIR.md de l'espace de l'agent (jamais la branche de migration : son diff ne touche que pom.xml)
+        agent_worktree = cucumber_tools.worktree_dir(client)
+        if os.path.isdir(agent_worktree):
+            path = os.path.join(agent_worktree, cucumber_a_revoir.A_REVOIR_FILE)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(cucumber_java21.a_revoir_section(_read_text(path), report))
+        share_knowledge(report, project or client.upper(), "migration-java21", f"Migration Java 21 de {client}",
+                        client=client)
+        state = cucumber_tools.load_state(client)
+        state.setdefault("java21", []).append({k: v for k, v in data.items() if k not in ("lignes", "diff_pom")}
+                                              | {"ecarts": (data["verdict"] or {}).get("ecarts")})
+        cucumber_tools.save_state(client, state)
+        print(f"[JAVA 21] {'⛔ ' + data['motif'] if data['motif'] and not data['verdict'] else data['verdict'].get('libelle', '')}")
+        print(f"[JAVA 21] Rapport : {os.path.join(java21_dir(client), cucumber_java21.REPORT_FILE)}")
+        return data
+
+    # 2. Préalables : job, rôles et environnements confirmés
+    job = cucumber_run.run_job(profile)
+    if not jenkins_tools.jenkins_configured() or not job:
+        return finish("Jenkins ou job du client non configuré (JENKINS_URL, « job Jenkins » du profil client)")
+    job_info = steps["prepare"]() if "prepare" in steps else cucumber_job.prepare(job, profile)
+    roles = job_info.get("roles") or {}
+    errors = job_info.get("erreurs", []) + cucumber_java21.environment_errors(avant, apres, roles)
+    if errors:
+        return finish(" ; ".join(errors))
+    # Branche lue par le job pour ce client : celle de son dernier build, à défaut la branche d'intégration
+    if "prepare" not in steps and roles.get("branche"):
+        reference = cucumber_job.reference_parameters(
+            job, repository or f"{cucumber_tools.java_package_segment(client)}-cucumber", job_info["definitions"],
+            agent_branch=profile.get("verify_branch", ""))
+        read_branch = ((reference or {}).get("parametres") or {}).get(roles["branche"], "").strip()
+        if read_branch and read_branch != target:
+            print(f"[JAVA 21] Branche lue par le job pour {client} (build n° {reference['numero']}) : {read_branch}.")
+            target = data["cible"] = read_branch
+    # 1. Migration du pom sur la branche dédiée, créée depuis la branche lue par le job
+    cucumber_tools._git(cucumber_repo_dir, "fetch", "-q", "origin", "--prune")
+    start = cucumber_tools.base_ref(cucumber_repo_dir, target)
+    if not start:
+        return finish(f"branche {target} lue par le job introuvable dans le dépôt client")
+    worktree = cucumber_tools.add_worktree(cucumber_repo_dir, os.path.join(java21_dir(client), "worktree"),
+                                           f"cucumber_{client}_java21", start, reset=True)
+    pom_path = os.path.join(worktree, "pom.xml")
+    if not os.path.exists(pom_path):
+        return finish("le dépôt client n'a pas de pom.xml (exécuté en surcouche du Standard) : la migration "
+                      "concerne le Cucumber Standard, hors périmètre de ce contrôle")
+    pom_before = _read_text(pom_path)
+    migrated = cucumber_java21.migrate_pom(pom_before)
+    if migrated["erreur"]:
+        return finish(migrated["erreur"])
+    data["changements"] = migrated["changements"]
+    run_branch = branch
+    if migrated["changements"]:
+        with open(pom_path, "w", encoding="utf-8", newline="") as f:
+            f.write(migrated["pom"])
+        cucumber_tools._git(worktree, "add", "--", "pom.xml")
+        cucumber_tools._git(worktree, "commit", "-q", "-m",
+                            f"Cucumber {client} : migration Java 21 (pom.xml seul)\n\n"
+                            + "".join(f"- {c['element']} : {c['avant']} -> {c['apres']} ({c['raison']})\n"
+                                      for c in migrated["changements"]))
+    else:
+        print(f"[JAVA 21] pom.xml déjà en Java {cucumber_java21.java_version(pom_before)} : aucune branche de "
+              f"migration, les runs APRÈS lisent {target}.")
+        run_branch = target
+    changed = [p for p in cucumber_tools._git(worktree, "diff", "--name-only", start, "HEAD").stdout.splitlines() if p]
+    data["diff_pom"] = cucumber_tools._git(worktree, "diff", start, "HEAD", "--", "pom.xml").stdout[:6000]
+    git_pom = lambda ref: cucumber_tools._git(worktree, "show", f"{ref}:pom.xml").stdout  # noqa: E731
+    refused = cucumber_java21.branch_errors(changed, git_pom(start), git_pom("HEAD"))
+    if refused:
+        return finish("contrôle de la branche : " + " ; ".join(refused))
+    if migrated["changements"]:
+        local = steps["local"](worktree) if "local" in steps else java21_local_checks(
+            client, worktree, cucumber_std_dir, pom_before, pom_path)
+        data["compilation"], data["dry_run"] = local.get("compilation") or [], local.get("dry_run") or {}
+        if local.get("erreur"):
+            return finish(local["erreur"])
+        # Contrôle refait juste avant le push : rien d'autre que le pom n'a pu entrer dans la branche
+        changed = [p for p in cucumber_tools._git(worktree, "diff", "--name-only", start, "HEAD").stdout.splitlines()
+                   if p]
+        refused = cucumber_java21.branch_errors(changed, git_pom(start), git_pom("HEAD"))
+        if refused:
+            return finish("contrôle de la branche avant push : " + " ; ".join(refused))
+        pushed =steps["push"](worktree, branch) if "push" in steps else java21_push(client, worktree, branch)
+        if pushed:
+            return finish(pushed)
+    run = steps.get("run") or (lambda branch_, values, tags=None, extra="": java21_run(
+        client, worktree, profile, branch_, values, roles, repository, tags, extra))
+    # 2. Outillage du job : version de javac lue dans la console d'un essai (aucun scénario sélectionné)
+    essai = run(run_branch, apres, cucumber_java21.ESSAI_TAG)
+    tool = cucumber_java21.toolchain(essai.get("console", ""))
+    data["outillage"] = (f"Java {tool['version']} ({tool['preuve']})" if tool["version"] else tool["preuve"]
+                         or "version illisible") + (f" — essai {essai.get('build')}" if essai.get("build") else "")
+    if essai.get("erreur") and not essai.get("console"):
+        return finish(f"essai de compilation sur Jenkins non abouti : {essai['erreur']}")
+    if tool["ok"] is False:
+        return finish(f"l'outillage du job ne compile pas en Java 21 ({data['outillage']}) : faites installer un "
+                      f"JDK 21 sur l'agent Jenkins")
+    if tool["ok"] is None:
+        return finish("version de javac illisible dans la console de l'essai : faites afficher la version de Java "
+                      "par le job (mvn -V ou java -version) avant de relancer")
+    # 3. Runs de comparaison : AVANT (référence récente réutilisée, sinon relancé), APRÈS, relance des écarts
+    reference = steps["reference"](target, avant, roles) if "reference" in steps else java21_reference(
+        client, target, avant, roles)
+    before = reference or run(target, avant)
+    data["avant_reutilise"] = bool(reference)
+    data["build_avant"] = before.get("build_url") or before.get("build", "")
+    if before.get("erreur") or before.get("non_analyse") or not before.get("resultats"):
+        return finish(f"run AVANT inexploitable : {before.get('erreur') or before.get('non_analyse') or 'aucun résultat'}")
+    after = run(run_branch, apres)
+    data["build_apres"] = after.get("build_url") or after.get("build", "")
+    if after.get("erreur") or after.get("non_analyse") or not after.get("resultats"):
+        return finish(f"run APRÈS inexploitable : {after.get('erreur') or after.get('non_analyse') or 'aucun résultat'}")
+    rows = cucumber_java21.compare_results(before["resultats"], after["resultats"])
+    differing = cucumber_java21.to_rerun(rows)
+    rerun = {}
+    if differing:
+        print(f"[JAVA 21] {len(differing)} scénario(s) au résultat différent : relance unique en APRÈS.")
+        selection = cucumber_java21.rerun_selection(
+            differing, lambda rel: _read_text(os.path.join(worktree, *rel.split("/"))))
+        again = run(run_branch, apres, None, selection)
+        data["build_relance"] = again.get("build_url") or again.get("build", "")
+        rerun = {i: r for i, r in (again.get("resultats") or {}).items() if i in set(differing)}
+        rows = cucumber_java21.compare_results(before["resultats"], after["resultats"], rerun)
+    for row in rows:
+        if row["categorie"] in ("nouvel_echec", "instable"):
+            row["classement"] = cucumber_java21.classify_failure(row)
+    data["lignes"] = rows
+    data["contextes"] = {r["id"]: cucumber_java21.scenario_context(
+        _read_text(os.path.join(worktree, *r["id"].split("::", 1)[0].split("/"))), r["id"].split("::", 1)[1])
+        for r in rows if r["categorie"] != "identique"}
+    data["durees"] = cucumber_java21.compare_durations(
+        (before.get("durees") or {}).get("par_scenario") or {}, (after.get("durees") or {}).get("par_scenario") or {})
+    data["verdict"] = cucumber_java21.verdict(rows)
+    # 5. Livraison : jamais de fusion ; sans régression, PR proposée vers la branche lue par le job
+    if not data["verdict"]["regression"] and run_branch != target:
+        project_key, repo_slug = cucumber_java21.repo_coordinates(cucumber_delivery.push_url(worktree))
+        payload = cucumber_java21.pull_request_payload(project_key, repo_slug, branch, target, client,
+                                                       cucumber_java21.report_markdown(client, data))
+        try:
+            data["pr"] = steps["pull_request"](payload) if "pull_request" in steps else \
+                pr_review.create_pull_request(project_key, repo_slug, payload)
+            cucumber_delivery.log_event(client, "pr_migration_java21", branche=branch, cible=target, pr=data["pr"])
+        except Exception as e:  # noqa: BLE001 - PR non créée : la branche reste à proposer à la main
+            data["pr"] = f"non créée ({e}) : proposez la branche {branch} vers {target} à la main"
+    return finish()
+
+
 def check_promoted_regression(client: str, analysis: dict, build_params: dict = None, revert=None) -> dict:
     """
     Run importé sur la branche cible après une promotion de l'agent : échecs nouveaux (face au dernier run de la
@@ -4436,6 +4768,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         aligned = align_library(client, cucumber_repo_dir, base, local_cucumber_std_repo, args.cucumber_repo,
                                 local_client_repo, project, force=True)
         return 0 if aligned.get("livree") or not aligned.get("casse") else 1
+    if args.java21:
+        result = run_java21_migration(client, cucumber_repo_dir, args.cucumber_base_branch, local_cucumber_std_repo,
+                                      args.cucumber_repo, project, parse_environment(args.java21_avant),
+                                      parse_environment(args.java21_apres))
+        return 0 if result.get("verdict") and not result["verdict"]["regression"] else 1
     if args.module_tag.strip():
         subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
         return retag_module(client, cucumber_repo_dir, base, args.module_tag.strip().upper(), args.module_tag_restore)

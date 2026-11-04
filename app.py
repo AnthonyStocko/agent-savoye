@@ -14,7 +14,7 @@ from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
 from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, standard_version, standard_version_task
-from tools import (cucumber_a_revoir, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
+from tools import (cucumber_a_revoir, cucumber_java21, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
                    cucumber_init_data, cucumber_initializers, cucumber_journey, cucumber_profile, cucumber_run,
@@ -1985,6 +1985,69 @@ def render_cucumber_health(ctx: dict) -> None:
             st.markdown(health)
 
 
+def render_cucumber_java21(ctx: dict) -> None:
+    """
+    Migration Java 21 du projet de tests et contrôle de non-régression : environnements AVANT / APRÈS proposés
+    (profil et historique Jenkins) puis confirmés par l'utilisateur, avant tout lancement.
+    """
+    client = ctx["client"]
+    if not client:
+        return
+    report_path = os.path.join(cucumber_tools.cache_dir(client), "java21", cucumber_java21.REPORT_FILE)
+    last = (cucumber_tools.load_state(client).get("java21") or [{}])[-1]
+    title = "Migration Java 21 et contrôle de non-régression"
+    if last.get("date"):
+        title += f" : {last.get('verdict', {}).get('libelle') or 'arrêtée'} ({last['date'][:16].replace('T', ' ')})"
+    with st.expander(title, icon=":material/upgrade:"):
+        st.caption("Le pom.xml du projet de tests passe en Java 21 sur une branche dédiée (features, steps et données "
+                   "intacts : tout autre changement arrête le contrôle), puis la suite active est comparée entre "
+                   "l'application en Java 11 (AVANT) et en Java 21 (APRÈS). La branche n'est jamais fusionnée par "
+                   "l'agent : sans régression, une PR est proposée pour validation humaine.")
+        key = f"java21_{client}"
+        profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+        if st.button("Proposer les valeurs d'environnement", icon=":material/history:", key=f"{key}_propose",
+                     help="AVANT : composant et KIS du dernier build vert du client. APRÈS : version client choisie "
+                          "(Données du projet), à défaut un build récent d'une autre version du composant."):
+            job = cucumber_run.run_job(profile)
+            info = cucumber_job.prepare(job, profile) if job else {"roles": {}}
+            repo = f"{cucumber_tools.java_package_segment(client)}-cucumber"
+            proposal = cucumber_java21.propose_environments(
+                profile, jenkins_tools.recent_builds(job, 30) if job else [], info.get("roles") or {}, repo)
+            for side in ("avant", "apres"):
+                for role in cucumber_java21.ENV_ROLES:
+                    st.session_state[f"{key}_{side}_{role}"] = proposal[side].get(role, "")
+            st.session_state[f"{key}_sources"] = proposal["sources"]
+            st.session_state[f"{key}_confirme"] = False
+        sources = st.session_state.get(f"{key}_sources") or {}
+        values = {}
+        for side, label in (("avant", "AVANT — application en Java 11"), ("apres", "APRÈS — application en Java 21")):
+            st.markdown(f"**{label}**" + (f" :gray[({sources[side]})]" if sources.get(side) else ""))
+            with st.container(horizontal=True):
+                values[side] = {role: st.text_input(
+                    "Version du composant (COMPONENT_VERSION)" if role == "composant_version"
+                    else "Version KIS (KIS_VERSION)", key=f"{key}_{side}_{role}").strip()
+                    for role in cucumber_java21.ENV_ROLES}
+        filled = all(values[s][r] for s in values for r in cucumber_java21.ENV_ROLES)
+        confirmed = st.checkbox("Je confirme ces paramètres d'environnement", key=f"{key}_confirme",
+                                disabled=not filled)
+        if st.button("Migration Java 21 et contrôle de non-régression", icon=":material/play_arrow:",
+                     type="primary", key=f"{key}_lancer", disabled=not (ctx["ready"] and filled and confirmed),
+                     help="Compilation et dry-run en Java 21 (CUCUMBER_JAVA21_HOME), essai de compilation sur "
+                          "Jenkins, run AVANT (référence récente réutilisée si elle existe), run APRÈS, relance des "
+                          "écarts. Plusieurs runs complets : long. Aucun appel à Claude."):
+            encode = lambda v: ";".join(f"{r}={v[r]}" for r in cucumber_java21.ENV_ROLES)  # noqa: E731
+            code = run_main_step(ctx["cmd"] + ["--java21", "--java21-avant", encode(values["avant"]),
+                                               "--java21-apres", encode(values["apres"])], on_line=ctx["capture"])
+            if code == 0:
+                st.success("Aucune régression détectée : PR proposée pour validation humaine (voir le rapport).")
+            else:
+                st.warning("Contrôle arrêté ou écarts détectés : voir le rapport ci-dessous.", icon=":material/warning:")
+            st.rerun()
+        if os.path.exists(report_path):
+            with open(report_path, "r", encoding="utf-8", errors="replace") as f:
+                st.markdown(f.read())
+
+
 def render_init_patch(client: str) -> None:
     """Patch du lot d'initialisation (séparé des tests), téléchargeable."""
     init_patch = cucumber_tools.init_patch_path(client) if client else ""
@@ -2845,6 +2908,7 @@ def render_expert(ctx: dict, data: dict) -> None:
     with tabs[0]:
         render_cucumber_profile(ctx, data["profile_doc"], data["detected"], data["init_status"])
         render_cucumber_health(ctx)
+        render_cucumber_java21(ctx)
     with tabs[1]:
         if data["rows"]:
             render_coverage_summary(ctx, data["rows"], data["links"],
@@ -4209,6 +4273,17 @@ with tab_config:
             help="Commande de compilation lancée après chaque lot (en Python, sans token). Dépôt client sans pom.xml : "
                  "compilé par-dessus une copie du Cucumber Standard. Hors ligne (-o) en échec faute de dépendances : "
                  "relancée une fois en ligne.")
+        with st.container(horizontal=True):
+            env_values["CUCUMBER_JAVA21_HOME"] = st.text_input(
+                "CUCUMBER_JAVA21_HOME", value=os.getenv("CUCUMBER_JAVA21_HOME", ""),
+                help="Dossier d'un JDK 21 pour la compilation et le dry-run locaux de la migration Java 21 (vide : "
+                     "JDK courant de Maven, qui doit être en 21).")
+            java21_days = st.number_input(
+                "CUCUMBER_JAVA21_REFERENCE_DAYS", min_value=0, step=1,
+                value=env_int("CUCUMBER_JAVA21_REFERENCE_DAYS", cucumber_java21.DEFAULT_REFERENCE_DAYS),
+                help="Âge maximal (jours) d'un run complet vert réutilisé comme run AVANT de la migration Java 21 "
+                     "(0 : toujours relancé).")
+        env_values["CUCUMBER_JAVA21_REFERENCE_DAYS"] = str(int(java21_days))
         with st.container(horizontal=True):
             fix_attempts = st.number_input(
                 "CUCUMBER_FIX_ATTEMPTS", min_value=0, step=1, value=env_int("CUCUMBER_FIX_ATTEMPTS", 2),

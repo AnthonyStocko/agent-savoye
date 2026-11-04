@@ -130,7 +130,7 @@ def tested_version(client_name: str, params: dict, roles: dict, inventory: dict 
 
 def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=print, repository: str = "",
            base_branch: str = "", inventory: dict = None, client_root: str = "", push: bool = True,
-           branch: str = "") -> dict:
+           branch: str = "", overrides: dict = None, extra_arguments: str = "") -> dict:
     """
     Push, contrôle du commit en tête de la branche distante, lancement et suivi (voir docstring du module).
     `repository` : dépôt client (rôle « depot ») ; `base_branch` : branche d'intégration, interdite ; `inventory` et
@@ -139,6 +139,8 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     "version_testee"} ; ok faux si rien n'a été lancé ou si le build n'a pas abouti (le build terminé, même en échec
     de tests, est importable). `push` faux : rien n'est commité ni poussé, le job exécute la branche (`branch`, à
     défaut celle du profil) telle qu'elle est sur le dépôt client — lecture seule, branche d'intégration permise.
+    `overrides` : paramètres du job imposés pour ce run seulement (ex. environnement AVANT / APRÈS de la migration
+    Java 21) ; `extra_arguments` : options ajoutées aux arguments Maven (ex. relance ciblée -Dcucumber.features).
     """
     asked = (tags or "").strip()
     # Modules exclus du périmètre testé (profil) : « and not @<TAG> », sans leurs tags d'init
@@ -195,6 +197,9 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     params = cucumber_job.build_parameters(check["definitions"], roles, check["branche"], repository, tags,
                                            run["commit"], fixed=fixed,
                                            target=cucumber_job.tag_target(profile, roles), reference=reference)
+    params.update({k: v for k, v in (overrides or {}).items() if k})
+    if extra_arguments and roles.get("arguments"):
+        params[roles["arguments"]] = f"{params.get(roles['arguments'], '')} {extra_arguments}".strip()
     run["parametres"] = cucumber_job.visible_parameters(params, roles)
     run["version_testee"] = tested_version(client_name, params, roles, inventory, client_root)
     if run["version_testee"]:
@@ -222,7 +227,7 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     run["ok"] = bool(build["url"]) and build["result"] not in ("TIMEOUT", "INDISPONIBLE", "ABORTED")
     run["message"] = (f"build terminé : {build['result']}" if run["ok"] else
                       f"build non abouti : {build['result']}" + (f" ({build['url']})" if build["url"] else ""))
-    if run["ok"] and tags:
+    if run["ok"] and tags and not extra_arguments:
         console = jenkins_tools.build_bytes(build["url"], "consoleText").decode("utf-8", "replace")
         run["selection"] = selection_check(console, worktree, tags, texts)
         if run["selection"]:

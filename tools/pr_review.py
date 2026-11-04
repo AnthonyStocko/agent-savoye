@@ -91,6 +91,29 @@ def summarize(pr: dict) -> dict:
             "jira": jira_keys(pr.get("title", ""), source.get("displayId", ""), pr.get("description", ""))}
 
 
+def create_pull_request(project: str, repo: str, payload: dict) -> str:
+    """
+    Ouvre une PR (création seule : jamais d'approbation ni de fusion par l'agent) et renvoie son adresse. PR déjà
+    ouverte pour la même branche : son adresse. Lève BitbucketError.
+    """
+    if not configured():
+        raise BitbucketError("BITBUCKET_URL ou BITBUCKET_HTTP_TOKEN non renseigné (onglet Configuration)")
+    path = f"/rest/api/1.0/projects/{project}/repos/{repo}/pull-requests"
+    try:
+        response = requests.post(f"{base_url()}{path}", headers={**_headers(), "Content-Type": "application/json"},
+                                 json=payload, timeout=30)
+    except requests.RequestException as e:
+        raise BitbucketError(f"Bitbucket injoignable : {type(e).__name__}") from e
+    if response.status_code == 409:
+        source = (payload.get("fromRef") or {}).get("id", "")
+        for pr in _paged(path, {"state": "OPEN", "direction": "OUTGOING", "at": source}, limit=25):
+            return ((pr.get("links") or {}).get("self") or [{}])[0].get("href", "")
+        raise BitbucketError(f"PR refusée par Bitbucket (HTTP 409) : {response.text[:200]}")
+    if response.status_code not in (200, 201):
+        raise BitbucketError(f"PR refusée par Bitbucket (HTTP {response.status_code}) : {response.text[:200]}")
+    return ((response.json().get("links") or {}).get("self") or [{}])[0].get("href", "")
+
+
 def review_inbox(role: str = "REVIEWER") -> list:
     """PR ouvertes où l'utilisateur du jeton a ce rôle (REVIEWER, PARTICIPANT, AUTHOR), plus récentes d'abord."""
     prs = _paged("/rest/api/1.0/dashboard/pull-requests", {"state": "OPEN", "role": role, "order": "NEWEST"})
