@@ -2091,10 +2091,22 @@ def render_simple_base(ctx: dict, step: dict) -> None:
 
 
 def render_simple_init(ctx: dict, step: dict) -> None:
-    """Étape 4 : init du Standard à la version du client, écarts du client seulement, run Jenkins de l'init."""
-    st.button("Préparer et vérifier l'init", type="primary", icon=":material/play_arrow:",
-              key=f"cs_init_{ctx['client']}", disabled=True,
-              help="En cours de développement : utilisez l'onglet « Cucumber (avancé) » en attendant.")
+    """
+    Étape 4 : clear déduit des routes de l'application du client à sa version, init du Standard adaptée (ou init
+    existante comparée), diff validé avant tout push, run Jenkins de l'init ; correction connue proposée sur échec.
+    """
+    plan = step["detail"].get("plan") or {}
+    if plan.get("diff"):
+        st.code(plan["diff"][:20000], language="diff")
+    action = plan.get("action") or "verifier"
+    labels = {"verifier": "Préparer et vérifier l'init", "appliquer": "Valider et pousser l'init sur la branche",
+              "lancer": "Lancer l'init sur Jenkins", "corriger": "Valider la correction et relancer l'init"}
+    if st.button(labels.get(action, labels["verifier"]), type="primary", icon=":material/play_arrow:",
+                 key=f"cs_init_{ctx['client']}", disabled=step["etat"] == "bloquee",
+                 help="Rien n'est poussé sans votre validation du diff ; le run Jenkins lit la branche de la version."):
+        simple_run(ctx, "init", ["--simple-init", action])
+    if action != "verifier" and st.button("Revérifier", type="tertiary", key=f"cs_init_check_{ctx['client']}"):
+        simple_run(ctx, "init", ["--simple-init", "verifier"])
 
 
 def render_simple_tests(ctx: dict, step: dict) -> None:
@@ -2105,11 +2117,32 @@ def render_simple_tests(ctx: dict, step: dict) -> None:
     if not features:
         st.caption("Les fonctionnalités du client apparaîtront ici après l'analyse du projet.")
         return
-    st.multiselect("Fonctionnalités à tester", [f["id"] for f in features],
+    chosen = st.multiselect("Fonctionnalités à tester", [f["id"] for f in features],
                             format_func=lambda i: next(f["libelle"] for f in features if f["id"] == i),
                             key=f"cs_features_{ctx['client']}", disabled=step["etat"] == "bloquee")
-    st.button("Générer les tests", type="primary", icon=":material/play_arrow:", key=f"cs_tests_{ctx['client']}",
-              disabled=True, help="En cours de développement : utilisez l'onglet « Cucumber (avancé) » en attendant.")
+    branch = ((cucumber_tools.load_state(ctx["client"]).get("simple") or {}).get("depot") or {}).get(
+        "detail", {}).get("branche", "")
+    st.caption(f"Générées et vérifiées une par une, à partir de la branche {branch or 'de la version'} ; la première "
+               f"démarre une nouvelle génération (celle de l'onglet avancé est remplacée).")
+    if st.button("Générer et vérifier les tests", type="primary", icon=":material/play_arrow:",
+                 key=f"cs_tests_{ctx['client']}", disabled=step["etat"] == "bloquee" or not chosen or not branch):
+        labels = {f["id"]: f["libelle"] for f in features}
+        lines = []
+        for index, spec_id in enumerate(chosen):
+            st.caption(f"{index + 1}/{len(chosen)} — {labels[spec_id]}")
+            run_main_step(ctx["cmd"] + ["--cucumber-base-branch", branch, "--specifics", spec_id]
+                          + (["--complete"] if index else []))
+            lines.append(cucumber_simple.feature_result(cucumber_tools.load_state(ctx["client"]), spec_id,
+                                                        labels[spec_id]))
+        state = cucumber_tools.load_state(ctx["client"])
+        previous = ((state.get("simple") or {}).get("tests") or {}).get("detail", {}).get("fonctionnalites") or []
+        merged = cucumber_simple.merge_features(previous, lines)
+        green = sum(1 for line in lines if line["vert"])
+        cucumber_simple.record_step(
+            state, "tests", "ok" if green == len(lines) else "echec",
+            f"{green}/{len(lines)} fonctionnalité(s) verte(s) sur cette exécution.", {"fonctionnalites": merged})
+        cucumber_tools.save_state(ctx["client"], state)
+        st.rerun()
     for line in (step["detail"].get("fonctionnalites") or []):
         st.markdown(("✔ " if line.get("vert") else "✖ ") + f"**{line.get('libelle', '')}** — {line.get('resultat', '')}")
 
@@ -2136,7 +2169,8 @@ def render_simple_cucumber() -> None:
     client = ctx["client"]
     deduction = (client_version.saved(client).get("deduction") or {}) if client else {}
     records = (cucumber_tools.load_state(client).get("simple") or {}) if client else {}
-    for step in cucumber_simple.states(cucumber_simple.project_step(deduction, ctx["ready"]), records):
+    project = cucumber_simple.project_step(deduction, ctx["ready"], cucumber_simple.missing_prerequisites())
+    for step in cucumber_simple.states(project, records):
         with st.container(border=True):
             st.markdown(f"{cucumber_simple.ICONS[step['etat']]} **{cucumber_simple.label(step, client)}**")
             if step["resultat"]:
@@ -2144,10 +2178,13 @@ def render_simple_cucumber() -> None:
             if step["etat"] == "bloquee" or (step["cle"] != "projet" and not client):
                 continue
             SIMPLE_RENDERERS[step["cle"]](ctx, step)
-            technical = {k: v for k, v in step["detail"].items() if k not in ("plan", "fonctionnalites")}
+            technical = cucumber_simple.detail_lines(step["detail"])
             if technical:
                 with st.expander("Détail technique"):
-                    st.json(technical, expanded=False)
+                    for label, text, items in technical:
+                        st.markdown(f"**{label}** : {text}")
+                        if items:
+                            st.code("\n".join(items), language=None)
 
 
 def render_cucumber_java21(ctx: dict) -> None:
@@ -4293,6 +4330,10 @@ with tab_config:
                                                     help="Ex: https://git.kiscloud.io")
         env_values["BITBUCKET_HTTP_TOKEN"] = secret_input("BITBUCKET_HTTP_TOKEN",
                                                            help="Jeton d'accès HTTP personnel Bitbucket (lecture des dépôts).")
+        env_values["BITBUCKET_WRITE_TOKEN"] = secret_input(
+            "BITBUCKET_WRITE_TOKEN", help="Jeton réservé aux écritures de l'onglet « Cucumber » sur le dépôt "
+                                          "<client>-cucumber (création du dépôt, branche de la version, pushes). "
+                                          "BITBUCKET_HTTP_TOKEN reste en lecture.")
         env_values["REVIEW_PROJECTS"] = st.text_input(
             "REVIEW_PROJECTS", value=os.getenv("REVIEW_PROJECTS", ""), placeholder="OXY, APPAREL",
             help="Projets Bitbucket proposés dans la vue « Par projet » de l'onglet Revue de PR (toutes leurs PR "

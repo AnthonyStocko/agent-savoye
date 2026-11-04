@@ -223,13 +223,32 @@ class RepoError(RuntimeError):
     pass
 
 
-def _call(method: str, path: str, **kwargs):
+WRITE_TOKEN = "BITBUCKET_WRITE_TOKEN"
+
+
+def write_token() -> str:
+    """Jeton réservé aux écritures sur <client>-cucumber (création, branche, pushes) ; BITBUCKET_HTTP_TOKEN : lecture."""
+    import os
+    return os.getenv(WRITE_TOKEN, "").strip()
+
+
+def write_token_missing(slug: str = "<client>-cucumber") -> str:
+    """Message clair si le jeton d'écriture manque ('' s'il est renseigné)."""
+    return "" if write_token() else (f"{WRITE_TOKEN} non renseigné : ce jeton, distinct de BITBUCKET_HTTP_TOKEN (lecture), "
+                                     f"est réservé aux écritures sur {slug} (onglet Configuration)")
+
+
+def _call(method: str, path: str, write: bool = False, **kwargs):
+    """Appel REST Bitbucket : jeton de lecture, ou jeton d'écriture (`write`) pour la création et ses contrôles."""
     if not pr_review.configured():
         raise RepoError("BITBUCKET_URL ou BITBUCKET_HTTP_TOKEN non renseigné (onglet Configuration)")
+    headers = {**pr_review._headers(), "Content-Type": "application/json"}
+    if write:
+        if not write_token():
+            raise RepoError(write_token_missing())
+        headers["Authorization"] = f"Bearer {write_token()}"
     try:
-        return requests.request(method, f"{pr_review.base_url()}{path}",
-                                headers={**pr_review._headers(), "Content-Type": "application/json"},
-                                timeout=30, **kwargs)
+        return requests.request(method, f"{pr_review.base_url()}{path}", headers=headers, timeout=30, **kwargs)
     except requests.RequestException as e:
         raise RepoError(f"Bitbucket injoignable : {type(e).__name__}") from e
 
@@ -244,8 +263,9 @@ def repo_exists(project: str, slug: str, call=None) -> bool:
 
 
 def can_create(project: str, call=None) -> bool:
-    """Le compte du jeton peut créer un dépôt dans `project` (droit d'administration du projet)."""
-    response = (call or _call)("GET", "/rest/api/1.0/projects", params={"permission": "PROJECT_ADMIN", "limit": 1000})
+    """Le compte du jeton d'écriture peut créer un dépôt dans `project` (droit d'administration du projet)."""
+    response = (call or _call)("GET", "/rest/api/1.0/projects", params={"permission": "PROJECT_ADMIN", "limit": 1000},
+                               **({} if call else {"write": True}))
     if response.status_code != 200:
         raise RepoError(f"lecture des droits du compte : HTTP {response.status_code}")
     return project.upper() in {p.get("key", "").upper() for p in response.json().get("values") or []}
@@ -253,7 +273,8 @@ def can_create(project: str, call=None) -> bool:
 
 def create_repo(project: str, slug: str, call=None) -> str:
     """Crée le dépôt et renvoie son adresse de clone HTTP. Lève RepoError."""
-    response = (call or _call)("POST", f"/rest/api/1.0/projects/{project}/repos", json={"name": slug, "scmId": "git"})
+    response = (call or _call)("POST", f"/rest/api/1.0/projects/{project}/repos", json={"name": slug, "scmId": "git"},
+                               **({} if call else {"write": True}))
     if response.status_code not in (200, 201):
         raise RepoError(f"création de {project}/{slug} refusée : HTTP {response.status_code} {response.text[:200]}")
     links = (response.json().get("links") or {}).get("clone") or []

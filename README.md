@@ -206,6 +206,16 @@ Une tâche n'est jamais déclarée non testable par manque d'information non che
 
 Captures (client fictif, application réelle lancée dans un dossier isolé) : [test écrit, diff et patch](docs/captures/stabilisation-a-test-ecrit.png) · [couverte par une autre tâche](docs/captures/stabilisation-b-couverte-par.png) · [sans logique propre](docs/captures/stabilisation-c-sans-logique.png) · [génération interrompue (Maven indisponible)](docs/captures/stabilisation-d-generation-interrompue.png) · [.env invalide](docs/captures/stabilisation-e-env-invalide.png) · [tag client rétroactif](docs/captures/stabilisation-f-tag-client-retroactif.png).
 
+### Onglet « Cucumber » en 5 étapes
+
+Une étape se débloque quand la précédente est OK ; chacune a un état, une action et un résultat en une ou deux phrases, son « Détail technique » replié est un texte lisible (branche, commit poussé, bibliothèque, compilation, clear et ses preuves…). Rien n'est poussé sans validation d'un diff affiché.
+
+1. **Projet** : version du client (tout en est déduit : Standard, bibliothèque, KIS), modules testés. Les prérequis des étapes suivantes sont contrôlés ici : `MAVEN_REPOSITORY_URL`, identifiants Nexus (`MAVEN_REPOSITORY_USER`, `MAVEN_REPOSITORY_PASSWORD`) et `BITBUCKET_WRITE_TOKEN`.
+2. **Dépôt `<client>-cucumber`** : créé si besoin (droits contrôlés), branche de la version, bibliothèque et runner alignés, OK quand `mvn test-compile` passe. Les écritures (création, branche, pushes) utilisent `BITBUCKET_WRITE_TOKEN`, réservé à ce dépôt ; `BITBUCKET_HTTP_TOKEN` reste en lecture.
+3. **Base de données** (optionnelle) : recopie de la configuration du client pour les essais locaux.
+4. **Initialisation** (`--simple-init`, `tools/cucumber_simple_init.py`, 0 token) : le clear est choisi de façon déterministe d'après les routes du code de l'application du client à sa version — ressources `init-data-rest-clear-main-<m>` des `bundle.list` (et des contribs importées, lues dans le Standard à sa version), routes `@DELETE("/clear/<m>/…")` de leurs classes REST ; `full/all` déployée : purge du Standard conservée ; sinon `<m>/all` de chaque module testé ; sans preuve : arrêt avec la cause. Init absente : celle du Standard à la version, adaptée (tags, titre, clear, modules exclus, steps absents de la bibliothèque). Init présente : comparée, jamais recopiée — clear différent corrigé après validation, contournements écrits pour une bibliothèque plus ancienne signalés, écarts de steps avec le Standard listés. Puis run Jenkins des tags `@INIT_<CLIENT>_<MOD>` sur la branche de la version ; sur un dépassement de l'attente fixe de la bibliothèque, la correction connue (step du projet à délai paramétrable) est proposée en diff.
+5. **Tests** : fonctionnalités choisies dans une liste, générées depuis la branche de la version et vérifiées une par une ; une ligne verte seulement si chaque scénario écrit est vérifié pertinent par exécution.
+
 ### Onglet Cucumber simplifié (parcours normal)
 
 L'onglet se lit sans explication ; tout ce qui est technique est dans le **Mode expert**, replié par défaut.

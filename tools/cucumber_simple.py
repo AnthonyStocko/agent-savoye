@@ -39,12 +39,36 @@ def version_line(deduction: dict) -> str:
     return f"Version client {client_version} → Standard {standard or 'non déterminé'}"
 
 
-def project_step(deduction: dict, ready: bool) -> dict:
-    """Étape 1 : OK quand la version du Standard est déterminée pour la version du client choisie."""
+# Prérequis des étapes suivantes, contrôlés dès l'étape 1 : (variables, message)
+PREREQUISITES = (
+    (("MAVEN_REPOSITORY_URL",), "MAVEN_REPOSITORY_URL (dépôt Nexus des versions publiées de la bibliothèque Cucumber, "
+                                "lu à l'étape 2)"),
+    (("MAVEN_REPOSITORY_USER", "MAVEN_REPOSITORY_PASSWORD"), "identifiants Nexus MAVEN_REPOSITORY_USER et "
+                                                             "MAVEN_REPOSITORY_PASSWORD"),
+    (("BITBUCKET_WRITE_TOKEN",), "BITBUCKET_WRITE_TOKEN (jeton réservé aux écritures sur <client>-cucumber ; "
+                                 "BITBUCKET_HTTP_TOKEN reste en lecture)"),
+)
+
+
+def missing_prerequisites(env: dict = None) -> list:
+    """Prérequis absents de la configuration (messages), lus dans `env` (défaut : variables d'environnement)."""
+    import os
+    env = os.environ if env is None else env
+    return [message for names, message in PREREQUISITES if not all((env.get(n) or "").strip() for n in names)]
+
+
+def project_step(deduction: dict, ready: bool, missing: list = ()) -> dict:
+    """
+    Étape 1 : OK quand la version du Standard est déterminée pour la version du client choisie et que les prérequis
+    des étapes suivantes (`missing`, missing_prerequisites) sont renseignés.
+    """
     if not ready:
         return {"etat": "a_faire", "resultat": "Renseignez le projet Bitbucket du client."}
     line = version_line(deduction)
     if ((deduction or {}).get("standard") or {}).get("version"):
+        if missing:
+            return {"etat": "echec", "resultat": f"{line}. À renseigner dans l'onglet Configuration avant l'étape 2 : "
+                                                 + " ; ".join(missing) + "."}
         return {"etat": "ok", "resultat": line + "."}
     if line:
         return {"etat": "echec", "resultat": f"{line} : la version du Standard n'a pas pu être déduite de cette "
@@ -98,3 +122,88 @@ def feature_choices(inventory: dict, profile: dict) -> list:
         out.append({"id": spec["id"], "module": module,
                     "libelle": f"{module} — {cucumber_coverage.business_title(spec)}"})
     return sorted(out, key=lambda f: (f["module"].lower(), f["libelle"].lower()))
+
+
+# ---------------------------------------------------------------------------
+# « Détail technique » lisible (jamais un objet replié)
+# ---------------------------------------------------------------------------
+
+DETAIL_LABELS = (
+    ("projet", "Projet Bitbucket"), ("depot", "Dépôt"), ("branche", "Branche"), ("commit", "Commit"),
+    ("bibliotheque", "Bibliothèque Cucumber"), ("choix_bibliotheque", "Choix de la bibliothèque"),
+    ("compilation", "Compilation"), ("clear", "Clear retenu"), ("preuves_clear", "Preuves du clear"),
+    ("init", "Init"), ("tags", "Tags lancés"), ("build", "Build Jenkins"), ("scenarios", "Scénarios"),
+    ("ecarts_standard", "Écarts avec l'init du Standard"), ("remarques", "Remarques"),
+    ("sauvegarde", "Sauvegarde"), ("message", "Message"), ("erreur", "Erreur"), ("erreurs", "Erreurs"),
+)
+HIDDEN_DETAIL = {"plan", "fonctionnalites", "correction"}
+
+
+def _text(value) -> str:
+    if isinstance(value, dict):
+        return " ; ".join(f"{k} : {_text(v)}" for k, v in value.items() if v not in ("", None, [], {}))
+    if isinstance(value, (list, tuple)):
+        return " ; ".join(_text(v) for v in value if v not in ("", None))
+    return str(value)
+
+
+def detail_lines(detail: dict) -> list:
+    """
+    Détail technique d'une étape en lignes lisibles : [(libellé, texte, liste)] ; `liste` : éléments affichés un
+    par ligne (erreurs, remarques, preuves), sinon None. Ordre fixe des clés connues, puis les autres.
+    """
+    detail = {k: v for k, v in (detail or {}).items() if k not in HIDDEN_DETAIL and v not in ("", None, [], {})}
+    labels = dict(DETAIL_LABELS)
+    keys = [k for k, _ in DETAIL_LABELS if k in detail] + [k for k in detail if k not in labels]
+    out = []
+    for key in keys:
+        value = detail[key]
+        label = labels.get(key) or key.replace("_", " ").capitalize()
+        if isinstance(value, (list, tuple)):
+            out.append((label, f"{len(value)} élément(s)" if len(value) > 1 else _text(value),
+                        [_text(v) for v in value] if len(value) > 1 else None))
+        else:
+            out.append((label, _text(value), None))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Étape 5 : résultat d'une fonctionnalité générée puis vérifiée
+# ---------------------------------------------------------------------------
+
+def feature_result(state: dict, spec_id: str, label: str = "") -> dict:
+    """
+    Résultat de la dernière génération de `spec_id` (lots de etat.json) : {id, libelle, vert, resultat}. Vert :
+    couvert, et chaque scénario écrit vérifié pertinent par exécution (jamais par la seule compilation).
+    """
+    lot = next((l for l in reversed((state or {}).get("lots") or []) if spec_id in (l.get("ids") or [])), None)
+    out = {"id": spec_id, "libelle": label or spec_id, "vert": False}
+    if not lot:
+        return {**out, "resultat": "Aucune génération trouvée pour cette fonctionnalité."}
+    result = next((r for r in lot.get("resultats") or [] if r.get("id") == spec_id), {})
+    status = result.get("statut") or lot.get("statut") or ""
+    if lot.get("statut") == "erreur_compilation":
+        return {**out, "resultat": "Tests écrits, mais la compilation échoue : rien n'a été vérifié."}
+    if status != "couvert":
+        why = result.get("resume") or result.get("raison") or "aucun scénario écrit"
+        return {**out, "resultat": f"Non couverte : {why}"[:400]}
+    files = set(result.get("fichiers") or [])
+    runs = [s for s in ((lot.get("execution") or {}).get("scenarios") or {}).values()
+            if (s.get("id") or "").split("::", 1)[0] in files]
+    if not runs:
+        message = (lot.get("execution") or {}).get("message") or "aucune exécution"
+        return {**out, "resultat": f"Scénarios écrits, non vérifiés : {message}"[:400]}
+    passed = [s for s in runs if s.get("statut") == "pertinent"]
+    if len(passed) == len(runs):
+        build = next((s.get("build") for s in runs if s.get("build")), "")
+        return {**out, "vert": True, "resultat": f"{len(runs)} scénario(s) vérifié(s) pertinent(s) par exécution"
+                                                 + (f" ({build})" if build else "") + "."}
+    first = next(s for s in runs if s.get("statut") != "pertinent")
+    return {**out, "resultat": f"{len(passed)}/{len(runs)} scénario(s) vérifié(s) : {first.get('statut')} — "
+                               f"{first.get('motif') or ''}"[:400]}
+
+
+def merge_features(previous: list, current: list) -> list:
+    """Lignes de l'étape 5 : les nouvelles remplacent les anciennes de même id, ordre d'arrivée conservé."""
+    ids = {line["id"] for line in current}
+    return [line for line in previous or [] if line.get("id") not in ids] + list(current)
