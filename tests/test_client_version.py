@@ -205,3 +205,35 @@ def test_cucumber_standard_checkout_without_master_fallback(tmp_path, monkeypatc
     assert main.checkout_cucumber_std_ref(clone, "26.24") == "origin/v26.23"
     assert "plus proche inférieure" in capsys.readouterr().out
     assert main.checkout_cucumber_std_ref(clone, "26.20") == ""                  # rien d'inférieur : pas de master
+
+
+CUCUMBER_POM = ("<project><groupId>savoye</groupId><artifactId>clientx-cucumber</artifactId><version>1.0</version>"
+                "<dependencies><dependency><groupId>io.cucumber</groupId><artifactId>cucumber-java</artifactId>"
+                "<version>7.13.0</version></dependency><dependency><groupId>a-sis</groupId>"
+                "<artifactId>Cucumber</artifactId><version>{lib}</version><type>test-jar</type>"
+                "<scope>test</scope></dependency></dependencies></project>")
+
+
+def test_library_read_on_the_cucumber_branch_of_the_chosen_version(project, tmp_path):
+    """Cas Canson : intégration du dépôt Cucumber en 26.16, branche v1.3 en 26.22 ; version client 1.3.0."""
+    _clone(tmp_path, f"{CLIENT}-cucumber", [("integration", {"pom.xml": CUCUMBER_POM.format(lib="26.16")}, ""),
+                                           ("v1.3", {"pom.xml": CUCUMBER_POM.format(lib="26.22")}, "")])
+    app = cv.app_repository(cv.repositories(project), GROUPS)
+    assert app.name == "clientx-odatio-app"                       # le dépôt Cucumber n'est pas l'application
+    entries = {e["type"]: e for e in cv.git_versions(app)}
+    tag = cv.library_at_version(project, CLIENT, entries["tag"])
+    assert tag == {"version": "26.22", "depot": f"{CLIENT}-cucumber", "ref": "v1.3", "repli": False}
+    assert cv.library_at_version(project, CLIENT, entries["integration"])["version"] == "26.16"
+    # Aucune branche pour la version : intégration, repli signalé
+    other = cv.library_at_version(project, CLIENT, {"type": "tag", "version": "2.0.1", "ref": "odatio-app-2.0.1"})
+    assert other["ref"] == "integration" and other["repli"]
+    assert "aucune branche du dépôt Cucumber" in cv.library_where(other)
+    deduced = cv.deduce(entries["tag"], app.file(entries["tag"], "pom.xml"), GROUPS, ["v26.22"], tag["version"], {},
+                        library_source=cv.library_where(tag))
+    assert not any("montée proposée" in w for w in deduced["avertissements"])
+    assert "(actuelle" not in cv.line(deduced)
+    stale = cv.deduce(entries["tag"], app.file(entries["tag"], "pom.xml"), GROUPS, ["v26.22"], "26.16", {},
+                      library_source=cv.library_where(tag))
+    assert any(f"({CLIENT}-cucumber, branche v1.3)" in w for w in stale["avertissements"])
+    assert cv.cucumber_library_ref({"type": "release", "version": "1.3", "ref": "release/1.3"},
+                                   ["integration", "release/1.3"]) == "release/1.3"

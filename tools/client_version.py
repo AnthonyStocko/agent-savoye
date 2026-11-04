@@ -132,6 +132,70 @@ def repositories(client_repo: str) -> list:
             if "cucumber" not in name.lower()]
 
 
+def cucumber_repository(client_repo: str, client_name: str):
+    """Dépôt <client>-cucumber du projet client (Bitbucket ou clone local) ; None s'il est introuvable."""
+    from tools.standard_version_task import list_repos, project_of
+    base, key = project_of(client_repo)
+    if base:
+        names = [s for s in list_repos(base, key) if "cucumber" in s.lower()]
+        make = lambda n: BitbucketRepo(base, key, n)
+    else:
+        found = {n: p for n, p in git_repos(client_repo).items() if "cucumber" in n.lower()}
+        names = sorted(found)
+        make = lambda n: LocalRepo(found[n], n)
+    wanted = f"{client_name}-cucumber".lower()
+    picked = next((n for n in names if n.lower() == wanted), names[0] if len(names) == 1 else None)
+    return make(picked) if picked else None
+
+
+def cucumber_library_ref(entry: dict, names: list) -> str:
+    """
+    Branche (ou tag) du dépôt <client>-cucumber qui correspond à la version client choisie : intégration pour la
+    branche d'intégration ; sinon même nom de référence, v<version>, <version>, release/<version>, puis la ligne
+    majeure.mineure (v1.3, 1.3, release/1.3) ; à défaut intégration. '' si aucune.
+    """
+    names = set(names or [])
+    version = str(entry.get("version") or "").strip()
+    line_ = re.match(r"(\d+\.\d+)", version)
+    line_ = line_.group(1) if line_ else ""
+    candidates = [] if entry.get("type") == INTEGRATION else [
+        entry.get("ref"), f"v{version}", version, f"release/{version}", f"v{line_}", line_, f"release/{line_}"]
+    return next((c for c in candidates + [INTEGRATION] if c and c in names), "")
+
+
+def library_at_version(client_repo: str, client_name: str, entry: dict) -> dict:
+    """
+    Bibliothèque Cucumber (dépendance test-jar) du pom.xml de <client>-cucumber À LA BRANCHE de la version client
+    choisie (v1.3 pour 1.3.1), lue en direct : {"version", "depot", "ref", "repli"} ; {} si illisible.
+    """
+    from tools.standard_version_task import SourceError
+    try:
+        repo = cucumber_repository(client_repo, client_name)
+        refs = repo.refs() if repo else []
+    except (SourceError, OSError):
+        return {}
+    by_name = {}
+    for ref in refs:                      # branche prioritaire sur un tag du même nom
+        by_name.setdefault(ref["nom"], ref) if ref["type"] == "tag" else by_name.__setitem__(ref["nom"], ref)
+    name = cucumber_library_ref(entry, list(by_name))
+    if not name:
+        return {}
+    try:
+        version = sv.library_from_pom(repo.file(by_name[name], "pom.xml"))
+    except (SourceError, OSError):
+        return {}
+    fallback = name == INTEGRATION and entry.get("type") != INTEGRATION
+    return {"version": version, "depot": repo.name, "ref": name, "repli": fallback} if version else {}
+
+
+def library_where(library: dict) -> str:
+    """« canson-cucumber, branche v1.3 » (repli sur intégration signalé)."""
+    if not library:
+        return ""
+    return (f"{library['depot']}, branche {library['ref']}"
+            + (" — aucune branche du dépôt Cucumber pour cette version" if library.get("repli") else ""))
+
+
 def _integration(repo) -> dict:
     return next((r for r in repo.refs() if r["type"] == "branche" and r["nom"] == INTEGRATION), {})
 
@@ -331,7 +395,7 @@ def record_kis(version: str, kis: str) -> dict:
 
 
 def deduce(entry: dict, app_pom: str, groups: set, cucumber_std_refs: list, library_current: str,
-           registry: dict, client_ref_found: bool = True) -> dict:
+           registry: dict, client_ref_found: bool = True, library_source: str = "") -> dict:
     """
     Déduction pour la version choisie `entry` : `app_pom` (pom de l'application à sa référence), `groups`
     (groupIds du Standard), `cucumber_std_refs` (branches et tags du Cucumber Standard), `library_current`
@@ -355,8 +419,9 @@ def deduce(entry: dict, app_pom: str, groups: set, cucumber_std_refs: list, libr
         warnings.append(cucumber["avertissement"])
     current_short = sv.normalize(library_current)[0]
     if standard and current_short and current_short != standard:
-        warnings.append(f"bibliothèque Cucumber {library_current} du dépôt Cucumber du client, cible {standard} : "
-                        f"montée proposée")
+        where = f" ({library_source})" if library_source else ""
+        warnings.append(f"bibliothèque Cucumber {library_current} du pom.xml du dépôt Cucumber du client{where}, "
+                        f"Standard de l'application {standard} : montée proposée")
     kis = (registry or {}).get(standard) or {}
     if standard and not kis.get("kis"):
         warnings.append(f"version KIS inconnue pour le Standard {standard} (aucun build qui a démarré une application "
@@ -365,7 +430,7 @@ def deduce(entry: dict, app_pom: str, groups: set, cucumber_std_refs: list, libr
                "kis_version": kis.get("kis", "")}
     return {"version_client": entry.get("version", ""), "type": entry.get("type", ""), "ref_client": ref_client,
             "standard": {"version": standard, "complete": code.get("complete", ""), "detail": code.get("detail", "")},
-            "cucumber_standard": cucumber, "bibliotheque": {"cible": standard, "actuelle": library_current},
+            "cucumber_standard": cucumber, "bibliotheque": {"cible": standard, "actuelle": library_current, "source": library_source},
             "kis": kis, "jenkins": jenkins, "avertissements": warnings}
 
 
@@ -519,7 +584,7 @@ def remote_ref_names(url: str) -> list:
 
 
 def compute(client_name: str, entry: dict, client_repo: str, std_repo: str, cucumber_std_refs: list,
-            library_current: str, builds: list = None) -> dict:
+            library_current: str, builds: list = None, library_source: str = "") -> dict:
     """Déduction réelle pour `entry` : pom de l'application à sa référence, registre KIS mis à jour."""
     groups = std_groups(std_repo, client_name)
     repos = repositories(client_repo)
@@ -528,7 +593,7 @@ def compute(client_name: str, entry: dict, client_repo: str, std_repo: str, cucu
     pom = repo.file(ref, "pom.xml") if repo and ref else ""
     registry = kis_registry(builds or [], load_kis_registry())
     _write_json(KIS_REGISTRY, registry)
-    return deduce(entry, pom, groups, cucumber_std_refs, library_current, registry)
+    return deduce(entry, pom, groups, cucumber_std_refs, library_current, registry, library_source=library_source)
 
 
 def cucumber_std_refs_for(std_input: str) -> list:
@@ -557,8 +622,12 @@ def choose(client_name: str, entry: dict, client_repo: str, std_repo: str, cucum
     """Version choisie : déduction calculée et enregistrée dans le profil. Renvoie la déduction."""
     from tools import cucumber_profile
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name))
+    # Bibliothèque lue en direct à la branche de la version choisie ; à défaut, la dernière détection du profil
+    library = library_at_version(client_repo, client_name, entry)
+    source = library_where(library) if library else (
+        "dernière analyse du profil" if profile.get("library_version") else "")
     deduction = compute(client_name, entry, client_repo, std_repo, cucumber_std_refs_for(cucumber_std_input),
-                        profile.get("library_version", ""), builds)
+                        library.get("version") or profile.get("library_version", ""), builds, source)
     save(client_name, entry, deduction)
     return deduction
 

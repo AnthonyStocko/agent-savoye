@@ -1678,9 +1678,10 @@ def render_client_version(ctx: dict, prefix: str = "") -> None:
         versions = found["versions"]
         if found.get("erreur"):
             st.caption(f":material/info: {found['erreur']}")
-        # Par défaut : la branche d'intégration
-        if versions and not current.get("choix"):
-            apply_client_version(ctx, versions[0])
+        # Par défaut : la branche d'intégration ; actualiser relit aussi la déduction de la version choisie
+        chosen = next((v for v in versions if v["id"] == (current.get("choix") or {}).get("id")), None)
+        if versions and (not current.get("choix") or (refresh and chosen)):
+            apply_client_version(ctx, chosen or versions[0])
             st.rerun()
     if not versions:
         st.caption("Version du client : aucune version lue (dépôt de l'application introuvable ou illisible).")
