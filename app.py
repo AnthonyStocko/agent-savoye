@@ -2125,7 +2125,8 @@ def render_simple_tests(ctx: dict, step: dict) -> None:
     """Étape 5 : fonctionnalités choisies dans une liste simple, générées et vérifiées une par une."""
     inventory = cucumber_tools.load_inventory(ctx["client"])
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(ctx["client"]))
-    features = cucumber_simple.feature_choices(inventory, profile)
+    features = cucumber_simple.feature_choices(inventory, profile,
+                                               cucumber_coverage.load_ticket_links(ctx["client"]))
     if not features:
         st.caption("Les fonctionnalités du client apparaîtront ici après l'analyse du projet.")
         return

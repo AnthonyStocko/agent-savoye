@@ -46,12 +46,28 @@ def test_steps_unlock_in_order_and_database_is_optional():
     assert cs.label(steps["depot"], CLIENT) == f"2. Dépôt {CLIENT}-cucumber — OK"
 
 
+def test_feature_list_probable_ticket_when_no_proof(tmp_path):
+    extract = tmp_path / "jira_a.md"
+    extract.write_text("# Tickets\n\n## OXY-5 — Bruit [Fermé]\n…\n\n## SPEC-1500 — Réception partielle [Livrée]\n…\n",
+                       encoding="utf-8")
+    inventory = {"specifiques": [{"id": "a", "libelle": "app · reception-order", "dossier": "reception",
+                                  "depot": "app", "jira": str(extract)}]}
+    assert cs.feature_choices(inventory, {}, {})[0]["libelle"] == "SPEC-1500 — Réception partielle (reception, ticket probable)"
+
+
 def test_feature_list_by_module_without_excluded_modules():
     inventory = {"specifiques": [
         {"id": "a", "libelle": "app · reception-order", "dossier": "reception", "depot": "app"},
         {"id": "b", "libelle": "app · shipping-label", "dossier": "shipping", "depot": "app"}]}
     choices = cs.feature_choices(inventory, {})
     assert [c["id"] for c in choices] == ["a", "b"] and all(" — " in c["libelle"] for c in choices)
+    assert all(c["libelle"].endswith("(aucun ticket lié)") for c in choices)
+    # Ticket Jira lié par une preuve : « SPEC-1234 — titre (module) », SPEC d'abord, tâches avec ticket triées par clé
+    links = {"a": [{"cle": "WMS-12", "titre": "Autre"}, {"cle": "SPEC-1203", "titre": "Réception des commandes [Analysée]"}],
+             "b": [{"cle": "SPEC-987", "titre": "Étiquette d'expédition"}]}
+    choices = cs.feature_choices(inventory, {}, links)
+    assert [c["libelle"] for c in choices] == ["SPEC-987 — Étiquette d'expédition (shipping)",
+                                               "SPEC-1203 — Réception des commandes (reception)"]
 
 
 # ---------------------------------------------------------------------------
