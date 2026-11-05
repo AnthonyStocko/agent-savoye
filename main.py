@@ -1290,6 +1290,7 @@ def main():
     parser.add_argument("--backup", default="", help="restore-config : sauvegarde à remettre en place (retour arrière)")
     parser.add_argument("--question", default="", help="ask : question posée à l'assistant (onglet Assistant)")
     parser.add_argument("--answer-file", default="", help="ask : fichier où écrire la réponse")
+    parser.add_argument("--no-init", action="store_true", help="generate-cucumber-client : aucune init lancée avant de juger les lots (données du client déjà présentes dans l'environnement, ex. configuration recopiée)")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
@@ -6053,7 +6054,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         gap_file = cucumber_versions.library_gap_file(local_cucumber_std_repo, profile["library_version"])
         print(f"[CUCUMBER PROFIL] Écarts du catalogue avec la bibliothèque {profile['library_version']} : "
               f"{gap_file or 'référence de la bibliothèque introuvable dans le dépôt Standard'}")
-    init_tags = profile["init_tags"] or cucumber_verify.init_tags()
+    no_init = getattr(args, "no_init", False)
+    init_tags = "" if no_init else (profile["init_tags"] or cucumber_verify.init_tags())
+    if no_init:
+        print("[CUCUMBER] Option « Initialisation » décochée : aucune init lancée, les lots sont jugés sur les données "
+              "déjà présentes dans l'environnement.")
     # Initialisation du client (init_tags du profil), une fois par génération : en échec, les lots ne sont pas jugés
     if profile["verify_branch"]:
         print(f"[CUCUMBER] Vérification sur la branche {profile['verify_branch']} (paramètre "

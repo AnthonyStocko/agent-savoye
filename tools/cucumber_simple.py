@@ -18,6 +18,13 @@ ICONS = {"a_faire": ":material/radio_button_unchecked:", "en_cours": ":material/
 STEPS = ((1, "projet", "Projet"), (2, "depot", "Dépôt <client>-cucumber"), (3, "base", "Base de données"),
          (4, "init", "Initialisation"), (5, "tests", "Tests"))
 OPTIONAL = {"base"}
+INIT_OFF_NOTE = ("Facultative : option « Initialisation » décochée (données du client déjà présentes, ex. recopiées à "
+                 "l'étape 3) — l'étape 5 génère et vérifie les tests sans lancer l'init.")
+
+
+def init_enabled(records: dict) -> bool:
+    """Option « Initialisation » de l'onglet (etat.json simple.options.init) : cochée par défaut (projet neuf)."""
+    return ((records or {}).get("options") or {}).get("init", True) is not False
 OPTIONAL_NOTE = ("Optionnelle : recopie pour les essais locaux. Les runs Jenkins utilisent le schéma de leur slot "
                  "(cucumber_customer_<n>) et l'init commence par un clear qui efface cette configuration : l'étape "
                  "ne bloque pas l'initialisation.")
@@ -86,6 +93,7 @@ def states(project: dict, records: dict) -> list:
     obligatoires suivantes ; l'étape optionnelle est bloquée seulement si l'étape 1 ou 2 n'est pas OK.
     """
     from tools.cucumber_repo_setup import branch_version_line, version_line as line_of
+    optional = OPTIONAL | ({"init"} if not init_enabled(records) else set())
     out, previous_ok = [], True
     wanted = line_of((project or {}).get("version", ""))
     depot_branch = (((records or {}).get("depot") or {}).get("detail") or {}).get("branche", "")
@@ -109,9 +117,11 @@ def states(project: dict, records: dict) -> list:
             result = "Se débloque quand l'étape précédente est OK."
         if key in OPTIONAL and not result:
             result = OPTIONAL_NOTE
+        if key == "init" and key in optional and status != "bloquee":
+            result = INIT_OFF_NOTE + (f" Dernier résultat : {result}" if result else "")
         out.append({"numero": number, "cle": key, "titre": title, "etat": status, "resultat": result,
-                    "optionnelle": key in OPTIONAL, "detail": record.get("detail") or {}})
-        if key not in OPTIONAL:
+                    "optionnelle": key in optional, "detail": record.get("detail") or {}})
+        if key not in optional:
             previous_ok = previous_ok and status == "ok"
     return out
 
