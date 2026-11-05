@@ -5689,6 +5689,18 @@ def guard_corrections(client: str, state: dict, worktree: str, profile: dict, re
     return result
 
 
+NO_INIT_BLOCK = """=== ENVIRONNEMENT SANS INITIALISATION ===
+L'option « Initialisation » est décochée : aucune init ni aucun clear n'est lancé avant tes tests ; l'environnement où
+Jenkins les joue contient déjà les données du client (sa configuration a été recopiée depuis sa base).
+- Une donnée, un document, un paramétrage, un besoin ou un champ personnalisé PRÉSENT dans la base de l'environnement
+  (accès en lecture seule ci-dessus : vérifie-le par une requête) est DISPONIBLE : utilise-le tel quel, ne le recrée
+  pas, et ne conclus jamais « donnee_impossible », « non livré » ni « non déployé » pour lui.
+- Cite la requête et son résultat dans « recherches », source « base » (en plus des 6 sources ci-dessous).
+- Ne crée dans le Background que ce qui manque réellement en base.
+
+"""
+
+
 def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_repo: str,
                         local_cucumber_std_repo: str, odatio_version: str, cucumber_repo_dir: str,
                         token_saving_rules: str, python_exe: str, workspace_dir: str) -> int:
@@ -6125,6 +6137,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                    step="generate-cucumber-client", profile="cucumber"),
         # Logs applicatifs de l'environnement de test (groundcover), en lecture seule
         "logs_block": build_logs_block(python_exe, workspace_dir),
+        # Option « Initialisation » décochée : les données déjà présentes dans la base de l'environnement font foi
+        "environnement_block": NO_INIT_BLOCK if no_init else "",
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
         "features_std": catalogue["features_std"],
         "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",

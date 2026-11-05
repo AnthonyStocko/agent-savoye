@@ -290,7 +290,7 @@ def test_system_prompt_asks_to_write_early(main_module):
     assert main_module.warning_turn(40) == 30 and main_module.warning_turn(25) == 19
     names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
              "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
-             "class_suffix features_root client_tag clear_name tag_a_revoir knowledge_block valeurs_connues sources_std compilation_agent").split()
+             "class_suffix features_root client_tag clear_name tag_a_revoir knowledge_block valeurs_connues sources_std compilation_agent environnement_block").split()
     text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
                                      tour_alerte=main_module.warning_turn(40))
     assert "=== ÉCRIRE TÔT ===" in text and "au plus 40 tours" in text and "au tour 30 (75 %)" in text
@@ -335,7 +335,7 @@ def test_system_prompt_describes_constats(main_module):
     names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
              "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
              "class_suffix features_root client_tag clear_name tag_a_revoir knowledge_block valeurs_connues "
-             "sources_std compilation_agent").split()
+             "sources_std compilation_agent environnement_block").split()
     text = main_module.render_prompt("cucumber_client_lot_systeme", **{n: n for n in names}, max_turns="40",
                                      tour_alerte=30)
     assert "=== CONSTATS" in text and '"constats": [{"type": "donnee_introuvable|ecart_spec_code|defaut_code|comportement_surprenant|tautologique"' in text
