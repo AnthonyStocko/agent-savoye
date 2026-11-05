@@ -393,3 +393,45 @@ def test_columns_used_by_the_standard_with_the_same_step_are_not_flagged(tmp_pat
     cv._STD_USAGE.clear()
     usage = cv.std_control_usage(str(tmp_path), lambda step: "PREP- <X> besoins pour l'UP")
     assert ("PREP- <X> besoins pour l'UP", "wmsEnumNeed.value.id") in usage
+
+
+def test_missing_data_files_or_configuration_must_be_created(monkeypatch):
+    from tools import cucumber_testability as ctst
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        main = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    gave_up = {"id": "EPO-2412", "statut": "non_couvert", "resume": "Il manque les fichiers de données pour "
+               "constituer un OP palettisable, et le document APPAIRAGE_BL n'a aucun échange associé en base.",
+               "blocage": {"type": "donnee_impossible", "preuve": "exchange : SELECT ... → 0 ligne"},
+               "recherches": [{"source": "base", "cherche": "exchange : SELECT * FROM exchange", "trouve": "0"}]}
+    assert ctst.missing_db_proof(gave_up) == [] and ctst.missing_creation(gave_up)
+    proved = {**gave_up, "blocage": {"type": "donnee_impossible",
+                                     "preuve": "aucun endpoint d'échange dans endpoints_std, aucun step"}}
+    assert ctst.missing_creation(proved) == []
+    assert ctst.missing_creation({"id": "x", "statut": "non_couvert", "resume": "aucun échange",
+                                  "sans_objet": {"preuve": "DTO"}}) == []
+    calls, tools = [], []
+
+    def claude(prompt, model, allowed, *a, **k):
+        calls.append(prompt)
+        tools.append(allowed)
+        return 0, "x", {}, False
+    monkeypatch.setattr(main, "run_cucumber_claude", claude)
+    monkeypatch.setattr(main, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main.cucumber_tools, "parse_lot_result",
+                        lambda text: [{"id": "EPO-2412", "statut": "couvert", "resume": "créé", "constats": []}])
+    out = main.require_db_proof([gave_up], "LOT", {"db_block": "", "donnees_tool": "PY XLSM"}, "m", "40", "/tmp",
+                                "", "", {}, "1", "K")
+    assert out[0]["statut"] == "couvert" and len(calls) == 1
+    assert "c'est à toi de les créer" in calls[0] and "PY XLSM show / copy" in calls[0] and "idempotente" in calls[0]
+    assert any("xlsm_tool.py" in t for t in tools[0])
+
+
+def test_lot_prompt_asks_to_create_missing_files_and_configuration():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "prompts", "cucumber_client_lot_systeme.md"), encoding="utf-8").read()
+    assert "${donnees_tool} show <classeur>" in text and "IDEMPOTENTE" in text
+    assert "n'est JAMAIS un « non_couvert »" in text

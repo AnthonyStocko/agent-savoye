@@ -1969,14 +1969,23 @@ def read_db_journal(path: str) -> list:
     return entries
 
 
+XLSM_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "xlsm_tool.py")
+
+
+def xlsm_command() -> str:
+    """Commande de l'outil des classeurs de données (.xlsm/.xlsx) des tests, citée dans le prompt des lots."""
+    return f'"{sys.executable}" "{XLSM_TOOL}"'
+
+
 def lot_tools(values: dict) -> list:
     """
     Outils d'un appel Cucumber : CUCUMBER_TOOLS, plus le python de l'agent si l'accès base est accordé ou si l'agent
-    compile lui-même (CUCUMBER_AGENT_COMPILE : tools/cucumber_compile.py).
+    compile lui-même (CUCUMBER_AGENT_COMPILE : tools/cucumber_compile.py) ; sinon, au moins l'outil des classeurs
+    de données (tools/xlsm_tool.py : lecture, copie adaptée sous files/ seulement).
     """
-    return CUCUMBER_TOOLS + ([f"Bash({sys.executable}:*)"]
-                             if values.get("db_block") or values.get("logs_block") or values.get("compilation_agent")
-                             else [])
+    if values.get("db_block") or values.get("logs_block") or values.get("compilation_agent"):
+        return CUCUMBER_TOOLS + [f"Bash({sys.executable}:*)"]
+    return CUCUMBER_TOOLS + [f"Bash({sys.executable} {XLSM_TOOL}:*)", f'Bash("{sys.executable}" "{XLSM_TOOL}":*)']
 
 
 def db_summary(entries: list) -> str:
@@ -5708,9 +5717,13 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
     disponible : renvoyé UNE fois à l'agent (même lot, consigne cucumber_preuve_base) pour trouver la table dans le
     code, l'interroger et écrire le test ou prouver l'absence. Les résultats renvoyés remplacent les premiers.
     """
-    if not fixed_values.get("db_block"):
+    creations = {r["id"]: cucumber_testability.missing_creation(r) for r in results or []}
+    creations = {k: v for k, v in creations.items() if v}
+    if not fixed_values.get("db_block") and not creations:
         return results
     pending = {r["id"]: cucumber_testability.missing_db_proof(r) for r in results or []}
+    if not fixed_values.get("db_block"):
+        pending = {}
     pending = {k: v for k, v in pending.items() if v}
     worktree = fixed_values.get("worktree") or ""
 
@@ -5719,9 +5732,12 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
                  for f in result.get("fichiers") or [] if str(f).endswith(".feature") and worktree]
         return cucumber_testability.referenced_data_files(texts)
     references = {r["id"]: cucumber_testability.missing_reference_proof(r, cited(r)) for r in results or []}
-    references = {k: v for k, v in references.items() if v and k not in pending}
-    if not (pending or references):
+    references = {k: v for k, v in references.items() if v and k not in pending} if fixed_values.get("db_block") else {}
+    if not (pending or references or creations):
         return results
+    if creations:
+        print(f"[LOT {label}] 🛠️ {len(creations)} tâche(s) non couverte(s) faute de données ou de paramétrage à créer "
+              f"({', '.join(creations)}) : création demandée à l'agent.")
     if pending:
         print(f"[LOT {label}] 🔎 {len(pending)} tâche(s) jugée(s) non couverte(s) pour une donnée absente sans requête "
               f"en base ({', '.join(pending)}) : vérification en base demandée à l'agent.")
@@ -5740,9 +5756,20 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
     covered_text = ("Pour " + ", ".join(pending) + ", tu as conclu « non_couvert » en invoquant une donnée absente "
                     "ou « non vérifiable » (" + " ; ".join(f"{k} : {', '.join(v)}" for k, v in pending.items())
                     + ") sans requête en base : ce n'est pas accepté.\n") if pending else ""
-    extra = render_prompt("cucumber_preuve_base", ids=", ".join([*pending, *references]),
-                          references=reference_text, non_couverts=covered_text)
-    pending = {**pending, **references}
+    creation_text = ("Pour " + ", ".join(creations) + ", tu as renoncé faute de données ou de paramétrage ("
+                     + " ; ".join(f"{k} : {', '.join(v)}" for k, v in creations.items())
+                     + ") : ce n'est pas un blocage, c'est à toi de les créer. Paramétrage ou lien manquant en base "
+                       "(ex. document sans échange associé) : trouve dans les endpoints du Standard celui qui le crée, "
+                       "et le step qui l'appelle (ou écris-en un dans le projet), puis crée-le dans le Background, de "
+                       "façon idempotente (lecture puis création si absent), avec des valeurs inspirées des "
+                       "enregistrements existants. Fichiers de données manquants : écris les tiens sous le dossier "
+                       "de données de la feature, à partir du modèle le plus proche, avec des codes vérifiés en base "
+                       "(classeur .xlsm/.xlsx : " + fixed_values.get("donnees_tool", xlsm_command())
+                     + " show / copy). « donnee_impossible » n'est accepté qu'avec les recherches d'endpoint et de "
+                       "step citées dans sa preuve.\n") if creations else ""
+    extra = render_prompt("cucumber_preuve_base", ids=", ".join(dict.fromkeys([*pending, *references, *creations])),
+                          references=reference_text + creation_text, non_couverts=covered_text)
+    pending = {**pending, **references, **creations}
     returncode, output, usage, limit_hit = run_cucumber_claude(prompt + extra, model, lot_tools(fixed_values),
                                                                max_turns, run_dir, effort, system_file,
                                                                lot.setdefault("base", []), "preuve en base")
@@ -6213,6 +6240,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "logs_block": build_logs_block(python_exe, workspace_dir),
         # Option « Initialisation » décochée : les données déjà présentes dans la base de l'environnement font foi
         "environnement_block": NO_INIT_BLOCK if no_init else "",
+        # Classeurs de données (.xlsm/.xlsx) : lecture et copie adaptée par l'agent (binaire, non éditable par Edit)
+        "donnees_tool": xlsm_command(),
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
         "features_std": catalogue["features_std"],
         "examples": ", ".join(f"'{e}'" for e in catalogue["examples"]) or "aucun",
