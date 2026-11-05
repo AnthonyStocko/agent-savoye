@@ -61,7 +61,7 @@ Nombre de scénarios par spécifique : le cas nominal, plus les cas aux limites 
 === CRÉER PLUTÔT QUE RENONCER ===
 - Une donnée nécessaire qui n'existe pas mais peut être créée par l'API ou par un fichier propre à la feature (document de test, client, paramétrage) est créée dans le Background du scénario. « Fixture non disponible » n'est une raison que si la création est impossible, preuve à l'appui.
 
-=== AVANT DE CONCLURE « non_couvert » ===
+${environnement_block}=== AVANT DE CONCLURE « non_couvert » ===
 - Lis d'abord ce que le spécifique change (parties modifiées injectées, puis les fichiers du spécifique si nécessaire) : une conclusion sans avoir examiné le comportement modifié n'est pas acceptée.
 - Applique les recettes du lot (en particulier : un champ ou une entité modifiés se vérifient en relisant l'objet par un endpoint REST Standard, avec un nouveau step si besoin), examine ses « Steps candidats », puis fais AU MOINS 3 recherches dans '${steps_std}' / '${endpoints_std}' avec des formulations différentes : synonymes, anglais / français (repack / reconditionnement, slot / emplacement, screen / écran / interaction…), nom de l'objet métier, chemin REST.
 - Pour CHAQUE donnée, clé, valeur ou fixture que tu crois manquante, cherche dans cet ordre et cite dans « recherches » ce que tu as trouvé ou non dans chaque source (Grep de la valeur d'abord dans '${valeurs_connues}', qui les réunit toutes) :

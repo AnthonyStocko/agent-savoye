@@ -283,3 +283,16 @@ def test_lots_signature_detects_nothing_new():
     state["lots"][0]["statut"] = "termine"
     assert cs.lots_signature(state, "a,b") != before
     assert cs.lots_signature(state, "z") != before
+
+
+def test_no_init_tells_the_lot_agent_that_database_data_counts():
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        main = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    text = open(os.path.join(os.path.dirname(main.__file__), "prompts", "cucumber_client_lot_systeme.md"),
+                encoding="utf-8").read()
+    assert "${environnement_block}=== AVANT DE CONCLURE" in text
+    assert "PRÉSENT dans la base de l'environnement" in main.NO_INIT_BLOCK and "source « base »" in main.NO_INIT_BLOCK
