@@ -276,6 +276,9 @@ def refresh_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir:
     document = load_profile(client_name)
     # Rôles des paramètres du job : détectés sur Jenkins (record_job_roles), pas dans le dépôt
     detected["job_roles"] = (document.get("detecte") or {}).get("job_roles") or {}
+    # Adresse autorisée du dépôt Cucumber (garde d'écriture, relevée sur le clone) : conservée d'une détection à l'autre
+    if (document.get("detecte") or {}).get("cucumber_repo_url") and not detected.get("cucumber_repo_url"):
+        detected["cucumber_repo_url"] = document["detecte"]["cucumber_repo_url"]
     # Version du Standard propre au client (tools/standard_version), jamais la version globale à sa place
     version = document.get("version_standard") or {}
     if version:

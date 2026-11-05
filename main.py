@@ -5034,8 +5034,20 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
 SIMPLE_INIT_DELIVERABLE_FINDINGS = ("initializer", "controle_environnement", "champ_personnalise")
 
 
+def version_branch_write() -> bool:
+    """CUCUMBER_VERSION_BRANCH_WRITE (défaut 1) : l'agent écrit directement sur la branche de la version du dépôt
+    <client>-cucumber (v1.1, v1.2… : des tests seulement), jamais sur la branche d'intégration ; 0 : branche de l'agent
+    et patch à appliquer."""
+    return os.getenv("CUCUMBER_VERSION_BRANCH_WRITE", "1").strip() != "0"
+
+
 def simple_init_branch(profile: dict, branch: str) -> str:
-    """Branche de l'agent pour l'init de la version `branch` : « <branche de travail>-init-<version> »."""
+    """
+    Branche où l'agent écrit l'init de la version `branch` : la branche de la version elle-même (réglage par défaut,
+    jamais « integration »), sinon « <branche de travail>-init-<version> ».
+    """
+    if version_branch_write() and branch and branch.strip().lower() not in ("integration", "master", "main", "develop"):
+        return branch
     work = (profile.get("verify_branch") or "feature/agent-cucumber").strip().rstrip("/")
     return f"{work}-init-{branch.replace('/', '-')}"
 
@@ -5234,6 +5246,9 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     if not os.path.isdir(os.path.join(local, ".git")):
         simple_record(client, "init", "echec", f"Clone de {slug} absent : relancez l'étape 2.", detail)
         return 1
+    # Dépôt autorisé pour la garde d'écriture : relevé sur le clone à chaque fois (une redétection du profil, après un
+    # changement de version, ne le garde pas)
+    cucumber_delivery.register_repo(client, local)
     subprocess.run(["git", *_git_auth_args(), "-C", local, "fetch", "-q", "origin", "--prune"], capture_output=True)
     # Espace de l'agent : sa branche d'init si elle existe (ses commits), mise à jour avec la branche de la version
     has_work = cucumber_tools._git(local, "rev-parse", "--verify", "-q", f"origin/{work}").returncode == 0
@@ -5333,8 +5348,10 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         return built["ok"]
 
     def pushed_line() -> str:
-        return (f"{cucumber_tools.rev_parse(worktree, 'HEAD')[:10]} poussé sur {work} (branche de l'agent) ; patch "
-                f"à appliquer sur {branch} : {patch_path}")
+        head = cucumber_tools.rev_parse(worktree, 'HEAD')[:10]
+        if work == branch:
+            return f"{head} poussé sur {branch} (branche de la version)"
+        return f"{head} poussé sur {work} (branche de l'agent) ; patch à appliquer sur {branch} : {patch_path}"
 
     if plan["changes"] or plan["binaries"] or plan["deletions"]:
         if action != "appliquer":
@@ -5343,8 +5360,9 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             listed = "".join(f"+ {rel} (fichier de données du Standard)\n" for rel in plan["binaries"]) + "".join(
                 f"- {rel} (retiré : copie écrite par l'agent, devenue inutile)\n" for rel in plan["deletions"])
             simple_record(client, "init", "a_faire", f"Init de {branch} : à mettre à jour ("
-                          + " ; ".join(plan["reasons"]) + f"). Relisez le diff puis validez : il sera poussé sur la "
-                          f"branche de l'agent {work}, et un patch vous sera livré pour {branch}.",
+                          + " ; ".join(plan["reasons"]) + "). Relisez le diff puis validez : il sera poussé "
+                          + (f"directement sur la branche de la version {branch}." if work == branch else
+                             f"sur la branche de l'agent {work}, et un patch vous sera livré pour {branch}."),
                           {**detail, "plan": {"action": "appliquer", "diff": diff + listed}})
             return 0
         refused = deliver(plan["changes"], plan["binaries"],

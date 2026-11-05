@@ -172,6 +172,7 @@ def main_module():
 def init_workspace(tmp_path, monkeypatch, main_module):
     monkeypatch.setattr(ct, "CACHE_ROOT", str(tmp_path / "cache"))
     monkeypatch.delenv("AGENT_AUTH_USER", raising=False)
+    monkeypatch.setenv("CUCUMBER_VERSION_BRANCH_WRITE", "0")     # tests de la branche de l'agent + patch
     os.makedirs(os.path.dirname(cp.profile_path(CLIENT)), exist_ok=True)
     profile = cp.empty_profile()
     profile["modules"] = [{"code": "WMS", "tag": "@WMS", "sources": ["test"]}]
@@ -640,6 +641,27 @@ def test_timeout_on_std_files_step_rewrites_it_never_copies(init_workspace, main
     assert record["detail"]["echec_fichiers_standard"].startswith("org.awaitility")
 
 
+def test_init_written_directly_on_the_version_branch(init_workspace, main_module, monkeypatch):
+    """Réglage par défaut : l'agent écrit sur la branche de la version (v1.3), sans patch ; jamais sur integration."""
+    monkeypatch.setenv("CUCUMBER_VERSION_BRANCH_WRITE", "1")
+    w = init_workspace
+    runs = []
+    helpers = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "std_files": STD_FILES_STEP,
+               "run": lambda profile, worktree: runs.append(profile["verify_branch"]) or {"ok": True, "message": "OK",
+                                                                                          "build": "b"}}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("verifier") == 0 and "directement sur la branche de la version v1.3" in _init_record()["resultat"]
+    assert call("appliquer") == 0
+    assert FEATURE in git(w["origin"], "ls-tree", "-r", "--name-only", "v1.3")
+    assert AGENT_BRANCH not in git(w["origin"], "branch", "--list")
+    record = _init_record()
+    assert "patch" not in record["detail"] and "branche de la version" in record["detail"]["commit"]
+    assert call("lancer") == 0 and runs == ["v1.3"]
+    assert main_module.simple_init_branch({}, "integration") != "integration"
+
+
 def test_init_stops_without_proven_clear(init_workspace, main_module):
     w = init_workspace
     code = main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", "verifier",
@@ -671,3 +693,14 @@ def test_feature_result_green_only_when_executed_and_relevant():
     assert not cs.feature_result({"lots": []}, "b")["vert"]
     merged = cs.merge_features([{"id": "a", "vert": False}, {"id": "b", "vert": True}], [{"id": "a", "vert": True}])
     assert merged == [{"id": "b", "vert": True}, {"id": "a", "vert": True}]
+
+
+def test_profile_redetection_keeps_the_authorised_cucumber_repo(init_workspace, monkeypatch):
+    """Changement de version -> redétection du profil : l'adresse du dépôt autorisée (garde d'écriture) est gardée."""
+    document = cp.load_profile(CLIENT)
+    document["detecte"]["cucumber_repo_url"] = "https://git.example/scm/cli/clientx-cucumber.git"
+    ct._write_json(cp.profile_path(CLIENT), document)
+    monkeypatch.setattr(cp, "detect_profile", lambda *a, **k: (cp.empty_profile(), [], []))
+    monkeypatch.setattr(cp, "repo_profile", lambda *a, **k: {})
+    cp.refresh_profile(CLIENT, "/inexistant", "HEAD", "")
+    assert cp.load_profile(CLIENT)["detecte"]["cucumber_repo_url"] == "https://git.example/scm/cli/clientx-cucumber.git"
