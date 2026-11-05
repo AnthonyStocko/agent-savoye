@@ -9,6 +9,7 @@ runs Jenkins dépend du slot alloué (cucumber_customer_<slot>) ; elle ne bloque
 Les résultats des étapes sont gardés dans etat.json (« simple » : {depot, base, init, tests}) par
 record_step ; aucune valeur propre à un client n'est écrite en dur.
 """
+import re
 from datetime import datetime
 
 STATES = {"a_faire": "à faire", "en_cours": "en cours", "ok": "OK", "echec": "en échec", "bloquee": "bloquée"}
@@ -122,10 +123,19 @@ def label(step: dict, client: str = "") -> str:
         f" — {STATES[step['etat']]}"
 
 
-def feature_choices(inventory: dict, profile: dict) -> list:
+def ticket_of(links: list) -> dict:
+    """Ticket affiché pour une tâche : premier lien VÉRIFIÉ du projet SPEC, à défaut le premier lien vérifié."""
+    links = [l for l in links or [] if l.get("cle")]
+    return next((l for l in links if l["cle"].upper().startswith("SPEC-")), links[0] if links else {})
+
+
+def feature_choices(inventory: dict, profile: dict, links: dict = None) -> list:
     """
-    Fonctionnalités proposées à l'étape 5 : [{id, libelle « MODULE — titre métier »}], hors modules décochés,
-    triées par module puis titre. Aucun compteur.
+    Fonctionnalités proposées à l'étape 5 : [{id, ticket, libelle}], hors modules décochés. Libellé « SPEC-1234 —
+    titre du ticket Jira (MODULE) » quand un ticket est lié à la tâche par une preuve (commit ou référence dans ses
+    fichiers, cucumber_coverage.verify_ticket_links), à défaut le ticket rapproché par mots-clés à l'inventaire,
+    marqué « ticket probable », sinon « MODULE — titre métier (aucun ticket lié) ». Tâches avec
+    ticket d'abord, triées par clé ; puis les autres par module et titre.
     """
     from tools import cucumber_coverage, cucumber_modules
     codes = cucumber_modules.codes(profile)
@@ -135,9 +145,24 @@ def feature_choices(inventory: dict, profile: dict) -> list:
             continue
         found = sorted(cucumber_modules.task_modules(spec, codes)) if codes else []
         module = found[0] if found else cucumber_coverage.module_of(spec)
-        out.append({"id": spec["id"], "module": module,
-                    "libelle": f"{module} — {cucumber_coverage.business_title(spec)}"})
-    return sorted(out, key=lambda f: (f["module"].lower(), f["libelle"].lower()))
+        ticket = ticket_of((links or {}).get(spec["id"]))
+        probable = {} if ticket else ticket_of([{"cle": k, "titre": t} for k, t in
+                                                cucumber_coverage.candidate_tickets(spec).items()])
+        if ticket:
+            label = f"{ticket['cle']} — {cucumber_coverage.strip_status(ticket.get('titre', ''))} ({module})"
+        elif probable:
+            # Rapprochement par mots-clés de l'inventaire, sans preuve : signalé comme tel
+            ticket = probable
+            label = f"{ticket['cle']} — {ticket.get('titre', '')} ({module}, ticket probable)"
+        else:
+            label = f"{module} — {cucumber_coverage.business_title(spec)} (aucun ticket lié)"
+        out.append({"id": spec["id"], "module": module, "ticket": ticket.get("cle", ""), "libelle": label})
+
+    def key(f: dict) -> tuple:
+        number = re.search(r"-(\d+)$", f["ticket"])
+        return (0, f["ticket"].split("-")[0], int(number.group(1)) if number else 0, "") if f["ticket"] else \
+            (1, f["module"].lower(), 0, f["libelle"].lower())
+    return sorted(out, key=key)
 
 
 # ---------------------------------------------------------------------------
