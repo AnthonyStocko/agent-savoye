@@ -478,8 +478,32 @@ def check_lot_files(worktree: str, base: str, files: list, client_name: str, cuc
     placed = [f for f in features if not any(e.startswith(f + " :") for e in misplaced)]
     data = check_data_files(worktree, placed, cucumber_std_dir, inspired=inspired)
     tags = check_tags(worktree, features, conventions.get("client_tag") or client_tag(worktree, base, client_name))
+    expressions = check_step_expressions(worktree, [f for f in files if f.endswith(".java")])
     return {"copies": data["copies"], "restaures": protected["restaures"],
-            "erreurs": protected["erreurs"] + misplaced + tags + data["erreurs"]}
+            "erreurs": protected["erreurs"] + misplaced + tags + data["erreurs"] + expressions}
+
+
+_STEP_ANNOTATION = re.compile(r'@(?:Given|When|Then|And|But)\(\s*"((?:[^"\\]|\\.)*)"\s*\)')
+_OPTIONAL_TEXT = re.compile(r"(?<!\\)\(([^()]*)(?<!\\)\)")
+
+
+def check_step_expressions(worktree: str, java_files: list) -> list:
+    """
+    Expressions Cucumber des steps du projet : des parenthèses non échappées sont du texte FACULTATIF (« besoin(s) »
+    = « besoin » ou « besoins », jamais le texte littéral « besoin(s) » écrit dans la feature : step non défini).
+    """
+    errors = []
+    for rel in java_files:
+        text = _read_text_file(os.path.join(worktree, *rel.split("/")))
+        for expression in _STEP_ANNOTATION.findall(text):
+            if expression.startswith("^") or expression.endswith("$"):
+                continue                                    # expression régulière, pas une expression Cucumber
+            for group in _OPTIONAL_TEXT.findall(expression):
+                errors.append(f"{rel} : step « {expression} » — « ({group}) » est du texte FACULTATIF dans une "
+                              f"expression Cucumber (la feature doit écrire le mot avec ou sans « {group} », jamais "
+                              f"« ({group}) ») : écris le texte voulu sans parenthèses (ex. « besoins »), ou échappe "
+                              f"les parenthèses (\\\\( et \\\\)) si la feature les contient vraiment")
+    return errors
 
 
 # ---------------------------------------------------------------------------

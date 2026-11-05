@@ -350,3 +350,22 @@ def test_data_files_without_database_checked_codes_are_sent_back(monkeypatch):
     out = main.require_db_proof([written], "LOT", {"db_block": "accès"}, "m", "40", "/tmp", "", "", {}, "1", "K")
     assert out[0]["recherches"][0]["source"] == "base" and len(calls) == 1
     assert "fichiers de données" in calls[0] and "01-Order.xml" in calls[0] and "non_couvert » en invoquant" not in calls[0]
+
+
+def test_unescaped_parentheses_in_project_steps_are_reported(tmp_path):
+    from tools import cucumber_checks as cc
+    java = tmp_path / "src" / "Steps.java"
+    java.parent.mkdir()
+    java.write_text('@Then("CANSON- {int} besoin(s) {string} pour l\'UP en contexte")\n'
+                    '@Then("A \\\\(x\\\\) b")\n@Given("^regex (a|b)$")\n', encoding="utf-8")
+    errors = cc.check_step_expressions(str(tmp_path), ["src/Steps.java"])
+    assert len(errors) == 1 and "besoin(s)" in errors[0] and "FACULTATIF" in errors[0]
+
+
+def test_standard_data_files_cited_by_features_need_database_codes():
+    from tools import cucumber_testability as ctst
+    feature = 'Given INIT- Intégration des fichiers via l\'écran\n  | fileName |\n  | CIN-TOW-846.xml |\n  | WOI-TOW-846.xml |\n'
+    cited = ctst.referenced_data_files([feature])
+    assert cited == ["CIN-TOW-846.xml", "WOI-TOW-846.xml"]
+    result = {"id": "a", "statut": "couvert", "fichiers": ["x.feature"], "recherches": []}
+    assert ctst.missing_reference_proof(result, cited) == cited
