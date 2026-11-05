@@ -2100,15 +2100,18 @@ def render_simple_init(ctx: dict, step: dict) -> None:
     if plan.get("diff"):
         st.code(plan["diff"][:20000], language="diff")
     action = plan.get("action") or "verifier"
-    labels = {"verifier": "Préparer et vérifier l'init", "appliquer": "Valider l'init (branche de l'agent)",
-              "completer": "Valider les compléments (branche de l'agent)",
+    direct = os.getenv("CUCUMBER_VERSION_BRANCH_WRITE", "1").strip() != "0"
+    where = "branche de la version" if direct else "branche de l'agent"
+    labels = {"verifier": "Préparer et vérifier l'init", "appliquer": f"Valider l'init ({where})",
+              "completer": f"Valider les compléments ({where})",
               "lancer": "Lancer l'init sur Jenkins", "corriger": "Valider la correction et relancer l'init"}
     if st.button(labels.get(action, labels["verifier"]), type="primary", icon=":material/play_arrow:",
                  key=f"cs_init_{ctx['client']}", disabled=step["etat"] == "bloquee",
                  help="L'init du Standard est lancée telle quelle quand elle suffit ; les sujets propres au client "
-                      "vont dans des compléments à part. Rien n'est poussé sans votre validation du diff, et "
-                      "seulement sur la branche de l'agent : la branche de la version reçoit le patch, appliqué par "
-                      "vous."):
+                      "vont dans des compléments à part. Rien n'est poussé sans votre validation du diff, jamais sur "
+                      "la branche d'intégration ni en forçant ; "
+                      + ("directement sur la branche de la version (v1.3…)." if direct else
+                         "sur la branche de l'agent : la branche de la version reçoit le patch, appliqué par vous.")):
         simple_run(ctx, "init", ["--simple-init", action])
     if action != "verifier" and st.button("Revérifier", type="tertiary", key=f"cs_init_check_{ctx['client']}"):
         simple_run(ctx, "init", ["--simple-init", "verifier"])
@@ -4585,6 +4588,12 @@ with tab_config:
                      "puis des « pertinent » tirés au hasard.")
         env_values["CUCUMBER_VERIFY_TIMEOUT"] = str(int(verify_timeout))
         env_values["CUCUMBER_VERIFY_FIX_MAX"] = str(int(verify_fixes))
+        env_values["CUCUMBER_VERSION_BRANCH_WRITE"] = "1" if st.checkbox(
+            "Écrire directement sur les branches de version du dépôt <client>-cucumber (v1.1, v1.2…)",
+            value=os.getenv("CUCUMBER_VERSION_BRANCH_WRITE", "1").strip() != "0",
+            help="Étape 4 de l'onglet Cucumber : diff validé puis poussé sur la branche de la version (des tests "
+                 "seulement), jamais sur la branche d'intégration ni en forçant. Décoché : branche de l'agent et patch "
+                 "à appliquer (CUCUMBER_VERSION_BRANCH_WRITE).") else "0"
         # Ancien réglage (plafond fixe) : remplacé par le plafond adaptatif, 0 conservé comme « aucune correction »
         env_values["CUCUMBER_VERIFY_FIX_ATTEMPTS"] = "0" if int(verify_fixes) == 0 else ""
         env_values["CUCUMBER_REVIEW_SAMPLE"] = str(int(review_sample))
