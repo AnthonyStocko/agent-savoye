@@ -299,6 +299,15 @@ def feature_result(state: dict, spec_id: str, label: str = "") -> dict:
                                f"{first.get('motif') or ''}"[:400]}
 
 
+def lots_signature(state: dict, ids: str) -> str:
+    """Empreinte des lots qui concernent `ids` (début de la génération, statuts, résultats) : inchangée = rien de neuf."""
+    import json
+    wanted = {i for i in (ids or "").split(",") if i}
+    lots = [{k: lot.get(k) for k in ("numero", "statut", "resultats", "execution")}
+            for lot in (state or {}).get("lots") or [] if wanted & set(lot.get("ids") or [])]
+    return json.dumps({"debut": (state or {}).get("debut"), "lots": lots}, sort_keys=True, default=str)
+
+
 def group_result(state: dict, ids: str, label: str = "") -> dict:
     """Résultat d'une ligne (ticket à plusieurs tâches « a,b ») : verte si toutes ses tâches le sont."""
     parts = [feature_result(state, i, label) for i in ids.split(",") if i]

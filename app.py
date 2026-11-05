@@ -2148,13 +2148,17 @@ def render_simple_tests(ctx: dict, step: dict) -> None:
             st.caption(f"{index + 1}/{len(chosen)} — {labels[spec_id]}")
             no_init = [] if cucumber_simple.init_enabled(
                 cucumber_tools.load_state(ctx["client"]).get("simple") or {}) else ["--no-init"]
+            before = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
             code = run_main_step(ctx["cmd"] + ["--cucumber-base-branch", branch, "--specifics", spec_id]
                                  + (["--complete"] if index else []) + no_init)
-            if code in (2, 3):
-                # Arrêt avant tout lot (environnement, génération introuvable) : jamais le résultat d'un run précédent
+            after = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
+            if code != 0 and (code in (2, 3) or after == before):
+                # Arrêt avant le résultat (environnement, interruption, erreur) : jamais celui d'un run précédent
+                why = ("la génération s'est arrêtée avant tout lot (problème d'environnement)" if code in (2, 3)
+                       else f"exécution interrompue avant son résultat (code {code} ; arrêt, rechargement de la "
+                            f"page ou erreur)")
                 lines.append({"id": spec_id, "libelle": labels[spec_id], "vert": False,
-                              "resultat": "Non lancée : la génération s'est arrêtée avant tout lot (problème "
-                                          "d'environnement, voir le journal technique)."})
+                              "resultat": f"Non terminée : {why}. Voir le journal technique, puis relancer."})
                 continue
             lines.append(cucumber_simple.group_result(cucumber_tools.load_state(ctx["client"]), spec_id,
                                                       labels[spec_id]))
@@ -4402,6 +4406,12 @@ with tab_config:
             help="URL du projet Bitbucket/KISCloud (ex: https://git.kiscloud.io/projects/COMPONENT) "
                  "ou chemin local d'un clone (ex: C:\\development\\branch_dev)."
         )
+        env_values["STD_FETCH_MAX_AGE_MINUTES"] = str(int(st.number_input(
+            "STD_FETCH_MAX_AGE_MINUTES (réutilisation des copies du Standard)", min_value=0, step=60,
+            value=env_int("STD_FETCH_MAX_AGE_MINUTES", 1440),
+            help="Les copies locales du Standard (lues par Claude pendant les analyses) ne sont récupérées de "
+                 "nouveau que si leur dernier fetch date de plus de ce délai, en minutes. 1440 = un jour ; "
+                 "0 = à chaque analyse.")))
         env_values["ODATIO_VERSION"] = st.text_input(
             "ODATIO_VERSION (facultatif)", value=os.getenv("ODATIO_VERSION", ""), placeholder="ex. 26.16",
             help="Repli seulement : chaque client Cucumber a sa propre version du Standard, détectée dans le code de "

@@ -274,3 +274,12 @@ def test_init_option_unchecked_makes_step_four_optional():
     assert steps["init"]["optionnelle"] and steps["init"]["resultat"].startswith("Facultative")
     assert steps["tests"]["etat"] == "a_faire"
     assert cs.init_enabled({}) and not cs.init_enabled(records)
+
+
+def test_lots_signature_detects_nothing_new():
+    state = {"debut": "2026-11-05T10:00", "lots": [{"numero": 1, "ids": ["a"], "statut": "erreur_compilation"}]}
+    before = cs.lots_signature(state, "a,b")
+    assert cs.lots_signature(state, "a,b") == before                     # run interrompu : rien de neuf
+    state["lots"][0]["statut"] = "termine"
+    assert cs.lots_signature(state, "a,b") != before
+    assert cs.lots_signature(state, "z") != before

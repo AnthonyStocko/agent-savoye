@@ -297,7 +297,7 @@ def test_recent_standard_fetch_is_reused(tmp_path, monkeypatch):
     monkeypatch.setenv("STD_FETCH_MAX_AGE_MINUTES", "0")
     assert main.std_fetch_max_age() == 0
     monkeypatch.setenv("STD_FETCH_MAX_AGE_MINUTES", "abc")
-    assert main.std_fetch_max_age() == 60
+    assert main.std_fetch_max_age() == 1440                      # un jour par défaut
 
 
 def test_clear_of_a_module_no_longer_imported_is_commented():
