@@ -237,3 +237,29 @@ def test_library_read_on_the_cucumber_branch_of_the_chosen_version(project, tmp_
     assert any(f"({CLIENT}-cucumber, branche v1.3)" in w for w in stale["avertissements"])
     assert cv.cucumber_library_ref({"type": "release", "version": "1.3", "ref": "release/1.3"},
                                    ["integration", "release/1.3"]) == "release/1.3"
+
+
+MODULE_POM = ("<project><parent><groupId>a-sis</groupId><artifactId>o2-parent-jvm11</artifactId><version>1.1.4"
+              "</version></parent><artifactId>spec-core</artifactId><dependencies><dependency><groupId>a-sis</groupId>"
+              "<artifactId>kis-core</artifactId><version>{kis}</version></dependency></dependencies></project>")
+
+
+def test_kis_read_in_the_application_poms_when_no_build(project, tmp_path):
+    """Cas Canson 1.2 : aucun build du Standard 26.21 -> version KIS lue dans les poms de l'application (modules)."""
+    root = POM.format(own="1.2", std="26.21.0").replace("</project>", "<modules><module>wms</module></modules></project>")
+    wms = "<project><modules><module>core</module></modules></project>"
+    _clone(tmp_path, "clienty-odatio-app", [("integration", {"pom.xml": root, "wms/pom.xml": wms,
+                                                             "wms/core/pom.xml": MODULE_POM.format(kis="3.11-SNAPSHOT")},
+                                            "odatio-app-1.2.0")])
+    app = next(r for r in cv.repositories(project) if r.name == "clienty-odatio-app")
+    entry = next(e for e in cv.git_versions(app) if e["type"] == "tag")
+    found = cv.kis_from_poms(app, entry)
+    assert found["kis"] == "3.11" and found["source"] == "pom" and "wms/core/pom.xml : kis-core 3.11-SNAPSHOT" in found["detail"]
+    deduced = cv.deduce(entry, app.file(entry, "pom.xml"), GROUPS, ["v26.21"], "26.21", {}, kis_pom=found)
+    assert deduced["kis"]["kis"] == "3.11" and deduced["jenkins"]["kis_version"] == "3.11"
+    assert not any("version KIS" in w for w in deduced["avertissements"])
+    assert cv.line(deduced).endswith("KIS 3.11 (pom de l'application)")
+    # Un build réel ou une saisie l'emporte sur le pom
+    built = cv.deduce(entry, app.file(entry, "pom.xml"), GROUPS, ["v26.21"], "26.21",
+                      {"26.21": {"kis": "3.10", "source": "build"}}, kis_pom=found)
+    assert built["kis"]["kis"] == "3.10"

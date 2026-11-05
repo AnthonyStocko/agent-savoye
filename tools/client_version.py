@@ -395,7 +395,7 @@ def record_kis(version: str, kis: str) -> dict:
 
 
 def deduce(entry: dict, app_pom: str, groups: set, cucumber_std_refs: list, library_current: str,
-           registry: dict, client_ref_found: bool = True, library_source: str = "") -> dict:
+           registry: dict, client_ref_found: bool = True, library_source: str = "", kis_pom: dict = None) -> dict:
     """
     Déduction pour la version choisie `entry` : `app_pom` (pom de l'application à sa référence), `groups`
     (groupIds du Standard), `cucumber_std_refs` (branches et tags du Cucumber Standard), `library_current`
@@ -423,6 +423,8 @@ def deduce(entry: dict, app_pom: str, groups: set, cucumber_std_refs: list, libr
         warnings.append(f"bibliothèque Cucumber {library_current} du pom.xml du dépôt Cucumber du client{where}, "
                         f"Standard de l'application {standard} : montée proposée")
     kis = (registry or {}).get(standard) or {}
+    if standard and not kis.get("kis") and (kis_pom or {}).get("kis"):
+        kis = dict(kis_pom)                  # build réel ou saisie d'abord ; à défaut, poms de l'application
     if standard and not kis.get("kis"):
         warnings.append(f"version KIS inconnue pour le Standard {standard} (aucun build qui a démarré une application "
                         f"de cette version) : à renseigner")
@@ -446,7 +448,8 @@ def line(deduction: dict) -> str:
             f"Standard {(deduction.get('standard') or {}).get('version') or '?'} → Cucumber Standard "
             f"{(deduction.get('cucumber_standard') or {}).get('ref') or '?'} → bibliothèque Cucumber {target}"
             + (f" (actuelle : {current})" if sv.normalize(current)[0] != sv.normalize(target)[0] else "")
-            + f" → KIS {(deduction.get('kis') or {}).get('kis') or '?'}")
+            + f" → KIS {(deduction.get('kis') or {}).get('kis') or '?'}"
+            + (" (pom de l'application)" if (deduction.get("kis") or {}).get("source") == "pom" else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +586,63 @@ def remote_ref_names(url: str) -> list:
     return names
 
 
+_KIS_ARTIFACT = re.compile(r"<artifactId>\s*(kis-[\w.-]+)\s*</artifactId>")
+_VERSION_TAG = re.compile(r"<version>\s*([^<\s]+)\s*</version>")
+_PROPERTY = re.compile(r"\$\{([\w.-]+)\}")
+_MODULE = re.compile(r"<module>\s*([^<\s]+)\s*</module>")
+
+
+def kis_in_pom(text: str, properties: dict = None) -> str:
+    """Version KIS déclarée par un pom (dépendance ou parent a-sis:kis-*, propriété résolue) ; '' sinon."""
+    props = dict(properties or {})
+    for name, value in re.findall(r"<([\w.-]+)>\s*([^<\s]+)\s*</\1>",
+                                  (re.search(r"<properties>(.*?)</properties>", text or "", re.S) or [None, ""])[1]
+                                  if re.search(r"<properties>", text or "") else ""):
+        props.setdefault(name, value)
+    for block in re.findall(r"<(?:dependency|parent)>(.*?)</(?:dependency|parent)>", text or "", re.S):
+        if not _KIS_ARTIFACT.search(block) or "a-sis" not in block:
+            continue
+        version = _VERSION_TAG.search(block)
+        if not version:
+            continue
+        value = _PROPERTY.sub(lambda m: props.get(m.group(1), m.group(0)), version.group(1))
+        if "${" not in value and re.match(r"\d+\.\d+", value):
+            return value
+    return ""
+
+
+def kis_from_poms(repo, ref: dict, limit: int = 40) -> dict:
+    """
+    Version KIS lue dans les poms de l'application à la référence de la version choisie (racine puis modules, en
+    largeur) : {"kis": « 3.12 », "detail": « <dépôt>/<chemin>/pom.xml : kis-core 3.12-SNAPSHOT », "source": "pom"} ;
+    {} si aucun pom ne la déclare.
+    """
+    if not (repo and ref):
+        return {}
+    root = repo.file(ref, "pom.xml")
+    root_props = dict(re.findall(r"<([\w.-]+)>\s*([^<\s]+)\s*</\1>",
+                                 (re.search(r"<properties>(.*?)</properties>", root or "", re.S) or [None, ""])[1]
+                                 if "<properties>" in (root or "") else ""))
+    queue, seen = [""], set()
+    while queue and len(seen) < limit:
+        folder = queue.pop(0)
+        if folder in seen:
+            continue
+        seen.add(folder)
+        path = f"{folder}/pom.xml" if folder else "pom.xml"
+        text = root if not folder else repo.file(ref, path)
+        if not text:
+            continue
+        found = kis_in_pom(text, root_props)
+        if found:
+            artifact = next((m for block in re.findall(r"<(?:dependency|parent)>(.*?)</(?:dependency|parent)>", text,
+                                                       re.S) for m in _KIS_ARTIFACT.findall(block)), "kis")
+            return {"kis": sv.normalize(found)[0] or found.replace("-SNAPSHOT", ""), "source": "pom",
+                    "detail": f"{repo.name}/{path} : {artifact} {found}", "build": "", "numero": 0}
+        queue += [f"{folder}/{m}".strip("/") for m in _MODULE.findall(text)]
+    return {}
+
+
 def compute(client_name: str, entry: dict, client_repo: str, std_repo: str, cucumber_std_refs: list,
             library_current: str, builds: list = None, library_source: str = "") -> dict:
     """Déduction réelle pour `entry` : pom de l'application à sa référence, registre KIS mis à jour."""
@@ -593,7 +653,9 @@ def compute(client_name: str, entry: dict, client_repo: str, std_repo: str, cucu
     pom = repo.file(ref, "pom.xml") if repo and ref else ""
     registry = kis_registry(builds or [], load_kis_registry())
     _write_json(KIS_REGISTRY, registry)
-    return deduce(entry, pom, groups, cucumber_std_refs, library_current, registry, library_source=library_source)
+    # Aucun build ni saisie pour ce Standard : version KIS déclarée par les poms de l'application à cette version
+    return deduce(entry, pom, groups, cucumber_std_refs, library_current, registry, library_source=library_source,
+                  kis_pom=kis_from_poms(repo, ref) if repo and ref else {})
 
 
 def cucumber_std_refs_for(std_input: str) -> list:
