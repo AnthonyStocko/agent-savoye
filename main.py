@@ -2580,6 +2580,8 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
                                                           conventions.get("library_version", ""))
     if errors:
         print(f"[LOT {label}] Fichiers : {len(errors)} erreur(s) ({time.time() - started:.0f} s)")
+        for error in errors[:12]:
+            print(f"    - {error[:300]}")
         return {"ok": False, "etape": "fichiers", "erreurs": errors, "environnement": False}
     if not compile_cmd:
         return {"ok": True, "etape": "fichiers", "erreurs": [], "environnement": False}

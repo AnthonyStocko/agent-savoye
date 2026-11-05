@@ -369,3 +369,27 @@ def test_standard_data_files_cited_by_features_need_database_codes():
     assert cited == ["CIN-TOW-846.xml", "WOI-TOW-846.xml"]
     result = {"id": "a", "statut": "couvert", "fichiers": ["x.feature"], "recherches": []}
     assert ctst.missing_reference_proof(result, cited) == cited
+
+
+def test_setup_scenario_may_become_the_background():
+    from tools import cucumber_a_revoir as ar
+    before = ("Feature: F\n\n  Scenario: Contexte : intégration des OP\n    Given PREP- Intégration \"WOI.xml\"\n"
+              "    And PREP- Mise en préparation\n\n  Scenario: Cas 1\n    When PREP- Palettisation\n"
+              "    Then PREP- Contrôle\n      | code |\n      | A |\n")
+    after = ("Feature: F\n\n  Background:\n    Given PREP- Intégration \"WOI.xml\"\n    And PREP- Mise en préparation\n\n"
+             "  Scenario: Cas 1\n    When PREP- Palettisation\n    Then PREP- Contrôle\n      | code |\n      | A |\n")
+    assert ar.forbidden_changes(before, after, "f.feature") == []
+    removed = after.replace("  Scenario: Cas 1", "  Scenario: Autre")
+    assert any("Cas 1" in e and "supprimé" in e for e in ar.forbidden_changes(before, removed, "f.feature"))
+    assert ar.background_steps(after) == {'PREP- Intégration "WOI.xml"', "PREP- Mise en préparation"}
+
+
+def test_columns_used_by_the_standard_with_the_same_step_are_not_flagged(tmp_path):
+    from tools import cucumber_versions as cv
+    feature = tmp_path / "src/test/resources/cucumber/features/WMS/TOW-574.feature"
+    feature.parent.mkdir(parents=True)
+    feature.write_text("Feature: x\n  Scenario: y\n    Then PREP- 1 besoins pour l'UP\n"
+                       "      | X | wmsEnumNeed.value.id |\n      | 1 | PALLETIZE |\n", encoding="utf-8")
+    cv._STD_USAGE.clear()
+    usage = cv.std_control_usage(str(tmp_path), lambda step: "PREP- <X> besoins pour l'UP")
+    assert ("PREP- <X> besoins pour l'UP", "wmsEnumNeed.value.id") in usage
