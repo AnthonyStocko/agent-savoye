@@ -123,9 +123,21 @@ def label(step: dict, client: str = "") -> str:
         f" — {STATES[step['etat']]}"
 
 
+# Tickets de montée de version (épopées EPO « Montée de version 26.22 »…) : leurs commits touchent les fichiers de
+# toutes les tâches ; ils ne décrivent aucune fonctionnalité et ne servent jamais de libellé
+_UPGRADE = re.compile(r"mont[ée]es?\s+(de\s+)?versions?|\bMDV\b|\bupgrade\b|passage\s+en\s+(java|v?\d)", re.I)
+
+
+def is_upgrade_ticket(ticket: dict) -> bool:
+    return bool(_UPGRADE.search(ticket.get("titre") or ""))
+
+
 def ticket_of(links: list) -> dict:
-    """Ticket affiché pour une tâche : premier lien VÉRIFIÉ du projet SPEC, à défaut le premier lien vérifié."""
-    links = [l for l in links or [] if l.get("cle")]
+    """
+    Ticket affiché pour une tâche : premier lien du projet SPEC, à défaut le premier lien ; jamais un ticket de
+    montée de version.
+    """
+    links = [l for l in links or [] if l.get("cle") and not is_upgrade_ticket(l)]
     return next((l for l in links if l["cle"].upper().startswith("SPEC-")), links[0] if links else {})
 
 
@@ -156,7 +168,31 @@ def feature_choices(inventory: dict, profile: dict, links: dict = None) -> list:
             label = f"{ticket['cle']} — {ticket.get('titre', '')} ({module}, ticket probable)"
         else:
             label = f"{module} — {cucumber_coverage.business_title(spec)} (aucun ticket lié)"
-        out.append({"id": spec["id"], "module": module, "ticket": ticket.get("cle", ""), "libelle": label})
+        out.append({"id": spec["id"], "module": module, "ticket": ticket.get("cle", ""), "libelle": label,
+                    "titre": ticket.get("titre", ""), "probable": bool(probable)})
+    # Un ticket = une ligne : ses tâches (plusieurs dossiers ou processus d'une même fonctionnalité) regroupées,
+    # générées ensemble (identifiant « a,b »)
+    grouped, seen = [], {}
+    for item in out:
+        if not item["ticket"]:
+            grouped.append(item)
+            continue
+        if item["ticket"] not in seen:
+            seen[item["ticket"]] = {**item, "ids": [item["id"]], "modules": [item["module"]]}
+            grouped.append(seen[item["ticket"]])
+            continue
+        entry = seen[item["ticket"]]
+        entry["ids"].append(item["id"])
+        if item["module"] not in entry["modules"]:
+            entry["modules"].append(item["module"])
+        entry["probable"] = entry["probable"] and item["probable"]
+    for entry in (e for e in grouped if e.get("ids")):
+        entry["id"] = ",".join(entry["ids"])
+        title = cucumber_coverage.strip_status(entry["titre"])
+        extra = f", {len(entry['ids'])} tâches" if len(entry["ids"]) > 1 else ""
+        entry["libelle"] = (f"{entry['ticket']} — {title} ({', '.join(entry['modules'])}{extra}"
+                            + (", ticket probable" if entry["probable"] else "") + ")")
+    out = [{k: v for k, v in e.items() if k not in ("ids", "modules", "titre", "probable")} for e in grouped]
 
     def key(f: dict) -> tuple:
         number = re.search(r"-(\d+)$", f["ticket"])
@@ -245,6 +281,17 @@ def feature_result(state: dict, spec_id: str, label: str = "") -> dict:
     first = next(s for s in runs if s.get("statut") != "pertinent")
     return {**out, "resultat": f"{len(passed)}/{len(runs)} scénario(s) vérifié(s) : {first.get('statut')} — "
                                f"{first.get('motif') or ''}"[:400]}
+
+
+def group_result(state: dict, ids: str, label: str = "") -> dict:
+    """Résultat d'une ligne (ticket à plusieurs tâches « a,b ») : verte si toutes ses tâches le sont."""
+    parts = [feature_result(state, i, label) for i in ids.split(",") if i]
+    if len(parts) == 1:
+        return {**parts[0], "id": ids}
+    green = [p for p in parts if p["vert"]]
+    first = next((p for p in parts if not p["vert"]), None)
+    return {"id": ids, "libelle": label or ids, "vert": not first,
+            "resultat": f"{len(green)}/{len(parts)} tâche(s) verte(s)" + (f" — {first['resultat']}" if first else ".")}
 
 
 def merge_features(previous: list, current: list) -> list:
