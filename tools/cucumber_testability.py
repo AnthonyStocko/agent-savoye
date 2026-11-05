@@ -397,7 +397,9 @@ def missing_db_proof(result: dict) -> list:
 _TO_CREATE = re.compile(r"fichiers? de donn[ée]es|manque[^.]{0,80}fichier|fichier[^.]{0,40}(manquant|absent)|"
                         r"aucun (é|e)change|sans (é|e)change|(é|e)change associ|aucun lien|non li[ée]|pas li[ée]|"
                         r"param[ée]trage (manquant|absent)|aucun param[ée]trage|à cr[ée]er|non cr[ée]{2}|"
-                        r"constituer un|aucune? (fixture|donn[ée]e de test)", re.I)
+                        r"constituer un|aucune? (fixture|donn[ée]e de test)|"
+                        r"[ée]quivalents?|ne contient aucun|aucun des codes|codes? (du|de) (jeu|test|Standard)|"
+                        r"pas pu (d[ée]terminer|trouver|identifier)|codes? (absents?|introuvables?|inexistants?)", re.I)
 _NO_API_PROOF = re.compile(r"endpoint|/api/|\bREST\b|steps?_std|aucun step", re.I)
 
 

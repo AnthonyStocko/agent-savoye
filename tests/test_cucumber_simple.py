@@ -435,3 +435,14 @@ def test_lot_prompt_asks_to_create_missing_files_and_configuration():
     text = open(os.path.join(root, "prompts", "cucumber_client_lot_systeme.md"), encoding="utf-8").read()
     assert "${donnees_tool} show <classeur>" in text and "IDEMPOTENTE" in text
     assert "n'est JAMAIS un « non_couvert »" in text
+
+
+def test_absent_standard_codes_must_be_mapped_to_database_equivalents():
+    from tools import cucumber_testability as ctst
+    gave_up = {"id": "EPO-2412", "statut": "non_couvert", "resume": "Je ne l'ai pas écrit : l'environnement du "
+               "client ne contient aucun des codes du jeu de test Standard (site, emplacements, palette, poste de "
+               "travail), et je n'ai pas pu déterminer leurs équivalents.", "recherches": []}
+    assert ctst.missing_creation(gave_up)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "prompts", "cucumber_client_lot_systeme.md"), encoding="utf-8").read()
+    assert "code Standard → code client" in text and "n'est pas une conclusion" in text
