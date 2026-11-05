@@ -236,3 +236,24 @@ def test_push_integrates_a_remote_branch_that_moved_ahead(setup, tmp_path):
     error, _ = cc.push_for_verification(worktree, "cucumber-agent", "x")
     assert "conflit" in error and "a.feature" in error and _remote_head(origin, "cucumber-agent") == remote
     assert git(worktree, "status", "--porcelain") == ""
+
+
+def test_previous_agent_runs_on_the_remote_branch_are_replaced_without_force(setup, tmp_path):
+    worktree, origin = setup["worktree"], setup["origin"]
+    other = str(tmp_path / "ancien-run")
+    git(str(tmp_path), "clone", "-q", "-b", "cucumber-agent", origin, other)
+    for key, value in (("user.name", "test"), ("user.email", "t@example.com")):
+        git(other, "config", key, value)
+    old = "src/test/resources/cucumber/features/clientx/WMS/ancien.feature"
+    _change(other, old, TEXT, "Cucumber coverage of clientx specifics - lot 1 (vérification)")
+    _change(other, FEATURE, TEXT + "\n  Scenario: Ancien\n    Given o\n",
+            "Cucumber coverage of clientx specifics - lot 1 (vérification)")
+    git(other, "push", "-q", "origin", "cucumber-agent")
+    previous = _remote_head(origin, "cucumber-agent")
+    _change(worktree, FEATURE, TEXT + "\n  Scenario: Nouveau\n    Given n\n")
+    error, _ = cc.push_for_verification(worktree, "cucumber-agent", "x")
+    assert error == "" and _remote_head(origin, "cucumber-agent") == git(worktree, "rev-parse", "HEAD")
+    assert git(worktree, "merge-base", "--is-ancestor", previous, "HEAD") == ""      # historique conservé
+    assert not os.path.exists(os.path.join(worktree, *old.split("/")))               # ancien run non réintroduit
+    with open(os.path.join(worktree, *FEATURE.split("/")), encoding="utf-8") as f:
+        assert "Nouveau" in f.read()

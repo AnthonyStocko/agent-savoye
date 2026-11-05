@@ -373,3 +373,20 @@ def test_odatio_version_is_not_a_repository_version(monkeypatch):
         f"<project {ns}><parent><groupId>com.kis</groupId><artifactId>odatio-parent</artifactId>"
         f"<version>25.4.2</version></parent><version>1.0.0</version></project>")[0] == "25.4.2"
     assert m.odatio_version_from_pom(f"<project {ns}><version>26.16</version></project>")[0] == "26.16"
+
+
+def test_without_init_standard_data_files_are_never_copied_nor_kept_identical(client_repo, std_dir):
+    rel = f"{RES}/features/clientx/WMS/Content/Nouveau.feature"
+    write(os.path.join(client_repo, *rel.split("/")), LOT)
+    inspired = ["src/test/resources/cucumber/features/WMS/07-Stock/13-Interactions_avec_le_WCS/TOW-1130.feature / Ctx"]
+    result = cc.check_data_files(client_repo, [rel], std_dir, inspired=inspired, no_init=True)
+    data = f"{RES}/files/clientx/WMS/Content/TOW-1130-Draft.xlsm"
+    assert data not in dict(result["copies"]) and not os.path.exists(os.path.join(client_repo, *data.split("/")))
+    assert any("TOW-1130-Draft.xlsm" in e and "sans initialisation" in e for e in result["erreurs"])
+    # Copie identique au Standard : refusée ; version propre au client : acceptée
+    cc.check_data_files(client_repo, [rel], std_dir, inspired=inspired)
+    again = cc.check_data_files(client_repo, [rel], std_dir, inspired=inspired, no_init=True)["erreurs"]
+    assert any("identique à celui du Standard" in e and "TOW-1130-Draft.xlsm" in e for e in again)
+    write(os.path.join(client_repo, *data.split("/")), "xlsm du client, site 01")
+    again = cc.check_data_files(client_repo, [rel], std_dir, inspired=inspired, no_init=True)["erreurs"]
+    assert not any("TOW-1130-Draft.xlsm" in e for e in again)
