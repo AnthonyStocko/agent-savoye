@@ -613,6 +613,33 @@ def test_rules_read_from_the_standard_too(init_workspace, main_module):
     assert "+    Given INIT- Initialisation globale des règles\n" not in diff
 
 
+def test_std_files_step_must_not_keep_the_fixed_library_wait():
+    fixed = STD_FILES_JAVA.replace("fileIntegration.integrateStandard(", "GS1EndPoints.sendPack(pack, true); f(")
+    assert any("attente fixe" in e for e in si.check_std_files_java(fixed))
+    unfollowed = STD_FILES_JAVA.replace("fileIntegration.integrateStandard(", "GS1EndPoints.sendPack(pack, false); f(")
+    assert any("non suivie" in e for e in si.check_std_files_java(unfollowed))
+    followed = unfollowed.replace("f(", "while (!suivi.getFinish()) { Thread.sleep(500); } f(", 1)
+    assert si.check_std_files_java(followed) == []
+
+
+def test_timeout_on_std_files_step_rewrites_it_never_copies(init_workspace, main_module):
+    """42/47 fichiers intégrés à 360 s : step réécrit avec une attente suivie, pas de repli sur la copie."""
+    w = init_workspace
+    timeout = ("org.awaitility.core.ConditionTimeoutException: cucumber.endPoints.EndPointsNotification expected <true> "
+               "but was <false> within 360 seconds.")
+    outcome = {"run": {"ok": False, "message": "environnement non initialisé", "build": "b",
+                       "echecs": [{"fichier": FEATURE, "step": 'INIT- Initialisation globale par fichiers du Standard "WMS"',
+                                   "message": timeout}]}}
+    helpers = {"clear": lambda: CLIENT_CLEAR, "compile": lambda wt: {"ok": True, "erreurs": []}, "push": _push,
+               "std_files": STD_FILES_STEP, "run": lambda profile, worktree: outcome["run"]}
+    call = lambda action: main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", action,  # noqa: E731
+                                                      helpers)
+    assert call("appliquer") == 0 and call("lancer") == 1
+    record = _init_record()
+    assert "attente suivie" in record["resultat"] and "fichiers_copies" not in record["detail"]
+    assert record["detail"]["echec_fichiers_standard"].startswith("org.awaitility")
+
+
 def test_init_stops_without_proven_clear(init_workspace, main_module):
     w = init_workspace
     code = main_module.run_simple_init(CLIENT, w["root"], w["std"], None, "26.22", "verifier",

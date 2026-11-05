@@ -7,6 +7,12 @@ L'init du client (worktree '${worktree}') est celle du Standard, avec un seul é
 === CE QUE TU ÉCRIS ===
 UNE classe '${java_path}' (package ${package}), qui définit le step « ${expression} » : paramètre = code du module (WMS, TMS, OMS). Il fait EXACTEMENT ce que fait « ${std_step} » (mêmes appels, même ordre, mêmes attentes, même contrôle du résultat de chaque fichier), mais sur le dossier de données du Standard pour ce module (`cucumber/files/<MOD>/01-Contexte/`).
 
+=== ATTENTE DE L'INTÉGRATION (constat sur Jenkins) ===
+`GS1EndPoints.sendPack(fichiers, true)` attend la fin de l'intégration 360 s au plus (délai FIXE de la bibliothèque) : sur Jenkins, 42 fichiers sur 47 étaient intégrés quand il a abandonné (ConditionTimeoutException, sans état). N'utilise donc PAS l'attente de la bibliothèque : envoie le pack SANS attente (`sendPack(fichiers, false)`), puis suis l'intégration toi-même comme le fait ce step du projet déjà éprouvé (KisWebSocket : getNbIntegration, getFinish, getException, getMessageException ; journal de l'avancement « n/total fichier(s) intégré(s) »), avec un délai de ${delai} s (constante de la classe, surchargeable par la propriété système « cucumber.init.delai »), échec IMMÉDIAT sur une erreur notifiée et échec explicite au délai avec l'état lu :
+```java
+${exemple_attente}
+```
+
 === ET LES RÈGLES ===
 La même classe définit un second step, « ${rules_expression} » : il fait EXACTEMENT ce que fait « ${std_rules_step} » (QARuleStep : lecture de TOUTES les règles .json du dossier, même traitement), mais sur le dossier de règles du Standard pour ce module (`cucumber/rules/<MOD>/01-Contexte/`), au lieu de `rules/<dossier de la feature>/` (constat sur Jenkins : NullPointerException dans QARuleStep, le dossier `rules/<client>/01-Contexte/<MOD>/` n'existant pas). Même résolution que pour les fichiers ci-dessous (disque, sinon classpath extrait sous `target/`, dossier distinct de celui des fichiers).
 
