@@ -397,14 +397,24 @@ def missing_db_proof(result: dict) -> list:
 _DATA_FILE = re.compile(r"/files/.+\.(xml|csv|json|txt|xlsx?|xlsm)$", re.I)
 
 
-def missing_reference_proof(result: dict) -> list:
+_DATA_REF = re.compile(r"[\w.\-]+\.(?:xml|csv|json|xlsx?|xlsm)\b", re.I)
+
+
+def referenced_data_files(texts: list) -> list:
+    """Fichiers de données cités par des features (tables « fileName », arguments) : noms de fichiers."""
+    return list(dict.fromkeys(m for text in texts or [] for m in _DATA_REF.findall(text or "")))
+
+
+def missing_reference_proof(result: dict, referenced: list = None) -> list:
     """
-    Résultat qui livre des fichiers de données de test (XML, CSV…) sans requête en base citée : ces fichiers, dont les
-    codes de référence (site, donneur d'ordres, statut administratif…) doivent exister dans l'environnement ; [] sinon.
+    Résultat qui livre ou utilise des fichiers de données de test (XML, CSV… écrits par l'agent, ou cités par ses
+    features et copiés du Standard) sans requête en base citée : ces fichiers, dont les codes de référence (site,
+    donneur d'ordres, statut administratif…) doivent exister dans l'environnement ; [] sinon.
     """
     if (result or {}).get("statut") not in ("couvert", "partiel"):
         return []
     files = [f for f in result.get("fichiers") or [] if _DATA_FILE.search(str(f).replace("\\", "/"))]
+    files += [f for f in referenced or [] if f not in files]
     if not files:
         return []
     proved = any(isinstance(s, dict) and s.get("source") == "base"

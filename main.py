@@ -489,6 +489,10 @@ DB_BLOCK_WORDING = {
         "db_max_commands": "8",
     },
     "generate-cucumber-client": {
+        "db_error_rule": "DB_ERROR=… dû à TA requête (colonne ou table inexistante, jointure fausse) : lis la "
+                         "structure réelle (describe NOM_TABLE) puis corrige la requête, sans deviner les colonnes "
+                         "(« id » n'est pas toujours la clé). N'abandonne la base que si la connexion elle-même échoue, "
+                         "et signale-le en une ligne.",
         "db_usage": "le paramétrage qui active ou conditionne les spécifiques du lot, ainsi que les valeurs de "
                     "référence utiles aux jeux de données des scénarios (articles, emplacements, statuts, codes "
                     "existants). Une donnée de référence introuvable ou un échec « donnée de référence absente » se "
@@ -545,8 +549,14 @@ def _build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: s
         schema_hint = f"Sous SQL Server, préfixe les tables par le schéma ({db_schema}.NOM_TABLE)."
     else:
         schema_hint = f"Les noms de tables non qualifiés sont résolus dans le schéma {db_schema}."
+    wording = dict(DB_BLOCK_WORDING.get(step, DB_BLOCK_WORDING["default"]))
+    wording.setdefault("db_error_rule", "Si une commande renvoie DB_ERROR=…, n'insiste pas : poursuis sans la base "
+                                        "et signale-le en une ligne.")
+    if step == "generate-cucumber-client":
+        # Les lots prouvent l'existence des données et choisissent les codes des jeux de données en base
+        wording["db_max_commands"] = str(_env_int("CUCUMBER_DB_MAX_COMMANDS", 15))
     return "\n" + render_prompt("db_access", db_type=db_type, db_schema=db_schema, base_cmd=base_cmd,
-                                schema_hint=schema_hint, **DB_BLOCK_WORDING.get(step, DB_BLOCK_WORDING["default"]))
+                                schema_hint=schema_hint, **wording)
 
 
 def run_assistant(question: str, answer_file: str) -> int:
@@ -5700,7 +5710,13 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
         return results
     pending = {r["id"]: cucumber_testability.missing_db_proof(r) for r in results or []}
     pending = {k: v for k, v in pending.items() if v}
-    references = {r["id"]: cucumber_testability.missing_reference_proof(r) for r in results or []}
+    worktree = fixed_values.get("worktree") or ""
+
+    def cited(result: dict) -> list:
+        texts = [_read_text(os.path.join(worktree, *str(f).split("/")))
+                 for f in result.get("fichiers") or [] if str(f).endswith(".feature") and worktree]
+        return cucumber_testability.referenced_data_files(texts)
+    references = {r["id"]: cucumber_testability.missing_reference_proof(r, cited(r)) for r in results or []}
     references = {k: v for k, v in references.items() if v and k not in pending}
     if not (pending or references):
         return results
@@ -5715,7 +5731,10 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
                       + ") sans requête en base citée : vérifie en base CHAQUE code de référence qu'ils contiennent "
                         "(site, donneur d'ordres, statut administratif, partenaire, article, emplacement…), remplace "
                         "tout code absent par un code existant et cohérent pris dans la base (inspire-toi des "
-                        "enregistrements présents), et cite les requêtes (source « base »).\n") if references else ""
+                        "enregistrements présents), et cite les requêtes (source « base »). Un fichier repris du "
+                        "Standard (cité par ta feature, copié tel quel sinon) : écris-en TA version sous le dossier "
+                        "de données du client, avec des codes vérifiés en base, au lieu de garder ses codes "
+                        "(site VDA, donneur d'ordres SO-1… n'existent pas forcément chez le client).\n") if references else ""
     covered_text = ("Pour " + ", ".join(pending) + ", tu as conclu « non_couvert » en invoquant une donnée absente "
                     "ou « non vérifiable » (" + " ; ".join(f"{k} : {', '.join(v)}" for k, v in pending.items())
                     + ") sans requête en base : ce n'est pas accepté.\n") if pending else ""

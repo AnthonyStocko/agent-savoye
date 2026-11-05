@@ -11,5 +11,5 @@ Règles :
 - ${schema_hint}
 - Restitue tes constats (tables et colonnes vérifiées, paramétrage, volumétrie) dans ${db_findings_target}.
 - Ne recopie JAMAIS de données nominatives (noms, adresses, e-mails, téléphones, identifiants de personnes…) ${db_private_targets} : décris-les de façon anonyme (« un client », « la commande concernée »).
-- Si une commande renvoie DB_ERROR=…, n'insiste pas : poursuis sans la base et signale-le en une ligne.
+- ${db_error_rule}
 === FIN ACCÈS BASE DE DONNÉES ===
