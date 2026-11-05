@@ -365,6 +365,35 @@ def cited_sources(searches) -> set:
             and (s.get("cherche") or "").strip()}
 
 
+_DATA_ABSENCE = re.compile(r"document|énumération|enumeration|besoin|param[ée]trage|donn[ée]e|champ personnalis|"
+                          r"r[ée]f[ée]rentiel|valeur|n'existe pas|absent|introuvable|non v[ée]rifiable|pas livr|non livr",
+                          re.I)
+
+
+def missing_db_proof(result: dict) -> list:
+    """
+    Résultat « non_couvert » qui invoque une donnée absente ou non vérifiable sans requête en base citée (source
+    « base » avec un SELECT) : données en cause (codes cités, à défaut le motif) ; [] si rien à prouver.
+    """
+    if (result or {}).get("statut") != "non_couvert":
+        return []
+    sans_objet = result.get("sans_objet") or {}
+    if isinstance(sans_objet, dict) and (sans_objet.get("preuve") or "").strip():
+        return []
+    blocker = result.get("blocage") or {}
+    text = " ".join([result.get("raison") or "", result.get("resume") or "",
+                     (blocker.get("preuve") or "") if isinstance(blocker, dict) else str(blocker)])
+    kind = blocker.get("type", "") if isinstance(blocker, dict) else ""
+    if kind != "donnee_impossible" and not _DATA_ABSENCE.search(text):
+        return []
+    proved = any(isinstance(s, dict) and s.get("source") == "base"
+                 and re.search(r"\bselect\b", f"{s.get('cherche', '')} {s.get('trouve', '')}", re.I)
+                 for s in result.get("recherches") or [])
+    if proved:
+        return []
+    return list(dict.fromkeys(CODE.findall(text)))[:8] or [text.strip()[:160] or "donnée en cause"]
+
+
 def found_values(text: str, index: dict) -> dict:
     """Valeurs de type code citées dans `text` et présentes dans l'index : {valeur: [emplacements]}."""
     return {v: index[v] for v in dict.fromkeys(CODE.findall(text or "")) if v in index}
