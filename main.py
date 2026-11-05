@@ -5081,7 +5081,10 @@ def simple_init_std_files_step(client: str, worktree: str, cucumber_std_dir: str
               "expression": cucumber_simple_init.STD_FILES_EXPRESSION,
               "std_rules_step": cucumber_simple_init.RULES_STEP,
               "rules_expression": cucumber_simple_init.STD_RULES_EXPRESSION,
-              "echec_precedent": previous_failure or "aucun"}
+              "echec_precedent": previous_failure or "aucun",
+              "delai": str(cucumber_wait_steps.delay(360)),
+              "exemple_attente": cucumber_wait_steps.java(client)[
+                  cucumber_wait_steps.java(client).index("    @Given"):].rstrip().rstrip("}").rstrip()}
     label = "Step des fichiers du Standard"
     errors = write_init_steps(client, worktree, "cucumber_init_fichiers_standard", values,
                               lambda: cucumber_simple_init.check_std_files_java(_read_text(path)
@@ -5495,6 +5498,19 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         message = failure.get("message") or ""
         detail["erreur"] = (f"{label} — {failure.get('fichier', '')} — {failure.get('step', '')} — {message}"[:600]
                             if failure else f"{label} — {message_run}")
+        if (failure.get("step") or "").startswith(cucumber_simple_init.STD_FILES_STEP) and \
+                cucumber_wait_steps.is_library_timeout(message):
+            # Délai fixe de la bibliothèque dépassé (les fichiers sont bien lus) : step réécrit avec une attente suivie
+            cache = os.path.join(cucumber_tools.cache_dir(client), "fichiers_standard_step.json")
+            if os.path.exists(cache):
+                os.remove(cache)
+            simple_record(client, "init", "a_faire", f"Init en échec : l'intégration des fichiers du Standard a dépassé "
+                                                     f"l'attente fixe de la bibliothèque ({message[:160]}). Le step va être "
+                                                     f"réécrit avec une attente suivie (délai "
+                                                     f"{cucumber_wait_steps.delay(360)} s, échec immédiat sur erreur). "
+                                                     f"Revérifiez.",
+                          {**detail, "echec_fichiers_standard": message[:500], "plan": {"action": "verifier"}})
+            return 1
         if (failure.get("step") or "").startswith(cucumber_simple_init.STD_FILES_STEP):
             # Fichiers du Standard illisibles à l'exécution : copie des fichiers proposée à la place
             modules = sorted({m for rel, text in plan["present"].items() if cucumber_simple_init.uses_standard_files(text)

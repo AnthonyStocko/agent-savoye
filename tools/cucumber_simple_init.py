@@ -36,7 +36,7 @@ RULES_STEP = "INIT- Initialisation globale des règles"
 STD_RULES_STEP = "INIT- Initialisation globale des règles du Standard"
 STD_RULES_EXPRESSION = STD_RULES_STEP + " {string}"
 # Version de la consigne d'écriture du step (un step écrit avec une consigne plus ancienne est réécrit)
-STD_FILES_PROMPT_VERSION = "4-fichiers-et-regles"
+STD_FILES_PROMPT_VERSION = "5-attente-suivie"
 
 _BUNDLE = re.compile(r"^[ \t]*(runtime|import)[ \t]*:[ \t]*[\w.-]+/([\w.-]+)@", re.M)
 _DELETE = re.compile(r'@DELETE\(\s*"/?clear/([A-Za-z0-9_-]+/[A-Za-z0-9_-]+)"\s*\)')
@@ -381,6 +381,11 @@ def check_std_files_java(text: str) -> list:
         errors.append("le step écrit des fichiers ailleurs que dans un dossier temporaire sous target/ : interdit")
     if re.search(r"(Files\.(copy|write|move)|FileOutputStream)[^;]*src/test/resources", text):
         errors.append("le step écrit dans src/test/resources : interdit")
+    if re.search(r"sendPack\([^;]*,\s*true\s*\)", text):
+        errors.append("l'envoi du pack garde l'attente fixe de la bibliothèque (sendPack(…, true), 360 s dépassées sur "
+                      "Jenkins) : envoie sans attente et suis l'intégration avec un délai paramétrable")
+    elif "sendPack" in text and not re.search(r"getFinish|getNbIntegration", text):
+        errors.append("intégration non suivie après l'envoi du pack (fichiers intégrés, fin, erreur notifiée)")
     if not re.search(r"getResource|getResources|getResourceAsStream|ClassLoader", text):
         errors.append("le step ne lit pas les fichiers dans le classpath (bibliothèque test-jar) : sur Jenkins, le "
                       "dossier du Standard n'existe pas sur le disque")
