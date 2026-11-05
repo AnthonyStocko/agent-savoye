@@ -1069,11 +1069,22 @@ def fetch_age_minutes(repo_dir: str):
 
 
 def std_fetch_max_age() -> float:
-    """Âge maximal (minutes) d'un fetch du Standard réutilisé sans nouveau fetch : STD_FETCH_MAX_AGE_MINUTES (60)."""
+    """
+    Âge maximal (minutes) d'un fetch du Standard réutilisé sans nouveau fetch : STD_FETCH_MAX_AGE_MINUTES (1440, un
+    jour : le code du Standard lu par l'analyse n'a pas besoin d'être à la minute ; 0 = toujours récupérer).
+    """
     try:
-        return max(0.0, float(os.getenv("STD_FETCH_MAX_AGE_MINUTES", "60")))
+        return max(0.0, float(os.getenv("STD_FETCH_MAX_AGE_MINUTES", "1440")))
     except ValueError:
-        return 60.0
+        return 1440.0
+
+
+def fetch_workers() -> int:
+    """Récupérations Git menées en parallèle (GIT_FETCH_WORKERS, 8)."""
+    try:
+        return max(1, int(os.getenv("GIT_FETCH_WORKERS", "8")))
+    except ValueError:
+        return 8
 
 
 def ensure_local_repo(repo_input: str, repo_label: str, only: list = None) -> str:
@@ -1149,34 +1160,44 @@ def ensure_local_repo(repo_input: str, repo_label: str, only: list = None) -> st
             print(f"[GIT REPO] {len(set(only) & set(repos_to_clone))} dépôt(s) sur {len(repos_to_clone)} utiles au client "
                   f"(modules déployés et dépôts transverses) : les autres ne sont ni clonés ni récupérés.")
             repos_to_clone = [r for r in repos_to_clone if r in set(only)]
-        for idx, repo_name in enumerate(repos_to_clone, 1):
+        def sync_one(idx: int, repo_name: str) -> str:
+            """Fetch ou clonage d'un dépôt ; renvoie les lignes de journal (affichées dans l'ordre)."""
             repo_dir = os.path.join(target_dir, repo_name)
             clone_url = f"{bitbucket_url}/scm/{project_key}/{repo_name}.git"
-
             if os.path.exists(os.path.join(repo_dir, ".git")):
-                age = fetch_age_minutes(repo_dir)
-                if repo_label == "std" and age is not None and age < std_fetch_max_age():
-                    # Standard récupéré récemment : pas de nouveau fetch (STD_FETCH_MAX_AGE_MINUTES, 0 = toujours)
-                    skipped.append(repo_name)
-                    continue
-                print(f"[{idx}/{len(repos_to_clone)}] 🔄 Mettre à jour {repo_name} dans {repo_dir}...")
                 ok, message = update_clone(repo_dir, repo_name, git_cmd_extra, git_env)
-                print(f"     {'✅' if ok else '⚠️'} {message}")
+                lines = (f"[{idx}/{len(repos_to_clone)}] 🔄 Mettre à jour {repo_name} dans {repo_dir}...\n"
+                         f"     {'✅' if ok else '⚠️'} {message}")
             else:
-                print(f"[{idx}/{len(repos_to_clone)}] 📥 Clonage de {repo_name} depuis {clone_url}...")
                 cmd = ["git"] + git_cmd_extra + ["clone", clone_url, repo_dir]
                 res_clone = subprocess.run(cmd, capture_output=True, text=True, env=git_env)
-                if res_clone.returncode == 0:
-                    print(f"     ✅ {repo_name} cloné avec succès.")
-                else:
-                    print(f"     ❌ Échec clonage {repo_name} : {res_clone.stderr.strip()}")
+                lines = (f"[{idx}/{len(repos_to_clone)}] 📥 Clonage de {repo_name} depuis {clone_url}...\n     "
+                         + (f"✅ {repo_name} cloné avec succès." if res_clone.returncode == 0 else
+                            f"❌ Échec clonage {repo_name} : {res_clone.stderr.strip()}"))
             if repo_label == "std" or "cucumber" not in repo_name.lower():
                 # Copie de lecture (code client, Standard, Studio) : aucune adresse d'envoi
                 cucumber_delivery.disable_push(repo_dir)
+            return lines
+
+        todo = []
+        for idx, repo_name in enumerate(repos_to_clone, 1):
+            repo_dir = os.path.join(target_dir, repo_name)
+            age = fetch_age_minutes(repo_dir) if os.path.exists(os.path.join(repo_dir, ".git")) else None
+            if repo_label == "std" and age is not None and age < std_fetch_max_age():
+                # Standard récupéré récemment : pas de nouveau fetch (STD_FETCH_MAX_AGE_MINUTES, 0 = toujours)
+                skipped.append(repo_name)
+                continue
+            todo.append((idx, repo_name))
+        # Récupérations en parallèle (réseau) ; journal dans l'ordre des dépôts
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(fetch_workers(), max(1, len(todo)))) as pool:
+            for lines in pool.map(lambda item: sync_one(*item), todo):
+                print(lines)
 
         if skipped:
-            print(f"[GIT REPO] {len(skipped)} dépôt(s) du Standard récupéré(s) il y a moins de {std_fetch_max_age():g} "
-                  f"min : fetch sauté (STD_FETCH_MAX_AGE_MINUTES=0 pour toujours récupérer).")
+            print(f"[GIT REPO] {len(skipped)} dépôt(s) du Standard récupéré(s) il y a moins de "
+                  f"{std_fetch_max_age() / 60:g} h : fetch sauté (STD_FETCH_MAX_AGE_MINUTES, 0 pour toujours "
+                  f"récupérer).")
         print(f"\n[GIT COMPLETE] Traitement terminé pour le projet {project_key}.\n")
         return target_dir
 
