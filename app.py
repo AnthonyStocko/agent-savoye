@@ -4546,8 +4546,18 @@ with tab_config:
             fix_turns = st.number_input(
                 "CUCUMBER_FIX_MAX_TURNS", min_value=3, step=1, value=env_int("CUCUMBER_FIX_MAX_TURNS", 10),
                 help="Nombre maximal de tours de l'agent par appel de correction (--max-turns).")
+        with st.container(horizontal=True):
+            fix_max = st.number_input(
+                "CUCUMBER_FIX_MAX_ATTEMPTS", min_value=0, step=1, value=env_int("CUCUMBER_FIX_MAX_ATTEMPTS", 6),
+                help="Corrections au plus par lot, au total : au-delà des CUCUMBER_FIX_ATTEMPTS premières, avec le "
+                     "modèle du lot, tant que les erreurs évoluent (arrêt si les mêmes erreurs reviennent).")
+            fix_lot_turns = st.number_input(
+                "CUCUMBER_FIX_LOT_MAX_TURNS", min_value=3, step=1, value=env_int("CUCUMBER_FIX_LOT_MAX_TURNS", 25),
+                help="Tours de l'agent par correction faite avec le modèle du lot.")
         env_values["CUCUMBER_FIX_ATTEMPTS"] = str(int(fix_attempts))
         env_values["CUCUMBER_FIX_MAX_TURNS"] = str(int(fix_turns))
+        env_values["CUCUMBER_FIX_MAX_ATTEMPTS"] = str(int(fix_max))
+        env_values["CUCUMBER_FIX_LOT_MAX_TURNS"] = str(int(fix_lot_turns))
         dry_run = st.checkbox(
             "CUCUMBER_DRY_RUN", value=os.getenv("CUCUMBER_DRY_RUN", "1").strip() != "0",
             help="Après une compilation réussie, dry-run Cucumber des features du lot : vérifie que chaque step a "

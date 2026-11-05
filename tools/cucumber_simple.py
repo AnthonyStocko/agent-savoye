@@ -279,7 +279,9 @@ def feature_result(state: dict, spec_id: str, label: str = "") -> dict:
     result = next((r for r in lot.get("resultats") or [] if r.get("id") == spec_id), {})
     status = result.get("statut") or lot.get("statut") or ""
     if lot.get("statut") == "erreur_compilation":
-        return {**out, "resultat": "Tests écrits, mais la compilation échoue : rien n'a été vérifié."}
+        error = (lot.get("erreur") or "").strip()
+        return {**out, "resultat": ("Tests écrits, mais la compilation échoue après toutes les corrections : rien n'a "
+                                    "été vérifié." + (f" Erreur : {error}" if error else ""))[:400]}
     if status != "couvert":
         why = result.get("resume") or result.get("raison") or "aucun scénario écrit"
         return {**out, "resultat": f"Non couverte : {why}"[:400]}

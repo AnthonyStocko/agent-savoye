@@ -2626,23 +2626,35 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
     des corrections (lot["base"]).
     """
     plan = cucumber_fix_plan(model, _env_int("CUCUMBER_FIX_ATTEMPTS", 2))
-    attempts, violations = len(plan), []
+    # Jusqu'au bout : tant que les erreurs évoluent, d'autres corrections avec le modèle du lot (plus de tours), au
+    # plus CUCUMBER_FIX_MAX_ATTEMPTS au total ; arrêt quand les mêmes erreurs reviennent (aucun progrès)
+    limit = max(len(plan), _env_int("CUCUMBER_FIX_MAX_ATTEMPTS", 6))
+    if plan:
+        plan += [(model, claude_effort("CLAUDE_EFFORT_CUCUMBER"))] * (limit - len(plan))
+    attempts, violations, seen = len(plan), [], []
     fix_turns = str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))
+    lot_turns = str(max(_env_int("CUCUMBER_FIX_MAX_TURNS", 10), _env_int("CUCUMBER_FIX_LOT_MAX_TURNS", 25)))
     for attempt in range(attempts + 1):
         check = check_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
                                    inspired, context)
         if check["ok"] or check["environnement"] or attempt == attempts:
             return check
+        errors = frozenset(check["erreurs"])
+        if seen.count(errors) >= 2:
+            print(f"[LOT {label}] ⚠️ Mêmes erreurs de {check['etape']} après deux corrections : arrêt des corrections.")
+            return check
+        seen.append(errors)
         fix_model, effort = plan[attempt]
         resumed = bool(lot and lot.get("session") and resume_lot_session())
-        print(f"[LOT {label}] Correction {attempt + 1}/{attempts} "
+        print(f"[LOT {label}] Correction {attempt + 1}/{attempts} ({len(check['erreurs'])} erreur(s)) "
               + ("(reprise de la session du lot)..." if resumed else f"({fix_model}, effort {effort or 'défaut'})..."))
         prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", " ".join(check["erreurs"])), **values}, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         returncode, _, usage, limit_hit, fix_model, effort = cucumber_followup(
-            lot if resumed else None, prompt, fix_model, effort, lot_tools(values), fix_turns, run_dir,
+            lot if resumed else None, prompt, fix_model, effort, lot_tools(values),
+            lot_turns if fix_model == model else fix_turns, run_dir,
             db_log=db_log, db_step=f"correction ({check['etape']})")
         report_token_usage(work_key, "cucumber-fix", fix_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
