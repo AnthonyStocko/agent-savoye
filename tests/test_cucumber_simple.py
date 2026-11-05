@@ -88,7 +88,7 @@ def test_feature_list_by_module_without_excluded_modules():
              "b": [{"cle": "SPEC-987", "titre": "Étiquette d'expédition"}]}
     choices = cs.feature_choices(inventory, {}, links)
     assert [c["libelle"] for c in choices] == ["SPEC-987 — Étiquette d'expédition (shipping)",
-                                               "SPEC-1203 — Réception des commandes (reception)"]
+                                               "SPEC-1203 — Réception des commandes (reception ; aussi WMS-12)"]
 
 
 # ---------------------------------------------------------------------------

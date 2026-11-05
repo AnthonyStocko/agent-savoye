@@ -897,6 +897,28 @@ def _jql_field(field_id: str) -> str:
     return f"cf[{match.group(1)}]" if match else field_id
 
 
+def fetch_summaries(keys: list) -> dict:
+    """Titres de tickets Jira donnés par leur clé ({clé: titre}), par paquets de 50 ; {} en cas d'échec."""
+    keys = sorted({k for k in keys or [] if re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", k or "")})
+    if not keys:
+        return {}
+    try:
+        api, auth = _jira_connection()
+    except Exception:  # noqa: BLE001 - Jira non configuré : aucun titre
+        return {}
+    out = {}
+    for start in range(0, len(keys), 50):
+        body = {"jql": f"key in ({', '.join(keys[start:start + 50])})", "maxResults": 50, "fields": ["summary"]}
+        try:
+            response = requests.post(f"{api}/search/jql", auth=auth, json=body, timeout=60)
+        except requests.RequestException:
+            continue
+        if response.status_code != 200:
+            continue
+        out.update({i["key"]: (i.get("fields") or {}).get("summary", "") for i in response.json().get("issues", [])})
+    return out
+
+
 def fetch_application_tickets(field_id: str, values: list, exclude_key: str = "", max_tickets: int = 300) -> list:
     """
     Tickets de tous les projets dont le champ `field_id` (ex. « Projet / Application ») contient l'une des

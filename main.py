@@ -5852,7 +5852,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         cucumber_testability.save_index(client, index)
         # Liens ticket ↔ tâche vérifiés (commit qui modifie ses fichiers, référence explicite) : titres métier
         links = cucumber_coverage.verify_ticket_links(client, inventory, local_client_repo,
-                                                      cucumber_tools.cached_tickets(client, max_age_s=10 ** 9) or [])
+                                                      cucumber_tools.cached_tickets(client, max_age_s=10 ** 9) or [],
+                                                      jira_tools.fetch_summaries)
         print(f"[CUCUMBER DÉTECTION] Tickets Jira liés de façon vérifiée : {sum(map(len, links.values()))} "
               f"lien(s) sur {len(links)} tâche(s)")
         # Tous les tests du dépôt client (écrits ou non par l'agent), lus sur la branche du job, et leurs rattachements
