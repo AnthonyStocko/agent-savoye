@@ -394,6 +394,25 @@ def missing_db_proof(result: dict) -> list:
     return list(dict.fromkeys(CODE.findall(text)))[:8] or [text.strip()[:160] or "donnée en cause"]
 
 
+_DATA_FILE = re.compile(r"/files/.+\.(xml|csv|json|txt|xlsx?|xlsm)$", re.I)
+
+
+def missing_reference_proof(result: dict) -> list:
+    """
+    Résultat qui livre des fichiers de données de test (XML, CSV…) sans requête en base citée : ces fichiers, dont les
+    codes de référence (site, donneur d'ordres, statut administratif…) doivent exister dans l'environnement ; [] sinon.
+    """
+    if (result or {}).get("statut") not in ("couvert", "partiel"):
+        return []
+    files = [f for f in result.get("fichiers") or [] if _DATA_FILE.search(str(f).replace("\\", "/"))]
+    if not files:
+        return []
+    proved = any(isinstance(s, dict) and s.get("source") == "base"
+                 and re.search(r"\bselect\b", f"{s.get('cherche', '')} {s.get('trouve', '')}", re.I)
+                 for s in result.get("recherches") or [])
+    return [] if proved else [str(f).rsplit("/", 1)[-1] for f in files][:8]
+
+
 def found_values(text: str, index: dict) -> dict:
     """Valeurs de type code citées dans `text` et présentes dans l'index : {valeur: [emplacements]}."""
     return {v: index[v] for v in dict.fromkeys(CODE.findall(text or "")) if v in index}

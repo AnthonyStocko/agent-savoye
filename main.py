@@ -5700,12 +5700,28 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
         return results
     pending = {r["id"]: cucumber_testability.missing_db_proof(r) for r in results or []}
     pending = {k: v for k, v in pending.items() if v}
-    if not pending:
+    references = {r["id"]: cucumber_testability.missing_reference_proof(r) for r in results or []}
+    references = {k: v for k, v in references.items() if v and k not in pending}
+    if not (pending or references):
         return results
-    print(f"[LOT {label}] 🔎 {len(pending)} tâche(s) jugée(s) non couverte(s) pour une donnée absente sans requête en "
-          f"base ({', '.join(pending)}) : vérification en base demandée à l'agent.")
-    extra = render_prompt("cucumber_preuve_base", ids=", ".join(pending),
-                          donnees=" ; ".join(f"{k} : {', '.join(v)}" for k, v in pending.items()))
+    if pending:
+        print(f"[LOT {label}] 🔎 {len(pending)} tâche(s) jugée(s) non couverte(s) pour une donnée absente sans requête "
+              f"en base ({', '.join(pending)}) : vérification en base demandée à l'agent.")
+    if references:
+        print(f"[LOT {label}] 🔎 Fichiers de données sans codes vérifiés en base ({', '.join(references)}) : codes de "
+              f"référence à reprendre de la base.")
+    reference_text = ("Pour " + ", ".join(references) + ", tu as livré des fichiers de données ("
+                      + " ; ".join(f"{k} : {', '.join(v)}" for k, v in references.items())
+                      + ") sans requête en base citée : vérifie en base CHAQUE code de référence qu'ils contiennent "
+                        "(site, donneur d'ordres, statut administratif, partenaire, article, emplacement…), remplace "
+                        "tout code absent par un code existant et cohérent pris dans la base (inspire-toi des "
+                        "enregistrements présents), et cite les requêtes (source « base »).\n") if references else ""
+    covered_text = ("Pour " + ", ".join(pending) + ", tu as conclu « non_couvert » en invoquant une donnée absente "
+                    "ou « non vérifiable » (" + " ; ".join(f"{k} : {', '.join(v)}" for k, v in pending.items())
+                    + ") sans requête en base : ce n'est pas accepté.\n") if pending else ""
+    extra = render_prompt("cucumber_preuve_base", ids=", ".join([*pending, *references]),
+                          references=reference_text, non_couverts=covered_text)
+    pending = {**pending, **references}
     returncode, output, usage, limit_hit = run_cucumber_claude(prompt + extra, model, lot_tools(fixed_values),
                                                                max_turns, run_dir, effort, system_file,
                                                                lot.setdefault("base", []), "preuve en base")
@@ -5732,6 +5748,8 @@ Jenkins les joue contient déjà les données du client (sa configuration a ét�
   pas, et ne conclus jamais « donnee_impossible », « non livré » ni « non déployé » pour lui.
 - Cite la requête et son résultat dans « recherches », source « base » (en plus des 6 sources ci-dessous).
 - Ne crée dans le Background que ce qui manque réellement en base.
+- Fichiers de données des tests : aucune init ne crée les codes du « PROFIL CLIENT » ; prends TOUS les codes de
+  référence (site, donneur d'ordres, statut administratif…) dans la base, comme indiqué plus bas.
 
 """
 
