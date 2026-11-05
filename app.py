@@ -2146,9 +2146,11 @@ def render_simple_tests(ctx: dict, step: dict) -> None:
         lines = []
         for index, spec_id in enumerate(chosen):
             st.caption(f"{index + 1}/{len(chosen)} — {labels[spec_id]}")
+            no_init = [] if cucumber_simple.init_enabled(
+                cucumber_tools.load_state(ctx["client"]).get("simple") or {}) else ["--no-init"]
             before = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
             code = run_main_step(ctx["cmd"] + ["--cucumber-base-branch", branch, "--specifics", spec_id]
-                                 + (["--complete"] if index else []))
+                                 + (["--complete"] if index else []) + no_init)
             after = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
             if code != 0 and (code in (2, 3) or after == before):
                 # Arrêt avant le résultat (environnement, interruption, erreur) : jamais celui d'un run précédent
@@ -2195,6 +2197,18 @@ def render_simple_cucumber() -> None:
     client = ctx["client"]
     deduction = (client_version.saved(client).get("deduction") or {}) if client else {}
     records = (cucumber_tools.load_state(client).get("simple") or {}) if client else {}
+    if client:
+        # Projet neuf : init nécessaire ; données du client déjà présentes (recopiées) : init facultative
+        wanted = st.checkbox("Initialisation de l'environnement (projet neuf, sans données client)",
+                             value=cucumber_simple.init_enabled(records), key=f"cs_init_option_{client}",
+                             help="Décochée : les données du client sont déjà dans l'environnement (ex. configuration "
+                                  "recopiée à l'étape 3) ; l'étape 4 devient facultative et l'étape 5 génère et "
+                                  "vérifie les tests sans lancer l'init.")
+        if wanted != cucumber_simple.init_enabled(records):
+            state = cucumber_tools.load_state(client)
+            state.setdefault("simple", {}).setdefault("options", {})["init"] = wanted
+            cucumber_tools.save_state(client, state)
+            records = state["simple"]
     project = cucumber_simple.project_step(deduction, ctx["ready"], cucumber_simple.missing_prerequisites())
     for step in cucumber_simple.states(project, records):
         with st.container(border=True):

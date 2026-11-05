@@ -264,6 +264,18 @@ def test_results_of_another_version_are_not_shown_as_current():
     assert steps["depot"]["etat"] == "a_faire" and "v1.1" in steps["depot"]["resultat"]
 
 
+def test_init_option_unchecked_makes_step_four_optional():
+    """Données du client déjà présentes : l'étape 4 ne bloque plus l'étape 5."""
+    project = {"etat": "ok", "resultat": "Version client 1.3.1", "version": "1.3.1"}
+    records = {"depot": {"etat": "ok", "detail": {"branche": "v1.3"}}, "init": {"etat": "echec", "resultat": "x"}}
+    assert {s["cle"]: s for s in cs.states(project, records)}["tests"]["etat"] == "bloquee"
+    records["options"] = {"init": False}
+    steps = {s["cle"]: s for s in cs.states(project, records)}
+    assert steps["init"]["optionnelle"] and steps["init"]["resultat"].startswith("Facultative")
+    assert steps["tests"]["etat"] == "a_faire"
+    assert cs.init_enabled({}) and not cs.init_enabled(records)
+
+
 def test_lots_signature_detects_nothing_new():
     state = {"debut": "2026-11-05T10:00", "lots": [{"numero": 1, "ids": ["a"], "statut": "erreur_compilation"}]}
     before = cs.lots_signature(state, "a,b")
