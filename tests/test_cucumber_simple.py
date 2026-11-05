@@ -328,3 +328,25 @@ def test_non_covered_for_missing_data_requires_a_database_query(monkeypatch):
     assert [r["statut"] for r in out] == ["couvert", "couvert"] and len(calls) == 1
     assert calls[0].startswith("PROMPT DU LOT") and "PREUVE EN BASE OBLIGATOIRE" in calls[0] and "APPAIRAGE_BL" in calls[0]
     assert main.require_db_proof([unproved], "P", {"db_block": ""}, "m", "40", "/tmp", "", "", {}, "1", "K") == [unproved]
+
+
+def test_data_files_without_database_checked_codes_are_sent_back(monkeypatch):
+    from tools import cucumber_testability as ctst
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        main = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    written = {"id": "sp-9", "statut": "couvert", "recherches": [], "constats": [],
+               "fichiers": ["src/test/resources/cucumber/files/canson/WMS/APPAIRAGE/01-Order.xml",
+                            "src/test/resources/cucumber/features/canson/WMS/a.feature"]}
+    assert ctst.missing_reference_proof(written) == ["01-Order.xml"]
+    calls = []
+    monkeypatch.setattr(main, "run_cucumber_claude", lambda prompt, *a, **k: calls.append(prompt) or (0, "x", {}, False))
+    monkeypatch.setattr(main, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main.cucumber_tools, "parse_lot_result", lambda text: [{**written, "recherches": [
+        {"source": "base", "cherche": "ref_site : SELECT code FROM ref_site", "trouve": "VDA"}]}])
+    out = main.require_db_proof([written], "LOT", {"db_block": "accès"}, "m", "40", "/tmp", "", "", {}, "1", "K")
+    assert out[0]["recherches"][0]["source"] == "base" and len(calls) == 1
+    assert "fichiers de données" in calls[0] and "01-Order.xml" in calls[0] and "non_couvert » en invoquant" not in calls[0]
