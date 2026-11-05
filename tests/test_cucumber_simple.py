@@ -46,6 +46,27 @@ def test_steps_unlock_in_order_and_database_is_optional():
     assert cs.label(steps["depot"], CLIENT) == f"2. Dépôt {CLIENT}-cucumber — OK"
 
 
+def test_feature_list_one_line_per_ticket_without_upgrade_epics():
+    """Doublons : un ticket = une ligne (tâches regroupées) ; épopées de montée de version jamais affichées."""
+    inventory = {"specifiques": [
+        {"id": "a", "libelle": "app · reception-order", "dossier": "reception", "depot": "app"},
+        {"id": "b", "libelle": "app · reception-listener", "dossier": "reception", "depot": "app"},
+        {"id": "c", "libelle": "app · shipping-label", "dossier": "shipping", "depot": "app"}]}
+    upgrade = {"cle": "EPO-77", "titre": "Montée de version 26.22"}
+    links = {"a": [upgrade, {"cle": "SPEC-1203", "titre": "Réception des commandes"}],
+             "b": [upgrade, {"cle": "SPEC-1203", "titre": "Réception des commandes"}],
+             "c": [upgrade]}
+    choices = cs.feature_choices(inventory, {}, links)
+    assert [(c["id"], c["libelle"]) for c in choices] == [
+        ("a,b", "SPEC-1203 — Réception des commandes (reception, 2 tâches)"),
+        ("c", "shipping — Shipping, label (aucun ticket lié)")] or (
+        choices[0]["id"] == "a,b" and "EPO" not in " ".join(c["libelle"] for c in choices))
+    assert not any("EPO-" in c["libelle"] for c in choices)
+    state = {"lots": [{"ids": ["a"], "statut": "erreur_compilation", "resultats": []}]}
+    line = cs.group_result(state, "a,b", "SPEC-1203")
+    assert line["id"] == "a,b" and not line["vert"] and line["resultat"].startswith("0/2 tâche(s) verte(s)")
+
+
 def test_feature_list_probable_ticket_when_no_proof(tmp_path):
     extract = tmp_path / "jira_a.md"
     extract.write_text("# Tickets\n\n## OXY-5 — Bruit [Fermé]\n…\n\n## SPEC-1500 — Réception partielle [Livrée]\n…\n",

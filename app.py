@@ -2148,8 +2148,8 @@ def render_simple_tests(ctx: dict, step: dict) -> None:
             st.caption(f"{index + 1}/{len(chosen)} — {labels[spec_id]}")
             run_main_step(ctx["cmd"] + ["--cucumber-base-branch", branch, "--specifics", spec_id]
                           + (["--complete"] if index else []))
-            lines.append(cucumber_simple.feature_result(cucumber_tools.load_state(ctx["client"]), spec_id,
-                                                        labels[spec_id]))
+            lines.append(cucumber_simple.group_result(cucumber_tools.load_state(ctx["client"]), spec_id,
+                                                      labels[spec_id]))
         state = cucumber_tools.load_state(ctx["client"])
         previous = ((state.get("simple") or {}).get("tests") or {}).get("detail", {}).get("fonctionnalites") or []
         merged = cucumber_simple.merge_features(previous, lines)
