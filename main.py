@@ -554,7 +554,7 @@ def _build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: s
                                         "et signale-le en une ligne.")
     if step == "generate-cucumber-client":
         # Les lots prouvent l'existence des données et choisissent les codes des jeux de données en base
-        wording["db_max_commands"] = str(_env_int("CUCUMBER_DB_MAX_COMMANDS", 15))
+        wording["db_max_commands"] = str(_env_int("CUCUMBER_DB_MAX_COMMANDS", 40))
     return "\n" + render_prompt("db_access", db_type=db_type, db_schema=db_schema, base_cmd=base_cmd,
                                 schema_hint=schema_hint, **wording)
 
@@ -6281,6 +6281,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     # Initialisation du client vue par les lots : features d'init et codes de référence du profil
     client_init = cucumber_profile.init_view(profile)
     conventions = cucumber_profile.conventions(profile)
+    # Sans init : les codes des fichiers de données du Standard (site VDA…) n'existent pas dans l'environnement
+    conventions["sans_init"] = bool(no_init)
     # Compléments d'init corrigés par l'agent pendant cette génération : sortis des fichiers protégés (livrés)
     own_init = set((state.get("init_corrigee") or {}).get("fichiers") or [])
     if own_init:

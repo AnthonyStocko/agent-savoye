@@ -185,11 +185,27 @@ def std_source(cucumber_std_dir: str, index: dict, target: str, inspired: list =
     return "", candidates
 
 
+NO_INIT_HINT = ("sans initialisation (option « Initialisation » décochée), les codes du Standard (site VDA, donneur "
+                "d'ordres SO-1, articles, emplacements…) n'existent pas dans l'environnement : écris TA version de ce "
+                "fichier, à partir de {source}, avec des codes pris dans la base (classeur .xlsm/.xlsx : outil "
+                "xlsm_tool show / copy --replace)")
+
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return False
+
+
 def check_data_files(worktree: str, features: list, cucumber_std_dir: str, copy: bool = True,
-                     inspired: list = ()) -> dict:
+                     inspired: list = (), no_init: bool = False) -> dict:
     """
     Fichiers de données des `features` absents du worktree. Présents au Standard : copiés au chemin résolu (si
-    `copy`), sinon signalés « à copier depuis … ». Renvoie {"copies": [(cible, source)], "erreurs": [...]}.
+    `copy`), sinon signalés « à copier depuis … ». Sans init (`no_init`) : jamais copiés, et un fichier identique à
+    celui du Standard est une erreur (ses codes n'existent pas dans l'environnement). Renvoie {"copies": [(cible,
+    source)], "erreurs": [...]}.
     """
     present, index = repo_files(worktree), std_data_index(cucumber_std_dir)
     copies, errors, seen = [], [], set()
@@ -197,7 +213,16 @@ def check_data_files(worktree: str, features: list, cucumber_std_dir: str, copy:
         text = _read_text_file(os.path.join(worktree, *rel.split("/")))
         for ref in data_references(text):
             target = resolved_path(rel, ref)
-            if is_present(target, present) or target in seen:
+            if target in seen:
+                continue
+            if is_present(target, present):
+                if no_init and ref["nom"] != WHOLE_DIR and not ref["regle"]:
+                    seen.add(target)
+                    source, _ = std_source(cucumber_std_dir, index, target, inspired)
+                    if source and _same_file(os.path.join(worktree, *target.split("/")),
+                                             os.path.join(cucumber_std_dir, *source.split("/"))):
+                        errors.append(f"{rel}:{ref['ligne']} fichier de données « {ref['nom']} » identique à celui du "
+                                      f"Standard ({target}) : " + NO_INIT_HINT.format(source=source))
                 continue
             seen.add(target)
             if ref["nom"] == WHOLE_DIR:
@@ -206,6 +231,10 @@ def check_data_files(worktree: str, features: list, cucumber_std_dir: str, copy:
                               f"step par « INIT- Intégration des règles » avec la liste des fichiers")
                 continue
             source, candidates = std_source(cucumber_std_dir, index, target, inspired)
+            if source and no_init and not ref["regle"]:
+                errors.append(f"{rel}:{ref['ligne']} fichier de données « {ref['nom']} » absent : attendu en {target} ; "
+                              + NO_INIT_HINT.format(source=source))
+                continue
             if source and copy:
                 destination = os.path.join(worktree, *target.split("/"))
                 os.makedirs(os.path.dirname(destination), exist_ok=True)
@@ -476,7 +505,8 @@ def check_lot_files(worktree: str, base: str, files: list, client_name: str, cuc
     root = conventions.get("features_root") or client_features_root(worktree, base, client_name, cucumber_std_dir)
     misplaced = check_locations(features, root, client_name, new_features(worktree, base, features))
     placed = [f for f in features if not any(e.startswith(f + " :") for e in misplaced)]
-    data = check_data_files(worktree, placed, cucumber_std_dir, inspired=inspired)
+    data = check_data_files(worktree, placed, cucumber_std_dir, inspired=inspired,
+                            no_init=bool(conventions.get("sans_init")))
     tags = check_tags(worktree, features, conventions.get("client_tag") or client_tag(worktree, base, client_name))
     expressions = check_step_expressions(worktree, [f for f in files if f.endswith(".java")])
     return {"copies": data["copies"], "restaures": protected["restaures"],
@@ -621,6 +651,10 @@ def drop_case_duplicates(worktree: str) -> list:
 _NOT_FAST_FORWARD = re.compile(r"non-fast-forward|fetch first|rejected|fast-forwards|updates were rejected", re.I)
 
 
+# Commits écrits par l'agent (commit_lot, vérifications, init, intégrations précédentes)
+_AGENT_COMMIT = re.compile(r"Cucumber coverage of |Cucumber verification \(|Cucumber \S+ : init|Intégration de origin/")
+
+
 def integrate_remote(worktree: str, branch: str) -> str:
     """
     Intègre origin/`branch` dans HEAD par un merge (sans forcer ni réécrire). Renvoie '' si HEAD contient désormais la
@@ -629,8 +663,19 @@ def integrate_remote(worktree: str, branch: str) -> str:
     fetch = _git(worktree, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
     if fetch.returncode != 0:
         return "fetch impossible : " + " ".join((fetch.stderr.strip().splitlines() or ["?"])[-1].split())[:160]
+    remote = f"refs/remotes/origin/{branch}"
+    subjects = [line for line in _git(worktree, "log", "--format=%s", f"HEAD..{remote}").stdout.splitlines() if line]
+    if subjects and all(_AGENT_COMMIT.match(subject) for subject in subjects):
+        # La branche distante ne porte que des runs précédents de l'agent : l'espace de l'agent fait foi (nouvelle
+        # génération), merge « ours » — historique conservé, rien n'est forcé, anciens fichiers non réintroduits
+        merge = _git(worktree, "merge", "-s", "ours", "-m", f"Intégration de origin/{branch} : le run courant de "
+                     f"l'agent remplace ses runs précédents", remote)
+        if merge.returncode == 0:
+            print(f"[CUCUMBER] 🔀 {branch} ne portait que {len(subjects)} commit(s) de runs précédents de l'agent : "
+                  f"remplacés par le run courant (merge ours, sans force), push relancé.")
+            return ""
     merge = _git(worktree, "merge", "--no-edit", "-m", f"Intégration de origin/{branch} avant la vérification",
-                 f"refs/remotes/origin/{branch}")
+                 remote)
     if merge.returncode == 0:
         print(f"[CUCUMBER] 🔀 {branch} avait avancé sur origin : branche distante intégrée (merge), push relancé.")
         return ""
