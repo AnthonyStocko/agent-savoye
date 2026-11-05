@@ -210,3 +210,29 @@ def test_token_scope_flags_write_access_outside_cucumber_repos():
     assert scope["ok"] is False and scope["trop_larges"] == ["STD/wms-content-backend"]
     assert "trop large" in cd.token_scope_line(scope)
     assert cd.token_scope(lambda start: pages[1] | {"values": pages[0]["values"]})["ok"] is True
+
+
+def test_push_integrates_a_remote_branch_that_moved_ahead(setup, tmp_path):
+    worktree, origin = setup["worktree"], setup["origin"]
+    other = str(tmp_path / "autre")
+    git(str(tmp_path), "clone", "-q", "-b", "cucumber-agent", origin, other)
+    for key, value in (("user.name", "test"), ("user.email", "t@example.com")):
+        git(other, "config", key, value)
+    _change(other, "src/test/resources/cucumber/files/clientx/WMS/init.csv", "code\nB\n", "init poussée")
+    git(other, "push", "-q", "origin", "cucumber-agent")
+    _change(worktree, FEATURE, TEXT + "\n  Scenario: Troisième\n    Given z\n")
+    error, _ = cc.push_for_verification(worktree, "cucumber-agent", "x")
+    assert error == ""
+    assert _remote_head(origin, "cucumber-agent") == git(worktree, "rev-parse", "HEAD")
+    assert os.path.exists(os.path.join(worktree, "src", "test", "resources", "cucumber", "files", "clientx", "WMS",
+                                       "init.csv"))
+    # Conflit : merge annulé, rien n'est écrasé sur origin
+    git(other, "fetch", "-q", "origin")
+    git(other, "reset", "-q", "--hard", "origin/cucumber-agent")
+    _change(other, FEATURE, TEXT + "\n  Scenario: Manuel\n    Given m\n", "manuel")
+    git(other, "push", "-q", "origin", "cucumber-agent")
+    remote = _remote_head(origin, "cucumber-agent")
+    _change(worktree, FEATURE, TEXT + "\n  Scenario: Agent\n    Given a\n")
+    error, _ = cc.push_for_verification(worktree, "cucumber-agent", "x")
+    assert "conflit" in error and "a.feature" in error and _remote_head(origin, "cucumber-agent") == remote
+    assert git(worktree, "status", "--porcelain") == ""

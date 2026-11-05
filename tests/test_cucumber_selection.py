@@ -135,14 +135,15 @@ def test_push_for_verification_commits_and_pushes_without_force(tmp_path, repo):
     assert git(remote, "rev-parse", "verif") == git(repo, "rev-parse", "HEAD")
     # Rien de nouveau : pas de commit, la branche reste à jour
     assert cc.push_for_verification(repo, "verif", "lot 1 (vérification)") == ("", False)
-    # Branche distante divergente : jamais de push forcé, la vérification s'arrête
+    # Branche distante divergente en conflit : jamais de push forcé, merge annulé, la vérification s'arrête
     other = str(tmp_path / "autre")
     git(str(tmp_path), "clone", "-q", "-b", "verif", remote, other)
-    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "--allow-empty", "-m", "autre")
+    write(os.path.join(other, REL), FEATURE + "  Scenario: Autre\n    Given y\n")
+    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-am", "autre")
     git(other, "push", "-q", "origin", "verif")
     write(os.path.join(repo, REL), FEATURE)
     error, committed = cc.push_for_verification(repo, "verif", "lot 2 (vérification)")
-    assert committed and "push sur verif refusé" in error and "ancienne version" in error
+    assert committed and "push sur verif refusé" in error and "conflit" in error
 
 
 def test_verify_execution_lot_pushes_then_runs_on_the_branch(tmp_path, repo, main_module, monkeypatch):
@@ -159,16 +160,17 @@ def test_verify_execution_lot_pushes_then_runs_on_the_branch(tmp_path, repo, mai
     head = git(repo, "rev-parse", "HEAD")
     assert lot["commit"] and git(remote, "rev-parse", "verif") == head
     assert called[0][2] == head and called[0][8]["BRANCHE"] == "verif" and called[0][8]["CUCUMBER_SPEC_COMMIT"] == head
-    # Push refusé (branche distante divergente) : aucune exécution, scénarios non vérifiés
+    # Push refusé (branche distante divergente, en conflit) : aucune exécution, scénarios non vérifiés
     other = str(tmp_path / "autre")
     git(str(tmp_path), "clone", "-q", "-b", "verif", remote, other)
-    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "--allow-empty", "-m", "autre")
+    write(os.path.join(other, REL), FEATURE + "  Scenario: Autre\n    Given y\n")
+    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-am", "autre")
     git(other, "push", "-q", "origin", "verif")
     write(os.path.join(repo, REL), FEATURE)
     called.clear()
     main_module.verify_execution_lot(lot, [], "1/1", repo, "HEAD", [REL], [], "jenkins", "job", CLIENT, "", "", "",
                                      {}, "sonnet", "K", "/run", lambda u: None, context={"conventions": conventions})
-    assert not called and "ancienne version" in lot["execution"]["message"]
+    assert not called and "conflit" in lot["execution"]["message"]
     assert all(s["statut"] == "non_verifie" for s in lot["execution"]["scenarios"].values())
 
 
