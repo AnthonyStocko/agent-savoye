@@ -1024,7 +1024,42 @@ def update_clone(repo_dir: str, name: str, git_cmd_extra: list = (), git_env: di
     backup = f" ; {len(unpushed)} commit(s) local(aux) non poussé(s) sauvegardé(s) dans {saved}" if saved else ""
     if res.returncode != 0:
         return False, f"Erreur fetch sur {name} : {res.stderr.strip()[:300]}{backup}"
-    return True, f"{name} mis à jour (fetch){backup}."
+    synced = sync_working_copy(repo_dir)
+    return True, f"{name} mis à jour (fetch){backup}" + (f" ; {synced}" if synced else "") + "."
+
+
+def sync_working_copy(repo_dir: str, default_branch: str = "integration") -> str:
+    """
+    Fichiers de la copie de l'agent remis à jour quand c'est sans risque (Claude lit le code dans ces fichiers) :
+    - modifications non commitées ou fusion en cours : rien n'est touché ;
+    - branche suivie en retard : avance rapide (merge --ff-only), jamais de fusion ni de réécriture ;
+    - branche de travail non suivie (ex. SPEC-1996_dev_…) : la copie revient sur la branche d'intégration suivie,
+      la branche et ses commits restent intacts (et déjà sauvegardés dans un bundle s'ils ne sont pas poussés).
+    Renvoie ce qui a été fait ('' si rien).
+    """
+    def git(*args):
+        return subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True)
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip() or \
+            git("rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+        return ""
+    branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}").returncode != 0:
+        if branch == "HEAD" or git("rev-parse", "-q", "--verify", f"origin/{default_branch}").returncode != 0:
+            return ""
+        exists = git("rev-parse", "-q", "--verify", f"refs/heads/{default_branch}").returncode == 0
+        done = git("checkout", "-q", default_branch) if exists else \
+            git("checkout", "-q", "-b", default_branch, "--track", f"origin/{default_branch}")
+        if done.returncode != 0:
+            return ""
+        if exists:
+            git("branch", "-q", f"--set-upstream-to=origin/{default_branch}")
+        moved = f"copie remise sur {default_branch} (la branche {branch} est conservée)"
+    else:
+        moved = ""
+    behind = git("rev-list", "--count", "HEAD..@{u}").stdout.strip()
+    if behind.isdigit() and int(behind) and git("merge", "-q", "--ff-only", "@{u}").returncode == 0:
+        return (moved + " ; " if moved else "") + f"{behind} commit(s) appliqué(s) en avance rapide"
+    return moved
 
 
 def fetch_age_minutes(repo_dir: str):
