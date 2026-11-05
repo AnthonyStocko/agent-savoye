@@ -618,6 +618,30 @@ def drop_case_duplicates(worktree: str) -> list:
     return dropped
 
 
+_NOT_FAST_FORWARD = re.compile(r"non-fast-forward|fetch first|rejected|fast-forwards|updates were rejected", re.I)
+
+
+def integrate_remote(worktree: str, branch: str) -> str:
+    """
+    Intègre origin/`branch` dans HEAD par un merge (sans forcer ni réécrire). Renvoie '' si HEAD contient désormais la
+    branche distante, sinon la raison (fetch impossible, conflit : merge annulé, fichiers en conflit cités).
+    """
+    fetch = _git(worktree, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    if fetch.returncode != 0:
+        return "fetch impossible : " + " ".join((fetch.stderr.strip().splitlines() or ["?"])[-1].split())[:160]
+    merge = _git(worktree, "merge", "--no-edit", "-m", f"Intégration de origin/{branch} avant la vérification",
+                 f"refs/remotes/origin/{branch}")
+    if merge.returncode == 0:
+        print(f"[CUCUMBER] 🔀 {branch} avait avancé sur origin : branche distante intégrée (merge), push relancé.")
+        return ""
+    conflicts = [p for p in _git(worktree, "diff", "--name-only", "--diff-filter=U").stdout.splitlines() if p]
+    _git(worktree, "merge", "--abort")
+    if conflicts:
+        return (f"conflit en intégrant origin/{branch} ({', '.join(conflicts[:5])}) : merge annulé — résous le "
+                f"conflit sur la branche, puis relance")
+    return "merge impossible : " + " ".join((merge.stderr.strip().splitlines() or ["?"])[-1].split())[:160]
+
+
 def push_for_verification(worktree: str, branch: str, message: str, decision: bool = True) -> tuple:
     """
     Commite le worktree (hors sorties Maven, fichiers de test ignorés par le .gitignore ajoutés de force) puis le
@@ -640,6 +664,14 @@ def push_for_verification(worktree: str, branch: str, message: str, decision: bo
     if refused:
         return f"push sur {branch} refusé par la garde d'écriture : {refused}", committed
     push = _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
+    if push.returncode != 0 and _NOT_FAST_FORWARD.search(push.stderr or ""):
+        # Branche distante en avance (run précédent, init poussée, correction manuelle) : intégrée par un merge,
+        # jamais écrasée ; conflit → merge annulé, arrêt avec les fichiers en conflit
+        merged = integrate_remote(worktree, branch)
+        if merged:
+            return f"push sur {branch} refusé (branche distante divergente) : {merged}", committed
+        committed = True
+        push = _git(worktree, "push", "origin", f"HEAD:refs/heads/{branch}")
     if push.returncode != 0:
         detail = " ".join((push.stderr.strip().splitlines() or ["?"])[-1].split())[:200]
         return (f"push sur {branch} refusé ({detail}) : le job exécuterait une ancienne version — intègre la branche "
