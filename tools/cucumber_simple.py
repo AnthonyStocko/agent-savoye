@@ -157,7 +157,9 @@ def feature_choices(inventory: dict, profile: dict, links: dict = None) -> list:
             continue
         found = sorted(cucumber_modules.task_modules(spec, codes)) if codes else []
         module = found[0] if found else cucumber_coverage.module_of(spec)
-        ticket = ticket_of((links or {}).get(spec["id"]))
+        linked = [l for l in (links or {}).get(spec["id"]) or [] if l.get("cle") and not is_upgrade_ticket(l)]
+        ticket = ticket_of(linked)
+        others = [l["cle"] for l in linked if l["cle"] != ticket.get("cle")]
         probable = {} if ticket else ticket_of([{"cle": k, "titre": t} for k, t in
                                                 cucumber_coverage.candidate_tickets(spec).items()])
         if ticket:
@@ -169,7 +171,7 @@ def feature_choices(inventory: dict, profile: dict, links: dict = None) -> list:
         else:
             label = f"{module} — {cucumber_coverage.business_title(spec)} (aucun ticket lié)"
         out.append({"id": spec["id"], "module": module, "ticket": ticket.get("cle", ""), "libelle": label,
-                    "titre": ticket.get("titre", ""), "probable": bool(probable)})
+                    "titre": ticket.get("titre", ""), "probable": bool(probable), "autres": others})
     # Un ticket = une ligne : ses tâches (plusieurs dossiers ou processus d'une même fonctionnalité) regroupées,
     # générées ensemble (identifiant « a,b »)
     grouped, seen = [], {}
@@ -178,11 +180,13 @@ def feature_choices(inventory: dict, profile: dict, links: dict = None) -> list:
             grouped.append(item)
             continue
         if item["ticket"] not in seen:
-            seen[item["ticket"]] = {**item, "ids": [item["id"]], "modules": [item["module"]]}
+            seen[item["ticket"]] = {**item, "ids": [item["id"]], "modules": [item["module"]],
+                                    "autres": list(item["autres"])}
             grouped.append(seen[item["ticket"]])
             continue
         entry = seen[item["ticket"]]
         entry["ids"].append(item["id"])
+        entry["autres"] += [k for k in item["autres"] if k not in entry["autres"]]
         if item["module"] not in entry["modules"]:
             entry["modules"].append(item["module"])
         entry["probable"] = entry["probable"] and item["probable"]
@@ -190,9 +194,11 @@ def feature_choices(inventory: dict, profile: dict, links: dict = None) -> list:
         entry["id"] = ",".join(entry["ids"])
         title = cucumber_coverage.strip_status(entry["titre"])
         extra = f", {len(entry['ids'])} tâches" if len(entry["ids"]) > 1 else ""
+        also = f" ; aussi {', '.join(entry['autres'][:4])}" if entry.get("autres") else ""
         entry["libelle"] = (f"{entry['ticket']} — {title} ({', '.join(entry['modules'])}{extra}"
-                            + (", ticket probable" if entry["probable"] else "") + ")")
-    out = [{k: v for k, v in e.items() if k not in ("ids", "modules", "titre", "probable")} for e in grouped]
+                            + (", ticket probable" if entry["probable"] else "") + also + ")")
+    out = [{k: v for k, v in e.items() if k not in ("ids", "modules", "titre", "probable", "autres")}
+           for e in grouped]
 
     def key(f: dict) -> tuple:
         number = re.search(r"-(\d+)$", f["ticket"])

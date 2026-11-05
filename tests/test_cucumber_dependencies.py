@@ -117,6 +117,16 @@ def test_ticket_link_verified_by_commit_or_reference(cache, tmp_path):
     # Titre : ticket vérifié sans statut ; le ticket rapproché par mots-clés seul (FIC-7) ne donne pas le titre
     assert cov.business_title(inventory["specifiques"][0], links["sp-a"]) == "Contrôle du dossier d'arrivée"
     assert cov.business_title(inventory["specifiques"][0]) == "Regle"
+    # Clé prouvée hors des tickets récents du client (EPO-2414 fermé depuis longtemps) : titre demandé à Jira
+    write(os.path.join(repo, "a", "Regle.java"), "class Regle { int x; }\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "EPO-2414 menu mobilité appairage BL")
+    asked = []
+    links = cov.verify_ticket_links(CLIENT, inventory, root, tickets,
+                                    lambda keys: asked.extend(keys) or {"EPO-2414": "CANSON - Menu mobilité [Fermée]"})
+    assert asked == ["EPO-2414"]
+    assert {"cle": "EPO-2414", "titre": "CANSON - Menu mobilité"} in [{k: l[k] for k in ("cle", "titre")}
+                                                                       for l in links["sp-a"]]
 
 
 # ---------------------------------------------------------------------------

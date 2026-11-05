@@ -352,7 +352,8 @@ def candidate_tickets(spec: dict) -> dict:
                 for m in re.finditer(r"^##\s+([A-Z][A-Z0-9]+-\d+)\s*[—–-]\s*(.+)$", f.read(), re.M)}
 
 
-def verify_ticket_links(client_name: str, inventory: dict, client_root: str, tickets: list) -> dict:
+def verify_ticket_links(client_name: str, inventory: dict, client_root: str, tickets: list,
+                        fetch_titles=None) -> dict:
     """
     Liens ticket ↔ tâche VÉRIFIÉS (0 token, lecture seule) : clé d'un ticket Jira connu dans le message d'un commit
     qui modifie les fichiers de la tâche, ou référence explicite dans l'un de ses fichiers ; le plus souvent lié
@@ -360,7 +361,7 @@ def verify_ticket_links(client_name: str, inventory: dict, client_root: str, tic
     """
     known = {t["key"]: strip_status(t.get("summary", "")) for t in tickets or [] if t.get("key")}
     repos = git_repos(client_root)
-    out = {}
+    out, pending = {}, []
     for spec in inventory.get("specifiques") or []:
         titles = {**candidate_tickets(spec), **known}
         found = {}
@@ -383,12 +384,18 @@ def verify_ticket_links(client_name: str, inventory: dict, client_root: str, tic
                 for key in _TICKET_KEY.findall(_read_text_file(local)):
                     found.setdefault(key, f"référence dans {item.get('repo', '')}/{item.get('path', '')}")
                     count[key] = count.get(key, 0) + 1
+        pending.append((spec["id"], titles, found, count))
+    # Clés prouvées dont le titre est inconnu (ticket hors des tickets récents du client) : titres demandés à Jira
+    missing = sorted({k for _, titles, found, _ in pending for k in found if not titles.get(k)})
+    fetched = {k: strip_status(v) for k, v in (fetch_titles(missing) if fetch_titles and missing else {}).items() if v}
+    for spec_id, titles, found, count in pending:
+        titles = {**titles, **fetched}
         # Ticket le plus souvent lié aux fichiers de la tâche, puis le plus ancien (celui qui l'a créée)
         order = list(found)
         links = [{"cle": k, "titre": titles[k], "preuve": found[k]}
                  for k in sorted(order, key=lambda k: (-count.get(k, 0), order.index(k))) if titles.get(k)]
         if links:
-            out[spec["id"]] = links
+            out[spec_id] = links
     _write_json(ticket_links_path(client_name), out)
     return out
 
