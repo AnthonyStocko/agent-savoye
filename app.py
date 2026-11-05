@@ -4388,6 +4388,12 @@ with tab_config:
             help="URL du projet Bitbucket/KISCloud (ex: https://git.kiscloud.io/projects/COMPONENT) "
                  "ou chemin local d'un clone (ex: C:\\development\\branch_dev)."
         )
+        env_values["STD_FETCH_MAX_AGE_MINUTES"] = str(int(st.number_input(
+            "STD_FETCH_MAX_AGE_MINUTES (réutilisation des copies du Standard)", min_value=0, step=60,
+            value=env_int("STD_FETCH_MAX_AGE_MINUTES", 1440),
+            help="Les copies locales du Standard (lues par Claude pendant les analyses) ne sont récupérées de "
+                 "nouveau que si leur dernier fetch date de plus de ce délai, en minutes. 1440 = un jour ; "
+                 "0 = à chaque analyse.")))
         env_values["ODATIO_VERSION"] = st.text_input(
             "ODATIO_VERSION (facultatif)", value=os.getenv("ODATIO_VERSION", ""), placeholder="ex. 26.16",
             help="Repli seulement : chaque client Cucumber a sa propre version du Standard, détectée dans le code de "
