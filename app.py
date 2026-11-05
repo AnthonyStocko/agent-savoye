@@ -2146,13 +2146,17 @@ def render_simple_tests(ctx: dict, step: dict) -> None:
         lines = []
         for index, spec_id in enumerate(chosen):
             st.caption(f"{index + 1}/{len(chosen)} — {labels[spec_id]}")
+            before = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
             code = run_main_step(ctx["cmd"] + ["--cucumber-base-branch", branch, "--specifics", spec_id]
                                  + (["--complete"] if index else []))
-            if code in (2, 3):
-                # Arrêt avant tout lot (environnement, génération introuvable) : jamais le résultat d'un run précédent
+            after = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
+            if code != 0 and (code in (2, 3) or after == before):
+                # Arrêt avant le résultat (environnement, interruption, erreur) : jamais celui d'un run précédent
+                why = ("la génération s'est arrêtée avant tout lot (problème d'environnement)" if code in (2, 3)
+                       else f"exécution interrompue avant son résultat (code {code} ; arrêt, rechargement de la "
+                            f"page ou erreur)")
                 lines.append({"id": spec_id, "libelle": labels[spec_id], "vert": False,
-                              "resultat": "Non lancée : la génération s'est arrêtée avant tout lot (problème "
-                                          "d'environnement, voir le journal technique)."})
+                              "resultat": f"Non terminée : {why}. Voir le journal technique, puis relancer."})
                 continue
             lines.append(cucumber_simple.group_result(cucumber_tools.load_state(ctx["client"]), spec_id,
                                                       labels[spec_id]))

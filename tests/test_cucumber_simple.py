@@ -262,3 +262,12 @@ def test_results_of_another_version_are_not_shown_as_current():
     records["depot"]["detail"]["branche"] = "v1.1"
     steps = {s["cle"]: s for s in cs.states(project, records)}
     assert steps["depot"]["etat"] == "a_faire" and "v1.1" in steps["depot"]["resultat"]
+
+
+def test_lots_signature_detects_nothing_new():
+    state = {"debut": "2026-11-05T10:00", "lots": [{"numero": 1, "ids": ["a"], "statut": "erreur_compilation"}]}
+    before = cs.lots_signature(state, "a,b")
+    assert cs.lots_signature(state, "a,b") == before                     # run interrompu : rien de neuf
+    state["lots"][0]["statut"] = "termine"
+    assert cs.lots_signature(state, "a,b") != before
+    assert cs.lots_signature(state, "z") != before
