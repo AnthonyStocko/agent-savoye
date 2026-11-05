@@ -5765,7 +5765,13 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
                        "enregistrements existants. Fichiers de données manquants : écris les tiens sous le dossier "
                        "de données de la feature, à partir du modèle le plus proche, avec des codes vérifiés en base "
                        "(classeur .xlsm/.xlsx : " + fixed_values.get("donnees_tool", xlsm_command())
-                     + " show / copy). « donnee_impossible » n'est accepté qu'avec les recherches d'endpoint et de "
+                     + " show / copy). Codes du jeu de test du Standard absents de l'environnement (site, emplacements, palette "
+                       "ou support, poste de travail, donneur d'ordres, article…) : ce n'est pas un blocage, trouve "
+                       "leurs ÉQUIVALENTS en base — pour chaque code, la table qui le stocke (Grep de l'entité dans "
+                       "le code), une requête qui liste les enregistrements existants du même type (même type "
+                       "d'emplacement, même zone, poste du même process…), puis choisis-en un, cohérent avec les "
+                       "autres (même site, même donneur d'ordres) ; cite chaque requête et la correspondance "
+                       "« code Standard → code client » dans « recherches ». « donnee_impossible » n'est accepté qu'avec les recherches d'endpoint et de "
                        "step citées dans sa preuve.\n") if creations else ""
     extra = render_prompt("cucumber_preuve_base", ids=", ".join(dict.fromkeys([*pending, *references, *creations])),
                           references=reference_text + creation_text, non_couverts=covered_text)
