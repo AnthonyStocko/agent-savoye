@@ -693,3 +693,14 @@ def test_feature_result_green_only_when_executed_and_relevant():
     assert not cs.feature_result({"lots": []}, "b")["vert"]
     merged = cs.merge_features([{"id": "a", "vert": False}, {"id": "b", "vert": True}], [{"id": "a", "vert": True}])
     assert merged == [{"id": "b", "vert": True}, {"id": "a", "vert": True}]
+
+
+def test_profile_redetection_keeps_the_authorised_cucumber_repo(init_workspace, monkeypatch):
+    """Changement de version -> redétection du profil : l'adresse du dépôt autorisée (garde d'écriture) est gardée."""
+    document = cp.load_profile(CLIENT)
+    document["detecte"]["cucumber_repo_url"] = "https://git.example/scm/cli/clientx-cucumber.git"
+    ct._write_json(cp.profile_path(CLIENT), document)
+    monkeypatch.setattr(cp, "detect_profile", lambda *a, **k: (cp.empty_profile(), [], []))
+    monkeypatch.setattr(cp, "repo_profile", lambda *a, **k: {})
+    cp.refresh_profile(CLIENT, "/inexistant", "HEAD", "")
+    assert cp.load_profile(CLIENT)["detecte"]["cucumber_repo_url"] == "https://git.example/scm/cli/clientx-cucumber.git"

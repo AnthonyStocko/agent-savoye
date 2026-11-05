@@ -5246,6 +5246,9 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     if not os.path.isdir(os.path.join(local, ".git")):
         simple_record(client, "init", "echec", f"Clone de {slug} absent : relancez l'étape 2.", detail)
         return 1
+    # Dépôt autorisé pour la garde d'écriture : relevé sur le clone à chaque fois (une redétection du profil, après un
+    # changement de version, ne le garde pas)
+    cucumber_delivery.register_repo(client, local)
     subprocess.run(["git", *_git_auth_args(), "-C", local, "fetch", "-q", "origin", "--prune"], capture_output=True)
     # Espace de l'agent : sa branche d'init si elle existe (ses commits), mise à jour avec la branche de la version
     has_work = cucumber_tools._git(local, "rev-parse", "--verify", "-q", f"origin/{work}").returncode == 0
