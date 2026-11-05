@@ -23,7 +23,7 @@ DEDUCTION = {"version_client": "1.3.1", "standard": {"version": "26.24"}}
 
 def test_project_step_ok_when_standard_known():
     step = cs.project_step(DEDUCTION, True)
-    assert step == {"etat": "ok", "resultat": "Version client 1.3.1 → Standard 26.24."}
+    assert step == {"etat": "ok", "resultat": "Version client 1.3.1 → Standard 26.24.", "version": "1.3.1"}
     assert cs.project_step({"version_client": "1.3.1"}, True)["etat"] == "echec"
     assert cs.project_step({}, False)["etat"] == "a_faire"
 
@@ -67,6 +67,11 @@ def test_version_branch_follows_the_repository_convention():
     assert rs.version_branch("1.3.1", ["1.3.1"]) == "1.3.1"                             # même version : pas de doublon
     assert rs.version_branch("1.4", ["1.2", "1.3"]) == "1.4"                            # convention sans « v »
     assert rs.version_branch("1.4", ["integration"]) == "v1.4"
+    # Branche de travail de l'agent qui finit par un numéro : jamais prise pour la branche de la version
+    assert rs.version_branch("1.1", ["cucumber_canson_agent-init-v1.1", "v1.3"]) == "v1.1"
+    assert rs.version_branch("1.2", ["feature/agent-cucumber-init-v1.2"]) == "v1.2"
+    assert rs.version_branch("1.2", ["release/1.2"]) == "release/1.2"
+    assert rs.branch_version_line("cucumber_canson_agent-init-v1.1") == "" and rs.branch_version_line("v1.3") == "1.3"
 
 
 def test_scaffold_has_library_runner_tree_and_gitignore():
@@ -205,3 +210,18 @@ def test_existing_repository_branch_then_alignment_validated(workspace, main_mod
     assert "<version>26.22.1</version>" in git(origin, "show", "1.3:pom.xml")
     assert git(origin, "rev-parse", "integration") != git(origin, "rev-parse", "1.3")      # intégration intacte
     assert run("verifier") == 0 and _record()["etat"] == "ok"
+
+
+def test_results_of_another_version_are_not_shown_as_current():
+    """Version passée de 1.1 à 1.3 : dépôt et init de la 1.1 à refaire, jamais affichés comme ceux de la 1.3."""
+    project = {"etat": "ok", "resultat": "Version client 1.3.1", "version": "1.3.1"}
+    records = {"depot": {"etat": "ok", "resultat": "branche v1.3", "detail": {"branche": "v1.3"}},
+               "init": {"etat": "a_faire", "resultat": "Init prête… patch pour cucumber_canson_agent-init-v1.1",
+                        "detail": {"branche": "cucumber_canson_agent-init-v1.1", "plan": {"action": "lancer"}}}}
+    steps = {s["cle"]: s for s in cs.states(project, records)}
+    assert steps["depot"]["etat"] == "ok"
+    assert steps["init"]["etat"] == "a_faire" and "Version changée" in steps["init"]["resultat"]
+    assert "plan" not in steps["init"]["detail"]                       # action proposée : vérifier à nouveau
+    records["depot"]["detail"]["branche"] = "v1.1"
+    steps = {s["cle"]: s for s in cs.states(project, records)}
+    assert steps["depot"]["etat"] == "a_faire" and "v1.1" in steps["depot"]["resultat"]

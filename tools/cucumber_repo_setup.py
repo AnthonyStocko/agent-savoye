@@ -24,7 +24,15 @@ DEFAULT_CUCUMBER_VERSION = "7.13.0"
 RUNNER_PATH = "src/test/java/cucumber/RunnerTest.java"
 
 
-_VERSION_BRANCH = re.compile(r"^(?P<prefixe>[A-Za-z][A-Za-z_-]*?[-_/]?|)(?P<numero>\d+\.\d+(?:\.\d+)*)$")
+# Branche de version : numéro seul ou court préfixe de version (v1.3, release/1.3, version-1.3) ; jamais une branche
+# de travail qui finit par un numéro (« cucumber_canson_agent-init-v1.1 » n'est pas la branche de la 1.1)
+_VERSION_BRANCH = re.compile(r"^(?P<prefixe>(?:[vV]|version[-_/]?|releases?[-_/]|rel[-_/])?)(?P<numero>\d+\.\d+(?:\.\d+)*)$")
+
+
+def branch_version_line(branch: str) -> str:
+    """Ligne majeure.mineure d'une branche de version (« v1.3 » -> 1.3) ; '' si ce n'est pas une branche de version."""
+    match = _VERSION_BRANCH.match(branch or "")
+    return version_line(match.group("numero")) if match else ""
 
 
 def version_line(version_client: str) -> str:
