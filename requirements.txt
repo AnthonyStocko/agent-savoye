@@ -8,3 +8,4 @@ psycopg2-binary>=2.9   # PostgreSQL
 # oracledb             # Oracle
 # pymssql              # SQL Server (ou pyodbc + pilote ODBC Microsoft, cf. DB_ODBC_DRIVER)
 # pymysql              # MySQL
+openpyxl>=3.1

@@ -394,6 +394,37 @@ def missing_db_proof(result: dict) -> list:
     return list(dict.fromkeys(CODE.findall(text)))[:8] or [text.strip()[:160] or "donnée en cause"]
 
 
+_TO_CREATE = re.compile(r"fichiers? de donn[ée]es|manque[^.]{0,80}fichier|fichier[^.]{0,40}(manquant|absent)|"
+                        r"aucun (é|e)change|sans (é|e)change|(é|e)change associ|aucun lien|non li[ée]|pas li[ée]|"
+                        r"param[ée]trage (manquant|absent)|aucun param[ée]trage|à cr[ée]er|non cr[ée]{2}|"
+                        r"constituer un|aucune? (fixture|donn[ée]e de test)", re.I)
+_NO_API_PROOF = re.compile(r"endpoint|/api/|\bREST\b|steps?_std|aucun step", re.I)
+
+
+def missing_creation(result: dict) -> list:
+    """
+    Résultat « non_couvert » qui renonce faute de fichiers de données ou d'un paramétrage / lien en base (ex. document
+    sans échange associé) : c'est à l'agent de les créer (fichiers propres, Background par l'API). Accepté seulement
+    avec un blocage « donnee_impossible » / « step_impossible » dont la preuve cite la recherche d'un endpoint ou d'un
+    step. Renvoie les motifs relevés ; [] sinon.
+    """
+    if (result or {}).get("statut") != "non_couvert":
+        return []
+    sans_objet = result.get("sans_objet") or {}
+    if isinstance(sans_objet, dict) and (sans_objet.get("preuve") or "").strip():
+        return []
+    blocker = result.get("blocage") or {}
+    kind = blocker.get("type", "") if isinstance(blocker, dict) else ""
+    proof = ((blocker.get("preuve") or "") if isinstance(blocker, dict) else str(blocker)).strip()
+    if kind in ("non_deploye", "defaut_produit"):
+        return []
+    if kind in ("donnee_impossible", "step_impossible") and _NO_API_PROOF.search(proof):
+        return []
+    text = " ".join([result.get("raison") or "", result.get("resume") or "", proof])
+    found = [m.group(0) for m in _TO_CREATE.finditer(text)]
+    return list(dict.fromkeys(f.strip() for f in found))[:6]
+
+
 _DATA_FILE = re.compile(r"/files/.+\.(xml|csv|json|txt|xlsx?|xlsm)$", re.I)
 
 

@@ -65,7 +65,8 @@ def test_every_lot_call_collects_the_db_journal(main_module, tmp_path, monkeypat
 
 
 def test_db_tools_granted_with_the_db_block_only(main_module):
-    assert main_module.lot_tools({"db_block": ""}) == main_module.CUCUMBER_TOOLS
+    assert main_module.lot_tools({"db_block": ""})[:len(main_module.CUCUMBER_TOOLS)] == main_module.CUCUMBER_TOOLS
+    assert all("xlsm_tool.py" in t for t in main_module.lot_tools({"db_block": ""})[len(main_module.CUCUMBER_TOOLS):])
     assert main_module.lot_tools({"db_block": "\n=== ACCÈS BASE ==="})[-1] == f"Bash({sys.executable}:*)"
 
 

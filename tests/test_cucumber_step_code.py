@@ -112,7 +112,7 @@ def main_module():
 def test_prompts_carry_compilation_and_sources(main_module):
     block = main_module.agent_compilation_block('"py" "c.py" acme')
     assert 'Commande : "py" "c.py" acme' in block and main_module.agent_compilation_block("") == ""
-    assert main_module.lot_tools({}) == main_module.CUCUMBER_TOOLS
+    assert all("xlsm_tool.py" in t for t in main_module.lot_tools({})[len(main_module.CUCUMBER_TOOLS):])
     assert main_module.lot_tools({"compilation_agent": block})[-1].startswith("Bash(")
     for name in ("cucumber_client_fix", "cucumber_client_review"):
         import re
