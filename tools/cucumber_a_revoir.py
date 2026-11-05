@@ -72,6 +72,26 @@ def max_retract_pct() -> float:
 # Blocs de scénarios et contrôle des corrections (RÈGLE 3a, 3c)
 # ---------------------------------------------------------------------------
 
+_BACKGROUND = re.compile(r"^\s*(Background|Contexte)\s*:", re.I)
+_SCENARIO_START = re.compile(r"^\s*(Scenario|Scenario Outline|Scénario|Plan du scénario|Rule|Règle)\b", re.I)
+_STEP_TEXT = re.compile(r"^\s*(?:Given|When|Then|And|But|\*|Soit|Quand|Alors|Et|Mais)\s+(.*?)\s*$")
+
+
+def background_steps(text: str) -> set:
+    """Textes des steps du Background d'une feature (vide s'il n'y en a pas)."""
+    steps, inside = set(), False
+    for line in (text or "").splitlines():
+        if _BACKGROUND.match(line):
+            inside = True
+            continue
+        if inside and (_SCENARIO_START.match(line) or line.lstrip().startswith("@")):
+            break
+        match = _STEP_TEXT.match(line) if inside else None
+        if match:
+            steps.add(match.group(1))
+    return steps
+
+
 def scenario_blocks(text: str) -> dict:
     """{titre normalisé: (scénario, lignes du bloc)} : tags et commentaires au-dessus compris, jusqu'au suivant."""
     lines = text.splitlines()
@@ -120,9 +140,13 @@ def forbidden_changes(before: str, after: str, rel: str, allowed_removals=()) ->
     """
     errors, old, new = [], scenario_blocks(before), scenario_blocks(after)
     forbidden_tags = set(FORBIDDEN_TAGS) | {a_revoir_tag()}
+    background = background_steps(after)
     for key, (scenario, _) in old.items():
         if key not in new:
-            if key not in allowed_removals:
+            # Scénario de mise en place devenu le Background de la feature (mêmes steps) : permis
+            moved = background and scenario["steps"] and all(
+                st["texte"] in background for st in scenario["steps"]) and not _assertions(scenario)
+            if key not in allowed_removals and not moved:
                 errors.append(f"{rel} / {scenario['titre']} : scénario supprimé par la correction — interdit, un "
                               f"scénario se corrige (RÈGLE 3a)")
             continue

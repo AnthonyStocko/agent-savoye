@@ -366,6 +366,7 @@ def check_response_fields(worktree: str, base: str, features: list, cucumber_std
         library = std_snapshot(cucumber_std_dir, library_ref(cucumber_std_dir, library_version) or "HEAD")
     model = merge_models(java_model(files) if files else {}, library)
     match, errors = step_matcher(list(model["steps"])), []
+    standard_usage = std_control_usage(cucumber_std_dir, match)
     for rel in features:
         before = {(step, tuple(rows[0])) for _, step, rows in
                   _control_tables(_git(worktree, "show", f"{base}:{rel}").stdout)}
@@ -374,7 +375,10 @@ def check_response_fields(worktree: str, base: str, features: list, cucumber_std
             roots = model["steps"].get(expr, {}).get("pojos") or [] if expr else []
             if not roots or (step, tuple(rows[0])) in before:
                 continue
-            for path in (p for p in _checked_paths(rows) if "<" not in p):
+            placeholders = set(re.findall(r"<([^<>]+)>", step))
+            for path in (p for p in _checked_paths(rows) if "<" not in p and p not in placeholders):
+                if (expr, path) in standard_usage:
+                    continue                    # même step, même colonne dans une feature du Standard : pas d'alerte
                 results = [resolve_path(model, pojo, path) for pojo in roots]
                 if any(ok for ok, _ in results):
                     continue
@@ -385,6 +389,26 @@ def check_response_fields(worktree: str, base: str, features: list, cucumber_std
                               + (f" ; champ le plus proche « {closest[0]} »" if closest else "")
                               + (f" ; champs disponibles : {', '.join(available[:15])}" if available else ""))
     return errors
+
+
+_STD_USAGE = {}
+
+
+def std_control_usage(cucumber_std_dir: str, match) -> set:
+    """(expression du step, colonne) des contrôles écrits dans les features du Cucumber Standard (gardé en cache)."""
+    root = os.path.join(cucumber_std_dir or "", "src", "test", "resources", "cucumber", "features")
+    if not os.path.isdir(root):
+        return set()
+    if root not in _STD_USAGE:
+        usage = set()
+        for folder, _, names in os.walk(root):
+            for name in (n for n in names if n.endswith(".feature")):
+                for _, step, rows in _control_tables(_read_text_file(os.path.join(folder, name))):
+                    expr = match(step) if rows else None
+                    if expr:
+                        usage |= {(expr, path) for path in _checked_paths(rows)}
+        _STD_USAGE[root] = usage
+    return _STD_USAGE[root]
 
 
 def todo_markers(worktree: str, ref: str = "") -> list:
