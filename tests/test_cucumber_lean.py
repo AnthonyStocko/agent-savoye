@@ -242,6 +242,31 @@ def test_fix_plan(main_module, monkeypatch):
     assert main_module.cucumber_fix_plan("sonnet", 1) == [("sonnet", "low")]
 
 
+def test_fix_loop_goes_on_while_errors_change(main_module, monkeypatch, tmp_path):
+    monkeypatch.delenv("CLAUDE_MODEL_CUCUMBER_FIX", raising=False)
+    monkeypatch.setenv("CUCUMBER_FIX_ATTEMPTS", "1")
+    monkeypatch.setenv("CUCUMBER_FIX_MAX_ATTEMPTS", "6")
+    checks = iter([["e1", "e2", "e3"], ["e2", "e3"], ["e3"], ["e3"], []])
+    calls = []
+    monkeypatch.setattr(main_module, "check_cucumber_lot", lambda *a, **k: (lambda e: {
+        "ok": not e, "environnement": False, "etape": "compilation", "erreurs": e})(next(checks)))
+    monkeypatch.setattr(main_module, "cucumber_followup", lambda lot, prompt, model, effort, tools, turns, *a, **k:
+                        calls.append((model, turns)) or (0, "", {}, False, model, effort))
+    monkeypatch.setattr(main_module, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main_module.cucumber_a_revoir, "check_corrections", lambda *a: [])
+    monkeypatch.setattr(main_module.cucumber_a_revoir, "snapshot", lambda *a: {})
+    monkeypatch.setattr(main_module.cucumber_tools, "lot_files", lambda *a: [])
+    monkeypatch.setattr(main_module, "render_prompt", lambda *a, **k: "P")
+    check = main_module.verify_cucumber_lot("c", "1", str(tmp_path), "b", "", ["a.feature"], "mvn", "", {}, "sonnet",
+                                            "K", str(tmp_path), lambda u: None)
+    assert check["ok"] and len(calls) == 4 and calls[0][0] == "haiku" and calls[1] == ("sonnet", "25")
+    checks = iter([["e1"], ["e1"], ["e1"], ["e1"]])
+    calls.clear()
+    check = main_module.verify_cucumber_lot("c", "1", str(tmp_path), "b", "", ["a.feature"], "mvn", "", {}, "sonnet",
+                                            "K", str(tmp_path), lambda u: None)
+    assert not check["ok"] and len(calls) == 2
+
+
 def test_review_skipped_for_empty_fields_only(main_module, monkeypatch):
     calls = []
     monkeypatch.setattr(main_module, "run_claude", lambda *a, **k: calls.append(a) or (0, "[]", None, False))
