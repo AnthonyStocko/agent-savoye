@@ -65,11 +65,13 @@ def project_step(deduction: dict, ready: bool, missing: list = ()) -> dict:
     if not ready:
         return {"etat": "a_faire", "resultat": "Renseignez le projet Bitbucket du client."}
     line = version_line(deduction)
+    version = (deduction or {}).get("version_client", "")
     if ((deduction or {}).get("standard") or {}).get("version"):
         if missing:
-            return {"etat": "echec", "resultat": f"{line}. À renseigner dans l'onglet Configuration avant l'étape 2 : "
-                                                 + " ; ".join(missing) + "."}
-        return {"etat": "ok", "resultat": line + "."}
+            return {"etat": "echec", "version": version,
+                    "resultat": f"{line}. À renseigner dans l'onglet Configuration avant l'étape 2 : "
+                                + " ; ".join(missing) + "."}
+        return {"etat": "ok", "resultat": line + ".", "version": version}
     if line:
         return {"etat": "echec", "resultat": f"{line} : la version du Standard n'a pas pu être déduite de cette "
                                              f"version du client."}
@@ -82,11 +84,25 @@ def states(project: dict, records: dict) -> list:
     l'étape 1 (project_step) ; `records` : etat.json « simple ». Une étape obligatoire non OK bloque les étapes
     obligatoires suivantes ; l'étape optionnelle est bloquée seulement si l'étape 1 ou 2 n'est pas OK.
     """
+    from tools.cucumber_repo_setup import branch_version_line, version_line as line_of
     out, previous_ok = [], True
+    wanted = line_of((project or {}).get("version", ""))
+    depot_branch = (((records or {}).get("depot") or {}).get("detail") or {}).get("branche", "")
     for number, key, title in STEPS:
         record = project if key == "projet" else (records or {}).get(key) or {}
         status = record.get("etat") or "a_faire"
         result = record.get("resultat") or ""
+        branch = (record.get("detail") or {}).get("branche", "")
+        # Résultat obtenu pour une autre version du client (version changée depuis) : à refaire, jamais affiché
+        # comme celui de la version choisie
+        stale = ""
+        if key == "depot" and branch and wanted and branch_version_line(branch) != wanted:
+            stale = f"la branche {branch} n'est pas celle de la version {wanted}"
+        elif key != "projet" and key != "depot" and branch and depot_branch and branch != depot_branch:
+            stale = f"résultat obtenu sur la branche {branch}, la branche de la version est {depot_branch}"
+        if stale and record.get("etat"):
+            status, result = "a_faire", f"Version changée ({stale}) : relancez l'étape."
+            record = {**record, "detail": {k: v for k, v in (record.get("detail") or {}).items() if k != "plan"}}
         if not previous_ok:
             status = "bloquee"
             result = "Se débloque quand l'étape précédente est OK."
