@@ -296,3 +296,35 @@ def test_no_init_tells_the_lot_agent_that_database_data_counts():
                 encoding="utf-8").read()
     assert "${environnement_block}=== AVANT DE CONCLURE" in text
     assert "PRÉSENT dans la base de l'environnement" in main.NO_INIT_BLOCK and "source « base »" in main.NO_INIT_BLOCK
+
+
+def test_non_covered_for_missing_data_requires_a_database_query(monkeypatch):
+    from tools import cucumber_testability as ctst
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        main = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    unproved = {"id": "sp-1", "statut": "non_couvert", "resume": "Dépend du document APPAIRAGE_BL et de "
+                "SPEC_DELIVERY_NOTE_PAIRING dont la présence n'est pas vérifiable dans la base.", "recherches": []}
+    assert ctst.missing_db_proof(unproved) == ["APPAIRAGE_BL", "SPEC_DELIVERY_NOTE_PAIRING"]
+    proved = {**unproved, "recherches": [{"source": "base", "cherche": "ref_report_document : SELECT * FROM "
+                                          "ref_report_document WHERE code = 'APPAIRAGE_BL'", "trouve": "1 ligne"}]}
+    assert ctst.missing_db_proof(proved) == []
+    assert ctst.missing_db_proof({"id": "x", "statut": "couvert"}) == []
+    calls = []
+
+    def claude(prompt, *a, **k):
+        calls.append(prompt)
+        return 0, "```json\n[]\n```", {}, False
+    monkeypatch.setattr(main, "run_cucumber_claude", claude)
+    monkeypatch.setattr(main, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main.cucumber_tools, "parse_lot_result",
+                        lambda text: [{"id": "sp-1", "statut": "couvert", "resume": "testé", "constats": []}])
+    lot = {}
+    out = main.require_db_proof([unproved, {"id": "sp-2", "statut": "couvert"}], "PROMPT DU LOT",
+                                {"db_block": "accès base"}, "sonnet", "40", "/tmp", "", "", lot, "1", "K")
+    assert [r["statut"] for r in out] == ["couvert", "couvert"] and len(calls) == 1
+    assert calls[0].startswith("PROMPT DU LOT") and "PREUVE EN BASE OBLIGATOIRE" in calls[0] and "APPAIRAGE_BL" in calls[0]
+    assert main.require_db_proof([unproved], "P", {"db_block": ""}, "m", "40", "/tmp", "", "", {}, "1", "K") == [unproved]

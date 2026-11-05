@@ -5689,6 +5689,41 @@ def guard_corrections(client: str, state: dict, worktree: str, profile: dict, re
     return result
 
 
+def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str, max_turns, run_dir: str,
+                     effort: str, system_file: str, lot: dict, label: str, work_key: str, on_usage=None) -> list:
+    """
+    « non_couvert » pour donnée absente ou « non vérifiable » sans requête en base citée, alors que l'accès base est
+    disponible : renvoyé UNE fois à l'agent (même lot, consigne cucumber_preuve_base) pour trouver la table dans le
+    code, l'interroger et écrire le test ou prouver l'absence. Les résultats renvoyés remplacent les premiers.
+    """
+    if not fixed_values.get("db_block"):
+        return results
+    pending = {r["id"]: cucumber_testability.missing_db_proof(r) for r in results or []}
+    pending = {k: v for k, v in pending.items() if v}
+    if not pending:
+        return results
+    print(f"[LOT {label}] 🔎 {len(pending)} tâche(s) jugée(s) non couverte(s) pour une donnée absente sans requête en "
+          f"base ({', '.join(pending)}) : vérification en base demandée à l'agent.")
+    extra = render_prompt("cucumber_preuve_base", ids=", ".join(pending),
+                          donnees=" ; ".join(f"{k} : {', '.join(v)}" for k, v in pending.items()))
+    returncode, output, usage, limit_hit = run_cucumber_claude(prompt + extra, model, lot_tools(fixed_values),
+                                                               max_turns, run_dir, effort, system_file,
+                                                               lot.setdefault("base", []), "preuve en base")
+    report_token_usage(work_key, "cucumber-lot-preuve-base", model, usage, len(prompt) + len(extra), returncode,
+                       effort)
+    if on_usage:
+        on_usage(usage)
+    again = cucumber_tools.parse_lot_result(output) if returncode == 0 and not limit_hit else None
+    if not again:
+        print(f"[LOT {label}] ⚠️ Vérification en base sans réponse exploitable : premiers résultats conservés.")
+        return results
+    by_id = {r["id"]: r for r in again if r.get("id") in pending}
+    for spec_id, result in by_id.items():
+        print(f"[LOT {label}] {spec_id} après vérification en base : {result.get('statut')}"
+              + (f" — {result.get('resume')}" if result.get("resume") else ""))
+    return [by_id.get(r["id"], r) for r in results]
+
+
 NO_INIT_BLOCK = """=== ENVIRONNEMENT SANS INITIALISATION ===
 L'option « Initialisation » est décochée : aucune init ni aucun clear n'est lancé avant tes tests ; l'environnement où
 Jenkins les joue contient déjà les données du client (sa configuration a été recopiée depuis sa base).
@@ -6303,6 +6338,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                 if lot["erreur"] == "budget atteint":
                     continue
                 break
+            results = require_db_proof(results, prompt, fixed_values, model, max_turns, run_dir, effort, system_file,
+                                       lot, label, work_key, lambda usage: add_usage(lot, usage))
             files = cucumber_tools.lot_files(worktree, results)
             for result in results:
                 for constat in result["constats"]:
