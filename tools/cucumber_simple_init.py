@@ -357,6 +357,32 @@ def uses_plain_rules(text: str) -> bool:
                for line in (text or "").splitlines())
 
 
+_STD_FILES_ERROR = re.compile(r"(donn[ée]es|r[èe]gles) du Standard introuvable|/(files|rules)/[A-Z0-9]+/01-Contexte\b")
+
+
+def standard_files_error(console_error: str) -> bool:
+    """Erreur de console d'un build sans rapport : dossier de données ou de règles du Standard introuvable."""
+    return bool(_STD_FILES_ERROR.search(console_error or ""))
+
+
+def use_feature_files(text: str) -> str:
+    """
+    Inverse de use_standard_files : steps du Standard sur le dossier de la feature (fichiers et règles copiés dans le
+    dépôt du client), quand ceux du Standard sont illisibles pendant le run.
+    """
+    out = []
+    for line in (text or "").splitlines(keepends=True):
+        match = _STEP.match(line.rstrip("\r\n"))
+        if match and not line.lstrip().startswith("#"):
+            eol = "\r\n" if line.endswith("\r\n") else "\n"
+            for own, std in ((STD_FILES_STEP, GLOBAL_INIT_STEP), (STD_RULES_STEP, RULES_STEP)):
+                if re.fullmatch(re.escape(own) + r'\s+"[^"]*"', match.group(3)):
+                    line = f"{match.group(1)}{match.group(2)} {std}{eol}"
+                    break
+        out.append(line)
+    return "".join(out)
+
+
 def uses_standard_files(text: str) -> bool:
     return any((m := _STEP.match(line)) and not line.lstrip().startswith("#") and m.group(3).startswith(STD_FILES_STEP)
                for line in (text or "").splitlines())

@@ -38,7 +38,11 @@ ROLES = {"branche": "branche du dépôt client lue par le job (branche de travai
          "composant_nom": "nom de l'artefact monté",
          "composant_version": "version de l'artefact monté",
          "standard_branche": "branche ou tag du Cucumber Standard exécuté",
-         "kis_version": "version KIS de l'environnement"}
+         "kis_version": "version KIS de l'environnement",
+         "standard_actif": "case qui fait exécuter les features du Cucumber Standard (ex. hasStandard)",
+         "specifique_actif": "case qui fait exécuter les features du dépôt client (ex. hasSpecific)",
+         "tags_standard": "tags Standard ajoutés aux suites cochées (ex. ADDITIONAL_STANDARD_TAGS)",
+         "tags_standard_exclus": "tags Standard exclus (ex. STANDARD_TAGS_TO_EXCLUDE)"}
 # Rôles sans lesquels l'agent ne peut pas piloter le job
 REQUIRED_ROLES = ("branche", "arguments")
 # Détection : (motif du nom, motif exclu) ; plusieurs candidats pour un rôle = ambiguïté, rôle laissé vide
@@ -55,7 +59,14 @@ _DETECTION = {
     "composant_version": (r"(COMPONENT|ARTIFACT).*VERSION", r""),
     "standard_branche": (r"STANDARD.*BRANCH", r""),
     "kis_version": (r"KIS.*VERSION", r""),
+    "standard_actif": (r"^HAS_?STANDARD$|^STANDARD_?(ENABLED|ACTIF)$", r""),
+    "specifique_actif": (r"^HAS_?SPECIFI|^SPECIFI\w*_?(ENABLED|ACTIF)$", r""),
+    "tags_standard": (r"STANDARD.*TAGS|STD.*TAGS", r"EXCLU"),
+    "tags_standard_exclus": (r"(STANDARD|STD).*TAGS.*EXCLU|EXCLU.*(STANDARD|STD).*TAGS", r""),
 }
+# Suites du Standard : cases à cocher du job sans autre rôle (INIT_WMS, PREPARATION, RECEPTION…) ; celle de l'init
+# d'un module s'appelle INIT_<MODULE>
+_INIT_SUITE = re.compile(r"^INIT_([A-Z0-9]+)$", re.I)
 TAG_FILTER = "cucumber.filter.tags"
 _TAG_OPTION = re.compile(rf"\s*-D{re.escape(TAG_FILTER)}=(?:'[^']*'|\"[^\"]*\"|\S+)")
 # Options des arguments dont la valeur est un identifiant (masquée partout, en plus des motifs communs)
@@ -117,6 +128,42 @@ def register_job_secrets(definitions: dict, roles: dict) -> None:
     argline = str((definitions.get(roles.get("arguments") or "") or {}).get("defaut") or "")
     values = [argline] + [v.strip("'\"") for k, v in _OPTION.findall(argline) if _CREDENTIAL_KEY.search(k)]
     secret_tools.register_secrets(values)
+
+
+def standard_suites(definitions: dict, roles: dict) -> list:
+    """Cases à cocher du job qui choisissent les suites du Standard : booléens sans rôle de l'agent."""
+    taken = {name for name in (roles or {}).values() if name}
+    return [name for name, definition in (definitions or {}).items()
+            if "Boolean" in _type(definition) and name not in taken]
+
+
+def suite_values(definitions: dict, roles: dict, standard_modules=()) -> tuple:
+    """
+    Cases du job pour un run de l'agent, jamais reprises du build de référence (celui-ci peut avoir des suites du
+    Standard cochées) : ({nom: valeur}, avertissements).
+    - `standard_modules` (init du Standard, ex. ["WMS"]) : Standard actif, INIT_<MODULE> cochées, toutes les autres
+      suites décochées, dépôt client inactif, tags Standard additionnels et exclus vidés ;
+    - sinon (init du client, compléments, tests) : Standard inactif, toutes les suites décochées, dépôt client actif.
+    Job sans case « Standard actif » (rôle standard_actif) : rien n'est imposé ({}).
+    """
+    roles = roles or {}
+    if not roles.get("standard_actif"):
+        return {}, []
+    wanted = {m.upper() for m in standard_modules or ()}
+    values, warnings, found = {roles["standard_actif"]: "true" if wanted else "false"}, [], set()
+    if roles.get("specifique_actif"):
+        values[roles["specifique_actif"]] = "false" if wanted else "true"
+    for name in standard_suites(definitions, roles):
+        match = _INIT_SUITE.match(name)
+        on = bool(match and match.group(1).upper() in wanted)
+        found |= {match.group(1).upper()} if on else set()
+        values[name] = "true" if on else "false"
+    for role in ("tags_standard", "tags_standard_exclus"):
+        if roles.get(role):
+            values[roles[role]] = ""
+    for module in sorted(wanted - found):
+        warnings.append(f"aucune case INIT_{module} dans le job : l'init {module} du Standard n'y est pas sélectionnable")
+    return values, warnings
 
 
 def with_tag_filter(argline: str, tags: str) -> str:
@@ -220,14 +267,15 @@ def reference_parameters(job: str, repository: str, definitions: dict = None, bu
 
 def build_parameters(definitions: dict, roles: dict, branch: str, repository: str = "", tags: str = "",
                      commit: str = "", env: str = "", fixed: dict = None, target: str = "arguments",
-                     reference: dict = None) -> dict:
+                     reference: dict = None, suites: dict = None) -> dict:
     """
     Paramètres d'un build : configuration actuelle du job, remplacée par ceux du dernier build de ce client
-    (`reference`, reference_parameters), puis par les paramètres imposés du profil (`fixed`), puis branche de
-    travail, dépôt client, attente décochée, commit et environnement (si le job a ces rôles) et filtre de tags
-    ajouté aux arguments.
+    (`reference`, reference_parameters), puis par les cases des suites (`suites`, suite_values : jamais reprises du
+    build de référence), puis par les paramètres imposés du profil (`fixed`), puis branche de travail, dépôt client,
+    attente décochée, commit et environnement (si le job a ces rôles) et filtre de tags ajouté aux arguments.
     """
-    params = {**current_values(definitions), **((reference or {}).get("parametres") or {}), **(fixed or {})}
+    params = {**current_values(definitions), **((reference or {}).get("parametres") or {}), **(suites or {}),
+              **(fixed or {})}
     for role, value in (("branche", branch), ("depot", repository), ("commit", commit), ("environnement", env)):
         if roles.get(role) and value:
             params[roles[role]] = value
