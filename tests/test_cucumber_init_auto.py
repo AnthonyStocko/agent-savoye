@@ -188,3 +188,14 @@ def test_existing_init_falls_back_to_copied_standard_files(main, monkeypatch, tm
     segment = ct.java_package_segment(CLIENT)
     assert set(plan["binaries"]) == {f"{res}/files/{segment}/01-Contexte/WMS/01-SITE.xml",
                                      f"{res}/rules/{segment}/01-Contexte/WMS/rule-A.json"}
+
+
+def test_spec_tags_parameter_gets_the_positive_tags_of_the_run():
+    roles, _ = cj.detect_roles(DEFINITIONS)
+    assert cj.tag_target({}, roles) == "les_deux"
+    params = cj.build_parameters(DEFINITIONS, roles, "v1.3", "canson-cucumber", "@INIT_CANSON_WMS and not @TMS",
+                                 target=cj.tag_target({}, roles),
+                                 reference={"parametres": {"ADDITIONAL_SPEC_TAGS": ""}})
+    assert params["ADDITIONAL_SPEC_TAGS"] == "@INIT_CANSON_WMS"
+    assert params["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@INIT_CANSON_WMS and not @TMS'")
+    assert cj.job_tag_list("(@A or @B) and not @A_REVOIR and @C") == "@A,@B,@C"

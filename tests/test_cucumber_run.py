@@ -310,7 +310,10 @@ def test_tag_filter_target(jenkins):
     repo, remote, calls = jenkins
     roles = cjob.detect_roles(DEFINITIONS)[0]
     default = cjob.build_parameters(DEFINITIONS, roles, BRANCH, tags="@a", target=cjob.tag_target(PROFILE, roles))
-    assert default["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@a'") and default["ADDITIONAL_SPEC_TAGS"] == ""
+    # Par défaut, job avec un paramètre de tags : les deux (le paramètre reçoit la liste des tags positifs)
+    assert default["ADDITIONAL_ARGLINE"].endswith("-Dcucumber.filter.tags='@a'") and default["ADDITIONAL_SPEC_TAGS"] == "@a"
+    assert cjob.tag_target(PROFILE, {**roles, "tags": ""}) == "arguments"
+    assert cjob.tag_target({"run_tags_target": "arguments"}, roles) == "arguments"
     param = cjob.build_parameters(DEFINITIONS, roles, BRANCH, tags="@a",
                                   target=cjob.tag_target({"run_tags_target": "parametre"}, roles))
     assert param["ADDITIONAL_SPEC_TAGS"] == "@a" and "cucumber.filter.tags" not in param["ADDITIONAL_ARGLINE"]

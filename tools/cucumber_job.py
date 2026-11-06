@@ -242,13 +242,29 @@ TAG_TARGETS = ("arguments", "parametre", "les_deux")
 
 def tag_target(profile: dict, roles: dict) -> str:
     """
-    Cible du filtre de tags : profil (« run_tags_target »), sinon les arguments (comportement établi : sur les jobs
-    observés, le paramètre de tags n'atteignait pas Cucumber). « parametre » / « les_deux » demandent le rôle « tags ».
+    Cible du filtre de tags : profil (« run_tags_target »), sinon les deux quand le job a un paramètre de tags (rôle
+    « tags », ex. ADDITIONAL_SPEC_TAGS : laissé vide, le job peut ne rien lancer du dépôt client), sinon les
+    arguments. « parametre » / « les_deux » demandent le rôle « tags ».
     """
     chosen = ((profile or {}).get("run_tags_target") or "").strip().lower()
-    if chosen in ("parametre", "les_deux") and not (roles or {}).get("tags"):
+    has_parameter = bool((roles or {}).get("tags"))
+    if chosen in ("parametre", "les_deux") and not has_parameter:
         return "arguments"
-    return chosen if chosen in TAG_TARGETS else "arguments"
+    if chosen in TAG_TARGETS:
+        return chosen
+    return "les_deux" if has_parameter else "arguments"
+
+
+_POSITIVE_TAG = re.compile(r"(?<![\w@])(not\s+)?(@[\w.-]+)", re.I)
+
+
+def job_tag_list(expression: str) -> str:
+    """
+    Tags du run au format du paramètre de tags du job (« @TAG1,@TAG2 ») : tags positifs de l'expression Cucumber,
+    les exclusions (« not @X ») restant dans le filtre des arguments. « @A and not @TMS » → « @A ».
+    """
+    tags = [tag for negated, tag in _POSITIVE_TAG.findall(expression or "") if not negated]
+    return ",".join(dict.fromkeys(tags))
 
 
 def reference_parameters(job: str, repository: str, definitions: dict = None, builds: list = None,
@@ -291,7 +307,9 @@ def build_parameters(definitions: dict, roles: dict, branch: str, repository: st
         params[roles["attente"]] = "false"
     to_parameter = target in ("parametre", "les_deux") and roles.get("tags")
     if to_parameter:
-        params[roles["tags"]] = (tags or "").strip()
+        # Seul filtre (« parametre ») : l'expression entière ; avec les arguments (« les_deux ») : liste des tags
+        # positifs au format du job, l'expression complète restant dans -Dcucumber.filter.tags
+        params[roles["tags"]] = (tags or "").strip() if target == "parametre" else job_tag_list(tags)
     if roles.get("arguments"):
         # Filtre dans les arguments sauf s'il passe seulement par le paramètre de tags (un filtre déjà présent y est
         # retiré pour ne pas contredire ce paramètre)
