@@ -18,7 +18,9 @@ from tools import cucumber_verify as cv
 from tools import jenkins_tools, secret_tools
 
 BRANCH = "cucumber-agent"
-PROFILE = {"run_job": "DOSSIER/JOB-CLIENT", "verify_branch": BRANCH}
+# Artefact du client détecté dans le pom de son application (choix de la version) : COMPONENT_OWNER / NAME
+PROFILE = {"run_job": "DOSSIER/JOB-CLIENT", "verify_branch": BRANCH, "version_client": {"deduction": {"jenkins": {
+    "kis_version": "3.12", "composant_proprietaire": "com.client", "composant_nom": "client-app"}}}}
 LOGIN, PASSWORD = "jdupont.agent", "S3cr3t-Pwd!"
 ARGLINE = f"-Dapi.login={LOGIN} -Dapi.password={PASSWORD} -Dcucumber.filter.tags='@old' -Dlocale=fr"
 # Paramètres du job réel (noms propres au job : jamais en dur dans le code, détectés)

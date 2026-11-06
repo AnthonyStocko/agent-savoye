@@ -156,7 +156,8 @@ def fixed_parameters(profile: dict, definitions: dict = None) -> tuple:
     # Version du client choisie (« version_client ») : version de l'artefact, branche du Cucumber Standard et version
     # KIS déduites, jamais recopiées d'un build d'une autre version
     version, version_warnings = version_parameters(profile, definitions)
-    return {**fixed, **version}, warnings + version_warnings
+    # Paramètres imposés explicitement (job_params) prioritaires sur les valeurs déduites
+    return {**version, **fixed}, warnings + version_warnings
 
 
 def version_parameters(profile: dict, definitions: dict = None) -> tuple:
@@ -171,6 +172,12 @@ def version_parameters(profile: dict, definitions: dict = None) -> tuple:
         return {}, []
     roles, _ = effective_roles(profile, definitions)
     params, warnings = {}, []
+    # Artefact du client (propriétaire, nom) : détecté dans le pom de SON application (client_version.deduce),
+    # jamais repris de la configuration du job (celle du dernier client lancé)
+    owner, name = client_component(profile)
+    for role, value in (("composant_proprietaire", owner), ("composant_nom", name)):
+        if roles.get(role) and value:
+            params[roles[role]] = value
     for role in ("composant_version", "standard_branche", "kis_version"):
         name = roles.get(role)
         if not name:
@@ -223,11 +230,13 @@ def build_parameters(definitions: dict, roles: dict, branch: str, repository: st
                      reference: dict = None) -> dict:
     """
     Paramètres d'un build : configuration actuelle du job, remplacée par ceux du dernier build de ce client
-    (`reference`, reference_parameters), puis par les paramètres imposés du profil (`fixed`), puis branche de
+    (`reference`, reference_parameters), puis suites du Standard décochées (standard_switches), puis par les
+    paramètres imposés du profil (`fixed` : artefact et version du client compris), puis branche de
     travail, dépôt client, attente décochée, commit et environnement (si le job a ces rôles) et filtre de tags
     ajouté aux arguments.
     """
-    params = {**current_values(definitions), **((reference or {}).get("parametres") or {}), **(fixed or {})}
+    params = {**current_values(definitions), **((reference or {}).get("parametres") or {}),
+              **standard_switches(definitions, roles), **(fixed or {})}
     for role, value in (("branche", branch), ("depot", repository), ("commit", commit), ("environnement", env)):
         if roles.get(role) and value:
             params[roles[role]] = value
@@ -242,6 +251,99 @@ def build_parameters(definitions: dict, roles: dict, branch: str, repository: st
         argument_tags = "" if to_parameter and target == "parametre" else tags
         params[roles["arguments"]] = with_tag_filter(params.get(roles["arguments"], ""), argument_tags)
     return params
+
+
+def client_component(profile: dict) -> tuple:
+    """
+    (propriétaire, nom) de l'artefact du client, détectés dans le pom de son application au choix de la version
+    (« version_client » → deduction → jenkins) ; ('', '') si inconnus.
+    """
+    values = ((((profile or {}).get("version_client") or {}).get("deduction") or {}).get("jenkins") or {})
+    return str(values.get("composant_proprietaire") or "").strip(), str(values.get("composant_nom") or "").strip()
+
+
+# Interrupteur des suites du Standard (ex. hasStandard) et du dépôt spécifique (ex. hasSpecific) : détectés
+_STANDARD_SWITCH = re.compile(r"^has_?standard$|^standard_?(enabled|actif|active)$", re.I)
+_SPECIFIC_SWITCH = re.compile(r"^has_?spec(ific)?$|^spec(ific)?_?(enabled|actif|active)$", re.I)
+
+
+def standard_switches(definitions: dict, roles: dict = None) -> dict:
+    """
+    Runs de vérification de l'agent : suites du Standard décochées. L'interrupteur du Standard et les groupes qui le
+    suivent dans la définition du job (paramètres booléens jusqu'à l'interrupteur du spécifique : INIT_WMS, DEBUT,
+    PARAMETRAGE…) à false, l'interrupteur du spécifique à true. Aucun nom en dur : {} si le job n'a pas
+    d'interrupteur du Standard. Les paramètres imposés du profil (job_params) restent prioritaires.
+    """
+    names = list(definitions or {})
+    standard = next((n for n in names if _STANDARD_SWITCH.search(n)), "")
+    if not standard:
+        return {}
+    specific = next((n for n in names if _SPECIFIC_SWITCH.search(n)), "")
+    start = names.index(standard)
+    end = names.index(specific) if specific and names.index(specific) > start else len(names)
+    wait = (roles or {}).get("attente")
+    out = {n: "false" for n in names[start:end] if n != wait and "Boolean" in _type(definitions[n])}
+    if specific:
+        out[specific] = "true"
+    return out
+
+
+def other_clients(client_name: str, definitions: dict = None, roles: dict = None, own_identifiers=()) -> set:
+    """
+    Autres clients connus (noms en minuscules) : dossiers clients du cache de l'agent, et le client de la
+    configuration actuelle du job (dépôt « <client>-cucumber » et propriétaire de l'artefact par défaut : celui du
+    dernier client lancé), hors identifiants de CE client (`own_identifiers` : son artefact).
+    """
+    from tools.cucumber_tools import CACHE_ROOT
+    own = (client_name or "").strip().lower()
+    names = set()
+    try:
+        for entry in os.listdir(CACHE_ROOT):
+            folder = os.path.join(CACHE_ROOT, entry)
+            if not entry.startswith(("_", ".")) and os.path.isdir(folder) and any(
+                    os.path.exists(os.path.join(folder, f)) for f in ("profil.json", "projet.json")):
+                names.add(entry.lower())
+    except OSError:
+        pass
+    defaults = current_values(definitions)
+    for role in ("depot", "composant_proprietaire"):
+        value = defaults.get((roles or {}).get(role) or "", "").strip().lower()
+        if value:
+            names.add(re.sub(r"-cucumber$", "", value))
+    mine = {own, f"{own}-cucumber"} | {str(v).strip().lower() for v in own_identifiers if v}
+    return {n for n in names if len(n) >= 4 and n not in mine}
+
+
+def launch_errors(params: dict, roles: dict, client_name: str, profile: dict, definitions: dict = None) -> list:
+    """
+    Contrôle avant lancement : aucun paramètre d'un autre client, sinon le run est refusé. Artefact monté
+    (rôles « composant_proprietaire » / « composant_nom ») égal à celui détecté dans l'application de CE client ;
+    aucune valeur ne cite un autre client connu (other_clients). Les valeurs ne sont jamais citées (identifiants).
+    """
+    errors = []
+    owner, name = client_component(profile)
+    # Paramètre imposé explicitement dans le profil (job_params) : prioritaire, comme dans build_parameters
+    imposed = dict(str(line).split("=", 1) for line in (profile or {}).get("job_params") or [] if "=" in str(line))
+    imposed = {k.strip(): v.strip() for k, v in imposed.items()}
+    for role, expected in (("composant_proprietaire", owner), ("composant_nom", name)):
+        param = (roles or {}).get(role)
+        if not param:
+            continue
+        expected = imposed.get(param) or expected
+        if not expected:
+            errors.append(f"{param} ({ROLES[role]}) inconnu pour {client_name} : choisissez la version du client dans "
+                          f"« Données du projet » (artefact détecté dans le pom de son application) — la valeur du job "
+                          f"est celle du dernier client lancé")
+        elif str(params.get(param, "")).strip() != expected:
+            errors.append(f"{param} = {params.get(param, '')!s} au lieu de {expected} (application de {client_name})")
+    own = [imposed.get((roles or {}).get(r) or "") or v
+           for r, v in (("composant_proprietaire", owner), ("composant_nom", name))]
+    for other in sorted(other_clients(client_name, definitions, roles, own)):
+        pattern = re.compile(rf"(?<![a-z0-9]){re.escape(other)}(?![a-z0-9])", re.I)
+        cited = sorted(n for n, v in params.items() if pattern.search(str(v)))
+        if cited:
+            errors.append(f"paramètre(s) {', '.join(cited)} du client « {other} » (autre client)")
+    return [f"paramètres d'un autre client, run arrêté : {e}" for e in errors]
 
 
 def client_configuration_error(reference: dict, fixed: dict, repository: str, profile: dict = None) -> str:

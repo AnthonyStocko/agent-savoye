@@ -422,3 +422,139 @@ def share_a_revoir(client_name: str, project: str = "") -> dict:
         body = f.read()
     return knowledge_tools.publish_knowledge(body, project or client_name.upper(), "cucumber-a-revoir",
                                              f"À revoir Cucumber {client_name}", client=client_name, tags=["cucumber"])
+
+
+# ---------------------------------------------------------------------------
+# Bilan d'un lot de génération : couverture vérifiée, fichiers écrits, modifications écartées du patch
+# ---------------------------------------------------------------------------
+
+# Verdicts d'exécution : test vert et probant (contre-épreuves), test vert mais faible
+VERIFIED_STATUSES = ("pertinent",)
+WEAK_STATUSES = ("faible",)
+FAILED_STATUSES = ("invalide",)
+
+
+def spec_verification(lot: dict) -> dict:
+    """Statuts de vérification des scénarios de chaque spécifique du lot : {id du spécifique: [statut, ...]}."""
+    from tools.cucumber_verify import scenario_id
+    spec_of = {scenario_id(s.get("fichier", ""), s.get("titre", "")): s.get("spec")
+               for s in ((lot.get("indicateurs") or {}).get("scenarios") or []) if isinstance(s, dict)}
+    out = {}
+    for item in ((lot.get("execution") or {}).get("scenarios") or {}).values():
+        spec = spec_of.get(item.get("id"))
+        if spec:
+            out.setdefault(spec, []).append(item.get("statut", ""))
+    return out
+
+
+def file_kinds(files: list) -> str:
+    """« 3 fichier(s) : 1 feature, 1 fichier de données, 1 classe Java »."""
+    kinds = {"feature": 0, "fichier de données": 0, "classe Java": 0, "autre": 0}
+    for path in files or []:
+        kind = ("feature" if path.endswith(".feature") else "classe Java" if path.endswith(".java") else
+                "autre" if path.endswith(".md") else "fichier de données")
+        kinds[kind] += 1
+    detail = ", ".join(f"{n} {k}" for k, n in kinds.items() if n)
+    return f"{len(files or [])} fichier(s)" + (f" : {detail}" if detail else "")
+
+
+def lot_outcome(lot: dict, results: list, files: list, committed: bool, total: int) -> dict:
+    """
+    Bilan d'un lot, sans contradiction : un spécifique n'est « couvert » que si l'un de ses scénarios est vert et
+    probant à l'exécution (pertinent) ; écrit mais non vérifié, faible ou en échec, il est compté à part. Les
+    fichiers écrits sont ceux du lot (commités par la vérification sur la branche de travail ou par le lot).
+    Renvoie {"couverts", "faibles", "non_verifies", "echecs", "indirects", "ligne"}.
+    """
+    by_spec = spec_verification(lot)
+    executed = ((lot.get("execution") or {}).get("mode") or "aucun") != "aucun"
+    out = {"couverts": [], "faibles": [], "non_verifies": [], "echecs": [], "indirects": []}
+    for result in results or []:
+        status, spec = result.get("statut"), result.get("id")
+        if status == "couvert_indirectement":
+            out["indirects"].append(spec)
+        if status != "couvert":
+            continue
+        statuses = by_spec.get(spec) or []
+        if any(s in VERIFIED_STATUSES for s in statuses):
+            out["couverts"].append(spec)
+        elif any(s in WEAK_STATUSES for s in statuses):
+            out["faibles"].append(spec)
+        elif any(s in FAILED_STATUSES for s in statuses):
+            out["echecs"].append(spec)
+        else:
+            out["non_verifies"].append(spec)
+    parts = [f"{len(out['couverts'])}/{total} spécifique(s) couvert(s) et vérifié(s)"]
+    if out["faibles"]:
+        parts.append(f"{len(out['faibles'])} couvert(s) par un test faible")
+    if out["echecs"]:
+        parts.append(f"{len(out['echecs'])} test(s) écrit(s) en échec")
+    if out["non_verifies"]:
+        parts.append(f"{len(out['non_verifies'])} test(s) écrit(s) NON vérifié(s)"
+                     + ("" if executed else " (aucune exécution)") + " — pas comptés comme couverts")
+    if out["indirects"]:
+        parts.append(f"{len(out['indirects'])} indirectement")
+    written = [f for f in files or [] if not f.endswith("A_REVOIR.md")]
+    if not written:
+        where = "aucun fichier écrit"
+    elif committed:
+        where = f"{file_kinds(written)} écrit(s), commit créé"
+    elif lot.get("commit"):
+        where = f"{file_kinds(written)} écrit(s), commités et poussés lors de la vérification"
+    else:
+        where = f"{file_kinds(written)} écrit(s), non commités"
+    icon = "✅" if out["couverts"] and not (out["non_verifies"] or out["echecs"]) else "⚠️"
+    out["ligne"] = f"{icon} " + ", ".join(parts) + f" — {where}"
+    return out
+
+
+# Motifs des modifications écartées du patch (cucumber_tools.write_patch) : explication et action
+REJECTION_REASONS = (
+    ("créé par l'agent mais déjà présent", "fichier créé par l'agent, mais la branche de base en contient déjà une "
+     "version différente (souvent la version poussée par une vérification précédente, modifiée depuis) : la version "
+     "de la branche est conservée, celle de l'agent n'est pas livrée — comparer les deux et reporter à la main ce "
+     "qui manque"),
+    ("en conflit", "modification de l'agent en conflit avec une modification faite depuis sur la branche : la "
+     "version de la branche est conservée — reprendre la modification de l'agent à la main si elle est nécessaire"),
+    ("suppression écartée", "suppression d'un fichier existant : l'agent ne livre jamais de suppression — supprimer "
+     "à la main si elle est voulue"),
+)
+
+
+def rejected_explanation(ecarts_file: str) -> list:
+    """Modifications écartées du patch, regroupées par motif : lignes « n fichier(s) — explication : fichiers »."""
+    try:
+        with open(ecarts_file, encoding="utf-8", errors="replace") as f:
+            lines = [line[2:].strip() for line in f if line.startswith("- ")]
+    except OSError:
+        return []
+    groups = {}
+    for line in dict.fromkeys(lines):
+        path = line.split(" : ", 1)[0]
+        reason = next((text for key, text in REJECTION_REASONS if key in line), "motif non reconnu : voir le détail")
+        groups.setdefault(reason, [])
+        if path not in groups[reason]:
+            groups[reason].append(path)
+    return [f"{len(paths)} fichier(s) — {reason} : " + ", ".join(p.rsplit("/", 1)[-1] for p in paths)
+            for reason, paths in groups.items()]
+
+
+def db_share(entries: list, tokens: dict) -> dict:
+    """
+    Part des recherches en base dans le coût d'un lot : chaque commande base est un tour de l'agent, dont le coût
+    est estimé au prorata des tours (contexte relu à chaque tour). {"commandes", "erreurs", "tours", "part",
+    "cout_usd", "ligne"} ; part = commandes / tours (bornée à 1), coût = part × coût du lot.
+    """
+    entries = entries or []
+    errors = sum(1 for e in entries if not e.get("ok"))
+    turns = int((tokens or {}).get("tours") or 0)
+    cost = float((tokens or {}).get("cout_usd") or 0.0)
+    share = min(1.0, len(entries) / turns) if turns else 0.0
+    out = {"commandes": len(entries), "erreurs": errors, "tours": turns, "part": round(share, 3),
+           "cout_usd": round(share * cost, 2)}
+    if not entries:
+        out["ligne"] = "aucune recherche en base"
+    else:
+        out["ligne"] = (f"{len(entries)} commande(s) base" + (f" dont {errors} en erreur" if errors else "")
+                        + (f" = {len(entries)}/{turns} tours ({round(100 * share)} %), ≈ {out['cout_usd']:.2f} $ sur "
+                           f"{cost:.2f} $ (estimation au prorata des tours)" if turns else ""))
+    return out

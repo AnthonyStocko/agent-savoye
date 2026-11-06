@@ -137,13 +137,15 @@ def test_jenkins_parameters_deduced_never_copied_from_another_version(project, m
     refs = ["v26.22", "v26.23"]
     deduction = cv.deduce(entries["tag"], app.file(entries["tag"], "pom.xml"), GROUPS, refs, "26.16", registry)
     assert deduction["jenkins"] == {"composant_version": "1.3.0", "standard_branche": "v26.22",
-                                    "kis_version": "3.12"}
+                                    "kis_version": "3.12", "composant_proprietaire": "com.client",
+                                    "composant_nom": "odatio-app"}
     definitions = {name: {"type": "String", "defaut": ""} for name in (
         "COMPONENT_OWNER", "COMPONENT_NAME", "COMPONENT_VERSION", "CUCUMBER_STANDARD_BRANCH", "KIS_VERSION",
         "CUCUMBER_SPEC_BRANCH", "ADDITIONAL_ARGLINE")}
     profile = {"version_client": {"deduction": deduction}}
     fixed, warnings = cj.fixed_parameters(profile, definitions)
-    assert fixed == {"COMPONENT_VERSION": "1.3.0", "CUCUMBER_STANDARD_BRANCH": "v26.22", "KIS_VERSION": "3.12"}
+    assert fixed == {"COMPONENT_VERSION": "1.3.0", "CUCUMBER_STANDARD_BRANCH": "v26.22", "KIS_VERSION": "3.12",
+                     "COMPONENT_OWNER": "com.client", "COMPONENT_NAME": "odatio-app"}
     # Les valeurs déduites remplacent celles du build de référence (autre version)
     reference = {"parametres": {"COMPONENT_VERSION": "1.4-SNAPSHOT", "CUCUMBER_STANDARD_BRANCH": "v26.24",
                                 "KIS_VERSION": "9.99"}}

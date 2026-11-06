@@ -2769,6 +2769,10 @@ def _squashed_patch(worktree: str, base: str, output: str, client_name: str = ""
                         + "\n".join(f"- {r}" for r in dict.fromkeys(rejected)) + "\n")
             print(f"[CUCUMBER] Patch : {len(set(rejected))} modification(s) écartée(s) (conflit ou suppression), "
                   f"détail : {ecarts}")
+            # Bilan : chaque motif expliqué (ce qui n'est pas livré, pourquoi, quoi faire)
+            from tools.cucumber_bilan import rejected_explanation
+            for line in rejected_explanation(ecarts):
+                print(f"    {line}")
         elif os.path.exists(ecarts):
             os.remove(ecarts)
         if already:
@@ -3797,9 +3801,14 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
         for motif in d["motifs"]:
             key = re.sub(r" de \S+ / .*$| \(.*\)$", "", motif)
             reasons[key] = reasons.get(key, 0) + 1
+    # Un test écrit mais non vérifié (ou en échec) n'est jamais compté « couvert » (bilan du lot, cucumber_bilan)
+    unproven = [i for i in covered if (lot_of.get(i, {}).get("bilan") or {}) and i not in
+                (lot_of[i]["bilan"].get("couverts") or []) + (lot_of[i]["bilan"].get("faibles") or [])]
     lines = [f"# Couverture Cucumber des spécifiques {client_name}", "",
-             f"{len(specs)} spécifique(s) inventorié(s), {len(selected)} traité(s), {len(covered)} couvert(s), "
-             f"{len(indirect)} couvert(s) indirectement. "
+             f"{len(specs)} spécifique(s) inventorié(s), {len(selected)} traité(s), "
+             f"{len(covered) - len(unproven)} couvert(s)"
+             + (f", {len(unproven)} test(s) écrit(s) non vérifié(s) ou en échec (non couverts)" if unproven else "")
+             + f", {len(indirect)} couvert(s) indirectement. "
              f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}.", ""]
     own_init = state.get("init_corrigee") or {}
     if own_init.get("fichiers"):

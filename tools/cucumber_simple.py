@@ -325,3 +325,59 @@ def merge_features(previous: list, current: list) -> list:
     """Lignes de l'étape 5 : les nouvelles remplacent les anciennes de même id, ordre d'arrivée conservé."""
     ids = {line["id"] for line in current}
     return [line for line in previous or [] if line.get("id") not in ids] + list(current)
+
+
+# Environnement des runs Jenkins remonté à chaque run : schéma supprimé puis recréé (conteneur « dropschema »),
+# slot alloué au build (« Build running on slot N ») ; lu dans les consoles des builds du client (0 token)
+_REBUILT_MARKERS = (re.compile(r"\bdrop_?schema\b", re.I), re.compile(r"\bBuild running on slot \d+", re.I))
+
+
+def rebuilt_environment(consoles: list) -> str:
+    """Preuve qu'un run Jenkins remonte son environnement (premier indice trouvé dans les consoles) ; '' sinon."""
+    for text in consoles or []:
+        for marker in _REBUILT_MARKERS:
+            found = marker.search(text or "")
+            if found:
+                return found.group(0)
+    return ""
+
+
+def no_init_warning(proof: str, db_target: str = "", db_schema: str = "") -> str:
+    """
+    Avertissement « sans init » sur un environnement remonté à chaque run : ce qui est lu dans la base de test n'est
+    pas garanti dans le schéma du slot alloué au run ; propose de cocher l'initialisation. '' sans preuve.
+    """
+    if not proof:
+        return ""
+    where = f" ({db_target}{', schéma ' + db_schema if db_schema else ''})" if db_target or db_schema else ""
+    return (f"Sans initialisation, sur un environnement remonté à chaque run (console Jenkins : « {proof} ») : les "
+            f"données lues dans la base de test{where} ne sont PAS garanties dans l'environnement du run (schéma "
+            f"cucumber_customer_<slot> recréé pour le build). Les tests qui s'appuient sur elles échoueront ou ne "
+            f"prouveront rien : cochez « Initialisation de l'environnement » pour que l'init les crée à chaque run.")
+
+
+def client_no_init_warning(client_name: str) -> str:
+    """
+    no_init_warning pour un client : consoles Jenkins de ses derniers builds (cache de vérification) et base de test
+    lue par l'agent (profil « cucumber » de la connexion : cible et schéma, sans mot de passe).
+    """
+    import os
+    from tools import db_tools
+    from tools.cucumber_tools import cache_dir
+    folder = os.path.join(cache_dir(client_name), "verification")
+    names = [n for n in os.listdir(folder) if n.endswith("console.txt")] if os.path.isdir(folder) else []
+    consoles = []
+    for name in sorted(names, key=lambda n: -os.path.getmtime(os.path.join(folder, n)))[:5]:
+        with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+            consoles.append(f.read(200_000))
+    proof = rebuilt_environment(consoles)
+    if not proof:
+        return ""
+    previous = db_tools.set_profile("cucumber")
+    try:
+        config = db_tools.get_db_config()
+        configured = bool(config.get("host") or config.get("name"))
+        target, schema = (db_tools.describe_db_target(), config.get("schema", "")) if configured else ("", "")
+    finally:
+        db_tools.set_profile(previous)
+    return no_init_warning(proof, target, schema)

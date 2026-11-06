@@ -465,6 +465,50 @@ def describe_table(table: str, schema: str = "") -> str:
     return "\n".join(lines)
 
 
+def describe_tables(tables: list, schema: str = "") -> str:
+    """Plusieurs tables décrites en UNE commande (recherches groupées : un tour de l'agent au lieu d'un par table)."""
+    parts = []
+    for table in dict.fromkeys(tables or []):
+        try:
+            parts.append(describe_table(table, schema))
+        except DbError as e:
+            parts.append(f"Table {table} : {e}")
+    return "\n\n".join(parts)
+
+
+# Colonne inconnue (PostgreSQL, SQL Server, Oracle, MySQL) : l'erreur renvoie les vraies colonnes des tables lues
+_UNKNOWN_COLUMN = re.compile(r"UndefinedColumn|column .+ does not exist|Invalid column name|ORA-00904|Unknown column",
+                             re.I)
+MAX_HINT_COLUMNS = 60
+
+
+def column_hint(sql: str, error: str, schema: str = "") -> str:
+    """
+    « colonnes réelles : t1(a, b, …) ; t2(…) » pour une requête en erreur sur une colonne inconnue, '' sinon : la
+    requête suivante est juste du premier coup, sans describe ni nouvel essai à l'aveugle.
+    """
+    if not _UNKNOWN_COLUMN.search(error or ""):
+        return ""
+    _import_sqlalchemy()
+    from sqlalchemy import inspect
+    hints = []
+    try:
+        with readonly_connection(schema) as conn:
+            insp = inspect(conn)
+            for table in query_tables(sql, get_db_config().get("type", "")):
+                owner, _, name = table.rpartition(".")
+                try:
+                    names = [c["name"] for c in insp.get_columns(name, schema=owner or schema or None)]
+                except Exception:
+                    continue
+                if names:
+                    more = len(names) > MAX_HINT_COLUMNS
+                    hints.append(f"{table}({', '.join(names[:MAX_HINT_COLUMNS])}{', …' if more else ''})")
+    except Exception:
+        return ""
+    return f" — colonnes réelles : {' ; '.join(hints)}" if hints else ""
+
+
 def test_connection(schema: str = "", profile: str = None) -> tuple:
     """Renvoie (succès, message) ; utilisé par le bouton « Tester la connexion » de l'IHM."""
     if profile is not None:
@@ -517,7 +561,7 @@ def log_command(args, schema: str, error: str) -> None:
     if args.command == "query":
         tables = query_tables(args.sql, get_db_config().get("type", ""))
     elif args.command == "describe":
-        tables = [args.table]
+        tables = [args.table] if isinstance(args.table, str) else list(args.table)
     else:
         tables = []
     entry = {"date": datetime.now().isoformat(timespec="seconds"), "commande": args.command, "schema": schema,
@@ -541,8 +585,8 @@ def main() -> int:
     sub.add_parser("test", parents=[common], help="Teste la connexion")
     tables = sub.add_parser("tables", parents=[common], help="Liste les tables et vues du schéma")
     tables.add_argument("--like", default="", help="Motif LIKE (ex: ORD%%)")
-    describe = sub.add_parser("describe", parents=[common], help="Décrit une table")
-    describe.add_argument("table")
+    describe = sub.add_parser("describe", parents=[common], help="Décrit une ou plusieurs tables (une commande)")
+    describe.add_argument("table", nargs="+")
     query = sub.add_parser("query", parents=[common], help="Exécute une requête SELECT / WITH")
     query.add_argument("sql")
     query.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help=f"Lignes max (défaut {DEFAULT_LIMIT}, max {MAX_LIMIT})")
@@ -559,7 +603,7 @@ def main() -> int:
         elif args.command == "tables":
             print(list_tables(schema, args.like))
         elif args.command == "describe":
-            print(describe_table(args.table, schema))
+            print(describe_tables(args.table, schema))
         else:
             print(run_query(args.sql, schema, args.limit))
         print("DB_OK")
@@ -570,8 +614,11 @@ def main() -> int:
         log_command(args, schema, str(e))
         return 1
     except Exception as e:
-        print(f"DB_ERROR={_scrub(e)}")
-        log_command(args, schema, _scrub(e))
+        error = _scrub(e)
+        if args.command == "query":
+            error += column_hint(args.sql, error, schema)
+        print(f"DB_ERROR={error}")
+        log_command(args, schema, error)
         return 1
 
 

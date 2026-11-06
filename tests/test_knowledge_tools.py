@@ -380,8 +380,8 @@ def test_search_order_and_obsolete_filter(indexed, share):
     assert found[0] == rel["ticket"] and rel["old"] not in found
     # Même projet sans point commun : seuls les documents qui portent sur tout le projet
     assert rel["health"] in found and rel["unrelated"] not in found
-    # Autre client : retenu par le composant et les mots-clés, après ceux du projet
-    assert found.index(rel["other_client"]) > found.index(rel["health"])
+    # Autre client : jamais retenu, même avec un composant et des mots-clés communs
+    assert rel["other_client"] not in found
     assert rel["old"] in _found(documents, include_obsolete=True)
     assert _found(documents, projet="PROJZ", client="Ailleurs", tickets=[], composants=[], query_text="") == []
 
@@ -510,3 +510,24 @@ def test_readme_documents_confidentiality_and_format():
     assert "## Connaissances partagées" in readme and "lit tous les documents" in readme
     assert all(f"`{doc_type}`" in readme for doc_type in kt.KNOWLEDGE_TYPES)
     assert all(f"{field}:" in readme for field in kt.HEADER_FIELDS)
+
+
+def test_tests_never_use_the_real_shared_directory(tmp_path):
+    """Isolation (conftest) : les documents produits par les tests vont dans un répertoire temporaire."""
+    import dotenv
+    real = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    assert kt.knowledge_dir().startswith(str(tmp_path))
+    dotenv.load_dotenv(real, override=True)
+    assert kt.knowledge_dir().startswith(str(tmp_path))
+
+
+def test_documents_of_another_client_are_never_injected():
+    documents = [{"chemin": "autre/cucumber-a-revoir/a.md", "meta": {"client": "autre", "type": "cucumber-a-revoir",
+                                                                     "tags": ["cucumber"]}, "titres": []},
+                 {"chemin": "moi/cucumber-a-revoir/b.md", "meta": {"client": "moi", "type": "cucumber-a-revoir",
+                                                                   "tags": ["cucumber"]}, "titres": []},
+                 {"chemin": "SPEC/analyse/c.md", "meta": {"projet": "SPEC", "type": "analyse", "tags": ["cucumber"]},
+                  "titres": []}]
+    found = [r["doc"]["chemin"] for r in kt.find_knowledge(documents, "SPEC", client="moi", tags=["cucumber"])]
+    assert "autre/cucumber-a-revoir/a.md" not in found
+    assert "moi/cucumber-a-revoir/b.md" in found and "SPEC/analyse/c.md" in found

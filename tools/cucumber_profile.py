@@ -139,15 +139,22 @@ def application_clears(client_root: str) -> dict:
     return found
 
 
-def choose_clear(init_clear: str, app_clears: dict, analysed: bool) -> tuple:
+def choose_clear(init_clear: str, app_clears: dict, analysed: bool, proven: dict = None) -> tuple:
     """
-    (clear retenu, avertissement) : le clear vient de l'application du client ; celui de l'init n'est retenu que
-    s'il y figure. Sans application analysée (`analysed` faux), le clear de l'init est retenu tel quel.
+    (clear retenu, avertissement) : le clear vient de l'application du client, ou du socle (routes init-data de KIS
+    et des contribs du Standard) s'il est prouvé par un run vert de CE client (`proven`, record_proven_clear) ; celui
+    de l'init n'est retenu que s'il figure dans l'un ou l'autre. Sans application analysée (`analysed` faux), le
+    clear de l'init est retenu tel quel.
     """
+    proven = proven or {}
+    if init_clear and init_clear in proven:
+        return init_clear, ""
     if not analysed:
         return init_clear, ""
     if init_clear and init_clear in app_clears:
         return init_clear, ""
+    if not init_clear and not app_clears and len(proven) == 1:
+        return next(iter(proven)), ""
     names = sorted(app_clears)
     if len(names) == 1:
         return names[0], (f"clear de l'init « {init_clear} » absent de l'application du client : clear de "
@@ -157,6 +164,38 @@ def choose_clear(init_clear: str, app_clears: dict, analysed: bool) -> tuple:
                     f"l'environnement dans le profil client")
     return "", (CLEAR_QUESTION + (f" (l'init cite « {init_clear} », absent de l'application : il peut venir d'un "
                                   f"autre client)" if init_clear else ""))
+
+
+# Clears prouvés par un run vert du client (route du socle KIS / init-data comprise) : {route: {build, preuves, …}}
+PROVEN_CLEARS = "clears_prouves"
+
+
+def proven_clears(client_name: str) -> dict:
+    return dict((_read_json(profile_path(client_name), {}) or {}).get(PROVEN_CLEARS) or {}) if client_name else {}
+
+
+def record_proven_clear(client_name: str, routes: list, build: str, proofs: list = None, reason: str = "") -> dict:
+    """
+    Clear(s) fourni(s) par le socle (KIS / init-data) ou l'application et prouvé(s) par un run vert de l'init de ce
+    client : enregistrés dans le profil (valides), l'avertissement « aucun clear trouvé » retiré. Renvoie le document.
+    """
+    document = load_profile(client_name)
+    proven = dict(document.get(PROVEN_CLEARS) or {})
+    for route in (r.strip() for r in routes or [] if r and r.strip()):
+        proven[route] = {"build": build or "", "preuves": list(proofs or [])[:10], "motif": reason or "",
+                         "date": datetime.now().isoformat(timespec="seconds")}
+    document[PROVEN_CLEARS] = proven
+    if proven:
+        # Avertissements de la détection sur le clear (aucun clear, clear de l'init absent de l'application) levés
+        document["avertissements_detection"] = [w for w in document.get("avertissements_detection") or []
+                                                if not (w.startswith(CLEAR_QUESTION) or w.startswith("clear de l'init"))]
+        detected = document.setdefault("detecte", {})
+        if not detected.get("clear_name") or detected["clear_name"] not in proven:
+            routes_ok = [r for r in routes or [] if r in proven]
+            if len(routes_ok) == 1:
+                detected["clear_name"] = routes_ok[0]
+    _write_json(profile_path(client_name), document)
+    return document
 
 
 CLEAR_QUESTION = ("aucun clear trouvé dans le code ou la configuration de l'application du client : quel est le nom "
@@ -226,7 +265,7 @@ def detect_profile(client_name: str, worktree: str, ref: str, cucumber_std_dir: 
     init_clear = init_clear_name(list(texts.values()))
     analysed = bool(client_root and git_repos(client_root))
     app_clears = application_clears(client_root) if analysed else {}
-    clear, clear_warning = choose_clear(init_clear, app_clears, analysed)
+    clear, clear_warning = choose_clear(init_clear, app_clears, analysed, proven_clears(client_name))
     if clear_warning:
         warnings.append(clear_warning)
     profile.update(features_root=root, tag_client=tag, init_features=paths, init_tags=" or ".join(init_tags),
@@ -326,9 +365,10 @@ def effective_profile(document: dict) -> dict:
     detected_tags = (((document or {}).get("detecte") or {}).get("init_tags") or "")
     # Version du client choisie (tools/client_version) : paramètres Jenkins des runs de l'agent qui en sont déduits
     version = (document or {}).get("version_client") or {}
+    proven = dict((document or {}).get(PROVEN_CLEARS) or {})
     return cucumber_modules.scope_profile({**profile, "sources": sources, "avertissements": warnings,
                                            "clears_application": clears, "init_tags_detectes": detected_tags,
-                                           "version_client": version})
+                                           "version_client": version, PROVEN_CLEARS: proven})
 
 
 def save_user_fields(client_name: str, fields: dict) -> dict:
