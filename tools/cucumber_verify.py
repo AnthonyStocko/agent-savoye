@@ -930,6 +930,14 @@ KNOWN_FAILURES = (
      "technique", "ordre non lançable après le contrôle du client : les données reprises du Standard ne respectent pas "
      "une règle active du client ; crée dans le Background des données conformes (fichiers propres à la feature), "
      "sans modifier l'init globale ni affaiblir la règle"),
+    (re.compile(r"already (?:exists?|associated|used|integrated)|is not [«\"']?A lancer|d[ée]j[àa] (?:existant|"
+                r"associ[ée]|utilis[ée]|int[ée]gr[ée])|existe d[ée]j[àa]|duplicate key|unique constraint", re.I),
+     "technique", "objet déjà présent en base : si aucun clear ne passe entre deux exécutions (init décochée, runs "
+     "précédents conservés), les objets créés par les tests (OP, commandes, UP, SSCC, palettes…) restent d'un run à l'autre — "
+     "vérifie-le par une requête sur le code en base, puis rends leurs codes UNIQUES à chaque exécution (mécanisme du "
+     "Standard s'il existe : variable de contexte, step qui génère un code, substitution dans les fichiers ; sinon "
+     "step du projet qui copie le fichier sous target/ avec un suffixe propre au run et l'intègre), sans réutiliser "
+     "l'objet d'un run précédent"),
     (re.compile(r"(?:websocket|ws)\b.{0,80}\bform\b|\bform\b.{0,80}(?:websocket|ws)\b|canal\s*«?\s*form", re.I),
      "technique", "écran attendu différent de l'écran reçu (délai sur le canal « form ») : ajoute un diagnostic "
      "temporaire d'écran avant le step (titre, éléments, erreur, dernier bouton soumis), exécuté au run suivant"),

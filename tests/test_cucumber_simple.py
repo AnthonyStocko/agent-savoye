@@ -446,3 +446,16 @@ def test_absent_standard_codes_must_be_mapped_to_database_equivalents():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     text = open(os.path.join(root, "prompts", "cucumber_client_lot_systeme.md"), encoding="utf-8").read()
     assert "code Standard → code client" in text and "n'est pas une conclusion" in text
+
+
+def test_objects_left_by_previous_runs_get_a_unique_code_hint():
+    from tools import cucumber_verify as cv
+    hint = cv.failure_hint("SPEC-APB-1,SPEC-APB-1 is not A lancer or already associated to a launching campaign")
+    assert "UNIQUES à chaque exécution" in hint and "requête" in hint
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        main = importlib.import_module("main")
+    finally:
+        sys.stdout, sys.stderr = saved
+    assert "Aucun clear entre deux exécutions" in main.NO_INIT_BLOCK and "UNIQUES" in main.NO_INIT_BLOCK

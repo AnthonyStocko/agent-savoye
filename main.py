@@ -5816,6 +5816,12 @@ Jenkins les joue contient déjà les données du client (sa configuration a ét�
 - Ne crée dans le Background que ce qui manque réellement en base.
 - Fichiers de données des tests : aucune init ne crée les codes du « PROFIL CLIENT » ; prends TOUS les codes de
   référence (site, donneur d'ordres, statut administratif…) dans la base, comme indiqué plus bas.
+- Aucun clear entre deux exécutions : les objets que tes tests CRÉENT (OP, commandes, UP, SSCC, palettes, besoins…)
+  restent en base d'un run à l'autre ; un code fixe (ex. OP « SPEC-APB-1 ») échoue dès le 2e run (« already
+  associated », « déjà existant »). Leurs codes doivent être UNIQUES à chaque exécution : cherche d'abord le mécanisme
+  du Standard (Grep dans les steps : aléatoire, random, unique, horodat, timestamp, variable, contexte, ${, #{) ; sinon
+  écris un step du projet qui copie le fichier de données sous target/ en suffixant ces codes par un identifiant du run,
+  l'intègre comme le step du Standard, et garde les codes générés dans le contexte du scénario pour les steps suivants.
 
 """
 
