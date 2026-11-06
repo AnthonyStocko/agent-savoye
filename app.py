@@ -4556,6 +4556,15 @@ with tab_config:
                 help="Tours de l'agent par correction faite avec le modèle du lot.")
         env_values["CUCUMBER_FIX_ATTEMPTS"] = str(int(fix_attempts))
         env_values["CUCUMBER_FIX_MAX_TURNS"] = str(int(fix_turns))
+        with st.container(horizontal=True):
+            env_values["CLAUDE_MODEL_CUCUMBER_VERIFY_FIX"] = st.text_input(
+                "CLAUDE_MODEL_CUCUMBER_VERIFY_FIX", value=os.getenv("CLAUDE_MODEL_CUCUMBER_VERIFY_FIX", ""),
+                help="Modèle des corrections après exécution Jenkins. Vide : modèle du lot, en reprenant sa session "
+                     "(tout le contexte du lot est relu à chaque correction : le plus cher). Renseigné (ex. sonnet) : "
+                     "appel neuf avec ce modèle, sur le seul prompt de correction.")
+            env_values["CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX"] = st.text_input(
+                "CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX", value=os.getenv("CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX", ""),
+                help="Effort de ces corrections (low, medium, high…). Vide : CLAUDE_EFFORT_CUCUMBER_FIX.")
         env_values["CUCUMBER_FIX_MAX_ATTEMPTS"] = str(int(fix_max))
         env_values["CUCUMBER_FIX_LOT_MAX_TURNS"] = str(int(fix_lot_turns))
         dry_run = st.checkbox(
