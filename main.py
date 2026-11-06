@@ -2031,6 +2031,16 @@ def cucumber_followup(lot: dict, prompt: str, model: str, effort: str, tools: li
     return returncode, output, usage, limit_hit, model, effort
 
 
+def verify_fix_model(lot_model: str) -> tuple:
+    """
+    (modèle, effort) des corrections après exécution Jenkins : CLAUDE_MODEL_CUCUMBER_VERIFY_FIX /
+    CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX si renseignés (appel neuf, sans reprise de la session du lot), sinon le modèle du
+    lot (session reprise) et l'effort des corrections.
+    """
+    model = os.getenv("CLAUDE_MODEL_CUCUMBER_VERIFY_FIX", "").strip() or lot_model
+    return model, claude_effort("CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX") or cucumber_fix_effort()
+
+
 def cucumber_fix_effort() -> str:
     """Effort des corrections et de la revue : CLAUDE_EFFORT_CUCUMBER_FIX, défaut low."""
     return claude_effort("CLAUDE_EFFORT_CUCUMBER_FIX") or "low"
@@ -2279,9 +2289,12 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
-        effort = cucumber_fix_effort()
+        verify_model, effort = verify_fix_model(model)
+        # Modèle dédié : appel neuf (la reprise de la session imposerait le modèle du lot et relirait tout son
+        # contexte, l'essentiel du coût d'une correction après exécution)
         returncode, output, usage, limit_hit, used_model, effort = cucumber_followup(
-            lot, prompt, model, effort, lot_tools(values), str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir,
+            None if verify_model != model else lot, prompt, verify_model, effort, lot_tools(values),
+            str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir,
             db_log=lot.setdefault("base", []), db_step="correction après exécution")
         report_token_usage(work_key, "cucumber-verify-fix", used_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
@@ -5840,6 +5853,10 @@ Jenkins les joue contient déjà les données du client (sa configuration a ét�
 - Ne crée dans le Background que ce qui manque réellement en base.
 - Fichiers de données des tests : aucune init ne crée les codes du « PROFIL CLIENT » ; prends TOUS les codes de
   référence (site, donneur d'ordres, statut administratif…) dans la base, comme indiqué plus bas.
+- Tes tests CRÉENT leurs propres objets métier (OP, commandes, UP, campagnes de lancement…) avec des codes uniques :
+  n'utilise JAMAIS un objet métier existant du client (ex. « le premier OP à lancer du site »). Le prendre le consomme
+  (campagne laissée en base, réserve épuisée) et rend le test dépendant de données qui changent. Seules les données de
+  référence (site, donneur d'ordres, articles, stock, emplacements, transporteurs, paramétrage) sont reprises de la base.
 - Aucun clear entre deux exécutions : les objets que tes tests CRÉENT (OP, commandes, UP, SSCC, palettes, besoins…)
   restent en base d'un run à l'autre ; un code fixe (ex. OP « SPEC-APB-1 ») échoue dès le 2e run (« already
   associated », « déjà existant »). Leurs codes doivent être UNIQUES à chaque exécution : cherche d'abord le mécanisme

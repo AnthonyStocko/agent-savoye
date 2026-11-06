@@ -373,3 +373,14 @@ def test_system_prompt_describes_constats(main_module):
     assert "=== CONSTATS" in text and '"constats": [{"type": "donnee_introuvable|ecart_spec_code|defaut_code|comportement_surprenant|tautologique"' in text
     assert all(kind in text for kind in ct.CONSTAT_TYPES) and "Il n'est pas tautologique" in text
     assert "=== CONTRÔLES (Then) ===" in text and "jamais un comptage ou une recherche globale" in text
+
+
+def test_verify_fix_model_setting(main_module, monkeypatch):
+    monkeypatch.delenv("CLAUDE_MODEL_CUCUMBER_VERIFY_FIX", raising=False)
+    monkeypatch.delenv("CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX", raising=False)
+    monkeypatch.setenv("CLAUDE_EFFORT_CUCUMBER_FIX", "low")
+    assert main_module.verify_fix_model("opus") == ("opus", "low")
+    monkeypatch.setenv("CLAUDE_MODEL_CUCUMBER_VERIFY_FIX", "sonnet")
+    monkeypatch.setenv("CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX", "high")
+    assert main_module.verify_fix_model("opus") == ("sonnet", "high")
+    assert "n'utilise JAMAIS un objet métier existant" in main_module.NO_INIT_BLOCK
