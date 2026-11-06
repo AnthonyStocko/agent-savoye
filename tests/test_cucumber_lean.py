@@ -318,7 +318,7 @@ def test_summary_notes_unreviewed_and_presorted(tmp_path, monkeypatch):
 
 
 def test_system_prompt_asks_to_write_early(main_module):
-    assert main_module.DEFAULT_CUCUMBER_MAX_TURNS == 40
+    assert main_module.DEFAULT_CUCUMBER_MAX_TURNS == 60
     assert main_module.warning_turn(40) == 30 and main_module.warning_turn(25) == 19
     names = ("client_name token_saving_rules references_injectees steps_std features_std endpoints_std java_std "
              "java_client package_steps package_support couverture_existante inventaire cucumber_repo worktree "
@@ -384,3 +384,22 @@ def test_verify_fix_model_setting(main_module, monkeypatch):
     monkeypatch.setenv("CLAUDE_EFFORT_CUCUMBER_VERIFY_FIX", "high")
     assert main_module.verify_fix_model("opus") == ("sonnet", "high")
     assert "n'utilise JAMAIS un objet métier existant" in main_module.NO_INIT_BLOCK
+
+
+def test_max_turns_resumes_the_session_once_for_the_final_answer(main_module, monkeypatch):
+    calls = []
+
+    def once(prompt, model, tools, turns, run_dir, effort, system_file="", db_log=None, db_step="", resume=""):
+        calls.append((prompt[:20], turns, resume))
+        if len(calls) == 1:
+            return 0, "[Claude Code] Fin sans réponse texte (error_max_turns).", {
+                "fin": "error_max_turns", "session_id": "S1", "cout_usd": 1.5, "tours": 60}, False
+        return 0, '[{"id": "x"}]', {"fin": "success", "session_id": "S1", "cout_usd": 0.2, "tours": 3}, False
+    monkeypatch.setattr(main_module, "_run_cucumber_claude_once", once)
+    monkeypatch.delenv("CUCUMBER_FINISH_TURNS", raising=False)
+    code, out, usage, _ = main_module.run_cucumber_claude("P", "opus", [], "60", "/r", "high")
+    assert out == '[{"id": "x"}]' and calls[1][1:] == ("12", "S1") and usage["cout_usd"] == 1.7
+    monkeypatch.setenv("CUCUMBER_FINISH_TURNS", "0")
+    calls.clear()
+    main_module.run_cucumber_claude("P", "opus", [], "60", "/r", "high")
+    assert len(calls) == 1
