@@ -2249,6 +2249,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     if lot.get("type") == "correction":
         initial.update({s.get("tag"): s.get("message", "") for s in lot.get("corrections") or [] if s.get("tag")})
     described = list((lot.get("correction") or {}).get("corrections") or [])
+    second_chance = set()
     # Plafond adaptatif (cucumber_fix_budget) : on continue tant que l'échec change, scénario par scénario
     for attempt in range(cucumber_fix_budget.max_attempts() if mode else 0):
         bad = {t: v for t, v in to_fix().items() if t not in stuck}
@@ -2264,6 +2265,14 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             lines.append(f"- {item['id']} [tag {tag}] : {item['motif']}" + (
                 f" ; test Standard lié : '{linked[0].get('extrait', linked[0]['path'])}'" if linked else "")
                 + (f" — piste : {hint}" if hint else ""))
+            if tag in second_chance:
+                lines.append(
+                    "  ⚠️ MÊME ÉCHEC après ta correction précédente : sa cause était une hypothèse, elle est réfutée. "
+                    "Avant toute modification, PROUVE la cause sur CE run : requêtes en base sur les données "
+                    "générées par le dernier run (identifiants et codes de ce run, statuts, messages d'erreur des "
+                    "tables d'intégration), journal du serveur si disponible, et au besoin un diagnostic temporaire "
+                    "(sortie lue au run suivant). Cite la preuve dans « preuves_base » ; ne corrige que ce qui est "
+                    "prouvé. Pas de preuve possible : ne modifie rien et explique ce qui manque dans « restantes ».")
             # Sortie d'un diagnostic temporaire exécuté au tour précédent
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
@@ -2318,6 +2327,14 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             print(f"[LOT {label}] 🧹 Diagnostic temporaire exécuté puis retiré : {rel}")
         # Même échec qu'avant la correction : ce scénario ne repart plus (sauf diagnostic dont la sortie est nouvelle)
         newly = set() if temporary else cucumber_fix_budget.stuck_after(sent, to_fix())
+        # Premier « même échec » : une correction de plus, qui doit d'abord prouver la cause (base, logs,
+        # diagnostic) ; le second arrête ce scénario
+        retry = {t for t in newly if t not in second_chance}
+        second_chance |= retry
+        newly -= retry
+        for tag in sorted(retry):
+            print(f"[LOT {label}] 🔬 {result['scenarios'][tag]['id']} : même échec après correction — une tentative "
+                  f"de plus, cause à prouver d'abord (base, logs, diagnostic).")
         for tag in sorted(newly):
             print(f"[LOT {label}] ⏹ {result['scenarios'][tag]['id']} : même échec après correction, arrêt des "
                   f"tentatives (cause à prouver au prochain run importé).")
