@@ -1915,7 +1915,7 @@ def cucumber_jira_tickets(client_name: str, application_arg: str) -> list:
 
 
 CUCUMBER_TOOLS = ["Read", "Write", "Edit", "Grep", "Glob"]
-DEFAULT_CUCUMBER_MAX_TURNS = 40
+DEFAULT_CUCUMBER_MAX_TURNS = 60
 
 
 def agent_compilation_block(command: str) -> str:
@@ -1945,9 +1945,46 @@ def warning_turn(max_turns: int) -> int:
 EMPTY_FIELD_MOTIFS = {"« source » vide dans le JSON", "« difference_standard » vide dans le JSON"}
 
 
+FINISH_PROMPT = ("Tu as atteint le nombre maximal de tours de cet appel. Ne commence aucune nouvelle recherche : "
+                 "termine les fichiers en cours si c'est rapide, puis donne MAINTENANT ta réponse finale complète, "
+                 "au format demandé (JSON), avec ce que tu as établi et, dans « restantes » / « questions », ce qui "
+                 "reste à faire ou à vérifier.")
+
+
+def _add_usage(first: dict, second: dict) -> dict:
+    out = dict(second or {})
+    for key in ("tokens_entree", "cache_ecrit", "cache_lu", "tokens_sortie", "tours", "duree_s", "cout_usd"):
+        try:
+            out[key] = round(float((first or {}).get(key) or 0) + float((second or {}).get(key) or 0), 4)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
                         effort: str, system_file: str = "", db_log: list = None, db_step: str = "",
                         resume: str = "") -> tuple:
+    """
+    Appel d'un lot (voir _run_cucumber_claude_once). Arrêt sur le nombre maximal de tours : la même session est reprise
+    UNE fois (CUCUMBER_FINISH_TURNS tours, défaut 12 ; 0 = jamais) pour obtenir la réponse finale, au lieu de perdre
+    tout le travail de l'appel.
+    """
+    returncode, output, usage, limit_hit = _run_cucumber_claude_once(
+        prompt, model, allowed_tools, max_turns, run_dir, effort, system_file, db_log, db_step, resume)
+    finish = _env_int("CUCUMBER_FINISH_TURNS", 12)
+    if finish > 0 and not limit_hit and (usage or {}).get("fin") == "error_max_turns" and usage.get("session_id"):
+        print(f"[CUCUMBER] Nombre maximal de tours atteint : reprise de la session pour la réponse finale "
+              f"({finish} tours au plus).")
+        returncode, output, more, limit_hit = _run_cucumber_claude_once(
+            FINISH_PROMPT, model, allowed_tools, str(finish), run_dir, effort, system_file, db_log, db_step,
+            usage["session_id"])
+        usage = _add_usage(usage, more)
+    return returncode, output, usage, limit_hit
+
+
+def _run_cucumber_claude_once(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
+                              effort: str, system_file: str = "", db_log: list = None, db_step: str = "",
+                              resume: str = "") -> tuple:
     """
     Appel Claude d'un lot Cucumber : session allégée (CLAUDE_LEAN_SESSION) et budget CUCUMBER_MAX_BUDGET_USD.
     `system_file` : partie fixe ajoutée au prompt système (--append-system-prompt-file), identique d'un lot à
