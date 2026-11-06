@@ -188,7 +188,9 @@ def test_adaptive_budget_stops_when_the_failure_repeats_and_continues_while_it_c
                                      "sonnet", "K", "/run", lambda u: None,
                                      context={"conventions": {"client_tag": CLIENT_TAG}})
     assert len(calls) == 3                                     # plafond : le scénario mouvant change à chaque fois
-    assert "Bloqué" in calls[0] and "Bloqué" not in calls[1] and "Bloqué" not in calls[2]
+    # Même échec une fois : renvoyé avec l'obligation de prouver la cause ; deux fois : bloqué
+    assert "Bloqué" in calls[0] and "Bloqué" in calls[1] and "Bloqué" not in calls[2]
+    assert "MÊME ÉCHEC" not in calls[0] and "MÊME ÉCHEC" in calls[1] and "PROUVE la cause" in calls[1]
     assert fb.max_attempts() == 3
     monkeypatch.setenv("CUCUMBER_VERIFY_FIX_ATTEMPTS", "0")
     assert fb.max_attempts() == 0
