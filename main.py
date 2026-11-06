@@ -1984,7 +1984,7 @@ def lot_tools(values: dict) -> list:
     de données (tools/xlsm_tool.py : lecture, copie adaptée sous files/ seulement).
     """
     if values.get("db_block") or values.get("logs_block") or values.get("compilation_agent"):
-        return CUCUMBER_TOOLS + [f"Bash({sys.executable}:*)"]
+        return CUCUMBER_TOOLS + [f"Bash({sys.executable}:*)", f'Bash("{sys.executable}":*)']
     return CUCUMBER_TOOLS + [f"Bash({sys.executable} {XLSM_TOOL}:*)", f'Bash("{sys.executable}" "{XLSM_TOOL}":*)']
 
 
@@ -2631,7 +2631,7 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
     limit = max(len(plan), _env_int("CUCUMBER_FIX_MAX_ATTEMPTS", 6))
     if plan:
         plan += [(model, claude_effort("CLAUDE_EFFORT_CUCUMBER"))] * (limit - len(plan))
-    attempts, violations, seen = len(plan), [], []
+    attempts, violations, seen, tried = len(plan), [], [], {}
     fix_turns = str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10))
     lot_turns = str(max(_env_int("CUCUMBER_FIX_MAX_TURNS", 10), _env_int("CUCUMBER_FIX_LOT_MAX_TURNS", 25)))
     for attempt in range(attempts + 1):
@@ -2640,11 +2640,17 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
         if check["ok"] or check["environnement"] or attempt == attempts:
             return check
         errors = frozenset(check["erreurs"])
-        if seen.count(errors) >= 2:
-            print(f"[LOT {label}] ⚠️ Mêmes erreurs de {check['etape']} après deux corrections : arrêt des corrections.")
-            return check
-        seen.append(errors)
         fix_model, effort = plan[attempt]
+        if seen.count(errors) >= 2:
+            # Aucun progrès : on passe au modèle du lot s'il n'a pas encore corrigé ces erreurs, sinon arrêt
+            if any(m == model for m, _ in tried.get(errors, [])):
+                print(f"[LOT {label}] ⚠️ Mêmes erreurs de {check['etape']} après deux corrections (dont le modèle du "
+                      f"lot) : arrêt des corrections.")
+                return check
+            fix_model, effort = model, claude_effort("CLAUDE_EFFORT_CUCUMBER")
+            print(f"[LOT {label}] Mêmes erreurs après deux corrections {plan[attempt][0]} : passage au modèle du lot.")
+        seen.append(errors)
+        tried.setdefault(errors, []).append((fix_model, effort))
         resumed = bool(lot and lot.get("session") and resume_lot_session())
         print(f"[LOT {label}] Correction {attempt + 1}/{attempts} ({len(check['erreurs'])} erreur(s)) "
               + ("(reprise de la session du lot)..." if resumed else f"({fix_model}, effort {effort or 'défaut'})..."))
@@ -4039,14 +4045,15 @@ def run_cucumber_health(client: str, local_cucumber_std_repo: str, cucumber_repo
     return 0 if report["ok"] else 1
 
 
-def deliver_std_data(client: str, worktree: str, cucumber_std_dir: str, profile: dict) -> list:
+def deliver_std_data(client: str, worktree: str, cucumber_std_dir: str, profile: dict, no_init: bool = False) -> list:
     """
     Avant le patch : fichiers de données lus par TOUTES les features du client (de l'agent ou écrites à la main)
-    absents du worktree. Présents au Standard : copiés et commités (livrés) ; sinon signalés. Renvoie les copies.
+    absents du worktree. Présents au Standard : copiés et commités (livrés) ; sinon signalés. Sans init (`no_init`) :
+    jamais copiés (les codes du Standard n'existent pas dans l'environnement), signalés. Renvoie les copies.
     """
     root = profile.get("features_root") or f"{cucumber_checks.FEATURES_ROOT}{client}"
     result = cucumber_checks.check_data_files(worktree, cucumber_checks.suite_features(
-        worktree, profile.get("tag_client", ""), root), cucumber_std_dir)
+        worktree, profile.get("tag_client", ""), root), cucumber_std_dir, no_init=no_init)
     copied = [target for target, _ in result["copies"]]
     if copied:
         cucumber_tools._git(worktree, "add", "-f", "--", *copied)
@@ -6595,7 +6602,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
               f"features actives — appliquez le nettoyage du module (« Données du projet », Modules testés) :")
         print("\n".join(f"    {e}" for e in module_traces[:30]))
         exit_code = 1
-    elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile) is not None and (
+    elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile, no_init) is not None and (
             blocking := check_delivery(client, worktree, state, profile, local_cucumber_std_repo)):
         if os.path.exists(patch_file):
             os.remove(patch_file)
@@ -6603,7 +6610,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
               f"(fichier lu absent, création non rejouable, donnée utilisée jamais créée) :")
         print("\n".join(f"    {e}" for e in blocking[:30]))
         exit_code = 1
-    elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile) is not None and \
+    elif deliver_std_data(client, worktree, local_cucumber_std_repo, profile, no_init) is not None and \
             cucumber_tools.write_patch(worktree, state["base"], patch_file, client):
         print(f"\n[CUCUMBER] Patch généré : {patch_file}")
         missing = cucumber_checks.check_patch_files(worktree, state["base"], patch_file, client)
