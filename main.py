@@ -285,6 +285,23 @@ def claude_env() -> dict:
     return env
 
 
+# Limite d'usage de Claude Code : « You've hit your session limit », « You've hit your 5-hour limit · resets 7:30pm
+# (Europe/Paris) », limite hebdomadaire… (le libellé change selon la version de Claude Code et le type de limite)
+_USAGE_LIMIT = re.compile(r"hit your [\w -]*limit", re.I)
+_USAGE_RESET = re.compile(r"hit your [\w -]*limit\s*[·•-]?\s*(resets [^\n]+)", re.I)
+
+
+def usage_limit_hit(text: str) -> bool:
+    """Réponse de Claude Code refusée par une limite d'usage (aucun travail fait : ni tentative ni échec à compter)."""
+    return bool(_USAGE_LIMIT.search(text or ""))
+
+
+def usage_limit_reset(text: str) -> str:
+    """Heure de reprise annoncée par le message de limite (« resets 7:30pm (Europe/Paris) »), '' si absente."""
+    match = _USAGE_RESET.search(text or "")
+    return match.group(1).strip() if match else ""
+
+
 def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
                cwd: str = None, effort: str = "", lean: bool = False, budget_usd: str = "",
                env: dict = None) -> tuple:
@@ -315,12 +332,14 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
     stdout_output, token_usage = parse_claude_output(raw_stdout)
     if raw_stderr and raw_stderr.strip():
         stdout_output = f"{stdout_output.rstrip()}\n{raw_stderr.strip()}" if stdout_output.strip() else raw_stderr.strip()
-    session_limit_hit = "hit your session limit" in (stdout_output or "")
+    session_limit_hit = usage_limit_hit(stdout_output)
 
     if stdout_output:
         print(stdout_output)
         if session_limit_hit:
-            print("\n⚠️ QUOTA ATTEINT : La session Claude Code a atteint sa limite d'utilisation.")
+            reset = usage_limit_reset(stdout_output)
+            print("\n⚠️ QUOTA ATTEINT : La session Claude Code a atteint sa limite d'utilisation"
+                  + (f" ({reset}) : « Reprendre » après cette heure." if reset else "."))
     if budget_hit(token_usage):
         print(f"\n⚠️ BUDGET ATTEINT : arrêt de l'appel à --max-budget-usd {budget_usd}.")
     return process.returncode, stdout_output, token_usage, session_limit_hit
@@ -1332,7 +1351,7 @@ def main():
     parser.add_argument("--detect-only", action="store_true", help="generate-cucumber-client : détection automatique du projet (inventaire, profil client, faits de l'initialisation des données), mise en cache par empreinte des commits des dépôts et sautée si elle n'a pas changé ; lecture seule, sans appel à Claude")
     parser.add_argument("--align-library", action="store_true", help="generate-cucumber-client : bibliothèque Cucumber du pom.xml alignée sur la version du Standard du client (Jenkins, à défaut l'application) : seule la version change dans le pom, compilation corrigée dans les steps du projet, dry-run, puis (livraison autonome) runs de l'init et complet, promotion sans régression")
     parser.add_argument("--simple-depot", default="", choices=["", "verifier", "creer", "branche", "aligner"], help="generate-cucumber-client, onglet « Cucumber » simplifié, étape 2 : dépôt <client>-cucumber — constat, création (droits contrôlés), branche de la version, alignement validé de la bibliothèque et du runner, compilation")
-    parser.add_argument("--simple-init", default="", choices=["", "verifier", "appliquer", "completer", "lancer", "corriger"], help="generate-cucumber-client, onglet « Cucumber » simplifié, étape 4 : init du client sur la branche de la version — clear déduit des routes de l'application à sa version, init du Standard adaptée ou init existante comparée (diff validé avant tout push), run Jenkins de l'init, correction connue proposée sur échec")
+    parser.add_argument("--simple-init", default="", choices=["", "auto", "verifier", "appliquer", "completer", "lancer", "corriger"], help="generate-cucumber-client, onglet « Cucumber » simplifié, étape 4 : init du client sur la branche de la version — clear déduit des routes de l'application à sa version, init du Standard adaptée ou init existante comparée, run Jenkins de l'init, correction connue proposée sur échec ; « auto » enchaîne tout (fichiers générés et poussés, init lancée sur Jenkins) jusqu'à une init verte")
     parser.add_argument("--java21", action="store_true", help="generate-cucumber-client : migration Java 21 du projet de tests (pom.xml seul, branche dédiée jamais fusionnée) et contrôle de non-régression : compilation et dry-run en Java 21, runs AVANT (application Java 11) et APRÈS (application Java 21), relance des écarts, rapport, PR proposée sans régression")
     parser.add_argument("--java21-avant", default="", help="--java21 : environnement AVANT confirmé, « composant_version=<v>;kis_version=<v> »")
     parser.add_argument("--java21-apres", default="", help="--java21 : environnement APRÈS confirmé, « composant_version=<v>;kis_version=<v> »")
@@ -1641,6 +1660,9 @@ def main():
         sys.exit(run_simple_depot(args.client_name, args.client_repo or os.getenv("BITBUCKET_CLIENT_REPO_PATH", ""),
                                   local_client_repo, args.simple_depot, args.cucumber_base_branch))
     elif is_cucumber_client and args.simple_init:
+        if args.simple_init == "auto":
+            sys.exit(run_simple_init_auto(args.client_name, local_client_repo, local_cucumber_std_repo,
+                                          STD_READER[0] or STD_LOCAL_ROOT[0], odatio_version))
         sys.exit(run_simple_init(args.client_name, local_client_repo, local_cucumber_std_repo,
                                  STD_READER[0] or STD_LOCAL_ROOT[0], odatio_version, args.simple_init))
     elif is_cucumber_client:
@@ -5167,11 +5189,38 @@ def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version
                 gaps.append(f"{module} ({rel.rsplit('/', 1)[-1]}) : {cucumber_simple_init.summary(gap)}"
                             + "".join(f" ; − {s[:90]}" for s in gap["standard_seulement"][:3])
                             + "".join(f" ; + {s[:90]}" for s in gap["client_seulement"][:3]))
+    # Init existante qui lit les fichiers du Standard alors qu'ils sont illisibles pendant le run (dernier run,
+    # `copy_files`) : steps du Standard rétablis sur le dossier de la feature, fichiers et règles de l'init du Standard
+    # copiés dans le dépôt du client
+    segment = cucumber_tools.java_package_segment(client)
+    for rel, text in {**present, **owned}.items():
+        module = _module_of_init(rel, text, set(tested))
+        current = changes.get(rel, text)
+        if module not in copy_files or rel in deletions or not cucumber_simple_init.uses_standard_files(current):
+            continue
+        changes[rel] = cucumber_simple_init.use_feature_files(current)
+        copied = 0
+        for std_rel in std.get(module, []):
+            target = cucumber_init.client_path(std_rel, client)
+            if not std_rel.endswith(".feature") and not os.path.exists(os.path.join(worktree, *target.split("/"))):
+                binaries[target] = os.path.join(cucumber_std_dir, *std_rel.split("/"))
+                copied += 1
+        rules_root = os.path.join(cucumber_std_dir or "", *cucumber_init.RESOURCES_DIR.split("/"), "rules", module,
+                                  cucumber_init.INIT_DIR)
+        for folder, _, names in os.walk(rules_root) if cucumber_std_dir else ():
+            for name in sorted(names):
+                sub = os.path.relpath(os.path.join(folder, name), rules_root).replace(os.sep, "/")
+                target = f"{cucumber_init.RESOURCES_DIR}/rules/{segment}/{cucumber_init.INIT_DIR}/{module}/{sub}"
+                if not os.path.exists(os.path.join(worktree, *target.split("/"))):
+                    binaries[target] = os.path.join(folder, name)
+                    copied += 1
+        reasons.append(f"{rel.rsplit('/', 1)[-1]} : fichiers du Standard illisibles pendant le run, steps du Standard "
+                       f"rétablis et {copied} fichier(s) de données et de règles de l'init {module} copiés")
     # Step des fichiers du Standard déjà présent (branche de la version ou de l'agent) mais non conforme (lecture du
     # disque seulement, par exemple) alors qu'une init l'utilise : réécrit, quelle que soit la branche qui le porte
     java_rel = cucumber_simple_init.std_files_java_path(client)
     java_path = os.path.join(worktree, *java_rel.split("/"))
-    used = any(cucumber_simple_init.uses_standard_files(t) for t in {**present, **owned}.values())
+    used = any(cucumber_simple_init.uses_standard_files(changes.get(rel, t)) for rel, t in {**present, **owned}.items())
     if used:
         # Init qui lit les fichiers du Standard mais encore les règles du dossier de la feature : règles du Standard
         for rel, text in {**present, **owned}.items():
@@ -5372,6 +5421,51 @@ def simple_init_build_complements(client: str, local: str, worktree: str, client
     return {"patch": saved, "fichiers": result["fichiers"], "avertissements": result.get("avertissements") or []}
 
 
+SIMPLE_INIT_CHAIN = ("appliquer", "completer", "corriger", "lancer", "verifier")
+# Bornes de l'enchaînement « auto » : appels de run_simple_init et runs Jenkins (un seul job à la fois, ~10 min chacun)
+SIMPLE_INIT_AUTO_STEPS = 10
+SIMPLE_INIT_AUTO_RUNS = 3
+
+
+def run_simple_init_auto(client: str, client_root: str, cucumber_std_dir: str, std_root, version: str,
+                         helpers: dict = None, run_step=None) -> int:
+    """
+    Bouton de l'étape 4 : enchaîne sans s'arrêter aux validations (choix de l'utilisateur : agent autonome) —
+    vérification, écriture des fichiers de l'init et des compléments (poussés sur la branche de l'init, patch livré),
+    puis run Jenkins avec les cases et la branche de l'init, et corrections connues proposées sur échec, jusqu'à une
+    init verte. S'arrête sur un échec sans suite connue, sur une étape qui se répète à l'identique, ou aux bornes
+    (SIMPLE_INIT_AUTO_STEPS appels, SIMPLE_INIT_AUTO_RUNS runs Jenkins). Le diff de chaque écriture reste dans le
+    journal et dans le patch. `run_step(action)` (tests) remplace run_simple_init.
+    """
+    run_step = run_step or (lambda act: run_simple_init(client, client_root, cucumber_std_dir, std_root, version, act,
+                                                        helpers))
+    action, seen, runs, code = "verifier", set(), 0, 1
+    for _ in range(SIMPLE_INIT_AUTO_STEPS):
+        print(f"[ÉTAPE INIT] Enchaînement automatique : {action}")
+        code = run_step(action)
+        runs += action in ("lancer", "corriger")
+        entry = (cucumber_tools.load_state(client).get("simple") or {}).get("init") or {}
+        status = entry.get("etat", "")
+        following = ((entry.get("detail") or {}).get("plan") or {}).get("action", "")
+        if status == "ok":
+            return 0
+        key = (action, status, following, str(entry.get("resultat", ""))[:300])
+        if following not in SIMPLE_INIT_CHAIN or key in seen:
+            if key in seen:
+                print(f"[ÉTAPE INIT] ⛔ Arrêt : « {action} » donne le même résultat qu'avant ({entry.get('resultat', '')[:200]})")
+            return code or 1
+        if following in ("lancer", "corriger") and runs >= SIMPLE_INIT_AUTO_RUNS:
+            print(f"[ÉTAPE INIT] ⛔ Arrêt après {runs} run(s) Jenkins de l'init : {entry.get('resultat', '')[:200]}")
+            return code or 1
+        if status == "echec" and following == action == "lancer":
+            # Échec du run sans correction connue : relancer à l'identique ne changerait rien
+            return code or 1
+        seen.add(key)
+        action = following
+    print(f"[ÉTAPE INIT] ⛔ Arrêt après {SIMPLE_INIT_AUTO_STEPS} étapes sans init verte.")
+    return code or 1
+
+
 def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_root, version: str, action: str,
                     helpers: dict = None) -> int:
     """
@@ -5403,7 +5497,10 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     work = simple_init_branch(profile, branch)
     patch_path = simple_init_patch_path(client, branch)
     last = (cucumber_tools.load_state(client).get("simple") or {}).get("init") or {}
-    force_copy = set((last.get("detail") or {}).get("standard_indisponible") or [])
+    # Init du Standard jugée non exécutable par le job : verdict gardé seulement s'il a été rendu avec les cases du
+    # Standard cochées (suites_standard) ; un verdict plus ancien (cases reprises du build de référence) est réessayé
+    force_copy = set((last.get("detail") or {}).get("standard_indisponible") or []) \
+        if (last.get("detail") or {}).get("suites_standard") else set()
     # Repli sur la copie : seulement pour le step qui a échoué ; un step réécrit (consigne plus récente) est réessayé
     cached_step = (cucumber_tools._read_json(os.path.join(cucumber_tools.cache_dir(client),
                                                           "fichiers_standard_step.json"), {}) or {})
@@ -5415,7 +5512,7 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         copy_files = set((last.get("detail") or {}).get("fichiers_copies") or [])
     detail = {"branche": branch, "branche_agent": work}
     if force_copy:
-        detail["standard_indisponible"] = sorted(force_copy)
+        detail.update(standard_indisponible=sorted(force_copy), suites_standard=True)
     if copy_files:
         detail["fichiers_copies"] = sorted(copy_files)
     if (last.get("detail") or {}).get("echec_fichiers_standard"):
@@ -5674,7 +5771,9 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
     run_profile_base = {**profile, "verify_branch": work}
     builds = []
     for label, tags in groups:
-        run_profile = {**run_profile_base, "init_tags": tags}
+        # Init du Standard : cases INIT_<MODULE> et Standard cochés ; init du client et compléments : Standard décoché
+        run_profile = {**run_profile_base, "init_tags": tags,
+                       "init_standard_modules": sorted(plan["standard"]) if label == "init du Standard" else []}
         if "run" in h:
             run = h["run"](run_profile, worktree)
         else:
@@ -5694,10 +5793,14 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
             simple_record(client, "init", "a_faire", f"Le job n'a exécuté aucun scénario de l'init du Standard "
                                                      f"({tags}) : une init du client adaptée du Standard va être "
                                                      f"proposée. Revérifiez.",
-                          {**detail, "standard_indisponible": sorted(plan["standard"]),
+                          {**detail, "standard_indisponible": sorted(plan["standard"]), "suites_standard": True,
                            "plan": {"action": "verifier"}})
             return 1
         failure = next(iter(run.get("echecs") or []), {})
+        if not failure and cucumber_simple_init.standard_files_error(run.get("console_erreur", "")) and any(
+                cucumber_simple_init.uses_standard_files(t) for t in plan["present"].values()):
+            # Build sans rapport Cucumber : l'exception du step des fichiers du Standard est lue dans la console
+            failure = {"step": cucumber_simple_init.STD_FILES_STEP, "message": run["console_erreur"]}
         message = failure.get("message") or ""
         detail["erreur"] = (f"{label} — {failure.get('fichier', '')} — {failure.get('step', '')} — {message}"[:600]
                             if failure else f"{label} — {message_run}")
@@ -6724,10 +6827,12 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     share_file(coverage_file, project, "cucumber-couverture", f"Couverture Cucumber {client}", **cucumber_knowledge)
     share_file(os.path.join(worktree, cucumber_a_revoir.A_REVOIR_FILE), project, "cucumber-a-revoir",
                f"À revoir Cucumber {client}", **cucumber_knowledge)
-    not_compiling = [str(lot["numero"]) for lot in lots if lot.get("statut") == "erreur_compilation"]
+    not_compiling = [lot for lot in lots if lot.get("statut") == "erreur_compilation"]
     if not_compiling:
-        print(f"[CUCUMBER] ⚠️ Lot(s) en erreur de compilation, commités tels quels : {', '.join(not_compiling)} "
-              f"(« Reprendre » relance leur correction).")
+        # Statut historique « erreur_compilation » : l'étape réelle (compilation, fichiers, données…) est affichée
+        kinds = sorted({(lot.get("verification") or {}).get("etape") or "compilation" for lot in not_compiling})
+        print(f"[CUCUMBER] ⚠️ Lot(s) en erreur ({', '.join(kinds)}), commités tels quels : "
+              f"{', '.join(str(lot['numero']) for lot in not_compiling)} (« Reprendre » relance leur correction).")
         exit_code = 1
     cost = f"{total['cout_usd']:.4f} $" if total["cout_usd"] else "?"
     print(f"[TOKENS TOTAL] entrée={total['tokens_entree']} | cache écrit={total['cache_ecrit']} | "

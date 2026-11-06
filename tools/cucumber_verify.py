@@ -1160,6 +1160,15 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
             "resultats": parse_cucumber_report(report), "artefacts": build["artifacts"]}
 
 
+_CONSOLE_ERROR = re.compile(r"^.*\b(?:[\w.]+(?:Exception|Error)\b:?.*|BUILD FAILURE.*|\[ERROR\].*)$", re.M)
+
+
+def console_error(console: str) -> str:
+    """Première erreur lisible de la console d'un build sans rapport Cucumber (exception, [ERROR]…), '' sinon."""
+    match = _CONSOLE_ERROR.search(console or "")
+    return match.group(0).strip()[:500] if match else ""
+
+
 def branch_sources(profile: dict, repository: str) -> dict:
     """Contexte d'une exécution « branche » : profil (branche de travail, rôles du job) et dépôt client."""
     return {"profil": profile, "depot": repository}
@@ -1204,10 +1213,18 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
         return {"ok": False, "message": f"non vérifié : {refused}", "build": "", "resultats": {}}
     print(f"[CUCUMBER] Paramètres du job repris du build n° {reference.get('numero')} de {sources.get('depot')}"
           if reference else "[CUCUMBER] Paramètres du job : paramètres imposés du profil client")
+    # Suites du Standard : cochées seulement pour l'init du Standard (profil « init_standard_modules »), jamais
+    # reprises du build de référence
+    suites, suite_warnings = cucumber_job.suite_values(info["definitions"], info["roles"],
+                                                       profile.get("init_standard_modules") or ())
+    for warning in suite_warnings:
+        print(f"[CUCUMBER] ⚠️ {warning}")
+    if suites:
+        print("[CUCUMBER] Cases du job : " + ", ".join(f"{k}={v or '(vide)'}" for k, v in suites.items()))
     params = cucumber_job.build_parameters(info["definitions"], info["roles"], branch, sources.get("depot", ""),
                                            tags, head, env, fixed=fixed,
                                            target=cucumber_job.tag_target(profile, info["roles"]),
-                                           reference=reference)
+                                           reference=reference, suites=suites)
     # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
     build = jenkins_tools.run_exclusive(job, lambda: jenkins_tools.trigger_job(job, params), _timeout())
     if build["result"] == "INDISPONIBLE" and not build["url"]:
@@ -1237,7 +1254,8 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
                for key, r in console_results(console).items()}
     if not results:
         return {"ok": False, "message": f"build {build['result']} sans rapport Cucumber JSON ni scénario lisible dans "
-                                        f"la console", "build": build["url"], "resultats": {}}
+                                        f"la console", "build": build["url"], "resultats": {},
+                "console_erreur": console_error(console)}
     run = (console_facts(console).get("tests") or {}).get("executes")
     gap = count_gap(run, texts, tags) if run is not None else ""
     if gap:
@@ -1657,7 +1675,7 @@ def run_init(mode: str, worktree: str, base: str, build_fn, tags: str, sources: 
                      "journal": r.get("journal", "")}
                     for (rel, title), r in run["resultats"].items() if r["statut"] != "passe"] if run["ok"] else []
         return {"ok": False, "message": f"environnement non initialisé ({tags}) : {reason}", "build": run["build"],
-                "echecs": failures}
+                "echecs": failures, "console_erreur": run.get("console_erreur", "")}
     return {"ok": True, "message": f"initialisation {tags} : {len(run['resultats'])} scénario(s) OK",
             "build": run["build"]}
 

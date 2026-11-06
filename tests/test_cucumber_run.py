@@ -80,7 +80,8 @@ def test_roles_are_detected_on_the_job_parameters():
                      "environnement": "",
                      "composant_proprietaire": "COMPONENT_OWNER", "composant_nom": "COMPONENT_NAME",
                      "composant_version": "COMPONENT_VERSION",
-                     "standard_branche": "CUCUMBER_STANDARD_BRANCH", "kis_version": ""}
+                     "standard_branche": "CUCUMBER_STANDARD_BRANCH", "kis_version": "",
+                     "standard_actif": "", "specifique_actif": "", "tags_standard": "", "tags_standard_exclus": ""}
     assert warnings == []
     # Deux candidats : rôle laissé vide, ambiguïté signalée ; le profil tranche
     ambiguous = {**DEFINITIONS, "FEATURE_BRANCH": {"type": "StringParameterDefinition", "defaut": ""}}

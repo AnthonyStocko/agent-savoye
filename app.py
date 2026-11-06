@@ -2105,13 +2105,19 @@ def render_simple_init(ctx: dict, step: dict) -> None:
     labels = {"verifier": "Préparer et vérifier l'init", "appliquer": f"Valider l'init ({where})",
               "completer": f"Valider les compléments ({where})",
               "lancer": "Lancer l'init sur Jenkins", "corriger": "Valider la correction et relancer l'init"}
-    if st.button(labels.get(action, labels["verifier"]), type="primary", icon=":material/play_arrow:",
-                 key=f"cs_init_{ctx['client']}", disabled=step["etat"] == "bloquee",
-                 help="L'init du Standard est lancée telle quelle quand elle suffit ; les sujets propres au client "
-                      "vont dans des compléments à part. Rien n'est poussé sans votre validation du diff, jamais sur "
-                      "la branche d'intégration ni en forçant ; "
-                      + ("directement sur la branche de la version (v1.3…)." if direct else
-                         "sur la branche de l'agent : la branche de la version reçoit le patch, appliqué par vous.")):
+    if st.button("Générer et lancer l'init", type="primary", icon=":material/play_arrow:",
+                 key=f"cs_init_auto_{ctx['client']}", disabled=step["etat"] == "bloquee",
+                 help="Tout s'enchaîne : fichiers de l'init générés (init du Standard telle quelle quand elle suffit, "
+                      "compléments du client à part), commités et poussés "
+                      + ("directement sur la branche de la version (v1.3…)" if direct else "sur la branche de l'agent")
+                      + ", puis init lancée sur Jenkins sur cette branche, cases du job réglées (Standard et INIT_<module> "
+                        "pour l'init du Standard, dépôt client seul pour celle du client), corrections connues "
+                        "appliquées jusqu'à une init verte. Jamais sur la branche d'intégration ni en forçant ; le diff "
+                        "reste dans le journal et le patch."):
+        simple_run(ctx, "init", ["--simple-init", "auto"])
+    if action != "verifier" and st.button(labels.get(action, labels["verifier"]), type="secondary",
+                                          key=f"cs_init_{ctx['client']}", disabled=step["etat"] == "bloquee",
+                                          help="Étape par étape : seule l'action proposée est faite."):
         simple_run(ctx, "init", ["--simple-init", action])
     if action != "verifier" and st.button("Revérifier", type="tertiary", key=f"cs_init_check_{ctx['client']}"):
         simple_run(ctx, "init", ["--simple-init", "verifier"])
