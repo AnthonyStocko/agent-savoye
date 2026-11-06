@@ -176,6 +176,12 @@ def std_source(cucumber_std_dir: str, index: dict, target: str, inspired: list =
     candidates = [p for p in index.get(target.rsplit("/", 1)[-1], []) if p.startswith(root)]
     if not candidates:
         return "", []
+    # Même module que la cible (WMS, TMS, OMS…) : jamais un fichier d'un autre module à défaut
+    modules = [m for m in re.findall(r"/(WMS|TMS|OMS|WES|REF|EXC|TRA|LAB|SLO|INV)/", "/" + target[len(root):]) if m]
+    if modules:
+        candidates = [p for p in candidates if f"/{modules[0]}/" in "/" + p[len(root):]] or []
+        if not candidates:
+            return "", []
     folders = {feature_dir(str(p).split(" / ", 1)[0].strip()) for p in inspired or () if p}
     preferred = [p for p in candidates if p[len(root):].rsplit("/", 1)[0] in folders]
     if len(preferred) == 1:

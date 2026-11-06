@@ -390,3 +390,13 @@ def test_without_init_standard_data_files_are_never_copied_nor_kept_identical(cl
     write(os.path.join(client_repo, *data.split("/")), "xlsm du client, site 01")
     again = cc.check_data_files(client_repo, [rel], std_dir, inspired=inspired, no_init=True)["erreurs"]
     assert not any("TOW-1130-Draft.xlsm" in e for e in again)
+
+
+def test_standard_source_never_comes_from_another_module(tmp_path):
+    std = str(tmp_path)
+    tms = "src/test/resources/cucumber/rules/TMS/01-Contexte/rule-AssignNeed-DEFAUT.json"
+    write(os.path.join(std, *tms.split("/")), "{}")
+    index = {"rule-AssignNeed-DEFAUT.json": [tms]}
+    target = "src/test/resources/cucumber/rules/WMS/01-Contexte/rule-AssignNeed-DEFAUT.json"
+    assert cc.std_source(std, index, target) == ("", [])
+    assert cc.std_source(std, index, tms.replace("TMS", "TMS"))[0] == tms

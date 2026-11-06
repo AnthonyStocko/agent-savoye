@@ -265,6 +265,13 @@ def test_fix_loop_goes_on_while_errors_change(main_module, monkeypatch, tmp_path
     check = main_module.verify_cucumber_lot("c", "1", str(tmp_path), "b", "", ["a.feature"], "mvn", "", {}, "sonnet",
                                             "K", str(tmp_path), lambda u: None)
     assert not check["ok"] and len(calls) == 2
+    # Deux corrections haiku sans progrès : le modèle du lot essaie avant l'arrêt
+    monkeypatch.setenv("CUCUMBER_FIX_ATTEMPTS", "2")
+    checks = iter([["e1"]] * 6)
+    calls.clear()
+    check = main_module.verify_cucumber_lot("c", "1", str(tmp_path), "b", "", ["a.feature"], "mvn", "", {}, "sonnet",
+                                            "K", str(tmp_path), lambda u: None)
+    assert not check["ok"] and [m for m, _ in calls] == ["haiku", "haiku", "sonnet"]
 
 
 def test_review_skipped_for_empty_fields_only(main_module, monkeypatch):
