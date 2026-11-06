@@ -1428,6 +1428,7 @@ def main():
     jira_only = is_besoin or is_cadrage_answers
     local_std_repo = local_client_repo = local_cucumber_std_repo = ""
     odatio_version, branch_rule, repo_scope = "non requise", "", ""
+    remote_code = False
     conventions_path = ""
     if not jira_only:
         std_repo_arg = args.std_repo or os.getenv("BITBUCKET_STD_REPO_PATH", "").strip()
@@ -1442,7 +1443,18 @@ def main():
         # sans fetch ici ; les clones (génération) ne sont récupérés qu'après, pour les seuls dépôts utiles au client
         std_key = bitbucket_std.project_key(std_repo_arg)
         remote_std = bool(is_cucumber_client and args.client_name and std_key and os.getenv("BITBUCKET_URL", "").strip())
-        if remote_std:
+        # Ticket du socle seul (STD_ONLY_PROJECTS, ex. OXY) : code du Standard lu à jour dans Bitbucket par l'agent
+        # (tools/bitbucket_code.py), aucune copie locale ; seul le dépôt modifié au patch est copié (checkout)
+        std_only_ticket = target_project.upper() in std_only_projects() or args.client_repo == "STD_ONLY"
+        remote_code = bool(std_only_ticket and not is_cucumber_client and std_key
+                           and os.getenv("BITBUCKET_URL", "").strip())
+        if remote_code:
+            STD_READER[0] = bitbucket_std.RemoteStandard(std_key)
+            local_std_repo = os.path.join(workspace_dir, ".tmp", f"std_{std_key}_travail")
+            os.makedirs(local_std_repo, exist_ok=True)  # dossier d'écriture de l'agent (add-dir) avant tout checkout
+            print(f"[STANDARD] Code du Standard lu à jour dans Bitbucket (projet {std_key}, API REST) : aucune copie "
+                  f"locale ; seul le dépôt modifié au patch est copié dans {local_std_repo}.")
+        elif remote_std:
             STD_READER[0] = bitbucket_std.RemoteStandard(std_key)
             local_std_repo = os.path.join(workspace_dir, ".tmp", f"std_{std_key}")
             print(f"[STANDARD] Code du Standard lu dans Bitbucket (projet {std_key}, API REST) : aucun fetch préalable.")
@@ -1472,6 +1484,12 @@ def main():
             local_client_repo = ""
             branch_rule = f"Projet {target_project} : utilise la branche de base 'dev' sur le socle Standard. Branche de travail : '{target_issue}_dev_...'."
             repo_scope = f"Explore le code source UNIQUEMENT dans le socle standard '{local_std_repo}'."
+            if remote_code:
+                code_cli = f'"{python_exe}" "{os.path.join(workspace_dir, "tools", "bitbucket_code.py")}"'
+                branch_rule = (f"Projet {target_project} : branche de base du Standard « dev » (à défaut « development », "
+                               f"puis la branche par défaut du dépôt, résolue par l'outil ci-dessous). Branche de "
+                               f"travail : '{target_issue}_dev_...'.")
+                repo_scope = render_prompt("std_bitbucket_code", cli=code_cli, work_root=local_std_repo)
         else:
             client_repo_arg = args.client_repo or os.getenv("BITBUCKET_CLIENT_REPO_PATH", "")
             local_client_repo = ensure_local_repo(client_repo_arg, "client")
@@ -1710,6 +1728,9 @@ def main():
     # Modèle de prompt sans ${knowledge_block} (prompt personnalisé, besoin...) : le bloc est ajouté en fin de prompt
     if shared["bloc"] and shared["bloc"] not in prompt:
         prompt += knowledge_block
+    # Socle seul lu dans Bitbucket : la consigne d'accès au code vaut pour toutes les étapes (patch compris)
+    if not jira_only and remote_code and repo_scope not in prompt:
+        prompt += "\n\n=== CODE DU STANDARD ===\n" + repo_scope
     print(f"=== Exécution Étape: {args.step.upper()} ===")
     print(f"Projet Jira          : {target_project}")
     print(f"Ticket Cible         : {target_issue}")
