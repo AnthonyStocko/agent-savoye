@@ -1225,6 +1225,15 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
                                            tags, head, env, fixed=fixed,
                                            target=cucumber_job.tag_target(profile, info["roles"]),
                                            reference=reference, suites=suites)
+    # Contrôle avant lancement : aucun paramètre d'un autre client (artefact du client détecté dans SON application)
+    client = re.sub(r"-cucumber$", "", (sources.get("depot") or "").strip().lower())
+    foreign = cucumber_job.launch_errors(params, info["roles"], client, profile, info["definitions"])
+    if foreign:
+        return {"ok": False, "message": f"non vérifié : {' ; '.join(foreign)}", "build": "", "resultats": {}}
+    switched = sorted(n for n, v in cucumber_job.standard_switches(info["definitions"], info["roles"]).items()
+                      if params.get(n) == v)
+    if switched and not profile.get("init_standard_modules"):
+        print(f"[CUCUMBER] Suites du Standard décochées pour ce run de vérification ({len(switched)} paramètre(s)).")
     # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
     build = jenkins_tools.run_exclusive(job, lambda: jenkins_tools.trigger_job(job, params), _timeout())
     if build["result"] == "INDISPONIBLE" and not build["url"]:

@@ -201,6 +201,12 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     if extra_arguments and roles.get("arguments"):
         params[roles["arguments"]] = f"{params.get(roles['arguments'], '')} {extra_arguments}".strip()
     run["parametres"] = cucumber_job.visible_parameters(params, roles)
+    # Contrôle avant lancement : aucun paramètre d'un autre client (artefact, dépôt, valeurs), sinon arrêt
+    foreign = cucumber_job.launch_errors(params, roles, client_name, profile, check["definitions"])
+    if foreign:
+        run["message"] = f"rien n'est lancé : {' ; '.join(foreign)}"
+        record(client_name, run)
+        return run
     run["version_testee"] = tested_version(client_name, params, roles, inventory, client_root)
     if run["version_testee"]:
         log(f"[RUN JENKINS] {run['version_testee']}")
@@ -275,6 +281,10 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
                                                tags, commit or (rev_parse(worktree, "HEAD") if worktree else ""),
                                                fixed=fixed, target=out["cible_tags"], reference=reference)
         out["parametres"] = cucumber_job.visible_parameters(params, check["roles"])
+        foreign = cucumber_job.launch_errors(params, check["roles"], client_name, profile, check["definitions"])
+        if foreign:
+            out["erreurs"] += foreign
+            out["ok"] = False
     if worktree and os.path.exists(os.path.join(worktree, ".git")):
         texts = feature_texts(worktree) if texts is None else texts
         out["attendus"] = expected_count(texts, tags, a_revoir_tag())

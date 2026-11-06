@@ -826,7 +826,8 @@ def find_knowledge(documents: list, projet: str = "", client: str = "", tickets=
     [{"doc", "score", "raisons"}]. Même projet d'abord (dossier du client ou projet Jira), puis tickets,
     composants, tags et mots-clés (similarité de memory_tools). Un document d'un autre projet n'est retenu que s'il a
     un point commun ; un document du même projet, s'il a un point commun ou porte sur tout le projet. Documents
-    obsolètes ou remplacés exclus sauf `include_obsolete`.
+    obsolètes ou remplacés exclus sauf `include_obsolete` ; documents d'un AUTRE client (en-tête « client ») toujours
+    exclus quand `client` est donné.
     """
     from tools.memory_tools import _tokens
     folder = project_folder({"client": client, "projet": projet}).casefold() if (client or projet) else ""
@@ -836,6 +837,10 @@ def find_knowledge(documents: list, projet: str = "", client: str = "", tickets=
     for doc in documents:
         meta = doc.get("meta") or {}
         if not include_obsolete and meta.get("statut", STATUS_ACTIVE) != STATUS_ACTIVE:
+            continue
+        # Jamais les documents d'un autre client (son code, ses données, ses réponses ne valent pas pour celui-ci)
+        other = str(meta.get("client") or "").strip().casefold()
+        if client and other and other != str(client).strip().casefold():
             continue
         score, reasons, linked = 0.0, [], False
         same_project = bool(folder) and (doc["chemin"].split("/", 1)[0].casefold() == folder

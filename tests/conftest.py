@@ -64,3 +64,30 @@ def _no_standard_version_task(request, monkeypatch):
     """
     from tools import standard_version_task
     monkeypatch.setattr(standard_version_task, "start", lambda *args, **kwargs: False)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_knowledge(tmp_path, monkeypatch):
+    """
+    Connaissances partagées des tests dans un répertoire temporaire : jamais le vrai répertoire partagé
+    (AGENT_KNOWLEDGE_DIR du .env), où les documents du client fictif seraient injectés dans le travail sur un vrai
+    client. File d'attente et index aussi temporaires. app.py recharge le .env avec override=True à chaque exécution
+    (AppTest) : ce rechargement ne peut plus remettre le vrai répertoire.
+    """
+    import dotenv
+    from tools import knowledge_tools
+    monkeypatch.setenv("AGENT_KNOWLEDGE_DIR", str(tmp_path / "connaissances_partagees"))
+    monkeypatch.setattr(knowledge_tools, "OUTBOX_DIR", str(tmp_path / "knowledge_outbox"))
+    monkeypatch.setattr(knowledge_tools, "INDEX_CACHE", str(tmp_path / "knowledge_index.json"))
+    original = dotenv.load_dotenv
+
+    def guarded(*args, **kwargs):
+        kept = os.environ.get("AGENT_KNOWLEDGE_DIR")
+        try:
+            return original(*args, **kwargs)
+        finally:
+            if kept is None:
+                os.environ.pop("AGENT_KNOWLEDGE_DIR", None)
+            else:
+                os.environ["AGENT_KNOWLEDGE_DIR"] = kept
+    monkeypatch.setattr(dotenv, "load_dotenv", guarded)

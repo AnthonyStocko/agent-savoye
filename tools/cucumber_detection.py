@@ -283,13 +283,16 @@ def init_facts(worktree: str, client_name: str, profile: dict, inventory: dict) 
 
 def expected_clear(profile: dict) -> str:
     """
-    Clear propre au client : saisi ou fixé par le dépôt dans son profil, ou détecté dans son application (clear
-    retenu parmi clears_application). Le clear lu dans l'init n'est pas une référence (il serait comparé à lui-même
+    Clear propre au client : saisi ou fixé par le dépôt dans son profil, détecté dans son application (clear
+    retenu parmi clears_application), ou route du socle prouvée par un run vert (clears_prouves). Le clear lu dans l'init n'est pas une référence (il serait comparé à lui-même
     et peut venir d'un autre client) ; aucune valeur globale (CUCUMBER_CLEAR_NAME) commune à tous les clients.
     """
     if (profile.get("sources") or {}).get("clear_name") in ("saisi", "depot"):
         return profile.get("clear_name", "")
     if profile.get("clear_name") and profile["clear_name"] in (profile.get("clears_application") or {}):
+        return profile["clear_name"]
+    # Route du socle (KIS / init-data) prouvée par un run vert de ce client (cucumber_profile.record_proven_clear)
+    if profile.get("clear_name") and profile["clear_name"] in (profile.get("clears_prouves") or {}):
         return profile["clear_name"]
     return ""
 

@@ -508,10 +508,10 @@ DB_BLOCK_WORDING = {
         "db_max_commands": "8",
     },
     "generate-cucumber-client": {
-        "db_error_rule": "DB_ERROR=… dû à TA requête (colonne ou table inexistante, jointure fausse) : lis la "
-                         "structure réelle (describe NOM_TABLE) puis corrige la requête, sans deviner les colonnes "
-                         "(« id » n'est pas toujours la clé). N'abandonne la base que si la connexion elle-même échoue, "
-                         "et signale-le en une ligne.",
+        "db_error_rule": "DB_ERROR=… dû à TA requête (colonne ou table inexistante, jointure fausse) : corrige-la "
+                         "avec les colonnes réelles que donne l'erreur (sinon un describe de toutes les tables de la "
+                         "requête en une commande), sans deviner les colonnes (« id » n'est pas toujours la clé). "
+                         "N'abandonne la base que si la connexion elle-même échoue, et signale-le en une ligne.",
         "db_usage": "le paramétrage qui active ou conditionne les spécifiques du lot, ainsi que les valeurs de "
                     "référence utiles aux jeux de données des scénarios (articles, emplacements, statuts, codes "
                     "existants). Une donnée de référence introuvable ou un échec « donnée de référence absente » se "
@@ -573,7 +573,7 @@ def _build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: s
                                         "et signale-le en une ligne.")
     if step == "generate-cucumber-client":
         # Les lots prouvent l'existence des données et choisissent les codes des jeux de données en base
-        wording["db_max_commands"] = str(_env_int("CUCUMBER_DB_MAX_COMMANDS", 40))
+        wording["db_max_commands"] = str(_env_int("CUCUMBER_DB_MAX_COMMANDS", 20))
     return "\n" + render_prompt("db_access", db_type=db_type, db_schema=db_schema, base_cmd=base_cmd,
                                 schema_hint=schema_hint, **wording)
 
@@ -5846,6 +5846,11 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                       {**detail, "plan": {"action": "lancer"}})
         return 1
     simple_record(client, "init", "ok", f"Init verte sur {work} ({detail['tags']}).{pending}", detail)
+    # Clear prouvé par ce run vert (route de l'application ou du socle KIS / init-data) : valide, gardé au profil
+    cucumber_profile.record_proven_clear(client, decision.get("routes") or [], detail.get("build", ""),
+                                         decision.get("preuves") or [], decision.get("motif", ""))
+    print(f"[CUCUMBER INIT] Clear prouvé par l'init verte, enregistré dans le profil : "
+          f"{', '.join(decision.get('routes') or []) or '—'}.")
     return 0
 
 
@@ -6415,10 +6420,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"[CUCUMBER PROFIL] Écarts du catalogue avec la bibliothèque {profile['library_version']} : "
               f"{gap_file or 'référence de la bibliothèque introuvable dans le dépôt Standard'}")
     no_init = getattr(args, "no_init", False)
+    rebuilt_warning = ""
     init_tags = "" if no_init else (profile["init_tags"] or cucumber_verify.init_tags())
     if no_init:
         print("[CUCUMBER] Option « Initialisation » décochée : aucune init lancée, les lots sont jugés sur les données "
               "déjà présentes dans l'environnement.")
+        rebuilt_warning = cucumber_simple.client_no_init_warning(client)
+        if rebuilt_warning:
+            print(f"[CUCUMBER] ⚠️ {rebuilt_warning}")
     # Initialisation du client (init_tags du profil), une fois par génération : en échec, les lots ne sont pas jugés
     if profile["verify_branch"]:
         print(f"[CUCUMBER] Vérification sur la branche {profile['verify_branch']} (paramètre "
@@ -6465,7 +6474,8 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         # Logs applicatifs de l'environnement de test (groundcover), en lecture seule
         "logs_block": build_logs_block(python_exe, workspace_dir),
         # Option « Initialisation » décochée : les données déjà présentes dans la base de l'environnement font foi
-        "environnement_block": NO_INIT_BLOCK if no_init else "",
+        "environnement_block": (NO_INIT_BLOCK + (f"\nATTENTION : {rebuilt_warning}\n" if rebuilt_warning else ""))
+        if no_init else "",
         # Classeurs de données (.xlsm/.xlsx) : lecture et copie adaptée par l'agent (binaire, non éditable par Edit)
         "donnees_tool": xlsm_command(),
         "catalogue_std": catalogue["catalogue_std"], "steps_std": catalogue["steps_std"],
@@ -6736,15 +6746,18 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         lot.pop("erreur", None)
         lot["statut"] = "termine"
         cucumber_tools.save_state(client, state)
-        done = sum(1 for r in results if r.get("statut") == "couvert")
-        indirect = sum(1 for r in results if r.get("statut") == "couvert_indirectement")
+        # Bilan sans contradiction : « couvert » = vérifié vert et probant ; fichiers écrits comptés réellement
         verified = ("" if not files else " — compilation non vérifiée (environnement Maven)"
                     if check.get("environnement") else f" — {check['etape']} OK")
-        print(f"[LOT {label}] ✅ {done}/{len(lot_specs)} spécifique(s) couvert(s)"
-              + (f", {indirect} indirectement" if indirect else "")
-              + f"{' — commit créé' if committed else ' — aucun fichier écrit'}{verified}.")
+        outcome = cucumber_bilan.lot_outcome(lot, results, files, committed, len(lot_specs))
+        # Coût du lot : part due aux recherches en base (une commande = un tour), erreurs comprises
+        base_share = cucumber_bilan.db_share(lot.get("base") or [], lot.get("tokens") or {})
+        lot["bilan"] = {**{k: v for k, v in outcome.items() if k != "ligne"}, "base": base_share}
+        cucumber_tools.save_state(client, state)
+        print(f"[LOT {label}] {outcome['ligne']}{verified}.")
         if fixed_values["db_block"]:
             print(f"[LOT {label}] Base consultée : {db_summary(lot.get('base') or [])}.")
+            print(f"[LOT {label}] Coût des recherches en base : {base_share['ligne']}.")
 
     # 4. Patch et récapitulatif, produits en Python ; « couvert_indirectement » vérifié sur l'ensemble des lots
     requalified = cucumber_tools.requalify_indirect(state, inventory)

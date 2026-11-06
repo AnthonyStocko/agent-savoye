@@ -212,6 +212,22 @@ def app_repository(repos: list, groups: set):
     return best
 
 
+def pom_component(text: str) -> tuple:
+    """
+    (groupId, artifactId) du projet décrit par un pom (ceux du <parent> et des dépendances exclus ; groupId hérité
+    du parent s'il est absent) : l'artefact du client monté par le job (rôles « composant_* »). ('', '') sinon.
+    """
+    text = re.sub(r"<!--.*?-->", "", text or "", flags=re.S)
+    parent = re.search(r"<parent>(.*?)</parent>", text, re.S)
+    body = re.sub(r"<(parent|dependencies|dependencyManagement|build|profiles|modules|plugins|reporting)>.*?</\1>",
+                  "", text, flags=re.S)
+    group = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", body)
+    artifact = re.search(r"<artifactId>\s*([^<\s]+)\s*</artifactId>", body)
+    if not group and parent:
+        group = re.search(r"<groupId>\s*([^<\s]+)\s*</groupId>", parent.group(1))
+    return (group.group(1) if group else ""), (artifact.group(1) if artifact else "")
+
+
 def pom_project_version(text: str) -> str:
     """Version propre du projet (balise <version> racine) d'un pom ; '' sinon."""
     root = sv._parse(text or "")
@@ -428,8 +444,12 @@ def deduce(entry: dict, app_pom: str, groups: set, cucumber_std_refs: list, libr
     if standard and not kis.get("kis"):
         warnings.append(f"version KIS inconnue pour le Standard {standard} (aucun build qui a démarré une application "
                         f"de cette version) : à renseigner")
+    owner, name = pom_component(app_pom)
+    if app_pom and not (owner and name):
+        warnings.append("artefact du client (groupId / artifactId) introuvable dans le pom de l'application : "
+                        "COMPONENT_OWNER / COMPONENT_NAME inconnus, runs refusés")
     jenkins = {"composant_version": entry.get("version", ""), "standard_branche": cucumber["ref"],
-               "kis_version": kis.get("kis", "")}
+               "kis_version": kis.get("kis", ""), "composant_proprietaire": owner, "composant_nom": name}
     return {"version_client": entry.get("version", ""), "type": entry.get("type", ""), "ref_client": ref_client,
             "standard": {"version": standard, "complete": code.get("complete", ""), "detail": code.get("detail", "")},
             "cucumber_standard": cucumber, "bibliotheque": {"cible": standard, "actuelle": library_current, "source": library_source},
@@ -519,8 +539,14 @@ def std_groups(std_repo: str, client_name: str) -> set:
 
 
 def component(profile: dict, builds: list, cucumber_repo: str) -> tuple:
-    """(propriétaire, nom) de l'artefact du client : paramètres imposés du profil, sinon dernier build du client."""
+    """
+    (propriétaire, nom) de l'artefact du client : détectés dans le pom de son application (version choisie), sinon
+    paramètres imposés du profil, sinon dernier build du client.
+    """
     from tools import cucumber_job
+    detected = cucumber_job.client_component(profile)
+    if all(detected):
+        return detected
     fixed, _ = cucumber_job.fixed_parameters({**(profile or {}), FIELD: {}})
     sources = [fixed] + [b.get("parametres") or {} for b in builds or []
                          if any(cucumber_repo and cucumber_repo == str(v).strip().lower()

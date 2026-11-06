@@ -2215,6 +2215,11 @@ def render_simple_cucumber() -> None:
             state.setdefault("simple", {}).setdefault("options", {})["init"] = wanted
             cucumber_tools.save_state(client, state)
             records = state["simple"]
+        if not cucumber_simple.init_enabled(records):
+            # Environnement remonté à chaque run : les données lues en base ne sont pas garanties sans init
+            warning = cucumber_simple.client_no_init_warning(client)
+            if warning:
+                st.warning(warning, icon=":material/warning:")
     project = cucumber_simple.project_step(deduction, ctx["ready"], cucumber_simple.missing_prerequisites())
     for step in cucumber_simple.states(project, records):
         with st.container(border=True):
