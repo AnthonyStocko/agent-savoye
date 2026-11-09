@@ -458,6 +458,10 @@ def file_kinds(files: list) -> str:
     return f"{len(files or [])} fichier(s)" + (f" : {detail}" if detail else "")
 
 
+NO_RUN_ERROR = ("erreur de l'agent : test écrit sans run de vérification (init + tests dans le même build) — aucun "
+                "scénario du lot identifié dans ses features")
+
+
 def lot_outcome(lot: dict, results: list, files: list, committed: bool, total: int) -> dict:
     """
     Bilan d'un lot, sans contradiction : un spécifique n'est « couvert » que si l'un de ses scénarios est vert et
@@ -467,6 +471,7 @@ def lot_outcome(lot: dict, results: list, files: list, committed: bool, total: i
     """
     by_spec = spec_verification(lot)
     executed = ((lot.get("execution") or {}).get("mode") or "aucun") != "aucun"
+    agent_error = bool((lot.get("execution") or {}).get("erreur_agent"))
     out = {"couverts": [], "faibles": [], "non_verifies": [], "echecs": [], "indirects": []}
     for result in results or []:
         status, spec = result.get("statut"), result.get("id")
@@ -490,7 +495,8 @@ def lot_outcome(lot: dict, results: list, files: list, committed: bool, total: i
         parts.append(f"{len(out['echecs'])} test(s) écrit(s) en échec")
     if out["non_verifies"]:
         parts.append(f"{len(out['non_verifies'])} test(s) écrit(s) NON vérifié(s)"
-                     + ("" if executed else " (aucune exécution)") + " — pas comptés comme couverts")
+                     + ("" if executed else " (aucune exécution : erreur de l'agent)" if agent_error
+                        else " (aucune exécution)") + " — pas comptés comme couverts")
     if out["indirects"]:
         parts.append(f"{len(out['indirects'])} indirectement")
     written = [f for f in files or [] if not f.endswith("A_REVOIR.md")]
@@ -502,7 +508,8 @@ def lot_outcome(lot: dict, results: list, files: list, committed: bool, total: i
         where = f"{file_kinds(written)} écrit(s), commités et poussés lors de la vérification"
     else:
         where = f"{file_kinds(written)} écrit(s), non commités"
-    icon = "✅" if out["couverts"] and not (out["non_verifies"] or out["echecs"]) else "⚠️"
+    icon = "❌" if agent_error else "✅" if out["couverts"] and not (out["non_verifies"] or out["echecs"]) else "⚠️"
+    out["erreur_agent"] = agent_error
     # Init rejouée dans le même build que le lot : durée de l'init et durée des tests, séparément
     init = (lot.get("execution") or {}).get("init") or {}
     out["init"] = init

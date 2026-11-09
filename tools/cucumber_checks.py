@@ -693,6 +693,53 @@ def integrate_remote(worktree: str, branch: str) -> str:
     return "merge impossible : " + " ".join((merge.stderr.strip().splitlines() or ["?"])[-1].split())[:160]
 
 
+def init_paths_changed(worktree: str, ref: str, init_features: list) -> list:
+    """
+    Fichiers d'init (features d'init, fichiers de leurs dossiers, classes Java « Init* ») qui diffèrent entre HEAD et
+    `ref` : l'init de `ref` n'est pas sur la branche de base, la recréer depuis la base la perdrait.
+    """
+    folders = {f.rsplit("/", 1)[0] + "/" for f in init_features or [] if "/" in f}
+    changed = [p for p in _git(worktree, "diff", "--name-only", "HEAD", ref).stdout.splitlines() if p]
+    return [p for p in changed if p in (init_features or []) or any(p.startswith(d) for d in folders)
+            or (p.endswith(".java") and os.path.basename(p).startswith("Init"))]
+
+
+def replace_verify_branch(worktree: str, branch: str, protected_branches=(), init_features: list = ()) -> tuple:
+    """
+    Nouvelle génération : la branche de travail distante `branch` est RECRÉÉE depuis HEAD (worktree repartant de la
+    branche de base), jamais fusionnée avec les essais précédents (leurs fichiers ne reviennent pas) ; push
+    --force-with-lease sur le commit lu, ancien commit tracé dans le journal des écritures. Refusé pour une branche
+    protégée (base, cible) et quand la branche distante porte une init absente de la base (elle serait perdue :
+    l'apporter d'abord à la base par une PR) — la vérification reprend alors l'intégration habituelle.
+    Renvoie (fait, message).
+    """
+    from tools import cucumber_delivery
+    if not branch or branch in {b for b in protected_branches if b}:
+        return False, f"branche {branch or '(vide)'} protégée : jamais recréée"
+    fetch = _git(worktree, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    remote = _git(worktree, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}").stdout.strip()
+    head = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if fetch.returncode != 0 and not remote:
+        return False, f"{branch} absente du dépôt : créée par le premier push de la génération"
+    if remote == head:
+        return True, f"{branch} déjà sur la branche de base ({head[:8]})"
+    lost = init_paths_changed(worktree, f"refs/remotes/origin/{branch}", list(init_features or []))
+    if lost:
+        return False, (f"{branch} porte une init absente de la branche de base ({', '.join(lost[:4])}) : apporte-la "
+                       f"d'abord à la base (PR ne contenant que l'init et ses steps) — branche non recréée")
+    refused = cucumber_delivery.check_push(worktree, branch)
+    if refused:
+        return False, f"recréation de {branch} refusée par la garde d'écriture : {refused}"
+    push = _git(worktree, "push", f"--force-with-lease=refs/heads/{branch}:{remote}", "origin",
+                f"HEAD:refs/heads/{branch}")
+    if push.returncode != 0:
+        detail = " ".join((push.stderr.strip().splitlines() or ["?"])[-1].split())[:200]
+        return False, f"recréation de {branch} impossible ({detail})"
+    cucumber_delivery.log_event(cucumber_delivery.client_of(worktree), "push", branche=branch, commit=head,
+                                ancien=remote, message=f"branche de travail recréée depuis la base (ancien {remote[:8]})")
+    return True, f"{branch} recréée depuis la branche de base ({head[:8]}) ; essais précédents écartés (ancien {remote[:8]})"
+
+
 def push_for_verification(worktree: str, branch: str, message: str, decision: bool = True) -> tuple:
     """
     Commite le worktree (hors sorties Maven, fichiers de test ignorés par le .gitignore ajoutés de force) puis le

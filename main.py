@@ -6457,6 +6457,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"[CUCUMBER] Vérification sur la branche {profile['verify_branch']} (paramètre "
               f"{profile['verify_branch_param'] or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM}) : le worktree y est "
               f"commité et poussé avant chaque vérification.")
+        if verify_mode and not (resume_state or complete_state or args.from_import):
+            # Nouvelle génération : branche de travail recréée depuis la branche de base (worktree remis à zéro),
+            # jamais fusionnée avec les essais précédents ; refusé si elle porte une init absente de la base
+            done, line = cucumber_checks.replace_verify_branch(
+                worktree, profile["verify_branch"],
+                (state["base"].split("/", 1)[-1], profile.get("branche_cible") or ""),
+                profile.get("init_features_tous") or profile.get("init_features") or [])
+            print(f"[CUCUMBER] {'🌱' if done else '⚠️'} Branche de travail : {line}")
     branch_error = (cucumber_checks.push_for_verification(
         worktree, profile["verify_branch"], f"Cucumber coverage of {client} specifics - initialisation")[0]
                     if verify_mode and profile["verify_branch"] and init_tags and cucumber_tools.pending_lots(state)
@@ -6712,6 +6720,12 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                                  {**fixed_values, **java}, model, work_key, run_dir,
                                  lambda usage: add_usage(lot, usage), verify_sources, unverified_status, context)
             files = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
+        elif verify_mode and (check["ok"] or check.get("environnement")) and any(
+                r.get("statut") == "couvert" for r in results or []):
+            # Test écrit, exécution possible, mais aucun scénario du lot identifié : aucun run lancé — erreur de
+            # l'agent, jamais un simple « non vérifié »
+            lot["execution"] = {"mode": "aucun", "erreur_agent": True, "message": cucumber_bilan.NO_RUN_ERROR}
+            print(f"[LOT {label}] ❌ {cucumber_bilan.NO_RUN_ERROR}")
         # A_REVOIR.md du dépôt client (défauts détectés, scénarios désactivés ou faibles, arrêts), livré avec le lot
         if lot.get("arret"):
             lot["statut"] = "decision_humaine"

@@ -437,14 +437,26 @@ def _title_key(title: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", title.lower()).split())
 
 
-def _lot_scenarios(worktree: str, features: list, before_ref: str = "HEAD") -> tuple:
-    """(scénarios nouveaux des .feature du lot, scénarios client déjà là) ; un scénario existant au HEAD n'est pas nouveau."""
+def _scenario_body(scenario: dict) -> list:
+    return [(st["phase"], " ".join(st["texte"].split()), str(st.get("table") or "")) for st in scenario["steps"]]
+
+
+def _lot_scenarios(worktree: str, features: list, before_ref: str = "HEAD", results: list = None) -> tuple:
+    """
+    (scénarios du lot dans ses .feature, scénarios client déjà là). Un scénario est du lot s'il est absent au
+    `before_ref`, si ses steps ont changé depuis, ou si le JSON du lot (`results`) le déclare : un scénario réécrit
+    sous un titre déjà présent (essai précédent) est vérifié comme un nouveau.
+    """
     new, existing = [], []
     for rel in features:
-        before = {_title_key(s["titre"]) for s in parse_scenarios(_git(worktree, "show", f"{before_ref}:{rel}").stdout)}
+        before = {_title_key(s["titre"]): _scenario_body(s)
+                  for s in parse_scenarios(_git(worktree, "show", f"{before_ref}:{rel}").stdout)}
         for scenario in parse_scenarios(_read_text_file(os.path.join(worktree, *rel.split("/")))):
             scenario["fichier"] = rel
-            (existing if _title_key(scenario["titre"]) in before else new).append(scenario)
+            title = _title_key(scenario["titre"])
+            unchanged = title in before and before[title] == _scenario_body(scenario)
+            declared = bool(results) and _declared(scenario, results)[1] is not None
+            (existing if unchanged and not declared else new).append(scenario)
     base = os.path.join(worktree, "src", "test", "resources")
     for directory, _, names in os.walk(base) if os.path.isdir(base) else ():
         for name in names:
@@ -527,7 +539,7 @@ def analyse_lot(worktree: str, files: list, results: list, reference: dict, thre
             threshold = DEFAULT_DUP_THRESHOLD
     features = [f for f in files if f.endswith(".feature")]
     java_files = [f for f in files if f.endswith(".java")]
-    new, existing = _lot_scenarios(worktree, features, before_ref)
+    new, existing = _lot_scenarios(worktree, features, before_ref, results)
     structural = set(reference.get("titres_structurels", []))
 
     def is_setup(scenario):
