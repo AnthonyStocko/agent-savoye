@@ -503,7 +503,14 @@ def lot_outcome(lot: dict, results: list, files: list, committed: bool, total: i
     else:
         where = f"{file_kinds(written)} écrit(s), non commités"
     icon = "✅" if out["couverts"] and not (out["non_verifies"] or out["echecs"]) else "⚠️"
-    out["ligne"] = f"{icon} " + ", ".join(parts) + f" — {where}"
+    # Init rejouée dans le même build que le lot : durée de l'init et durée des tests, séparément
+    init = (lot.get("execution") or {}).get("init") or {}
+    out["init"] = init
+    timing = ""
+    if init:
+        from tools.cucumber_verify import init_line
+        timing = f" — {init_line(init)}" + ("" if init.get("ok") else " (lot non jugé : environnement non initialisé)")
+    out["ligne"] = f"{icon} " + ", ".join(parts) + f" — {where}{timing}"
     return out
 
 

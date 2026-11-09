@@ -29,8 +29,11 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def classify(result: dict, lot: dict) -> dict:
-    """Résultat d'une génération à partir du résultat de lot d'une tâche : {type, message, lot, …}."""
+def classify(result: dict, lot: dict, profile: dict = None) -> dict:
+    """
+    Résultat d'une génération à partir du résultat de lot d'une tâche : {type, message, lot, …} ; `profile` : profil
+    appliqué du client (modules exclus : blocage « dépend du module exclu »).
+    """
     base = {"lot": lot.get("numero"), "date": lot.get("fin") or _now()}
     scenarios = [s for s in result.get("scenarios") or [] if isinstance(s, dict)]
     declared = result.get("statut_declare") or result.get("statut")
@@ -50,19 +53,30 @@ def classify(result: dict, lot: dict) -> dict:
     if result.get("tri") or result.get("raison") == TECHNICAL_REASON or (result.get("sans_objet") or {}).get("preuve"):
         return {**base, "type": "sans_logique", "message": (result.get("sans_objet") or {}).get("preuve")
                 or cucumber_testability.summary(result.get("raison") or "", 1)}
-    evaluation = cucumber_testability.assess(result, {}, {})
+    evaluation = cucumber_testability.assess(result, {}, profile or {})
     if evaluation["etat"] == "non_testable":
         return {**base, "type": "blocage", "message": cucumber_testability.blocker_line(evaluation)}
     return {**base, "type": "a_confirmer",
             "message": result.get("resume") or cucumber_testability.summary(result.get("raison") or "", 2)}
 
 
+def client_profile(client_name: str) -> dict:
+    """Profil appliqué du client ({} sans client ou profil illisible)."""
+    if not client_name:
+        return {}
+    try:
+        from tools import cucumber_profile
+        return cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name))
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
 def record_lot(state: dict, lot: dict) -> list:
     """Enregistre le résultat de chaque tâche d'un lot terminé ; renvoie les identifiants enregistrés."""
-    done = []
+    done, profile = [], client_profile(state.get("client") or "")
     for result in lot.get("resultats") or []:
         if result.get("id"):
-            state.setdefault("generations", {})[result["id"]] = classify(result, lot)
+            state.setdefault("generations", {})[result["id"]] = classify(result, lot, profile)
             done.append(result["id"])
     return done
 

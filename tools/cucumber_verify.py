@@ -1020,8 +1020,14 @@ def parse_cucumber_report(report: list) -> dict:
                     title, [t.get("name", "") for t in element.get("tags") or [] if isinstance(t, dict)]):
                 setup_failed = (title, f"{outcome['step']} — {outcome['message']}"[:200], outcome["nature"])
             key = (rel, title)
+            # Durée du cas de test (hooks, Background et steps) ; exemples d'un plan de scénario additionnés
+            spent = elapsed + sum(_duration(h) for h in (element.get("before") or []) + (element.get("after") or []))
+            timing = {"debut": (results.get(key) or {}).get("debut") or (
+                started.isoformat(timespec="seconds") if started else ""),
+                      "duree": round((results.get(key) or {}).get("duree", 0) + spent, 1)}
             if key not in results or rank[outcome["statut"]] > rank[results[key]["statut"]]:
                 results[key] = outcome
+            results[key].update(timing)
     return results
 
 
@@ -1498,29 +1504,62 @@ def final_status(levels: dict) -> tuple:
 
 
 def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scenarios: dict, kinds: dict,
-               label: str, sources: dict = None) -> dict:
+               label: str, sources: dict = None, init_tags: str = "") -> dict:
     """
     Niveaux 2 et 3 pour les scénarios `scenarios` {tag: identifiant} d'un lot, `kinds` {tag: type du spécifique},
     `sources` : paramètres du job Jenkins désignant le dépôt et les commits de base (job_sources).
     Au plus 3 exécutions : client (CUCUMBER_VERIFY_ENV), Standard pour les overrides (CUCUMBER_VERIFY_ENV_STD),
     mutation des attendus sur le client. Les mises en place (@agent_…_0) des features concernées sont exécutées
-    avec les scénarios. Renvoie {tag: {id, statut, motif, niveaux, build, cause}} et les builds ; cause : nature
-    de l'échec de la mise en place pour un scénario « cascade ».
+    avec les scénarios. `init_tags` (init du client) : rejouée dans CHAQUE exécution, dans le même build que les
+    scénarios et avant eux (« (<init> or <lot>) and not <modules exclus> ») ; une init en échec, absente ou exécutée
+    après un scénario du lot : lot non jugé (« environnement non initialisé »). Renvoie {tag: {id, statut, motif,
+    niveaux, build, cause}}, les builds et « init » (résultat et durées de l'init et des tests du run client) ;
+    cause : nature de l'échec de la mise en place pour un scénario « cascade ».
     """
     found = tagged_scenarios(worktree, files, scenarios)
     key_of = {tag: (rel, s["titre"]) for tag, (rel, s) in found.items()}
+    init_tags = (init_tags or "").strip()
+    init, units = {"cles": set(), "fichiers": set(), "positions": []}, {}
+    if init_tags:
+        from tools.cucumber_modules import run_expression
+        # Init des modules exclus retirée (profil du job) : seule l'init du périmètre testé doit passer
+        scoped = run_expression(init_tags, (sources or {}).get("profil") or {})
+        units = worktree_units(worktree)
+        init = init_scenarios(units, scoped or init_tags)
+        refused = (f"{INIT_NOT_RUN} ({init_tags}) : aucun scénario de l'init dans le dépôt"
+                   if not init["cles"] else "")
+        lot_expression = " or ".join(sorted(set(scenarios) | setup_tags(worktree, files, scenarios)))
+        order = "" if refused else init_order_error(units, init, lot_expression)
+        if refused or order:
+            message = refused or f"{INIT_NOT_RUN} ({init_tags}) : {order}"
+            result = not_verified(scenarios, kinds, message, "environnement")
+            return {**result, "init": {"tags": init_tags, "ok": False, "message": message, "scenarios_init": 0,
+                                       "duree_init": None, "duree_tests": None}, "classes_executees": None}
 
-    def expression(selected):
-        return " or ".join(sorted(set(selected) | setup_tags(worktree, files, selected)))
+    def expression(selected, extra=()):
+        return with_init(" or ".join(sorted(set(selected) | setup_tags(worktree, files, selected)) + list(extra)),
+                         init_tags)
+
+    def judged(run: dict) -> tuple:
+        """(résultat de l'init dans `run`, message d'arrêt '' si le run peut être jugé)."""
+        if not init_tags or not run["ok"]:
+            return {}, ""
+        outcome = init_outcome(run["resultats"], init, init_tags)
+        return outcome, "" if outcome["ok"] else outcome["message"]
     builds, out = [], {}
     # Option : mutation dans le même build (copies <feature>_mut.feature, tags <tag>_mut) — un build de moins
     copies, counts, copy_of, mutated_tags = mutation_copies(worktree, [k[0] for k in key_of.values()], scenarios) \
         if merged_mutation() else ({}, {}, {}, set())
-    client = run_tags(mode, worktree, base, build_fn,
-                      " or ".join([expression(scenarios)] + sorted(mutated_tags)),
+    client = run_tags(mode, worktree, base, build_fn, expression(scenarios, sorted(mutated_tags)),
                       os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), copies, f"{label}-client", sources)
+    init_result, stop = judged(client)
     builds.append({"execution": "client" + (" + mutation" if copies else ""), "build": client["build"],
-                   "message": client["message"]})
+                   "message": client["message"], **({"init": init_result} if init_result else {})})
+    if stop:
+        # Init du client en échec dans ce build : les scénarios du lot ne sont pas jugés (RÈGLE : jamais sur un
+        # environnement non initialisé)
+        result = not_verified(scenarios, kinds, stop, "environnement", client["build"])
+        return {**result, "builds": builds, "init": init_result, "classes_executees": None}
     levels = {tag: {"client": _level(client["resultats"].get(key_of.get(tag, ("", ""))), False)
                     if client["ok"] else ("nv", client["message"])} for tag in scenarios}
     passing = [t for t in scenarios if levels[t]["client"][0] == "ok"]
@@ -1529,9 +1568,12 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
     if overrides and std_env:
         standard = run_tags(mode, worktree, base, build_fn, expression(overrides), std_env, {}, f"{label}-standard",
                             sources)
-        builds.append({"execution": "standard", "build": standard["build"], "message": standard["message"]})
+        standard_init, standard_stop = judged(standard)
+        builds.append({"execution": "standard", "build": standard["build"], "message": standard["message"],
+                       **({"init": standard_init} if standard_init else {})})
         for tag in overrides:
-            levels[tag]["standard"] = _level(standard["resultats"].get(key_of.get(tag, ("", ""))), True, True) \
+            levels[tag]["standard"] = ("nv", standard_stop) if standard_stop else \
+                _level(standard["resultats"].get(key_of.get(tag, ("", ""))), True, True) \
                 if standard["ok"] else ("nv", standard["message"])
     elif overrides and os.getenv("CUCUMBER_VERIFY_REQUIRE_STD", "").strip() == "1":
         # Contre-épreuve Standard exigée mais impossible : les overrides restent non vérifiés
@@ -1556,9 +1598,12 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
         if to_run:
             mutation = run_tags(mode, worktree, base, build_fn, expression(to_run),
                                 os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), mutated, f"{label}-mutation", sources)
-            builds.append({"execution": "mutation", "build": mutation["build"], "message": mutation["message"]})
+            mutation_init, mutation_stop = judged(mutation)
+            builds.append({"execution": "mutation", "build": mutation["build"], "message": mutation["message"],
+                           **({"init": mutation_init} if mutation_init else {})})
             for tag in to_run:
-                levels[tag]["mutation"] = _level(mutation["resultats"].get(key_of.get(tag, ("", ""))), True) \
+                levels[tag]["mutation"] = ("nv", mutation_stop) if mutation_stop else \
+                    _level(mutation["resultats"].get(key_of.get(tag, ("", ""))), True) \
                     if mutation["ok"] else ("nv", mutation["message"])
     executed = None
     if os.getenv("CUCUMBER_JACOCO", "").strip() == "1" and client["ok"]:
@@ -1580,7 +1625,8 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
                     **{k: (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get(k, "")
                        for k in ("step", "heure", "journal")},
                     "sorties": (client["resultats"].get(key_of.get(tag, ("", ""))) or {}).get("sorties") or []}
-    return {"scenarios": out, "builds": builds, "classes_executees": executed}
+    return {"scenarios": out, "builds": builds, "classes_executees": executed,
+            **({"init": init_result} if init_result else {})}
 
 
 # ---------------------------------------------------------------------------
@@ -1689,14 +1735,134 @@ def run_init(mode: str, worktree: str, base: str, build_fn, tags: str, sources: 
             "build": run["build"]}
 
 
-def not_verified(scenarios: dict, kinds: dict, message: str, status: str = "non_verifie") -> dict:
+def not_verified(scenarios: dict, kinds: dict, message: str, status: str = "non_verifie", build: str = "") -> dict:
     """
     Résultat d'un lot non exécuté : tout est `status` (non_verifie sans moyen d'exécution, environnement si
     l'initialisation CUCUMBER_INIT_TAGS a échoué), jamais compté pertinent.
     """
     return {"scenarios": {tag: {"id": identifier, "statut": status, "motif": message,
-                                "type": kinds.get(tag, ""), "niveaux": {"client": ["nv", message]}, "build": ""}
+                                "type": kinds.get(tag, ""), "niveaux": {"client": ["nv", message]}, "build": build}
                           for tag, identifier in scenarios.items()}, "builds": []}
+
+
+# ---------------------------------------------------------------------------
+# Init du client rejouée dans chaque run de vérification
+# ---------------------------------------------------------------------------
+# L'environnement Jenkins est remonté à chaque build (schéma cucumber_customer_<slot>) : les données d'une init
+# lancée dans un build précédent n'existent plus. Chaque run de vérification d'un lot exécute donc l'init du client
+# ET les scénarios du lot dans le même build, l'init en premier ; init en échec ou exécutée après un scénario du
+# lot : le lot n'est pas jugé (« environnement non initialisé »).
+
+INIT_NOT_RUN = "environnement non initialisé"
+
+
+def with_init(expression: str, init: str) -> str:
+    """« <tags d'init> or <tags du lot> » : un seul build pour l'init et les tests qu'elle prépare."""
+    init, expression = (init or "").strip(), (expression or "").strip()
+    if not init or not expression:
+        return init or expression
+
+    def part(value: str) -> str:
+        return f"({value})" if re.search(r"\band\b|\bnot\b|[()]", value) else value
+    return f"{part(init)} or {part(expression)}"
+
+
+def worktree_units(worktree: str) -> dict:
+    """{chemin relatif: scenario_units} des .feature du worktree (hors target/)."""
+    paths = _git(worktree, "ls-files", "-co", "--exclude-standard", "--", "*.feature").stdout.splitlines()
+    return {p: scenario_units(_read_text_file(os.path.join(worktree, *p.split("/")))) for p in paths
+            if not (p.startswith("target/") or "/target/" in p) and os.path.exists(os.path.join(worktree,
+                                                                                               *p.split("/")))}
+
+
+def _selected(unit: dict, expression: str) -> bool:
+    return any(tags_match(expression, set(unit["tags"]) | set(tags)) for tags, _ in unit["exemples"] or [((), 1)])
+
+
+def init_scenarios(units: dict, init: str) -> dict:
+    """
+    Scénarios de l'init du client sélectionnés par `init` : {"cles": {(fichier, titre)}, "fichiers": features dont
+    tous les scénarios sont de l'init (un plan de scénario y est reconnu par son fichier), "positions": [(fichier,
+    ligne)]}.
+    """
+    keys, files, positions = set(), set(), []
+    for rel, items in units.items():
+        chosen = [u for u in items if _selected(u, init)]
+        keys |= {(rel, u["titre"]) for u in chosen}
+        positions += [(rel, u["ligne"]) for u in chosen]
+        if chosen and len(chosen) == len(items):
+            files.add(rel)
+    return {"cles": keys, "fichiers": files, "positions": positions}
+
+
+def init_order_error(units: dict, init: dict, expression: str) -> str:
+    """
+    Ordre d'exécution du runner (JUnit 4 de Cucumber : features triées par chemin, majuscules avant minuscules,
+    scénarios dans l'ordre du fichier) : '' si toute l'init précède le premier scénario sélectionné par
+    `expression`, sinon le constat.
+    """
+    if not init["positions"]:
+        return ""
+    last = max(init["positions"])
+    tests = sorted((rel, u["ligne"]) for rel, items in units.items() for u in items
+                   if (rel, u["ligne"]) not in init["positions"] and _selected(u, expression))
+    early = [t for t in tests if t < last]
+    return (f"{early[0][0]}:{early[0][1]} s'exécute avant la fin de l'init ({last[0]}:{last[1]}) — le runner trie "
+            f"les features par chemin : placez la feature après l'initialisation") if early else ""
+
+
+def _is_init(key: tuple, init: dict) -> bool:
+    return key in init["cles"] or key[0] in init["fichiers"]
+
+
+def _total(values: list):
+    known = [v for v in values if isinstance(v, (int, float))]
+    return round(sum(known), 1) if known else None
+
+
+def init_outcome(results: dict, init: dict, tags: str) -> dict:
+    """
+    Init du client dans les résultats d'un run de vérification (dans l'ordre d'exécution) : {"ok", "message",
+    "tags", "scenarios_init", "duree_init", "duree_tests"} ; ok faux si un scénario de l'init manque ou ne passe pas,
+    ou si un scénario du lot a commencé avant la fin de l'init. Durées en secondes (None si le build ne les donne
+    pas).
+    """
+    order = list(results)
+    mine = [k for k in order if _is_init(k, init)]
+    others = [k for k in order if not _is_init(k, init)]
+    out = {"tags": tags, "ok": True, "message": f"init {tags} : {len(mine)} scénario(s) OK", "scenarios_init": len(mine),
+           "duree_init": _total([results[k].get("duree") for k in mine]),
+           "duree_tests": _total([results[k].get("duree") for k in others])}
+    failed = [k for k in mine if results[k]["statut"] != "passe"]
+    early = [k for k in others if mine and order.index(k) < order.index(mine[-1])]
+    if not mine:
+        reason = "aucun scénario de l'init dans les résultats du build"
+    elif failed:
+        r = results[failed[0]]
+        cause = r.get("cause") or r.get("nature")
+        reason = (f"{failed[0][1]} : {r.get('step', '')} — {r.get('message', '')}".strip(" —")
+                  + (f" (cause : {CAUSE_LABELS.get(cause, cause)})" if cause else ""))
+    elif early:
+        reason = f"« {early[0][1]} » ({early[0][0]}) exécuté avant la fin de l'init : ordre du runner à revoir"
+    else:
+        return out
+    return {**out, "ok": False, "message": f"{INIT_NOT_RUN} ({tags}) : {reason}"[:400]}
+
+
+def duration_text(seconds) -> str:
+    """« 4 min 12 s », « 37 s », « durée inconnue »."""
+    if not isinstance(seconds, (int, float)):
+        return "durée inconnue"
+    minutes, rest = divmod(int(round(seconds)), 60)
+    return f"{minutes} min {rest:02d} s" if minutes else f"{rest} s"
+
+
+def init_line(outcome: dict) -> str:
+    """Bilan d'un run de vérification : durée de l'init et durée des tests, séparément."""
+    if not outcome:
+        return ""
+    return (f"init {outcome.get('tags', '')} {'✅' if outcome.get('ok') else '⛔'} "
+            f"{duration_text(outcome.get('duree_init'))} ; tests {duration_text(outcome.get('duree_tests'))}")
 
 
 # ---------------------------------------------------------------------------

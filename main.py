@@ -2270,6 +2270,14 @@ def hold_meaning_changes(client: str, worktree: str, before: dict, client_tag: s
     return held
 
 
+def print_init_line(label: str, result: dict) -> None:
+    """Init rejouée dans le run du lot : résultat, durée de l'init et durée des tests."""
+    outcome = result.get("init") or {}
+    if outcome:
+        print(f"[LOT {label}] {'✅' if outcome.get('ok') else '🌐'} {cucumber_verify.init_line(outcome)}"
+              + ("" if outcome.get("ok") else f" — lot non jugé : {outcome.get('message', '')}"))
+
+
 def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, base: str, files: list,
                          results: list, mode: str, mode_message: str, client: str, cucumber_std_dir: str,
                          compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
@@ -2290,6 +2298,8 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     scenarios, kinds = dict(lot["tags"]), lot.get("types") or {}
     number = lot["numero"]
     conventions = (context or {}).get("conventions") or {}
+    # Tags d'init du client (vide : option « Initialisation » décochée), rejoués dans chaque run du lot
+    init_tags = (context or {}).get("init_tags", "")
 
     def build():
         return cucumber_tools.build_dir(client, worktree, cucumber_std_dir)
@@ -2320,9 +2330,12 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         print(f"[LOT {label}] {'🌐' if unverified_status == 'environnement' else '⚪'} {len(scenarios)} scénario(s) : "
               f"{mode_message}.")
     else:
+        # Environnement remonté à chaque build : l'init du client est rejouée dans le même build que le lot
         result = cucumber_verify.verify_lot(mode, worktree, base, build, files, scenarios, kinds, f"lot{number}",
-                                            sources)
+                                            sources, init_tags)
+        print_init_line(label, result)
     builds = list(result["builds"])
+    init_runs = [result["init"]] if result.get("init") else []
     tests = {s["id"]: s.get("tests_std") or [] for s in lot_specs}
     spec_of = {cucumber_verify.scenario_id(s["fichier"], s["titre"]): s["spec"]
                for s in (lot.get("indicateurs") or {}).get("scenarios", [])}
@@ -2411,7 +2424,9 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         if present:
             again = cucumber_verify.verify_lot(mode, worktree, base, build, files,
                                                {t: scenarios[t] for t in present}, kinds,
-                                               f"lot{number}-r{attempt + 1}", sources)
+                                               f"lot{number}-r{attempt + 1}", sources, init_tags)
+            print_init_line(label, again)
+            init_runs += [again["init"]] if again.get("init") else []
             builds += again["builds"]
             result["scenarios"].update(again["scenarios"])
         # D7 : un diagnostic temporaire ne s'exécute qu'une fois, sa sortie est gardée dans le journal du scénario
@@ -2504,6 +2519,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             print(f"[LOT {label}] ⚠️ {item['id']} : {hint}")
     lot["execution"] = {"mode": mode or "aucun", "message": mode_message, "builds": builds,
                         "scenarios": result["scenarios"], "desactives": disabled}
+    if init_runs:
+        # Bilan : durée de l'init et durée des tests de chaque run, séparément ; la dernière fait foi
+        lot["execution"]["init"] = init_runs[-1]
+        lot["execution"]["inits"] = init_runs
     if result.get("classes_executees") is not None:
         # CUCUMBER_JACOCO=1 : part des classes de chaque spécifique du lot exécutées pendant le build client
         lot["execution"]["couverture_code"] = cucumber_verify.specific_coverage(
@@ -6428,7 +6447,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         rebuilt_warning = cucumber_simple.client_no_init_warning(client)
         if rebuilt_warning:
             print(f"[CUCUMBER] ⚠️ {rebuilt_warning}")
-    # Initialisation du client (init_tags du profil), une fois par génération : en échec, les lots ne sont pas jugés
+    # Contrôle de l'initialisation du client (init_tags du profil) avant les lots : en échec, les lots ne sont pas
+    # jugés. Ce build ne prépare rien (environnement remonté à chaque build) : l'init est rejouée dans chaque run de
+    # vérification d'un lot, dans le même build que ses scénarios (cucumber_verify.verify_lot)
     if profile["verify_branch"]:
         print(f"[CUCUMBER] Vérification sur la branche {profile['verify_branch']} (paramètre "
               f"{profile['verify_branch_param'] or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM}) : le worktree y est "
@@ -6579,7 +6600,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"\n[LOT {label}] " + " ; ".join(s["libelle"] for s in lot_specs))
         java = cucumber_tools.client_java_context(client, worktree, std_java, conventions)
         context = {"init": client_init, "java": java, "conventions": conventions, "reference": reference,
-                   "longueurs": code_lengths}
+                   "longueurs": code_lengths, "init_tags": init_tags}
         if lot.get("type") == "correction" and lot.get("resultats") is None:
             # Lot « correction » d'un import : scénarios existants, aucune génération
             results = []

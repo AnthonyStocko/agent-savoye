@@ -81,6 +81,28 @@ def _unstamped(line: str) -> str:
     return _JENKINS_STAMP.sub("", line, count=1)
 
 
+def _console_stamp(line: str):
+    """Horodatage (UTC) d'une ligne de console du plugin Jenkins « timestamps », None sans horodatage."""
+    match = _JENKINS_STAMP.match(line or "")
+    return _timestamp(match.group(0).strip()[1:-1]) if match else None
+
+
+def _console_durations(scenarios: dict, began: list, raw: list) -> None:
+    """
+    Début et durée de chaque scénario lus dans une console horodatée : du début du scénario (« Scenario: ») au début
+    du suivant, le dernier jusqu'à la ligne « Tests run: » qui suit. Sans horodatage : rien n'est ajouté.
+    """
+    if not began:
+        return
+    end = next((s for s in map(_console_stamp, (r for r in raw if "Tests run:" in r)) if s and s >= began[-1][0]),
+               None)
+    for index, (stamp, key) in enumerate(began):
+        following = began[index + 1][0] if index + 1 < len(began) else end
+        scenarios[key].setdefault("debut", stamp.isoformat(timespec="seconds"))
+        if following:
+            scenarios[key]["duree"] = round(scenarios[key].get("duree", 0) + (following - stamp).total_seconds(), 1)
+
+
 def console_results(text: str) -> dict:
     """
     Résultats lus dans la console Jenkins quand le rapport Cucumber JSON manque : scénarios de la sortie lisible de
@@ -91,14 +113,19 @@ def console_results(text: str) -> dict:
     <début de la feature> » quand le nom de la feature contient une parenthèse ; à défaut de titre reconnu, le
     scénario est celui qui contient la ligne du step en échec (« at ✽.<step>(…<feature>:<ligne>) »).
     """
-    lines = [_unstamped(line) for line in text.replace("\r", "").splitlines()]
-    scenarios, starts = {}, {}
-    for line in lines:
+    raw = text.replace("\r", "").splitlines()
+    lines = [_unstamped(line) for line in raw]
+    scenarios, starts, began = {}, {}, []
+    for number, line in enumerate(lines):
         match = _PRETTY_SCENARIO.match(line)
         if match:
             key = (match.group(2), match.group(1).strip())
             scenarios.setdefault(key, {"statut": "passe", "step": "", "phase": "", "message": ""})
             starts.setdefault(match.group(2), []).append((int(match.group(3)), key))
+            stamp = _console_stamp(raw[number])
+            if stamp:
+                began.append((stamp, key))
+    _console_durations(scenarios, began, raw)
     for index, line in enumerate(lines):
         failure = _SUREFIRE_FAILURE.search(line)
         if not failure:
@@ -127,9 +154,10 @@ def console_results(text: str) -> dict:
             key = (path, re.split(r"\(", name.rsplit(".", 1)[-1], maxsplit=1)[0].strip() or name)
         nature, exception = failure_kind(error)
         message = next((b.strip() for b in block if b.strip() and not b.strip().startswith("at ")), "")
+        timing = {k: v for k, v in (scenarios.get(key) or {}).items() if k in ("debut", "duree")}
         scenarios[key] = {"statut": "echoue", "step": step_match.group(1) if step_match else "", "phase": "",
                           "message": " ".join(message.split())[:300], "nature": nature, "exception": exception,
-                          "heure": "", "erreur": error}
+                          "heure": "", "erreur": error, **timing}
     if not any(r["statut"] == "echoue" for r in scenarios.values()):
         scenarios.update(compile_failures(lines))
     return scenarios if any(r["statut"] == "echoue" for r in scenarios.values()) or scenarios else {}

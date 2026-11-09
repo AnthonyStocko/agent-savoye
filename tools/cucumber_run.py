@@ -108,6 +108,28 @@ def selection_check(console: str, worktree: str, tags: str, texts: list = None) 
     return f"{gap} (rôle « arguments » du job à vérifier)" if gap else ""
 
 
+def with_client_init(asked: str, profile: dict, texts: list, client_name: str = "") -> str:
+    """
+    Expression d'un run lancé par l'agent, init du client comprise : l'environnement est remonté à chaque build, un
+    run qui ne sélectionne pas toute l'init du client (profil « init_tags », modules exclus retirés) devient
+    « <init> or <tags demandés> » (cucumber_verify.with_init). Inchangée sans tags, sans init dans le profil, quand
+    elle sélectionne déjà toute l'init (ex. tag client porté par les features d'init) ou ne sélectionne que l'init.
+    """
+    from tools.cucumber_verify import init_scenarios, scenario_units, with_init
+    init = cucumber_modules.run_expression((profile or {}).get("init_tags") or "", profile, client_name)
+    asked = (asked or "").strip()
+    if not asked or not init:
+        return asked
+    units = {str(n): scenario_units(t) for n, t in enumerate(texts or [])}
+    found = init_scenarios(units, init)
+    if not found["positions"]:
+        return asked
+    chosen = init_scenarios(units, asked)
+    if set(found["positions"]) <= set(chosen["positions"]):
+        return asked
+    return with_init(asked, init)
+
+
 def record(client_name: str, run: dict) -> None:
     """Historique des lancements dans etat.json (« runs_jenkins »)."""
     state = load_state(client_name)
@@ -130,7 +152,7 @@ def tested_version(client_name: str, params: dict, roles: dict, inventory: dict 
 
 def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=print, repository: str = "",
            base_branch: str = "", inventory: dict = None, client_root: str = "", push: bool = True,
-           branch: str = "", overrides: dict = None, extra_arguments: str = "") -> dict:
+           branch: str = "", overrides: dict = None, extra_arguments: str = "", client_init: bool = True) -> dict:
     """
     Push, contrôle du commit en tête de la branche distante, lancement et suivi (voir docstring du module).
     `repository` : dépôt client (rôle « depot ») ; `base_branch` : branche d'intégration, interdite ; `inventory` et
@@ -141,8 +163,16 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
     défaut celle du profil) telle qu'elle est sur le dépôt client — lecture seule, branche d'intégration permise.
     `overrides` : paramètres du job imposés pour ce run seulement (ex. environnement AVANT / APRÈS de la migration
     Java 21) ; `extra_arguments` : options ajoutées aux arguments Maven (ex. relance ciblée -Dcucumber.features).
+    `client_init` : l'init du client est ajoutée aux tags qui ne la sélectionnent pas (with_client_init) ; faux
+    seulement pour un essai sans test (compilation).
     """
     asked = (tags or "").strip()
+    if client_init and asked and push and worktree and os.path.exists(os.path.join(worktree, ".git")):
+        from tools.cucumber_verify import feature_texts
+        joined = with_client_init(asked, profile, feature_texts(worktree), client_name)
+        if joined != asked:
+            log(f"[RUN JENKINS] Init du client ajoutée au run (environnement remonté à chaque build) : « {joined} »")
+            asked = joined
     # Modules exclus du périmètre testé (profil) : « and not @<TAG> », sans leurs tags d'init
     tags = cucumber_modules.run_expression(asked, profile, client_name)
     check = preflight(profile, worktree, client_name, "" if not push else base_branch)
@@ -251,7 +281,11 @@ def preview(client_name: str, worktree: str, profile: dict, tags: str = "", repo
     "parametres", "attendus"} ; ok faux si le run serait refusé.
     """
     from tools.cucumber_verify import a_revoir_tag, expected_count, feature_texts
-    tags = cucumber_modules.run_expression((tags or "").strip(), profile, client_name)
+    tags = (tags or "").strip()
+    if tags and push and worktree and os.path.exists(os.path.join(worktree, ".git")):
+        # Comme au lancement : init du client ajoutée aux tags qui ne la sélectionnent pas
+        tags = with_client_init(tags, profile, feature_texts(worktree), client_name)
+    tags = cucumber_modules.run_expression(tags, profile, client_name)
     check = preflight(profile, worktree, client_name, "" if not push else base_branch)
     if not push and branch:
         check["branche"] = branch.strip()

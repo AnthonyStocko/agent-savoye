@@ -40,7 +40,10 @@ STATES = {"testable": "testable", "a_confirmer": "testable, informations à conf
 BLOCKERS = {"non_deploye": "code ou personnalisation non déployé",
             "defaut_produit": "défaut du produit prouvé",
             "donnee_impossible": "donnée impossible à créer par l'API et absente de l'environnement",
-            "step_impossible": "step indispensable inexistant dans la bibliothèque et impossible à écrire"}
+            "step_impossible": "step indispensable inexistant dans la bibliothèque et impossible à écrire",
+            # Fonctionnalité qui passe par un module décoché dans « Données du projet » (ex. affectation transport →
+            # TMS) : non générée, classée « non testable : dépend du module exclu »
+            "module_exclu": "dépend du module exclu"}
 SOURCES = (("profil", "profil client"), ("init", "features d'init du dépôt client"),
            ("initializers", "initializers et configurations du client"),
            ("depot", "fichiers de données et features du dépôt client"), ("standard", "Cucumber Standard aligné"),
@@ -483,9 +486,17 @@ def assess(result: dict, index: dict, profile: dict = None, title: str = "") -> 
     blocker = result.get("blocage") or {}
     kind = blocker.get("type", "") if isinstance(blocker, dict) else ""
     proof = (blocker.get("preuve") or "").strip() if isinstance(blocker, dict) else ""
+    if kind == "module_exclu":
+        # Dépendance à un module exclu du périmètre testé : retenue si le module cité est bien exclu et prouvée
+        module, error = excluded_module(blocker, profile)
+        if not error and proof:
+            return {**out, "etat": "non_testable", "blocage": kind, "preuve": f"{module} — {proof}"}
+        kind = ""
+        out["rejets"] = [error or "dépendance au module exclu sans preuve (step, endpoint, process ou fichier du "
+                                  "module)"]
     asked = [q for q in result.get("questions") or [] if isinstance(q, str)]
     found = found_values(" ".join([reason, proof, *asked]), index)
-    rejections = []
+    rejections = list(out["rejets"])
     if kind not in BLOCKERS or not proof:
         rejections.append("aucun blocage prouvé (non déployé, défaut produit, donnée impossible à créer et absente, "
                           "step impossible) : une absence d'information n'est pas un blocage")
@@ -504,8 +515,35 @@ def assess(result: dict, index: dict, profile: dict = None, title: str = "") -> 
     return {**evaluation, "etat": "a_confirmer" if evaluation["attendues"] else "testable"}
 
 
+def excluded_module(blocker: dict, profile: dict = None) -> tuple:
+    """(module exclu cité par un blocage « module_exclu », erreur '' si ce module est bien exclu du périmètre)."""
+    from tools.cucumber_modules import excluded
+    out = excluded(profile or {})
+    module = str((blocker or {}).get("module") or "").strip().upper()
+    if not module:
+        cited = [c for c in sorted(out) if re.search(rf"(?<![A-Za-z0-9]){re.escape(c)}(?![A-Za-z0-9])", str((blocker or {}).get("preuve") or ""),
+                                                     re.I)]
+        module = cited[0] if cited else ""
+    if not out:
+        return module, "aucun module exclu du périmètre testé : « module_exclu » ne s'applique pas"
+    if module not in out:
+        return module, (f"module « {module or '?'} » non exclu du périmètre testé (exclus : {', '.join(sorted(out))}) "
+                        f": la fonctionnalité doit être générée")
+    return module, ""
+
+
+def non_testable_label(assessment: dict) -> str:
+    """« non testable : dépend du module exclu (TMS) » ou « non testable aujourd'hui »."""
+    if assessment.get("blocage") == "module_exclu":
+        module = (assessment.get("preuve") or "").split(" — ", 1)[0]
+        return f"non testable : dépend du module exclu ({module})" if module else "non testable : dépend du module exclu"
+    return STATES["non_testable"]
+
+
 def blocker_line(assessment: dict) -> str:
     """« <blocage> : <preuve> » pour l'avertissement de sélection."""
+    if assessment.get("blocage") == "module_exclu":
+        return f"{non_testable_label(assessment)} — preuve : {assessment.get('preuve') or '—'}"
     return f"{BLOCKERS.get(assessment.get('blocage'), 'blocage')} — preuve : {assessment.get('preuve') or '—'}"
 
 

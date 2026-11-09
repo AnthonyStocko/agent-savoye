@@ -423,7 +423,8 @@ def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_
         f"- Tag du client (casse exacte) : {tag}",
         cucumber_init_data.init_block(init_view(profile), clear, max_codes),
         protected_block(profile.get("protected_files") or []),
-        *filter(None, [version_block(profile.get("library_version", ""), profile.get("server_version", ""),
+        *filter(None, [excluded_modules_block(profile),
+                       version_block(profile.get("library_version", ""), profile.get("server_version", ""),
                                      gap_file),
                        initializers_block(profile.get("server_initialized_data") or [],
                                           profile.get("initializers_survive_clear", ""),
@@ -431,6 +432,21 @@ def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_
                                                          if any(p["source"] in ("init", "depot") for p in places)})]),
         "- N'utilise QUE des steps existants (catalogue du Standard, steps du client) ou définis par ce lot, avec la "
         "syntaxe de colonnes du Standard actuel ; préfère un Background à un scénario « Contexte » séparé."])
+
+
+def excluded_modules_block(profile: dict) -> str:
+    """
+    Ligne du bloc profil : modules exclus du périmètre testé (« Données du projet ») ; une fonctionnalité qui en
+    dépend n'est pas générée mais classée « non testable : dépend du module exclu ». '' sans module exclu.
+    """
+    from tools.cucumber_modules import excluded
+    out = sorted(excluded(profile))
+    if not out:
+        return ""
+    return (f"- Modules exclus du périmètre testé : {', '.join(out)} (absents de l'environnement de test). Une "
+            f"fonctionnalité qui en dépend (step, endpoint, process, job ou donnée du module ; ex. affectation "
+            f"transport → TMS) n'est PAS générée : réponds « non_couvert » avec « blocage » {{\"type\": "
+            f"\"module_exclu\", \"module\": \"<code>\", \"preuve\": \"<step, endpoint ou fichier du module>\"}}.")
 
 
 def version_block(library: str, server: str, gap_file: str = "") -> str:
