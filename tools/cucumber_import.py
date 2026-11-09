@@ -931,6 +931,10 @@ def failure_results(client_name: str, numero: int, results: dict, init: dict, st
     base = state.get("base", "")
     is_owned = (lambda rel: cucumber_failures.owned(worktree, base, rel)) if worktree and os.path.isdir(worktree) \
         else None
+    # Adresse de livraison de test du client (profil) : action d'un rejet « Adresse de livraison incohérente »
+    from tools.cucumber_results import client_profile
+    own = {"adresse_test": client_profile(client_name).get("adresse_test") or {}}
+    contexts = {i: {**((contexts or {}).get(i) or {}), "profil": own} for i in set(results) | set(contexts or {})}
     items = cucumber_failures.failure_results(results, init, is_owned, contexts=contexts,
                                               out_of_scope=out_of_scope)
     previous = {e["id"]: e for e in (_read_json(cucumber_failures.analysis_path(imports_dir(client_name), numero),

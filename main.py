@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import (
     _restore_keys as restore_epic_keys, draft_tasks, epic_manifest_path, load_epic_manifest, save_epic_manifest,
@@ -2379,7 +2379,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             # Sortie d'un diagnostic temporaire exécuté au tour précédent
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
-        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         verify_model, effort = verify_fix_model(model)
@@ -2679,9 +2679,11 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
         print(f"[LOT {label}] ⛔ Fichier de l'init globale modifié, restauré depuis la base : {rel}")
     errors = list(files_check["erreurs"]) + cucumber_a_revoir.check_deletions(worktree, base)
     # Aucune valeur du profil d'un autre client (clear, sites, codes, chemins) dans les fichiers du lot
-    errors += cucumber_isolation.check_files(
-        client, worktree, files, cucumber_profile.effective_profile(cucumber_profile.load_profile(client)),
-        cucumber_std_dir)
+    own_profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    errors += cucumber_isolation.check_files(client, worktree, files, own_profile, cucumber_std_dir)
+    # Adresse de livraison inventée dans un fichier de données (commande, client) : remplacée par l'adresse de test
+    for rel, found in cucumber_test_data.normalize_files(worktree, files, cucumber_test_data.test_address(own_profile)):
+        print(f"[LOT {label}] 🏠 {cucumber_test_data.normalized_line(rel, found)}")
     if context:
         new = cucumber_checks.new_features(worktree, base, [f for f in files if f.endswith(".feature")])
         errors += cucumber_init_data.check_lot_init(worktree, files, new, context.get("init"))
@@ -2783,7 +2785,7 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
         resumed = bool(lot and lot.get("session") and resume_lot_session())
         print(f"[LOT {label}] Correction {attempt + 1}/{attempts} ({len(check['erreurs'])} erreur(s)) "
               + ("(reprise de la session du lot)..." if resumed else f"({fix_model}, effort {effort or 'défaut'})..."))
-        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", " ".join(check["erreurs"])), **values}, lot_label=label, etape=check["etape"].upper(),
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", " ".join(check["erreurs"])), **values}, lot_label=label, etape=check["etape"].upper(),
                                erreurs="\n".join(f"- {e}" for e in check["erreurs"] + violations),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
@@ -3424,7 +3426,7 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     if data:
         print(f"[LOT {label}] {len(data)} échec(s) lié(s) aux données : "
               + ("preuve en base exigée." if db_available else "aucun accès base, causes NON PROUVÉES."))
-    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
+    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
                            erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available),
                            fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
@@ -3485,6 +3487,7 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
         cucumber_compile.write_context(client, worktree, cucumber_std_dir, compile_cmd)
         agent_compile = f'"{python_exe}" "{os.path.join(workspace_dir, "tools", "cucumber_compile.py")}" {client}'
     values = {"client_name": client, "token_saving_rules": token_saving_rules, "worktree": worktree,
+              "donnees_test": cucumber_test_data.prompt_block(profile),
               "java_std": std_java["java_std"], "sources_std": step_code["sources"],
               "check_expression": cucumber_environment.check_expression(client),
               "recreation_expression": cucumber_environment.recreation_expression(client),
@@ -6487,6 +6490,9 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     shared = consult_knowledge(project, client=client, tags=["cucumber"])
     fixed_values = {
         "client_name": client, "token_saving_rules": token_saving_rules,
+        # Adresse de livraison de test (profil, sinon défaut de l'agent) et données de référentiel jamais inventées :
+        # prompt système des lots et prompts de correction
+        "donnees_test": cucumber_test_data.prompt_block(profile),
         "knowledge_block": f"\n{shared['bloc']}\n" if shared["bloc"] else "",
         # Accès base en lecture seule de tous les lots et de leurs corrections (--db-schema), journalisé par lot
         # Base de l'environnement où Jenkins joue les tests (CUCUMBER_DB_*), à défaut la base DB_*

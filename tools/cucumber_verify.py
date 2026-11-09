@@ -913,6 +913,13 @@ def failure_kind(error_message: str) -> tuple:
 
 # Échecs connus (point 9f) : (motif, nature, piste de correction)
 KNOWN_FAILURES = (
+    # Donnée de test hors référentiel (cucumber_test_data) : adresse de livraison inventée, refusée par le contrôle
+    # des lieux de livraison ; échec du test, corrigé par l'adresse de test
+    (re.compile(r"adresse de livraison incoh[ée]rente|incoherent delivery address|inconsistent delivery address",
+                re.I), "technique",
+     "donnée de test hors référentiel : l'adresse de livraison a été inventée ; remplace-la, champ par champ (casse "
+     "comprise), par l'adresse de livraison de test du bloc « DONNÉES DE TEST » (profil, sinon défaut), sans toucher "
+     "aux contrôles du test"),
     (re.compile(r"Unable to find the custom field", re.I), "environnement",
      "champ personnalisé non déclaré sur l'entité dans cet environnement : sa déclaration fait partie des données que "
      "l'init du projet recrée (contrôle d'environnement) ; écris un champ personnalisé par le mécanisme prévu à cet "

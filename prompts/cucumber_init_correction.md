@@ -15,6 +15,8 @@ TOUT autre fichier est interdit : l'initialisation globale (01-Initialisation…
 === ERREURS DE LA TENTATIVE PRÉCÉDENTE ===
 ${erreurs}
 
+${donnees_test}
+
 === RÈGLES ===
 1. Comprends d'abord POURQUOI le step échoue : lis le message, le journal du scénario et la console autour du step (Grep), puis la méthode Java du step (Grep de son expression dans les fichiers autorisés, puis Read offset / limit).
 2. Contrôle de l'environnement « ${check_expression} » : LECTURE SEULE (aucun POST, PUT, PATCH ni DELETE). Il n'échoue QUE sur une absence PROUVÉE (la lecture répond et la dépendance n'y est pas). Une dépendance qu'il ne peut pas confirmer (aucun objet à lire, lecture impossible, endpoint absent) est un AVERTISSEMENT écrit dans le log du scénario, jamais un échec — y compris quand elles sont regroupées dans un message.

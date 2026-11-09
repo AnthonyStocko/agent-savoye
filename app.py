@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, standard_version, standard_version_task
+from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, cucumber_test_data, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_java21, cucumber_simple, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1830,6 +1830,18 @@ def profile_field_inputs(client: str, fields: list, profile: dict, profile_doc: 
         values[key] = [line.strip() for line in st.text_area(
             f"{cucumber_profile.LABELS[key]}, un par ligne", value="\n".join(profile[key]),
             height=100).splitlines() if line.strip()]
+    if "adresse_test" in fields:
+        # Adresse de livraison de test du client : remplace en bloc l'adresse par défaut de l'agent (tout vide : défaut)
+        default = cucumber_test_data.default_address()
+        st.caption(f"{cucumber_profile.LABELS['adresse_test'].capitalize()} — tout vide : adresse par défaut de "
+                   f"l'agent ({default['nom']}, {default['adresse']}, {default['code_postal']} {default['ville']}, "
+                   f"{default['code_pays']}).")
+        current = (profile.get("adresse_test") or {}) if isinstance(profile.get("adresse_test"), dict) else {}
+        columns = st.columns(2)
+        address = {key: columns[n % 2].text_input(cucumber_test_data.ADDRESS_LABELS[key], value=current.get(key) or "",
+                                                  key=f"cucumber_profile_address_{client}_{key}").strip()
+                   for n, key in enumerate(cucumber_test_data.ADDRESS_KEYS)}
+        values["adresse_test"] = address if any(address.values()) else {}
     if "spec_files" in fields:
         options = list(dict.fromkeys(profile["spec_files"] + (profile_doc.get("suggestions") or {}).get("spec_files",
                                                                                                         [])))

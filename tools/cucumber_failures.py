@@ -19,7 +19,7 @@ import difflib
 import os
 import re
 
-from tools import cucumber_wait_steps
+from tools import cucumber_test_data, cucumber_wait_steps
 from tools.cucumber_tools import _git, _read_json, _read_text_file, _write_json, _write_text
 from tools.cucumber_verify import failure_kind, parse_scenarios
 
@@ -52,6 +52,8 @@ NATURES = {
     "donnee_non_idempotente": "rendre la création rejouable : suppression préalable, init du client ou code unique "
                               "par exécution",
     "donnee_non_creee": "créer dans la feature (Background) l'objet qu'elle utilise sans jamais le créer",
+    "donnee_hors_referentiel": "donnée de test hors référentiel : remplacer l'adresse de livraison par l'adresse de "
+                               "test (profil, sinon défaut), sans toucher aux contrôles du test",
     "assertion": "corriger le scénario d'après l'écart constaté",
     "technique": "corriger le step, la colonne ou le fichier du test",
     "version": "écart de version entre la bibliothèque de steps et le serveur",
@@ -128,6 +130,15 @@ def classify(result: dict) -> dict:
         return out("environnement", "deploiement", f"Le test vérifie un code pas encore déployé sur l'environnement "
                                                    f"({context['code_non_deploye']}).",
                    "Déployer la version qui contient ce code, puis relancer ; le test n'est pas modifié.")
+    # Adresse de livraison inventée, refusée par le contrôle des lieux de livraison : donnée de test hors référentiel
+    if cucumber_test_data.is_address_rejection(full):
+        address = cucumber_test_data.test_address(context.get("profil"))
+        return out("correction", cucumber_test_data.REFERENCE_NATURE,
+                   "Donnée de test hors référentiel : l'adresse de livraison du test est refusée par le contrôle des "
+                   "lieux de livraison (« Adresse de livraison incohérente »).",
+                   f"Remplacer l'adresse de livraison par l'adresse de test ({address['nom']}, {address['code_postal']} "
+                   f"{address['ville']}, {address['code_pays']}), champ par champ, sans toucher aux contrôles ; rejet "
+                   f"persistant : voir la gestion du transport du WMS.")
     # Contrôles statiques de la feature (cucumber_data_rules) : cause prouvée par le texte du dépôt
     checks = context.get("controles") or {}
     if _DUPLICATE.search(full):

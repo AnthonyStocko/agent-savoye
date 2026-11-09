@@ -7,6 +7,8 @@ ${erreurs}
 === FICHIERS DU LOT ===
 ${fichiers}
 
+${donnees_test}
+
 === RÈGLES ===
 1. Corrige uniquement ces erreurs, dans les fichiers du worktree '${worktree}' (chemins ABSOLUS, jamais un autre dossier ni un dossier que tu nommes toi-même ; en priorité ceux du lot) : lis chaque fichier en cause autour de la ligne indiquée (offset / limit), pas en entier.
 2. Classe, méthode, constante ou POJO introuvable : cherche son nom exact par Grep dans '${java_std}' (signatures du Cucumber Standard, jamais en entier) puis dans '${java_client}', et corrige l'appel ou l'import d'après la signature trouvée ; pour voir comment le Standard l'utilise, lis le code dans '${sources_std}' (copie en lecture seule de ses sources de test, Grep puis offset / limit).
