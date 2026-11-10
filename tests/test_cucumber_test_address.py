@@ -105,13 +105,14 @@ def test_no_generated_test_keeps_an_invented_delivery_address(tmp_path):
     text = path.read_bytes().decode("utf-8")
     receiver = text.split("<receiver>")[1]
     for tag, value in (("city", "SAINT-ETIENNE"), ("postalCode", "42000"), ("name", "CLIENT TEST"),
-                       ("streetAddressOne", "rue de la richelandière"), ("countryCode", "FR"),
-                       ("streetAddressTwo", "")):
+                       ("streetAddressOne", "rue de la richelandière"), ("countryCode", "FR")):
         assert f"<{tag}>{value}</{tag}>" in receiver
+    # Champs vides de l'adresse de test : balises absentes, jamais vides
+    assert "streetAddressTwo" not in receiver and "pOBoxNumber" not in receiver
     assert "VILLE TEST" not in text and "59780" not in text
     # Adresse de l'expéditeur (site) intacte, fins de ligne CRLF conservées, idempotent
     assert "<city>SITE VILLE</city>" in text and "<postalCode>69000</postalCode>" in text
-    assert text.count("\r\n") == WOI.count("\r\n")
+    assert text.count("\r\n") == WOI.count("\r\n") - 1 and text.count("\n") == text.count("\r\n")  # ligne retirée
     assert td.invented_addresses(text, DEFAULT) == [] and td.normalize_files(str(tmp_path), [rel], DEFAULT) == []
     assert "VILLE TEST" in td.normalized_line(rel, changed[0][1])
 
@@ -139,3 +140,25 @@ def test_address_rejection_classified_as_out_of_referential_and_corrected():
     assert "1000 BRUXELLES, BE" in own["action"]
     # Sans rejet d'adresse : classement inchangé
     assert cucumber_failures.classify({"message": "expected:<1> but was:<2>"})["nature"] != td.REFERENCE_NATURE
+
+
+def test_empty_address_fields_are_removed_never_left_empty_and_fields_keep_the_gs1_order():
+    """Run Canson du 09/11 (build 345) : <pOBoxNumber></pOBoxNumber> et <provinceCode></provinceCode> vides → WOI
+    jamais intégré (checkGS1Message en délai dépassé), OP jamais créés."""
+    lines = ["<receiver>", "    <address>", "        <city>SAINT-ETIENNE</city>", "        <countryCode>FR</countryCode>",
+             "        <name>CLIENT TEST</name>", "        <pOBoxNumber></pOBoxNumber>",
+             "        <postalCode>42000</postalCode>", "        <provinceCode/>",
+             "        <streetAddressOne>rue de la richelandière</streetAddressOne>", "    </address>", "</receiver>"]
+    crlf = "\r\n"
+    woi = crlf.join(lines)
+    assert ("pOBoxNumber", "") in td.invented_addresses(woi, DEFAULT)
+    out = td.normalize_text(woi, DEFAULT)
+    assert "pOBoxNumber" not in out and "provinceCode" not in out
+    assert out == crlf.join(line for line in lines if "pOBox" not in line and "province" not in line)
+    assert td.invented_addresses(out, DEFAULT) == []
+    # Champ manquant : inséré à sa place dans l'ordre GS1 (après countryCode, avant postalCode), même indentation
+    missing = crlf.join(line for line in lines if "<name>" not in line and "pOBox" not in line
+                        and "province" not in line)
+    assert td.normalize_text(missing, DEFAULT) == out
+    block = td.prompt_block({})
+    assert "jamais de balise vide" in block and "<pOBoxNumber></pOBoxNumber>" in block

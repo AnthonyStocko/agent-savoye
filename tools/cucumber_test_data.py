@@ -80,7 +80,10 @@ def prompt_block(profile: dict = None) -> str:
         "- Tout test qui crée un client, une commande (ex. fichiers WOI) ou une adresse de livraison reprend CETTE "
         "adresse champ par champ, casse comprise. Interdit : inventer une adresse (nom, rue, code postal, ville).",
         f"- Fichiers GS1 : dans l'élément <address> du destinataire (receiver, shipTo…) : {tags} ; "
-        f"{', '.join(EXTRA_STREET_TAGS[:2])} vides ou absents.",
+        f"{', '.join(EXTRA_STREET_TAGS[:2])} absents. Champ vide de l'adresse de test : balise ABSENTE, "
+        "jamais de balise vide (ex. <pOBoxNumber></pOBoxNumber>) : le fichier GS1 serait rejeté et jamais intégré. "
+        "Ordre des balises dans <address> : city, countryCode, languageOfThePartyCode, name, pOBoxNumber, "
+        "postalCode, provinceCode, streetAddressOne.",
         "- Rejet « Adresse de livraison incohérente » sur une donnée de test : donnée de test hors référentiel ; "
         "remplace l'adresse par cette adresse de test, sans toucher aux contrôles du test.",
         "- Même principe pour toute autre donnée contrôlée par un référentiel (transporteur, mode d'expédition, "
@@ -93,23 +96,52 @@ def is_address_rejection(text: str) -> bool:
     return bool(ADDRESS_REJECTION.search(str(text or "")))
 
 
+# Ordre des éléments de l'AddressType GS1 (séquence XSD) : un champ ajouté prend sa place dans cet ordre
+GS1_ADDRESS_ORDER = ("city", "cityCode", "countryCode", "countyCode", "crossStreet", "currencyOfPartyCode",
+                     "languageOfThePartyCode", "name", "pOBoxNumber", "postalCode", "provinceCode", "state",
+                     "streetAddressOne", "streetAddressTwo", "streetAddressThree", "streetAddressFour",
+                     "geographicalCoordinates")
+
+
+def _tag_pattern(tag: str):
+    return re.compile(rf"<((?:[\w.-]+:)?{tag})(\s[^>]*)?(?:/>|>(.*?)</\1\s*>)", re.S)
+
+
 def _set_tag(block: str, tag: str, value: str) -> str:
-    """Valeur de la balise `tag` (préfixe d'espace de noms permis) dans `block` ; ajoutée avant </address> si absente
-    et non vide."""
-    pattern = re.compile(rf"<((?:[\w.-]+:)?{tag})(\s[^>]*)?(?:/>|>(.*?)</\1\s*>)", re.S)
-    match = pattern.search(block)
+    """
+    Valeur de la balise `tag` (préfixe d'espace de noms permis) dans `block`. Valeur vide : balise retirée avec sa
+    ligne (jamais de balise vide : la validation GS1 rejette le fichier, WOI jamais intégré). Balise absente et valeur
+    non vide : ajoutée à sa place dans l'ordre GS1_ADDRESS_ORDER.
+    """
+    match = _tag_pattern(tag).search(block)
     if match:
-        return block[:match.start()] + f"<{match.group(1)}{match.group(2) or ''}>{value}</{match.group(1)}>" \
-            + block[match.end():]
+        if value:
+            return block[:match.start()] + f"<{match.group(1)}{match.group(2) or ''}>{value}</{match.group(1)}>" \
+                + block[match.end():]
+        start, end = match.start(), match.end()
+        line_start = block.rfind("\n", 0, start) + 1
+        if not block[line_start:start].strip():
+            start = line_start - 1 if line_start > 0 else 0
+            if start > 0 and block[start - 1] == "\r":
+                start -= 1
+        return block[:start] + block[end:]
     if not value:
         return block
     close = re.search(r"(\s*)</((?:[\w.-]+:)?address)\s*>\s*$", block)
     if not close:
         return block
-    indent = re.search(r"\n([ \t]*)<(?:[\w.-]+:)?(?:city|postalCode|name|countryCode)\b", block)
     prefix = close.group(2).rsplit(":", 1)[0] + ":" if ":" in close.group(2) else ""
-    line = (f"\n{indent.group(1)}" if indent else "") + f"<{prefix}{tag}>{value}</{prefix}{tag}>"
-    return block[:close.start()] + line + block[close.start():]
+    element = f"<{prefix}{tag}>{value}</{prefix}{tag}>"
+    rank = GS1_ADDRESS_ORDER.index(tag) if tag in GS1_ADDRESS_ORDER else len(GS1_ADDRESS_ORDER)
+    for child in re.finditer(r"(\r?\n[ \t]*)?<(?:[\w.-]+:)?(\w+)[\s/>]", block[:close.start()]):
+        name = child.group(2)
+        if name in GS1_ADDRESS_ORDER and GS1_ADDRESS_ORDER.index(name) > rank:
+            # Avant le premier champ qui le suit dans l'ordre GS1, à la même indentation
+            sep = child.group(1) or ""
+            at = child.start() + len(sep)
+            return block[:at] + element + sep + block[at:]
+    indent = re.search(r"(\r?\n[ \t]*)<(?:[\w.-]+:)?(?:city|postalCode|name|countryCode)\b", block)
+    return block[:close.start()] + (indent.group(1) if indent else "") + element + block[close.start():]
 
 
 def _apply(address_block: str, address: dict) -> str:
@@ -146,7 +178,8 @@ def invented_addresses(text: str, address: dict) -> list:
             for key, _, _, tag, _ in ADDRESS_FIELDS + tuple((t, "", "", t, "") for t in EXTRA_STREET_TAGS):
                 expected = address.get(key) or "" if tag not in EXTRA_STREET_TAGS else ""
                 for found in re.findall(rf"<(?:[\w.-]+:)?{tag}(?:\s[^>]*)?>(.*?)</", block.group(0), re.S):
-                    if tag and found != expected and (tag, found) not in out:
+                    # Champ vide de l'adresse de test : balise présente (même vide) = à retirer
+                    if tag and (found != expected or not expected) and (tag, found) not in out:
                         out.append((tag, found))
             if not out:
                 out.append(("address", "champ de l'adresse de test manquant"))
