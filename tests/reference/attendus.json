@@ -169,6 +169,20 @@
           "360 s"
         ]
       }
+    },
+    {
+      "cas": "404 - No route found sur un step du projet",
+      "console": "15-route-sans-preuve.console.txt",
+      "source": "réel anonymisé (nom du client) : vérification d'un lot, step du projet qui crée un document lu par une fonction de la bibliothèque 26.22 dont le repli POST /reportdocs n'existe pas à la version 26.24 du Standard",
+      "attendu": {
+        "categorie": "correction",
+        "nature": "route_sans_preuve",
+        "cause_contient": [
+          "route sans preuve",
+          "step du projet",
+          "404 - No route found"
+        ]
+      }
     }
   ],
   "runs": [

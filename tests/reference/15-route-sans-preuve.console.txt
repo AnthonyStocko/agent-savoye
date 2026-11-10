@@ -1,0 +1,31 @@
+[2026-11-09T22:14:21.596Z] @WMS @PREPARATION @CLIENT @agent_client_1 @agent_client_1_2
+[2026-11-09T22:14:21.596Z] Scenario: Fin de prélèvement non mécanisé - l'échange par défaut du BL est validé (OK) et mémorisé sur l'OP                                        # src/test/resources/cucumber/features/client/WMS/03-Preparation/05-Realiser_la_preparation/CLIENT-Appairage_BL_fin_de_prelevement.feature:48
+[2026-11-09T22:14:21.597Z]   Given CLIENT- Création si absent du besoin d'unité de préparation                                                                                # cucumber.features.client.WmsPreparationClientSteps.creationSiAbsentDuBesoin(io.cucumber.datatable.DataTable)
+[2026-11-09T22:14:21.597Z]     | id                         | label                      | mandatoryArea | manuallyManaged | category.id      | startStatus | endStatus |
+[2026-11-09T22:14:21.597Z]     | SPEC_DELIVERY_NOTE_PAIRING | SPEC_DELIVERY_NOTE_PAIRING | false         | true            | PREPARATION_UNIT | NA          | NA        |
+[2026-11-09T22:14:22.560Z]   And CLIENT- Création si absent du document "APPAIRAGE_BL" sur le modèle du document "DELIVERY_NOTE" avec les échanges par défaut                 # cucumber.features.client.WmsPreparationClientSteps.creationSiAbsentDuDocument(java.lang.String,java.lang.String,io.cucumber.datatable.DataTable)
+[2026-11-09T22:14:22.560Z]     | code  |
+[2026-11-09T22:14:22.560Z]     | LASER |
+[2026-11-09T22:14:22.830Z]   And CLIENT- Création si absent du document "SPC_BON_PREPARATION_MECA" sur le modèle du document "DELIVERY_NOTE" avec les échanges par défaut     # cucumber.features.client.WmsPreparationClientSteps.creationSiAbsentDuDocument(java.lang.String,java.lang.String,io.cucumber.datatable.DataTable)
+[2026-11-09T22:14:22.830Z]     | code  |
+[2026-11-09T22:14:22.830Z]     | LASER |
+[2026-11-09T22:14:22.830Z]       java.lang.AssertionError: Lecture du document SPC_BON_PREPARATION_MECA impossible : 404 - No route found
+[2026-11-09T22:14:22.830Z] 	at cucumber.features.client.WmsPreparationClientSteps.findDoc(WmsPreparationClientSteps.java:160)
+[2026-11-09T22:14:22.830Z] 	at cucumber.features.client.WmsPreparationClientSteps.creationSiAbsentDuDocument(WmsPreparationClientSteps.java:116)
+[2026-11-09T22:14:22.831Z] 	at ✽.CLIENT- Création si absent du document "SPC_BON_PREPARATION_MECA" sur le modèle du document "DELIVERY_NOTE" avec les échanges par défaut(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/03-Preparation/05-Realiser_la_preparation/CLIENT-Appairage_BL_fin_de_prelevement.feature:29)
+[2026-11-09T22:14:22.831Z] Caused by: java.lang.RuntimeException: 404 - No route found
+[2026-11-09T22:14:22.831Z] 	at cucumber.endPoints.EndPoints.checkResponseSuccess(EndPoints.java:293)
+[2026-11-09T22:14:22.831Z] 	at cucumber.endPoints.EndPoints.checkCountWithTry(EndPoints.java:499)
+[2026-11-09T22:14:22.831Z] 	at cucumber.endPoints.EndPoints.sendGetRestToDisplayList(EndPoints.java:286)
+[2026-11-09T22:14:22.831Z] 	at cucumber.endPoints.refReport.RefReportDocEndPoints.findRefReportDocByCode(RefReportDocEndPoints.java:36)
+[2026-11-09T22:14:22.831Z] 	at cucumber.features.client.WmsPreparationClientSteps.findDoc(WmsPreparationClientSteps.java:156)
+[2026-11-09T22:14:22.831Z] 	at cucumber.features.client.WmsPreparationClientSteps.creationSiAbsentDuDocument(WmsPreparationClientSteps.java:116)
+[2026-11-09T22:14:22.831Z] 	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+
+[2026-11-09T22:14:42.513Z] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 732.1 s <<< FAILURE! -- in cucumber.RunnerTest
+[2026-11-09T22:14:42.513Z] [ERROR] Préparation : 05 - Réaliser la préparation - Client - Appairage du bon de livraison en fin de prélèvement non mécanisé.Fin de prélèvement non mécanisé - l'échange par défaut du BL est validé (OK) et mémorisé sur l'OP -- Time elapsed: 1.266 s <<< FAILURE!
+[2026-11-09T22:14:42.513Z] java.lang.AssertionError: Lecture du document SPC_BON_PREPARATION_MECA impossible : 404 - No route found
+[2026-11-09T22:14:42.513Z] 	at cucumber.features.client.WmsPreparationClientSteps.findDoc(WmsPreparationClientSteps.java:160)
+[2026-11-09T22:14:42.513Z] 	at cucumber.features.client.WmsPreparationClientSteps.creationSiAbsentDuDocument(WmsPreparationClientSteps.java:116)
+[2026-11-09T22:14:42.513Z] 	at ✽.CLIENT- Création si absent du document "SPC_BON_PREPARATION_MECA" sur le modèle du document "DELIVERY_NOTE" avec les échanges par défaut(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/03-Preparation/05-Realiser_la_preparation/CLIENT-Appairage_BL_fin_de_prelevement.feature:29)
+[2026-11-09T22:14:42.514Z] Caused by: java.lang.RuntimeException: 404 - No route found

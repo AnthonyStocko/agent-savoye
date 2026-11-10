@@ -16,7 +16,7 @@ with open(os.path.join(REFERENCE, "attendus.json"), encoding="utf-8") as f:
 
 
 def test_reference_covers_the_required_cases():
-    assert len(CASES) == 13 and all(os.path.exists(os.path.join(REFERENCE, c["console"])) for c in CASES)
+    assert len(CASES) == 14 and all(os.path.exists(os.path.join(REFERENCE, c["console"])) for c in CASES)
     assert all(c["attendu"]["nature"] in cucumber_failures.NATURES for c in CASES)
     assert all(c["attendu"]["categorie"] in cucumber_failures.CATEGORIES for c in CASES)
 

@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import (
     _restore_keys as restore_epic_keys, draft_tasks, epic_manifest_path, load_epic_manifest, save_epic_manifest,
@@ -1425,6 +1425,13 @@ def main():
         args.project = args.project or args.client_name.upper()
         args.generate_cucumber = True
         apply_excluded_modules(args.client_name, args.modules_exclus)
+        # Une seule génération à la fois par client : une seconde recréerait le worktree pendant la première
+        if not cucumber_lock.read_only(args):
+            locked, reason = cucumber_lock.acquire(args.client_name, " ".join(sys.argv[1:]))
+            if not locked:
+                print(f"[CUCUMBER] ⛔ Client {args.client_name} : {reason}. Attendez sa fin ou arrêtez-la avant "
+                      f"d'en lancer une autre.")
+                sys.exit(3)
     elif not (args.issue.strip() and args.project.strip()):
         parser.error("--issue et --project sont obligatoires pour cette étape")
 
@@ -2718,6 +2725,9 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
                 conventions["client_tag"])
         errors += cucumber_versions.check_response_fields(worktree, base, present, cucumber_std_dir,
                                                           conventions.get("library_version", ""))
+        # Routes HTTP écrites à la main dans les classes du projet : existantes à la version testée, preuve citée,
+        # fonction de la bibliothèque réutilisée quand elle couvre la route
+        errors += cucumber_routes.check_lot(worktree, files, context.get("routes"))
     if errors:
         print(f"[LOT {label}] Fichiers : {len(errors)} erreur(s) ({time.time() - started:.0f} s)")
         for error in errors[:12]:
@@ -6599,6 +6609,13 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         state["garde_fou_debut"] = {"import": args.from_import, "commit": cucumber_tools.rev_parse(worktree, "HEAD")}
         cucumber_tools.save_state(client, state)
 
+    # Aucune route HTTP sans preuve : index des routes REST de la version testée (Standard à sa version, client à
+    # la version choisie) et routes des fonctions de la bibliothèque du pom, construit une fois (cache par commit)
+    routes_context = None
+    if any(lot.get("statut") not in ("termine", "exclu") for lot in lots):
+        routes_context = cucumber_routes.prepare(
+            client, STD_LOCAL_ROOT[0], local_client_repo, odatio_version, cucumber_tools.CLIENT_VERSION_REF[0],
+            local_cucumber_std_repo, conventions.get("library_version", ""))
     # 3. Un appel Claude neuf par lot, puis compilation (et correction) en Python ; commit après chaque lot
     processed = 0
     for lot in lots:
@@ -6614,7 +6631,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         print(f"\n[LOT {label}] " + " ; ".join(s["libelle"] for s in lot_specs))
         java = cucumber_tools.client_java_context(client, worktree, std_java, conventions)
         context = {"init": client_init, "java": java, "conventions": conventions, "reference": reference,
-                   "longueurs": code_lengths, "init_tags": init_tags}
+                   "longueurs": code_lengths, "init_tags": init_tags, "routes": routes_context}
         if lot.get("type") == "correction" and lot.get("resultats") is None:
             # Lot « correction » d'un import : scénarios existants, aucune génération
             results = []

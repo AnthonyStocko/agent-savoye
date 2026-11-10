@@ -19,7 +19,7 @@ import difflib
 import os
 import re
 
-from tools import cucumber_test_data, cucumber_wait_steps
+from tools import cucumber_routes, cucumber_test_data, cucumber_wait_steps
 from tools.cucumber_tools import _git, _read_json, _read_text_file, _write_json, _write_text
 from tools.cucumber_verify import failure_kind, parse_scenarios
 
@@ -54,6 +54,9 @@ NATURES = {
     "donnee_non_creee": "créer dans la feature (Background) l'objet qu'elle utilise sans jamais le créer",
     "donnee_hors_referentiel": "donnée de test hors référentiel : remplacer l'adresse de livraison par l'adresse de "
                                "test (profil, sinon défaut), sans toucher aux contrôles du test",
+    "route_sans_preuve": "route HTTP sans preuve appelée par un step du projet : fonction de la bibliothèque de la "
+                         "version du pom, sinon route prouvée dans le code REST de la version testée (fichier, ligne, "
+                         "méthode HTTP cités en commentaire)",
     "assertion": "corriger le scénario d'après l'écart constaté",
     "technique": "corriger le step, la colonne ou le fichier du test",
     "version": "écart de version entre la bibliothèque de steps et le serveur",
@@ -222,6 +225,15 @@ def classify(result: dict) -> dict:
                    f"venir d'un autre client).",
                    "Renseigner dans le profil du client le clear déclaré par SON application (bundle de clear), "
                    "puis régénérer l'initialisation ; ne jamais reprendre le clear d'un autre client.")
+    # « 404 - No route found » levé par un step du projet : route appelée sans preuve (jamais un écart de version
+    # présumé) — le step réutilise la bibliothèque ou une route prouvée à la version testée
+    if cucumber_routes.project_step_without_route(step, full, context.get("client", "")):
+        return out("correction", cucumber_routes.NATURE,
+                   f"Route sans preuve (404 - No route found) : le step du projet « {step} » appelle une route "
+                   f"absente du serveur.",
+                   "Appeler la fonction de la bibliothèque de la version du pom qui couvre le besoin, sinon une route "
+                   "prouvée dans les ressources REST de la version testée, preuve citée en commentaire (« // Route : "
+                   "MÉTHODE /chemin — Fichier.java:ligne ») ; jamais une erreur HTTP prise pour une absence.")
     if _VERSION.search(full):
         return out("environnement", "version", f"Écart de version entre la bibliothèque de steps et le serveur : "
                                                f"{_sentence(message, 140)}",

@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_modules, cucumber_test_data, standard_version, standard_version_task
+from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_lock, cucumber_modules, cucumber_test_data, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_java21, cucumber_simple, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -1428,6 +1428,7 @@ def cucumber_header() -> dict:
     ]
     ctx = {"client": client, "cmd": cucumber_cmd, "ready": ready, "capture": capture_std_ref,
            "reglages_affiches": not ready or st.session_state["cucumber_project"] == NEW_PROJECT}
+    render_lock_banner(client if ready else "")
     with st.expander("Données du projet", icon=":material/settings:", expanded=ctx["reglages_affiches"]):
         render_project_settings(ctx)
     return ctx
@@ -2016,6 +2017,14 @@ def load_simple_project() -> None:
             os.getenv("BITBUCKET_CUCUMBER_STD_REPO", "") if field == "std_repo" else "")
 
 
+def render_lock_banner(client: str) -> None:
+    """Génération en cours sur ce client (verrou de main.py) : toute autre génération sera refusée."""
+    running = cucumber_lock.holder(client) if client else {}
+    if running:
+        st.warning(f"Client {client} : {cucumber_lock.describe(running)}. Une autre génération sur ce client "
+                   "sera refusée jusqu'à sa fin.", icon=":material/lock:")
+
+
 def simple_context() -> dict:
     """Contexte de l'onglet simplifié : client, dépôts, commande main.py (mêmes options que l'onglet avancé)."""
     value = lambda key: (st.session_state.get(key) or "").strip()  # noqa: E731
@@ -2213,6 +2222,7 @@ def render_simple_cucumber() -> None:
         load_simple_project()
     ctx = simple_context()
     client = ctx["client"]
+    render_lock_banner(client)
     deduction = (client_version.saved(client).get("deduction") or {}) if client else {}
     records = (cucumber_tools.load_state(client).get("simple") or {}) if client else {}
     if client:

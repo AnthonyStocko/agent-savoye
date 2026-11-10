@@ -18,7 +18,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 
-from tools import cucumber_job, jenkins_tools, memory_tools
+from tools import cucumber_job, cucumber_routes, jenkins_tools, memory_tools
 from tools.cucumber_tools import (_HTTP_CALL, _expression_regex, _first_argument, _git, _http_path, _java_methods,
                                   _read_text_file, _resolve, _step_prefix, _string_constants, _write_text,
                                   WORKSPACE_DIR, a_revoir_tag, blob_texts, disk_class_constants, extract_cucumber,
@@ -925,6 +925,9 @@ def failure_kind(error_message: str) -> tuple:
 
 # Échecs connus (point 9f) : (motif, nature, piste de correction)
 KNOWN_FAILURES = (
+    # « 404 - No route found » levé par un step du projet (cucumber_routes) : route appelée sans preuve, échec du test
+    # à corriger (jamais pris pour un écart de version de l'environnement)
+    (cucumber_routes.ProjectRouteFailure(), "technique", cucumber_routes.FAILURE_HINT),
     # Donnée de test hors référentiel (cucumber_test_data) : adresse de livraison inventée, refusée par le contrôle
     # des lieux de livraison ; échec du test, corrigé par l'adresse de test
     (re.compile(r"adresse de livraison incoh[ée]rente|incoherent delivery address|inconsistent delivery address",
