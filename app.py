@@ -13,7 +13,7 @@ import logging
 from dotenv import dotenv_values, load_dotenv
 
 from tools import auth_tools, env_tools
-from tools import client_version, cucumber_delivery, cucumber_init_fix, cucumber_library_upgrade, cucumber_lock, cucumber_modules, cucumber_test_data, standard_version, standard_version_task
+from tools import client_version, cucumber_delivery, cucumber_incidents, cucumber_init_fix, cucumber_library_upgrade, cucumber_lock, cucumber_modules, cucumber_test_data, standard_version, standard_version_task
 from tools import (cucumber_a_revoir, cucumber_java21, cucumber_simple, cucumber_audit, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_job,
                    cucumber_decisions, cucumber_detection, cucumber_environment, cucumber_failures, cucumber_import,
                    cucumber_preflight,
@@ -2023,6 +2023,14 @@ def render_lock_banner(client: str) -> None:
     if running:
         st.warning(f"Client {client} : {cucumber_lock.describe(running)}. Une autre génération sur ce client "
                    "sera refusée jusqu'à sa fin.", icon=":material/lock:")
+    # Version du client changée : réglages reportés à revalider par un run d'init avant toute génération, ou écart
+    revalidation = cucumber_incidents.pending(client) if client else {}
+    if revalidation.get("statut") == "ecart":
+        st.error("\n\n".join([cucumber_incidents.revalidation_line(revalidation)]
+                             + [line.strip() for line in (revalidation.get("ecart") or [])[1:]]),
+                 icon=":material/report:")
+    elif revalidation:
+        st.info(cucumber_incidents.revalidation_line(revalidation), icon=":material/published_with_changes:")
 
 
 def simple_context() -> dict:

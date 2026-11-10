@@ -19,7 +19,7 @@ import difflib
 import os
 import re
 
-from tools import cucumber_routes, cucumber_test_data, cucumber_wait_steps
+from tools import cucumber_incidents, cucumber_routes, cucumber_test_data, cucumber_wait_steps
 from tools.cucumber_tools import _git, _read_json, _read_text_file, _write_json, _write_text
 from tools.cucumber_verify import failure_kind, parse_scenarios
 
@@ -54,6 +54,8 @@ NATURES = {
     "donnee_non_creee": "créer dans la feature (Background) l'objet qu'elle utilise sans jamais le créer",
     "donnee_hors_referentiel": "donnée de test hors référentiel : remplacer l'adresse de livraison par l'adresse de "
                                "test (profil, sinon défaut), sans toucher aux contrôles du test",
+    "conflit_verrouillage": "conflit de verrouillage (écritures concurrentes sur le même schéma) : relance "
+                            "automatique unique, puis vérification des builds et copies de base concurrents",
     "route_sans_preuve": "route HTTP sans preuve appelée par un step du projet : fonction de la bibliothèque de la "
                          "version du pom, sinon route prouvée dans le code REST de la version testée (fichier, ligne, "
                          "méthode HTTP cités en commentaire)",
@@ -126,6 +128,16 @@ def classify(result: dict) -> dict:
                    "Remplacer chaque appel absent par une méthode ou un step existant de la bibliothèque de la version "
                    "du pom du client (python tools/cucumber_compile.py <client> --api <Classe>), puis vérifier par "
                    "mvn test-compile ; aucune livraison sans compilation réussie.")
+    # Conflit de verrouillage (StaleState, OptimisticLock, « Batch update returned unexpected row count ») : écritures
+    # concurrentes sur le même schéma, jamais un défaut du test — relance unique, puis vérification de la concurrence
+    if cucumber_incidents.is_lock_conflict(full):
+        table = cucumber_incidents.lock_table(full)
+        return out("environnement", cucumber_incidents.NATURE_LOCK,
+                   "Conflit de verrouillage" + (f" sur {table}" if table else "") + f" pendant « {step[:70]} » : "
+                   f"écriture concurrente sur le même schéma — relance automatique du run, une fois.",
+                   "Relance automatique (une fois) ; si l'échec persiste, vérifier qu'aucun autre build Jenkins ni "
+                   "aucune copie de base n'utilisait le même schéma au même moment (historique Jenkins, journal des "
+                   "copies), et le dire.")
     # Contexte du run établi hors du message (code testé absent du déploiement, configuration partagée écrite par
     # une autre feature) : prime sur le message, qui n'en montre que l'effet
     context = result.get("contexte") or {}

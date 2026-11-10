@@ -183,6 +183,24 @@
           "404 - No route found"
         ]
       }
+    },
+    {
+      "cas": "500 StaleStateException sur wms_device_identifier pendant le clear de la purge d'init (conflit de verrouillage)",
+      "console": "16-clear-conflit-verrouillage.console.txt",
+      "source": "reconstitué d'après le défaut constaté le 10/11/2026 (clear de l'init en 500 StaleState sur wms_device_identifier, résolu par une relance) ; client anonymisé ; à remplacer par l'extrait réel anonymisé dès qu'il est disponible",
+      "attendu": {
+        "categorie": "environnement",
+        "nature": "conflit_verrouillage",
+        "cause_contient": [
+          "conflit de verrouillage",
+          "wms_device_identifier",
+          "relance automatique"
+        ]
+      },
+      "suite": {
+        "relances": 1,
+        "puis": "vérification de la concurrence (builds Jenkins et copies de base sur le même schéma)"
+      }
     }
   ],
   "runs": [

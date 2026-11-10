@@ -24,7 +24,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from tools import (cucumber_data_rules, cucumber_decisions, cucumber_failures, cucumber_profile,
+from tools import (cucumber_data_rules, cucumber_decisions, cucumber_failures, cucumber_incidents, cucumber_profile,
                    cucumber_server_logs, db_tools, groundcover_tools, jenkins_tools)
 from tools.cucumber_diagnostic import TEMP_PREFIX
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
@@ -898,6 +898,14 @@ def analyse(client_name: str, numero: int, state: dict, worktree: str = "") -> d
         # Un résultat explicite par échec (cucumber_failures) ; ceux déjà traités par une correction sont gardés
         out["echecs"] = failure_results(client_name, numero, results, out["init_en_echec"], state, worktree,
                                         contexts, out_of_scope)
+        # Registre des incidents résolus : chaque échec est d'abord cherché par sa signature (incident connu ou nouveau)
+        version = cucumber_incidents.version_of(scope)
+        for item in out["echecs"]:
+            item.setdefault("incident", cucumber_incidents.describe(client_name, item.get("step", ""),
+                                                                    item.get("message", ""), version))
+        if out["init_en_echec"]:
+            out["init_en_echec"]["incident"] = cucumber_incidents.describe(
+                client_name, out["init_en_echec"].get("step", ""), out["init_en_echec"].get("message", ""), version)
         if not out["init_en_echec"]:
             out["propositions"], out["a_prouver"] = correction_proposals(
                 {i: r for i, r in failures.items() if i not in set(out["hors_perimetre"])}, state, extras,
@@ -964,7 +972,8 @@ def analysis_markdown(analysis: dict) -> str:
     init = analysis.get("init_en_echec") or {}
     if init:
         lines += ["## ⛔ Initialisation en échec : aucun scénario n'est jugé", "", f"- Scénario : {init['id']}",
-                  f"- Premier step en échec : `{init['step'] or '—'}`", f"- Cause : {init['message']}", ""]
+                  f"- Premier step en échec : `{init['step'] or '—'}`", f"- Cause : {init['message']}",
+                  f"- Registre : {(init.get('incident') or {}).get('libelle') or 'incident nouveau'}", ""]
     lines += [f"- ⚠️ {w}" for w in analysis.get("avertissements") or []]
     server = analysis.get("logs_serveur") or {}
     if cucumber_server_logs.log_dir() or groundcover_tools.configured() or server.get("lignes"):

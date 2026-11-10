@@ -1,0 +1,9 @@
+[2026-11-10T07:41:12.530Z] Scenario: Client - Initialisation des données WMS          # src/test/resources/cucumber/features/client/01-Contexte/WMS/01-Initialisation.feature:4
+[2026-11-10T07:41:12.530Z]   Given INIT- Purge de l'environnement par le clear "init-data-rest-clear-main-wms" # cucumber.features.client.InitClientSteps.purgeParClear(java.lang.String)
+[2026-11-10T07:41:12.530Z]
+[2026-11-10T07:41:19.884Z] [ERROR] Client - Initialisation des données WMS.Client - Initialisation des données WMS -- Time elapsed: 7.35 s <<< FAILURE!
+[2026-11-10T07:41:19.884Z] java.lang.AssertionError: DELETE clear/wms/all : 500 - org.hibernate.StaleStateException: Batch update returned unexpected row count from update [0]; actual row count: 0; expected: 1; statement executed: delete from wms_device_identifier where id=?
+[2026-11-10T07:41:19.884Z] 	at cucumber.endPoints.EndPoints.sendDeleteRest(EndPoints.java:212)
+[2026-11-10T07:41:19.884Z] 	at cucumber.features.client.InitClientSteps.purgeParClear(InitClientSteps.java:31)
+[2026-11-10T07:41:19.884Z] 	at ✽.INIT- Purge de l'environnement par le clear "init-data-rest-clear-main-wms"(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/01-Contexte/WMS/01-Initialisation.feature:5)
+[2026-11-10T07:41:19.884Z]

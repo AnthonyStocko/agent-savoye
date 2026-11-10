@@ -707,8 +707,13 @@ def cucumber_std_refs_for(std_input: str) -> list:
 
 def choose(client_name: str, entry: dict, client_repo: str, std_repo: str, cucumber_std_input: str,
            builds: list = None) -> dict:
-    """Version choisie : déduction calculée et enregistrée dans le profil. Renvoie la déduction."""
-    from tools import cucumber_profile
+    """
+    Version choisie : déduction calculée et enregistrée dans le profil. Version changée : réglages prouvés de
+    l'ancienne version reportés sur la nouvelle, à revalider par un run d'init avant toute génération
+    (cucumber_incidents.carry_over). Renvoie la déduction.
+    """
+    from tools import cucumber_incidents, cucumber_profile
+    previous = saved(client_name).get("deduction") or {}
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client_name))
     # Bibliothèque lue en direct à la branche de la version choisie ; à défaut, la dernière détection du profil
     library = library_at_version(client_repo, client_name, entry)
@@ -717,6 +722,8 @@ def choose(client_name: str, entry: dict, client_repo: str, std_repo: str, cucum
     deduction = compute(client_name, entry, client_repo, std_repo, cucumber_std_refs_for(cucumber_std_input),
                         library.get("version") or profile.get("library_version", ""), builds, source)
     save(client_name, entry, deduction)
+    if cucumber_incidents.carry_over(client_name, previous, deduction):
+        deduction = saved(client_name).get("deduction") or deduction
     return deduction
 
 

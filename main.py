@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_incidents, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import (
     _restore_keys as restore_epic_keys, draft_tasks, epic_manifest_path, load_epic_manifest, save_epic_manifest,
@@ -2387,7 +2387,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
         prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
-                               erreurs="\n".join(lines), fichiers="\n".join(f"- {f}" for f in files))
+                               erreurs="\n".join(lines) + cucumber_incidents.context_block(
+                                   client, [{"step": v.get("step", ""), "message": v.get("motif", "")}
+                                            for v in bad.values()]),
+                               fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
         verify_model, effort = verify_fix_model(model)
         # Modèle dédié : appel neuf (la reprise de la session imposerait le modèle du lot et relirait tout son
@@ -3304,7 +3307,9 @@ def print_import(analysis: dict) -> None:
     init = analysis.get("init_en_echec") or {}
     if init:
         print(f"{label} ⛔ initialisation en échec, aucun scénario jugé : {init['id']} — {init['step']} — "
-              f"{init['message'][:200]}")
+              f"{init['message'][:200]} — {(init.get('incident') or {}).get('libelle') or 'incident nouveau'}")
+    for item in [e for e in analysis.get("echecs") or [] if e.get("incident")][:10]:
+        print(f"    {item.get('titre') or item.get('id')} : {item['incident']['libelle'][:200]}")
     for warning in analysis.get("avertissements") or []:
         print(f"{label} ⚠️ {warning}")
     comparison = analysis.get("comparaison") or {}
@@ -3437,7 +3442,10 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
         print(f"[LOT {label}] {len(data)} échec(s) lié(s) aux données : "
               + ("preuve en base exigée." if db_available else "aucun accès base, causes NON PROUVÉES."))
     prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
-                           erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available),
+                           erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available)
+                           + cucumber_incidents.context_block(values.get("client_name", ""), [
+                               {"step": s.get("step", ""), "message": s.get("message", "")}
+                               for s in lot.get("corrections") or []]),
                            fichiers="\n".join(f"- {f}" for f in files))
     before = cucumber_a_revoir.snapshot(worktree, files)
     db_start = len(lot.setdefault("base", []))
@@ -3517,7 +3525,8 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
         before = cucumber_init_fix.snapshot(worktree, files)
         prompt = render_prompt("cucumber_init_correction", **values, tentative=attempt,
                                competences=skills.prompt_block("cucumber-init", first_failure),
-                               echecs=cucumber_init_fix.failure_lines(init.get("echecs") or []),
+                               echecs=cucumber_init_fix.failure_lines(init.get("echecs") or [])
+                               + cucumber_incidents.context_block(client, init.get("echecs") or []),
                                erreurs="\n".join(f"- {e}" for e in errors) or "aucune (première tentative)")
         returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, lot_tools(values),
                                                                    str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2),
@@ -3830,19 +3839,29 @@ def init_failure_line(init: dict, action: str) -> str:
             f"{(init.get('message') or 'message absent du rapport')[:300]} — action : {action or 'aucune'}")
 
 
-def run_init_and_import(client: str, profile: dict, worktree: str, repository: str, mode: str) -> dict:
+def run_init_and_import(client: str, profile: dict, worktree: str, repository: str, mode: str,
+                        lock_retry: bool = True, applied: dict = None) -> dict:
     """
     Init du profil (tags d'init, modules exclus écartés par run_expression) lancée sur la branche de travail de
-    l'agent, à sa tête, puis build importé et analysé : le prochain essai s'appuie sur ce run. Renvoie
-    {ok, message, build, numero, init_en_echec}.
+    l'agent, à sa tête, puis build importé et analysé : le prochain essai s'appuie sur ce run. Conflit de
+    verrouillage : une relance automatique (`lock_retry`), puis vérification de la concurrence s'il persiste. Le
+    résultat alimente le registre des incidents (cucumber_incidents.observe ; `applied` : incident connu dont la
+    correction vient d'être appliquée). Renvoie {ok, message, build, numero, init_en_echec, incident, concurrence}.
     """
     work = profile["verify_branch"]
     head = cucumber_tools.rev_parse(worktree, "HEAD")
     tags = profile.get("init_tags") or cucumber_verify.init_tags()
     sources = {**cucumber_verify.branch_sources(profile, repository), "CUCUMBER_SPEC_COMMIT": head,
                profile.get("verify_branch_param") or cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM: work}
-    print(f"[CUCUMBER INIT] Run Jenkins de l'init {tags} sur {work} @ {head[:8]}…")
-    out = cucumber_verify.run_init(mode, worktree, head, lambda: worktree, tags, sources)
+
+    def once() -> dict:
+        print(f"[CUCUMBER INIT] Run Jenkins de l'init {tags} sur {work} @ {head[:8]}…")
+        return cucumber_verify.run_init(mode, worktree, head, lambda: worktree, tags, sources)
+
+    def concurrency(run: dict) -> dict:
+        return cucumber_incidents.check_concurrency(client, run.get("build", ""), jenkins_tools.exclusive_jobs(
+            cucumber_verify.verification_job(profile)))
+    out = cucumber_incidents.run_with_lock_retry(once, concurrency) if lock_retry else once()
     result = {**out, "numero": 0, "init_en_echec": {}}
     if out.get("build"):
         try:
@@ -3854,7 +3873,47 @@ def run_init_and_import(client: str, profile: dict, worktree: str, repository: s
                                                cucumber_tools.worktree_dir(client))
             result["numero"] = imported["numero"]
             result["init_en_echec"] = analysis.get("init_en_echec") or {}
+    observed = cucumber_incidents.observe(client, profile, result, worktree, applied)
+    result["incident"] = observed["incident"]
+    if not result.get("ok"):
+        print(f"[INCIDENTS] {cucumber_incidents.line(observed['incident'])}")
+    for numero in observed["enregistres"]:
+        print(f"[INCIDENTS] Incident n° {numero} enregistré comme résolu (preuve : build {result.get('build') or '?'}).")
     return result
+
+
+def revalidate_version(client: str, profile: dict, worktree: str, repository: str, mode: str,
+                       no_init: bool = False) -> bool:
+    """
+    Revalidation de la version du client (cucumber_incidents.carry_over) avant toute génération : steps de
+    contournement de l'ancienne version appliqués au worktree, puis run d'init. Vert : réglages prouvés pour la
+    nouvelle version. Rouge : écart de version, avec l'ancien réglage et sa preuve ; False (rien n'est généré).
+    True s'il n'y a rien à revalider.
+    """
+    pending = cucumber_incidents.pending(client, cucumber_incidents.version_of(profile))
+    if not pending:
+        return True
+    print(f"[VERSION CLIENT] {cucumber_incidents.revalidation_line(pending)}")
+    if no_init or mode != "branche":
+        print("[VERSION CLIENT] ⚠️ Revalidation impossible (" + ("init décochée" if no_init else
+                                                                 "aucun run Jenkins de l'agent sur sa branche")
+              + ") : génération lancée sur des réglages reportés non revalidés.")
+        return True
+    carried = cucumber_incidents.apply_carried_steps(client, worktree)
+    if carried["fichiers"]:
+        print(f"[VERSION CLIENT] Steps de contournement reportés : {', '.join(carried['fichiers'])}")
+    for error in carried["erreurs"]:
+        print(f"[VERSION CLIENT] ⚠️ Step de contournement non reporté (code différent à cette version) : {error}")
+    run = run_init_and_import(client, profile, worktree, repository, mode)
+    if run.get("ok"):
+        print(f"[VERSION CLIENT] ✅ {cucumber_incidents.revalidation_line(cucumber_incidents.revalidation(client))}")
+        return True
+    failure = run.get("init_en_echec") or next(iter(run.get("echecs") or []), {}) or {"message": run.get("message")}
+    for text in cucumber_incidents.version_gap(client, failure, run.get("build", "")):
+        print(f"[VERSION CLIENT] ⛔ {text}")
+    print("[VERSION CLIENT] ⛔ Aucune génération tant que l'init de la nouvelle version n'est pas verte : corrigez "
+          "l'init (onglet Cucumber, étape init) puis relancez.")
+    return False
 
 
 def init_workspace(args, cucumber_repo_dir: str, profile: dict) -> tuple:
@@ -3874,7 +3933,7 @@ def init_workspace(args, cucumber_repo_dir: str, profile: dict) -> tuple:
 
 
 def deliver_init_correction(args, profile: dict, worktree: str, start: str, changed: list, message: str,
-                            init: dict, action: str) -> int:
+                            init: dict, action: str, lock_retry: bool = True, applied: dict = None) -> int:
     """
     Correction de l'init commitée dans l'espace d'init (`changed` : fichiers ; vide : rien à commiter, init seulement
     rejouée) : patch, push sur la branche de travail de l'agent contrôlé par git ls-remote, init du profil rejouée
@@ -3907,7 +3966,8 @@ def deliver_init_correction(args, profile: dict, worktree: str, start: str, chan
             return 1
         print(f"[CUCUMBER INIT] ✅ Poussé sur {args.cucumber_repo or 'le dépôt Cucumber du client'} : {work} @ "
               f"{head[:8]} (vérifié par git ls-remote)")
-    run = run_init_and_import(client, profile, worktree, args.cucumber_repo, mode)
+    run = run_init_and_import(client, cucumber_profile.effective_profile(cucumber_profile.load_profile(client)),
+                              worktree, args.cucumber_repo, mode, lock_retry, applied)
     after = run.get("init_en_echec") or {}
     print(f"[CUCUMBER INIT] Bilan : build {_build_number(run.get('build'))} "
           f"({run.get('build') or 'non lancé'}) — " + ("✅ init verte" if run.get("ok") else
@@ -3915,9 +3975,11 @@ def deliver_init_correction(args, profile: dict, worktree: str, start: str, chan
           + (f" — import n° {run['numero']}" if run.get("numero") else ""))
     print(f"[CUCUMBER INIT] Action faite : {action}")
     if not run.get("ok"):
+        if run.get("concurrence"):
+            print(f"[CUCUMBER INIT] ⛔ Conflit de verrouillage persistant : {run['concurrence'].get('message')}")
         if after:
             follow = (f"nouvel échec à analyser : relancez « Corriger l'initialisation » (référence : import "
-                      f"n° {run.get('numero')})")
+                      f"n° {run.get('numero')}) — {cucumber_incidents.line(run.get('incident') or {})}")
             print(f"[CUCUMBER INIT] ⛔ Init toujours en échec : {init_failure_line(after, follow)}")
         return 1
     return 0
@@ -3970,6 +4032,45 @@ def fix_init_excluded_modules(args, numero: int, cucumber_repo_dir: str) -> obje
     return deliver_init_correction(args, profile, worktree, start, changed,
                                    f"Cucumber : steps d'init des modules exclus ({', '.join(sorted(out))}) retirés "
                                    f"des inits de {client}", init, action)
+
+
+def fix_init_known_incident(args, numero: int, cucumber_repo_dir: str) -> object:
+    """
+    Registre des incidents résolus, consulté avant toute autre analyse de l'init en échec (0 token) : correction
+    connue du client (valeur du profil, version KIS, paramètre du job, step du projet) appliquée dans l'espace d'init,
+    puis init rejouée et importée (run de vérification) ; conflit de verrouillage sans incident connu : relance
+    unique, puis vérification de la concurrence. None si l'échec est un incident nouveau, ou si la correction connue
+    ne s'applique plus : l'analyse habituelle continue, avec les incidents proches en contexte.
+    """
+    client = args.client_name
+    init = cucumber_import.load_analysis(client, numero).get("init_en_echec") or {}
+    if not init:
+        return None
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    match = cucumber_incidents.lookup(client, init.get("step", ""), init.get("message", ""),
+                                      cucumber_incidents.version_of(profile))
+    lock = cucumber_incidents.is_lock_conflict(init.get("message", ""))
+    if not (match.get("applicable") or lock):
+        print(f"[INCIDENTS] Import n° {numero} : {cucumber_incidents.line(match)} — « {init.get('step')} » : "
+              f"analyse habituelle.")
+        return None
+    worktree, start = init_workspace(args, cucumber_repo_dir, profile)
+    if not match.get("applicable"):
+        print(f"[INCIDENTS] Import n° {numero} : conflit de verrouillage ({cucumber_incidents.line(match)}) — relance "
+              f"automatique de l'init, une fois.")
+        return deliver_init_correction(args, profile, worktree, start, [], "", init,
+                                       "relance automatique (conflit de verrouillage)", lock_retry=False)
+    applied = cucumber_incidents.apply(client, match["incident"], worktree, commit=False)
+    if applied["erreurs"]:
+        print(f"[INCIDENTS] ⚠️ Correction connue n° {match['numero']} non applicable "
+              f"({' ; '.join(applied['erreurs'])[:300]}) : analyse habituelle.")
+        return None
+    print(f"[INCIDENTS] Import n° {numero} : {applied['action']} — sans appel à Claude, init rejouée pour vérification.")
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    return deliver_init_correction(args, profile, worktree, start, applied["fichiers"],
+                                   f"Cucumber : correction connue de l'incident n° {match['numero']} dans l'init de "
+                                   f"{client} ({match['incident']['signature'].get('motif', '')[:80]})", init,
+                                   applied["action"], lock_retry=not applied["relance"], applied=match["incident"])
 
 
 def fix_init_known_waits(args, numero: int, cucumber_repo_dir: str) -> object:
@@ -5820,6 +5921,10 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         if run.get("ok"):
             continue
         message_run = run.get("message", "")
+        if run.get("concurrence"):
+            # Conflit de verrouillage persistant après la relance automatique : concurrence vérifiée et dite
+            message_run += f" — conflit de verrouillage persistant après relance : {run['concurrence']['message']}"
+            detail["concurrence"] = run["concurrence"]
         if label == "init du Standard" and "aucun scénario" in message_run:
             # Le job ne lance pas les features du Standard : copie adaptée proposée à la place
             simple_record(client, "init", "a_faire", f"Le job n'a exécuté aucun scénario de l'init du Standard "
@@ -5874,7 +5979,26 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                           {**detail, "correction": {"fichiers": files, "message": message},
                            "plan": {"action": "corriger"}})
             return 1
-        simple_record(client, "init", "echec", f"Init en échec ({label}) : {message_run}"[:500],
+        # Registre des incidents résolus : correction connue du client appliquée sans Claude (une fois par incident),
+        # puis relance de l'init pour vérification ; sinon incident nouveau, signalé comme tel
+        match = cucumber_incidents.lookup(client, failure.get("step", ""), message or message_run,
+                                          cucumber_incidents.version_of(profile))
+        detail["incident"] = cucumber_incidents.line(match)
+        if match.get("applicable") and (last.get("detail") or {}).get("incident_applique") != match["numero"]:
+            applied = cucumber_incidents.apply(client, match["incident"], worktree, commit=False)
+            changes = {rel: _read_text(os.path.join(worktree, *rel.split("/"))) for rel in applied["fichiers"]}
+            refused = "" if applied["erreurs"] or not changes else deliver(
+                changes, {}, f"Cucumber {client} : correction connue de l'incident n° {match['numero']} dans l'init")
+            if not applied["erreurs"] and not refused and (not changes or compiled()):
+                if changes:
+                    write_patch()
+                    detail["commit"] = pushed_line()
+                simple_record(client, "init", "a_faire", f"Init en échec ({label}) : {applied['action']} — sans appel à "
+                                                         f"Claude ; l'init va être relancée pour vérification.",
+                              {**detail, "incident_applique": match["numero"], "plan": {"action": "lancer"}})
+                return 1
+            detail["incident"] += " — non applicable : " + (" ; ".join(applied["erreurs"]) or refused)[:200]
+        simple_record(client, "init", "echec", f"Init en échec ({label}) : {message_run} — {detail['incident']}"[:600],
                       {**detail, "plan": {"action": "lancer"}})
         return 1
     simple_record(client, "init", "ok", f"Init verte sur {work} ({detail['tags']}).{pending}", detail)
@@ -6106,6 +6230,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         # Run de référence : le dernier import ; essai identique au précédent (même import, même branche de
         # travail, mêmes modules exclus) : dit, sans refaire la même analyse
         args.fix_init_from_import = reference_import(client, args.fix_init_from_import)
+        # Registre des incidents résolus d'abord : correction connue appliquée sans Claude, relance sur verrouillage
+        code = fix_init_known_incident(args, args.fix_init_from_import, cucumber_repo_dir)
+        if code is not None:
+            return code
         code = fix_init_excluded_modules(args, args.fix_init_from_import, cucumber_repo_dir)
         if code is not None:
             return code
@@ -6609,6 +6737,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         state["garde_fou_debut"] = {"import": args.from_import, "commit": cucumber_tools.rev_parse(worktree, "HEAD")}
         cucumber_tools.save_state(client, state)
 
+    # Changement de version du client : réglages prouvés de l'ancienne version reportés, revalidés par un run d'init
+    # AVANT toute génération ; un échec est un écart de version (ancien réglage et sa preuve), rien n'est généré
+    if any(lot.get("statut") not in ("termine", "exclu") for lot in lots) and not revalidate_version(
+            client, profile, worktree, args.cucumber_repo, verify_mode, no_init):
+        return 1
     # Aucune route HTTP sans preuve : index des routes REST de la version testée (Standard à sa version, client à
     # la version choisie) et routes des fonctions de la bibliothèque du pom, construit une fois (cache par commit)
     routes_context = None

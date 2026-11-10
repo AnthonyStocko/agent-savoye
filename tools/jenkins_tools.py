@@ -57,13 +57,13 @@ def _job_path(job_name: str) -> str:
 
 def recent_builds(job_name: str, count: int = 20) -> list:
     """
-    Derniers builds d'un job, du plus récent au plus ancien : [{numero, url, resultat, parametres: {nom: valeur}}] ; [] si
-    Jenkins n'est pas configuré ou injoignable (cause affichée).
+    Derniers builds d'un job, du plus récent au plus ancien : [{numero, url, resultat, debut (ms), duree (ms),
+    parametres: {nom: valeur}}] ; [] si Jenkins n'est pas configuré ou injoignable (cause affichée).
     """
     jenkins_url, _ = _jenkins()
     if not jenkins_url or not job_name.strip():
         return []
-    tree = f"builds[number,url,result,actions[parameters[name,value]]]{{0,{int(count)}}}"
+    tree = f"builds[number,url,result,timestamp,duration,actions[parameters[name,value]]]{{0,{int(count)}}}"
     try:
         response = _get(f"{jenkins_url}/{_job_path(job_name)}/api/json", 20, params={"tree": tree})
         if response.status_code != 200:
@@ -74,6 +74,7 @@ def recent_builds(job_name: str, count: int = 20) -> list:
         print(f"[JENKINS] Builds de {job_name} injoignables : {e}")
         return []
     return [{"numero": b.get("number"), "url": same_base(b.get("url") or ""), "resultat": b.get("result") or "",
+             "debut": b.get("timestamp"), "duree": b.get("duration") or 0,
              "parametres": {p.get("name"): p.get("value") for a in b.get("actions") or [] if isinstance(a, dict)
                             for p in a.get("parameters") or [] if p.get("name")}} for b in builds]
 
