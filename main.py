@@ -1595,6 +1595,23 @@ def main():
 
     cadrage_file = f"{target_issue}-cadrage.md"
     release_note_file = f"{target_issue}-release-note.md"
+    # Patch et révision : toujours l'analyse COMPLÈTE — fichier local validé, sinon reconstituée depuis Jira
+    # (commentaires « Analyse de l'agent » réassemblés, hors de JIRA_CONTEXT_MAX_CHARS) ; partie manquante : arrêt
+    if args.step in ("patch", "refine") and not is_cucumber_client:
+        try:
+            restored = analysis_publication.ensure_local(target_issue)
+        except analysis_publication.IncompleteAnalysis as e:
+            print(f"[ANALYSE] ⛔ {e}")
+            sys.exit(2)
+        except RuntimeError as e:
+            print(f"[ANALYSE] ⛔ Aucune analyse locale ({cadrage_file}) et analyse illisible dans Jira : {e}")
+            sys.exit(2)
+        if restored["source"] in ("commentaires", "description"):
+            print(f"[ANALYSE] {cadrage_file} absent : {restored['message']} ({len(restored['texte'])} caractères, "
+                  f"aucune troncature), fichier reconstitué.")
+        elif not restored["source"]:
+            print(f"[ANALYSE] ⛔ Aucune analyse pour {target_issue} (ni {cadrage_file}, ni dans Jira).")
+            sys.exit(2)
     cadrage_before_run = _read_text(cadrage_file)
     epic_previous_manifest = load_epic_manifest(target_issue) if args.step == "epic-cadrage" else {}
     run_started_at = time.time()

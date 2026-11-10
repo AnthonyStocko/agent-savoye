@@ -849,6 +849,69 @@ def _update_jira_description(issue_key: str, transform) -> None:
         raise RuntimeError(f"Mise à jour de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
 
 
+def put_jira_description(issue_key: str, adf_doc: dict) -> None:
+    """Remplace la description du ticket par le document ADF donné. Lève RuntimeError (texte de Jira) si refusé."""
+    ensure_jira_writable(f"Mise à jour de la description de {issue_key}")
+    api, auth = _jira_connection()
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    response = requests.put(f"{api}/issue/{issue_key}", auth=auth, headers=headers,
+                            json={"fields": {"description": adf_doc}}, timeout=30)
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"Mise à jour de {issue_key} refusée par Jira ({response.status_code}) : {response.text[:300]}")
+
+
+def list_jira_comments(issue_key: str) -> list:
+    """Tous les commentaires du ticket, du plus ancien au plus récent : [{"id", "body" (ADF), "created"}]."""
+    api, auth = _jira_connection()
+    comments, start = [], 0
+    while True:
+        response = requests.get(f"{api}/issue/{issue_key}/comment", auth=auth, timeout=20,
+                                headers={"Accept": "application/json"},
+                                params={"startAt": start, "maxResults": 100, "orderBy": "created"})
+        if response.status_code != 200:
+            raise RuntimeError(f"Lecture des commentaires de {issue_key} refusée par Jira ({response.status_code}) : "
+                               f"{response.text[:300]}")
+        data = response.json()
+        page = data.get("comments") or []
+        comments += [{"id": str(c.get("id")), "body": c.get("body"), "created": c.get("created", "")} for c in page]
+        start += len(page)
+        if not page or start >= int(data.get("total") or 0):
+            return comments
+
+
+def add_jira_comment(issue_key: str, adf_body: dict) -> str:
+    """Ajoute un commentaire (document ADF) ; renvoie son identifiant. Lève RuntimeError si refusé."""
+    ensure_jira_writable(f"Ajout d'un commentaire sur {issue_key}")
+    api, auth = _jira_connection()
+    response = requests.post(f"{api}/issue/{issue_key}/comment", auth=auth, timeout=30,
+                             headers={"Accept": "application/json", "Content-Type": "application/json"},
+                             json={"body": adf_body})
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"Commentaire refusé par Jira sur {issue_key} ({response.status_code}) : "
+                           f"{response.text[:300]}")
+    return str(response.json().get("id", ""))
+
+
+def update_jira_comment(issue_key: str, comment_id: str, adf_body: dict) -> None:
+    ensure_jira_writable(f"Modification d'un commentaire de {issue_key}")
+    api, auth = _jira_connection()
+    response = requests.put(f"{api}/issue/{issue_key}/comment/{comment_id}", auth=auth, timeout=30,
+                            headers={"Accept": "application/json", "Content-Type": "application/json"},
+                            json={"body": adf_body})
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"Modification du commentaire {comment_id} de {issue_key} refusée par Jira "
+                           f"({response.status_code}) : {response.text[:300]}")
+
+
+def delete_jira_comment(issue_key: str, comment_id: str) -> None:
+    ensure_jira_writable(f"Suppression d'un commentaire de {issue_key}")
+    api, auth = _jira_connection()
+    response = requests.delete(f"{api}/issue/{issue_key}/comment/{comment_id}", auth=auth, timeout=30)
+    if response.status_code not in (200, 204, 404):
+        raise RuntimeError(f"Suppression du commentaire {comment_id} de {issue_key} refusée par Jira "
+                           f"({response.status_code}) : {response.text[:300]}")
+
+
 def update_jira_section(issue_key: str, title: str, markdown: str) -> None:
     """
     Ajoute ou remplace la section `title` de la description du ticket (document ADF modifié directement :
