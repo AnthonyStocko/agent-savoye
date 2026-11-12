@@ -657,8 +657,9 @@ def drop_case_duplicates(worktree: str) -> list:
 _NOT_FAST_FORWARD = re.compile(r"non-fast-forward|fetch first|rejected|fast-forwards|updates were rejected", re.I)
 
 
-# Commits écrits par l'agent (commit_lot, vérifications, init, intégrations précédentes)
-_AGENT_COMMIT = re.compile(r"Cucumber coverage of |Cucumber verification \(|Cucumber \S+ : init|Intégration de origin/")
+# Commits écrits par l'agent (commit_lot, vérifications, init, compléments d'init, intégrations précédentes)
+_AGENT_COMMIT = re.compile(r"Cucumber coverage of |Cucumber verification \(|Cucumber \S+ : init|Cucumber initialisation complements of "
+                           r"|Intégration de origin/")
 
 
 def integrate_remote(worktree: str, branch: str) -> str:
