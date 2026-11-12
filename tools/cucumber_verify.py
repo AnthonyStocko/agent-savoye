@@ -1754,7 +1754,7 @@ def run_init(mode: str, worktree: str, base: str, build_fn, tags: str, sources: 
         reason = (failed[0] if failed else run["message"] if not run["ok"] else f"aucun scénario pour {tags}")[:300]
         # Scénarios de l'init en échec (fichier, titre, step, message, journal) : correction des compléments
         failures = [{"fichier": rel, "titre": title, "step": r.get("step", ""), "message": r.get("message", ""),
-                     "journal": r.get("journal", "")}
+                     "journal": r.get("journal", ""), "heure": r.get("heure", "")}
                     for (rel, title), r in run["resultats"].items() if r["statut"] != "passe"] if run["ok"] else []
         return {"ok": False, "message": f"environnement non initialisé ({tags}) : {reason}", "build": run["build"],
                 "echecs": failures, "console_erreur": run.get("console_erreur", "")}

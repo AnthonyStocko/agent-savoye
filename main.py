@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_incidents, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
+from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_incidents, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, mcp_servers, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import (
     _restore_keys as restore_epic_keys, draft_tasks, epic_manifest_path, load_epic_manifest, save_epic_manifest,
@@ -247,11 +247,13 @@ def budget_hit(usage: dict) -> bool:
 
 
 def claude_command(model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (), effort: str = "",
-                   lean: bool = False, budget_usd: str = "") -> list:
+                   lean: bool = False, budget_usd: str = "", mcp: dict = None) -> list:
     """
     Ligne de commande `claude --print`. `lean` : seules les définitions des outils autorisés sont envoyées
     (--tools, noms sans motif : Bash(python:*) -> Bash), sans serveur MCP, commandes ni skills, et les sections
-    propres au poste sorties du prompt système. `budget_usd` : --max-budget-usd.
+    propres au poste sorties du prompt système. `budget_usd` : --max-budget-usd. `mcp` (mcp_servers.claude_args,
+    étapes de diagnostic seulement) : --mcp-config du seul serveur Groundcover, --strict-mcp-config gardé, ses outils
+    de lecture ajoutés à --allowedTools.
     """
     cmd = [shutil.which("claude") or "claude", "--print", "--output-format", "json"]
     if model:
@@ -264,12 +266,17 @@ def claude_command(model: str, add_dirs: list, allowed_tools: list, extra_args: 
     if lean:
         cmd.extend(["--tools", *dict.fromkeys(t.split("(", 1)[0] for t in allowed_tools)])
         cmd.extend(["--strict-mcp-config", "--disable-slash-commands", "--exclude-dynamic-system-prompt-sections"])
+    if mcp:
+        # Liste fermée : seuls les serveurs du fichier --mcp-config sont chargés (Groundcover, jamais Jira)
+        if "--strict-mcp-config" not in cmd:
+            cmd.append("--strict-mcp-config")
+        cmd.extend(mcp["args"])
     if budget_usd:
         cmd.extend(["--max-budget-usd", budget_usd])
     for directory in add_dirs:
         cmd.extend(["--add-dir", directory])
     cmd.extend(extra_args)
-    cmd.extend(["--allowedTools", *allowed_tools])
+    cmd.extend(["--allowedTools", *allowed_tools, *((mcp or {}).get("tools") or [])])
     return cmd
 
 
@@ -304,14 +311,18 @@ def usage_limit_reset(text: str) -> str:
 
 def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, extra_args: tuple = (),
                cwd: str = None, effort: str = "", lean: bool = False, budget_usd: str = "",
-               env: dict = None) -> tuple:
+               env: dict = None, mcp_step: str = "") -> tuple:
     """
     Exécute `claude --print` sur le prompt (envoyé sur stdin) et affiche sa réponse.
     Renvoie (code retour, texte de la réponse, usage des tokens, quota atteint) ; usage["fin"] : subtype du résultat
     (error_max_budget_usd si le budget est atteint, cf. budget_hit). `env` : environnement du sous-processus
-    (par défaut claude_env()).
+    (par défaut claude_env()). `mcp_step` : étape de diagnostic qui reçoit Groundcover s'il est activé
+    (mcp_servers.DIAGNOSTIC_STEPS) ; la réponse est alors masquée (lignes de log) avant tout affichage ou stockage.
     """
-    cmd = claude_command(model, add_dirs, allowed_tools, extra_args, effort, lean, budget_usd)
+    mcp = mcp_servers.claude_args(mcp_step) if mcp_step else None
+    cmd = claude_command(model, add_dirs, allowed_tools, extra_args, effort, lean, budget_usd, mcp)
+    if mcp:
+        env = mcp_servers.agent_env(env if env is not None else claude_env())
 
     # stderr séparé : la sortie standard doit rester du JSON exploitable
     process = subprocess.Popen(
@@ -333,6 +344,12 @@ def run_claude(prompt: str, model: str, add_dirs: list, allowed_tools: list, ext
     if raw_stderr and raw_stderr.strip():
         stdout_output = f"{stdout_output.rstrip()}\n{raw_stderr.strip()}" if stdout_output.strip() else raw_stderr.strip()
     session_limit_hit = usage_limit_hit(stdout_output)
+    if mcp:
+        stdout_output = groundcover_tools.mask(stdout_output)
+        failure = mcp_servers.access_failure(stdout_output)
+        if failure:
+            mcp_servers.record_access_failure(failure)
+            print(f"[LOGS] ⚠️ {mcp_servers.failure_message(failure)}")
 
     if stdout_output:
         print(stdout_output)
@@ -532,6 +549,32 @@ def build_logs_block(python_exe: str, workspace_dir: str) -> str:
     print(f"[LOGS] Recherche dans les logs groundcover activée (filtre {groundcover_tools.config()['filter']}).")
     return "\n" + render_prompt("logs_access", cli=cli, max_lines=groundcover_tools.MAX_LINES,
                                  max_minutes=int(groundcover_tools.MAX_WINDOW.total_seconds() // 60))
+
+
+def build_mcp_logs_block(step: str, client: str, failures: list, build: str = "", console: str = "",
+                         pod: dict = None) -> str:
+    """
+    Bloc de prompt Groundcover (serveur MCP) d'une étape de diagnostic ('' hors diagnostic ou si Groundcover n'est
+    pas utilisable) : fenêtre de chaque échec (heure du step −30 s / +30 s), namespace et conteneur de l'application
+    de test (profil du client, à défaut la console du build), pod du build (console).
+    """
+    if step not in mcp_servers.DIAGNOSTIC_STEPS:
+        return ""
+    reason = mcp_servers.unavailable_reason()
+    if reason:
+        if mcp_servers.settings()["active"]:
+            print(f"[LOGS] Groundcover (MCP) non utilisé : {reason}.")
+        return ""
+    if not pod and not console and build:
+        try:
+            console = jenkins_tools.build_bytes(build, "consoleText").decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001 — console facultative : namespace et conteneur du profil suffisent
+            print(f"[LOGS] Console du build illisible ({type(e).__name__}) : pod du build inconnu.")
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client)) if client else {}
+    values = mcp_servers.prompt_values(failures, profile.get("logs_namespace", ""), profile.get("logs_conteneur", ""),
+                                       pod or mcp_servers.pod_info(console), build)
+    print(f"[LOGS] Groundcover (MCP, lecture seule) donné à l'étape {step} : {values['application']}.")
+    return "\n" + render_prompt("logs_mcp_access", **values)
 
 
 def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default",
@@ -2009,28 +2052,28 @@ def _add_usage(first: dict, second: dict) -> dict:
 
 def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
                         effort: str, system_file: str = "", db_log: list = None, db_step: str = "",
-                        resume: str = "") -> tuple:
+                        resume: str = "", mcp_step: str = "") -> tuple:
     """
     Appel d'un lot (voir _run_cucumber_claude_once). Arrêt sur le nombre maximal de tours : la même session est reprise
     UNE fois (CUCUMBER_FINISH_TURNS tours, défaut 12 ; 0 = jamais) pour obtenir la réponse finale, au lieu de perdre
-    tout le travail de l'appel.
+    tout le travail de l'appel. `mcp_step` : étape de diagnostic (Groundcover, voir run_claude).
     """
     returncode, output, usage, limit_hit = _run_cucumber_claude_once(
-        prompt, model, allowed_tools, max_turns, run_dir, effort, system_file, db_log, db_step, resume)
+        prompt, model, allowed_tools, max_turns, run_dir, effort, system_file, db_log, db_step, resume, mcp_step)
     finish = _env_int("CUCUMBER_FINISH_TURNS", 12)
     if finish > 0 and not limit_hit and (usage or {}).get("fin") == "error_max_turns" and usage.get("session_id"):
         print(f"[CUCUMBER] Nombre maximal de tours atteint : reprise de la session pour la réponse finale "
               f"({finish} tours au plus).")
         returncode, output, more, limit_hit = _run_cucumber_claude_once(
             FINISH_PROMPT, model, allowed_tools, str(finish), run_dir, effort, system_file, db_log, db_step,
-            usage["session_id"])
+            usage["session_id"], mcp_step)
         usage = _add_usage(usage, more)
     return returncode, output, usage, limit_hit
 
 
 def _run_cucumber_claude_once(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
                               effort: str, system_file: str = "", db_log: list = None, db_step: str = "",
-                              resume: str = "") -> tuple:
+                              resume: str = "", mcp_step: str = "") -> tuple:
     """
     Appel Claude d'un lot Cucumber : session allégée (CLAUDE_LEAN_SESSION) et budget CUCUMBER_MAX_BUDGET_USD.
     `system_file` : partie fixe ajoutée au prompt système (--append-system-prompt-file), identique d'un lot à
@@ -2048,7 +2091,8 @@ def _run_cucumber_claude_once(prompt: str, model: str, allowed_tools: list, max_
     started = time.time() - 1
     try:
         return run_claude(prompt, model, [cucumber_tools.STD_CACHE_DIR], allowed_tools, extra_args=extra,
-                          cwd=run_dir, effort=effort, lean=lean_session(), budget_usd=cucumber_budget())
+                          cwd=run_dir, effort=effort, lean=lean_session(), budget_usd=cucumber_budget(),
+                          mcp_step=mcp_step)
     finally:
         # Fichiers de test écrits hors du dépôt <client>-cucumber (dossier parasite) : rapatriés dans le worktree
         for source, target in cucumber_stray.relocate(run_dir, os.path.join(run_dir, "worktree"), started):
@@ -2108,7 +2152,7 @@ def resume_lot_session() -> bool:
 
 
 def cucumber_followup(lot: dict, prompt: str, model: str, effort: str, tools: list, max_turns: str, run_dir: str,
-                      db_log: list = None, db_step: str = "") -> tuple:
+                      db_log: list = None, db_step: str = "", mcp_step: str = "") -> tuple:
     """
     Appel de suite d'un lot (revue, correction de fichiers / compilation, correction après exécution). Si la session
     du lot est connue (lot["session"]), elle est reprise (--resume) avec le modèle, l'effort et le prompt système du
@@ -2123,7 +2167,7 @@ def cucumber_followup(lot: dict, prompt: str, model: str, effort: str, tools: li
         system_file = system_file if system_file and os.path.exists(system_file) else ""
         returncode, output, usage, limit_hit = run_cucumber_claude(prompt, lot_model, tools, max_turns, run_dir,
                                                                    lot_effort, system_file, db_log, db_step,
-                                                                   resume=session)
+                                                                   resume=session, mcp_step=mcp_step)
         if returncode == 0 or limit_hit or budget_hit(usage):
             if usage and usage.get("session_id"):
                 lot["session"] = usage["session_id"]
@@ -2131,7 +2175,7 @@ def cucumber_followup(lot: dict, prompt: str, model: str, effort: str, tools: li
         print("[CUCUMBER] Reprise de la session du lot impossible : appel neuf.")
         lot.pop("session", None)
     returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, tools, max_turns, run_dir, effort,
-                                                               db_log=db_log, db_step=db_step)
+                                                               db_log=db_log, db_step=db_step, mcp_step=mcp_step)
     return returncode, output, usage, limit_hit, model, effort
 
 
@@ -2403,7 +2447,11 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             # Sortie d'un diagnostic temporaire exécuté au tour précédent
             lines += cucumber_diagnostic.diagnostic_lines(item)
         lines += [f"- {e}" for e in violations]
-        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
+        # Logs serveur du run de vérification (Groundcover, si activé) : fenêtre de chaque step en échec
+        gc_block = build_mcp_logs_block("cucumber-verify-fix", client, [
+            {"id": v["id"], "step": v.get("step", ""), "heure": v.get("heure", "")} for v in bad.values()],
+            build=next((v.get("build") for v in bad.values() if v.get("build")), ""))
+        prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values, "logs_block": values.get("logs_block", "") + gc_block}, lot_label=label, etape="VÉRIFICATION PAR EXÉCUTION",
                                erreurs="\n".join(lines) + cucumber_incidents.context_block(
                                    client, [{"step": v.get("step", ""), "message": v.get("motif", "")}
                                             for v in bad.values()]),
@@ -2415,7 +2463,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         returncode, output, usage, limit_hit, used_model, effort = cucumber_followup(
             None if verify_model != model else lot, prompt, verify_model, effort, lot_tools(values),
             str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir,
-            db_log=lot.setdefault("base", []), db_step="correction après exécution")
+            db_log=lot.setdefault("base", []), db_step="correction après exécution", mcp_step="cucumber-verify-fix")
         report_token_usage(work_key, "cucumber-verify-fix", used_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
@@ -3458,7 +3506,13 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     if data:
         print(f"[LOT {label}] {len(data)} échec(s) lié(s) aux données : "
               + ("preuve en base exigée." if db_available else "aucun accès base, causes NON PROUVÉES."))
-    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
+    # Logs serveur du run importé (Groundcover, si activé) : pod et build lus dans la console de l'import
+    imported = cucumber_import.load_analysis(values.get("client_name", ""), lot.get("import")) \
+        if mcp_servers.enabled() else {}
+    gc_block = build_mcp_logs_block("cucumber-import-fix", values.get("client_name", ""), lot["corrections"],
+                                    build=imported.get("build", ""),
+                                    pod=(imported.get("console") or {}).get("pod") or None)
+    prompt = render_prompt("cucumber_client_fix", **{"logs_block": "", "donnees_test": cucumber_test_data.prompt_block(), "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": skills.prompt_block("cucumber-correction", "\n".join(lines)), **values, "logs_block": values.get("logs_block", "") + gc_block}, lot_label=label, etape="RAPPORT D'EXÉCUTION IMPORTÉ",
                            erreurs="\n".join(lines) + cucumber_db_proof.prompt_block(data, db_available)
                            + cucumber_incidents.context_block(values.get("client_name", ""), [
                                {"step": s.get("step", ""), "message": s.get("message", "")}
@@ -3470,7 +3524,8 @@ def run_correction_lot(lot: dict, label: str, worktree: str, values: dict, model
     returncode, output, usage, _ = run_cucumber_claude(prompt, model, lot_tools(values),
                                                        str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir, effort,
                                                        db_log=lot.setdefault("base", []),
-                                                       db_step="correction d'un run importé")
+                                                       db_step="correction d'un run importé",
+                                                       mcp_step="cucumber-import-fix")
     report_token_usage(work_key, "cucumber-import-fix", model, usage, len(prompt), returncode, effort)
     # Ce que la correction a fait (bilan après le prochain import) : corrections, restantes, réalignés, constats
     fixed = cucumber_diagnostic.parse_fix_result(output)
@@ -3540,7 +3595,10 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
         print(f"[CUCUMBER INIT] Correction des compléments d'init par l'agent, tentative {attempt} : "
               f"{', '.join(files)}")
         before = cucumber_init_fix.snapshot(worktree, files)
-        prompt = render_prompt("cucumber_init_correction", **values, tentative=attempt,
+        gc_block = build_mcp_logs_block("cucumber-init-fix", client, init.get("echecs") or [],
+                                        build=init.get("build", ""))
+        prompt = render_prompt("cucumber_init_correction", **{**values, "logs_block": values["logs_block"] + gc_block},
+                               tentative=attempt,
                                competences=skills.prompt_block("cucumber-init", first_failure),
                                echecs=cucumber_init_fix.failure_lines(init.get("echecs") or [])
                                + cucumber_incidents.context_block(client, init.get("echecs") or []),
@@ -3549,7 +3607,8 @@ def fix_own_init(client: str, worktree: str, init: dict, verify_mode: str, init_
                                                                    str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10) * 2),
                                                                    run_dir, effort,
                                                                    db_log=corrected.setdefault("base", []),
-                                                                   db_step="correction de l'initialisation")
+                                                                   db_step="correction de l'initialisation",
+                                                                   mcp_step="cucumber-init-fix")
         report_token_usage(work_key, "cucumber-init-fix", model, usage, len(prompt), returncode, effort)
         turns += int((usage or {}).get("tours") or 0)
         if limit_hit:

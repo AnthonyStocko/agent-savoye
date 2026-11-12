@@ -27,6 +27,7 @@ from tools.jira_tools import (
 )
 from tools.db_tools import DB_TYPES, test_connection
 from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant, db_restore, skills
+from tools import mcp_servers
 from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
@@ -113,6 +114,40 @@ JOURNAL_PATH = os.path.join(".tmp", "journal_technique.log")
 JOURNAL_MAX_BYTES = 5_000_000
 # Journal conservé de chaque exécution (le journal technique tourne, l'affichage disparaît au rechargement)
 RUN_LOGS_DIR = os.path.join(".tmp", "logs")
+
+
+def render_groundcover_mcp() -> None:
+    """Serveurs MCP : état de Groundcover, « Se connecter à Groundcover » (console Claude Code) et « Tester »."""
+    state = mcp_servers.status()
+    label = mcp_servers.STATUS_LABELS.get(state["statut"], state["statut"])
+    with st.container(horizontal=True, vertical_alignment="center"):
+        connect_clicked = st.button("Se connecter à Groundcover", icon=":material/login:",
+                                    disabled=not mcp_servers.configured(), key="groundcover_mcp_login")
+        test_clicked = st.button("Tester", icon=":material/lan:", disabled=not mcp_servers.configured(),
+                                 key="groundcover_mcp_test")
+        st.caption(f"Groundcover (MCP) : {label}" + (f" — {state['date'].replace('T', ' ')}" if state.get("date") else "")
+                   + (f" — {state['message']}" if state.get("message") else "")
+                   + (f" — {len(mcp_servers.allowed_tools())} outil(s) de lecture autorisé(s)"
+                      if state["statut"] in ("connecté", "désactivé") and mcp_servers.allowed_tools() else ""))
+    if connect_clicked:
+        try:
+            st.info(mcp_servers.open_login_console(), icon=":material/login:")
+        except (OSError, ValueError) as e:
+            st.error(f"Console non ouverte : {e}", icon=":material/error:")
+    if test_clicked:
+        with st.spinner("Test de Groundcover (démarrage de Claude Code, puis un appel de lecture)…"):
+            try:
+                result = mcp_servers.test_connection()
+            except ValueError as e:
+                result = {"statut": "erreur", "message": str(e)}
+        message = f"Groundcover : {mcp_servers.STATUS_LABELS.get(result['statut'], result['statut'])}" + (
+            f" — {result['message']}" if result.get("message") else "")
+        if result["statut"] == "connecté":
+            st.success(message, icon=":material/check_circle:")
+        elif result["statut"] == "expiré":
+            st.warning(message + " Cliquez « Se connecter à Groundcover ».", icon=":material/key_off:")
+        else:
+            st.error(message, icon=":material/error:")
 
 
 def secret_input(name: str, label: str = "", **kwargs) -> str:
@@ -1816,7 +1851,8 @@ def render_cucumber_findings(status: dict) -> None:
 
 
 PROFILE_TEXT_FIELDS = ("features_root", "tag_client", "init_tags", "clear_name", "library_version", "server_version",
-                       "verify_branch", "verify_branch_param", "run_job", "run_tags_target")
+                       "verify_branch", "verify_branch_param", "run_job", "run_tags_target", "logs_namespace",
+                       "logs_conteneur")
 
 
 def profile_field_inputs(client: str, fields: list, profile: dict, profile_doc: dict) -> dict:
@@ -1826,7 +1862,9 @@ def profile_field_inputs(client: str, fields: list, profile: dict, profile_doc: 
         values[key] = st.text_input(cucumber_profile.LABELS[key], value=profile[key],
                                     placeholder={"verify_branch_param": cucumber_profile.DEFAULT_VERIFY_BRANCH_PARAM,
                                                  "run_job": "DOSSIER/JOB",
-                                                 "run_tags_target": "arguments | parametre | les_deux"}.get(key, ""))
+                                                 "run_tags_target": "arguments | parametre | les_deux",
+                                                 "logs_namespace": "ex. jenkins",
+                                                 "logs_conteneur": "ex. local-appli"}.get(key, ""))
     for key in (k for k in ("init_features", "protected_files", "job_params") if k in fields):
         values[key] = [line.strip() for line in st.text_area(
             f"{cucumber_profile.LABELS[key]}, un par ligne", value="\n".join(profile[key]),
@@ -4743,6 +4781,35 @@ with tab_config:
             help="Mode local : chemin du jacoco.exec produit par l'environnement client.")
 
         st.markdown("---")
+        st.markdown("#### :material/hub: Serveurs MCP")
+        st.caption("Par défaut, les appels Claude de l'agent ne chargent aucun serveur MCP (--strict-mcp-config). "
+                   "Seul Groundcover peut être ajouté, en lecture des logs serveur, pour les étapes de diagnostic "
+                   "(échecs d'un run, correction de l'init, correction après exécution) ; jamais pour l'analyse d'un "
+                   "ticket ni la génération d'un patch. Aucun jeton dans le .env : la connexion se fait par "
+                   "navigateur et reste dans le dossier de configuration de Claude Code (compte Claude ci-dessous).")
+        env_values[mcp_servers.ENABLED_ENV] = "1" if st.checkbox(
+            "Groundcover activé", value=os.getenv(mcp_servers.ENABLED_ENV, "").strip() == "1",
+            help="GROUNDCOVER_MCP_ENABLED : donne le serveur MCP Groundcover (outils de lecture seulement) aux "
+                 "étapes de diagnostic.") else "0"
+        env_values[mcp_servers.URL_ENV] = st.text_input(
+            "Adresse du serveur MCP Groundcover", value=os.getenv(mcp_servers.URL_ENV, ""),
+            placeholder="Adresse donnée par « Connect to MCP » dans Groundcover",
+            help="GROUNDCOVER_MCP_URL. Collez l'adresse, ou la commande / la configuration JSON proposée par « Connect "
+                 "to MCP » : l'adresse et les en-têtes non secrets en sont extraits à l'enregistrement. Un en-tête "
+                 "d'authentification (jeton, clé) est refusé.").strip()
+        with st.container(horizontal=True):
+            env_values[mcp_servers.HEADERS_ENV] = st.text_input(
+                "En-têtes non secrets (facultatif)", value=os.getenv(mcp_servers.HEADERS_ENV, ""),
+                placeholder="Nom: valeur ; Nom: valeur",
+                help="GROUNDCOVER_MCP_HEADERS : en-têtes demandés par « Connect to MCP » (fuseau horaire, "
+                     "identifiant de tenant…). Jamais de jeton.").strip()
+            env_values[mcp_servers.TOOLS_ENV] = st.text_input(
+                "Outils autorisés (facultatif)", value=os.getenv(mcp_servers.TOOLS_ENV, ""),
+                placeholder="Vide : outils de lecture relevés par « Tester »",
+                help="GROUNDCOVER_MCP_TOOLS : noms complets (mcp__groundcover__…), séparés par des virgules. Seuls "
+                     "les outils de lecture (get, list, query, search…) sont gardés.").strip()
+
+        st.markdown("---")
         st.markdown("#### 🔑 Compte Claude")
         # Valeur du .env seule : celle héritée du shell n'est pas enregistrée par défaut
         saved_config_dir = (dotenv_values(ENV_PATH).get("CLAUDE_CONFIG_DIR") or "").strip()
@@ -4912,7 +4979,25 @@ with tab_config:
         st.markdown("---")
         submit_save = st.form_submit_button("💾 Enregistrer la configuration complète", type="primary", use_container_width=True)
 
-        if submit_save:
+        mcp_refused = ""
+        if submit_save and env_values.get(mcp_servers.URL_ENV):
+            # « Connect to MCP » collé tel quel : adresse et en-têtes non secrets extraits, jetons refusés
+            connect = mcp_servers.parse_connect(env_values[mcp_servers.URL_ENV])
+            if connect["erreur"]:
+                mcp_refused = f"Adresse Groundcover refusée : {connect['erreur']}."
+            else:
+                env_values[mcp_servers.URL_ENV] = connect["url"]
+                headers = {**connect["headers"], **mcp_servers.parse_headers(env_values[mcp_servers.HEADERS_ENV])}
+                secret = mcp_servers.secret_headers(headers)
+                env_values[mcp_servers.HEADERS_ENV] = mcp_servers.format_headers(
+                    {k: v for k, v in headers.items() if k not in secret})
+                if connect["refuses"] or secret:
+                    st.warning("En-têtes d'authentification non enregistrés (aucun jeton dans le .env) : "
+                               + ", ".join(connect["refuses"] + secret) + ". La connexion se fait par navigateur "
+                               "(« Se connecter à Groundcover »).", icon=":material/key_off:")
+        if mcp_refused:
+            st.error(mcp_refused + " Configuration non enregistrée.", icon=":material/error:")
+        elif submit_save:
             # Les secrets sont enregistrés tels quels ; les autres valeurs sans espaces superflus. Écriture unique
             # (une ligne par valeur, échappements, relecture contrôlée)
             try:
@@ -4961,6 +5046,9 @@ with tab_config:
                            icon=":material/check_circle:")
             except groundcover_tools.GroundcoverError as e:
                 st.error(str(e), icon=":material/error:")
+
+    # Hors formulaire : connexion (navigateur, dans Claude Code) et test du serveur MCP Groundcover enregistré
+    render_groundcover_mcp()
 
     # Hors formulaire : teste le répertoire partagé enregistré (existence, écriture, temps d'accès)
     with st.container(horizontal=True, vertical_alignment="center"):

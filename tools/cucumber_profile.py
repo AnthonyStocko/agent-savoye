@@ -32,18 +32,21 @@ FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_na
           "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
           "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
           "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible",
-          "maj_bibliotheque", "adresse_test")
+          "maj_bibliotheque", "adresse_test", "logs_namespace", "logs_conteneur")
 # Champs dont l'absence est normale : vides sans avertissement
 OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
                    "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
                    "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible",
-          "maj_bibliotheque", "adresse_test")
+          "maj_bibliotheque", "adresse_test", "logs_namespace", "logs_conteneur")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
 LABELS = {"adresse_test": "adresse de livraison de test (remplace l'adresse par défaut de l'agent, ex. client hors "
                           "de France)",
           "cucumber_repo_url": "dépôt Cucumber du client (seul dépôt où l'agent peut écrire)",
+          "logs_namespace": "namespace Kubernetes de l'application de test (logs Groundcover ; vide : celui du pod "
+                            "du build, lu dans la console)",
+          "logs_conteneur": "conteneur de l'application de test dans le pod du build (logs Groundcover)",
           "livraison_autonome": "livraison autonome : l'agent pousse et promeut lui-même ses corrections",
           "branche_cible": "branche lue par le job, cible de la promotion (ex. integration)",
           "maj_bibliotheque": "mise à jour automatique de la bibliothèque Cucumber (vide ou auto : activée, non : "
@@ -96,7 +99,7 @@ def empty_profile() -> dict:
             "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": [], "job_roles": {},
             "job_params": [], "run_tags_target": "", "modules": [], "modules_exclus": [],
             "cucumber_repo_url": "", "livraison_autonome": False, "branche_cible": "",
-            "maj_bibliotheque": "", "adresse_test": {}}
+            "maj_bibliotheque": "", "adresse_test": {}, "logs_namespace": "", "logs_conteneur": ""}
 
 
 def is_empty(value) -> bool:

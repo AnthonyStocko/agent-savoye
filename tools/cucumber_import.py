@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timezone
 
 from tools import (cucumber_data_rules, cucumber_decisions, cucumber_failures, cucumber_incidents, cucumber_profile,
-                   cucumber_server_logs, db_tools, groundcover_tools, jenkins_tools)
+                   cucumber_server_logs, db_tools, groundcover_tools, jenkins_tools, mcp_servers)
 from tools.cucumber_diagnostic import TEMP_PREFIX
 # Masquage commun à tout l'agent (réexporté : MASK, SECRET_PATTERNS, mask_secrets)
 from tools.secret_tools import MASK, SECRET_PATTERNS, mask_secrets  # noqa: F401
@@ -190,7 +190,10 @@ def compile_failures(lines: list) -> dict:
 
 
 def console_facts(text: str) -> dict:
-    """Faits d'une console Jenkins : numéro de build, tags lancés, patch non applicable, dernier « Tests run »."""
+    """
+    Faits d'une console Jenkins : numéro de build, tags lancés, patch non applicable, dernier « Tests run », pod du
+    build (namespace, pod, conteneurs : fenêtre des logs serveur dans Groundcover).
+    """
     tags = _FILTER_TAGS.findall(text)
     tests = _TESTS_RUN.findall(text)
     build = _BUILD_NUMBER.search(text)
@@ -199,7 +202,8 @@ def console_facts(text: str) -> dict:
             "tags": next((g for g in tags[-1] if g), "") if tags else "",
             "patch_non_applicable": "PATCH_NON_APPLICABLE" in text,
             "tests": dict(zip(("executes", "echecs", "erreurs", "ignores"), map(int, tests[-1]))) if tests else {},
-            "debut": f"{first.group(1)}T{first.group(2)}" if first else ""}
+            "debut": f"{first.group(1)}T{first.group(2)}" if first else "",
+            "pod": mcp_servers.pod_info(text)}
 
 
 def full_run(analysis: dict, client_tag: str = "") -> bool:
@@ -350,7 +354,7 @@ def normalize_analysis(analysis: dict) -> dict:
             fichier, titre = identifier.split("::", 1)
             result = results.get(identifier) or {}
             scenarios.append({"tag": "", "fichier": fichier, "titre": titre, "step": result.get("step", ""),
-                              "message": result.get("message", ""), **item})
+                              "message": result.get("message", ""), "heure": result.get("heure", ""), **item})
         proposals.append({**proposal, "spec": proposal.get("spec") or "", "scenarios": scenarios})
     if "propositions" in analysis:
         analysis = {**analysis, "propositions": proposals}
@@ -764,6 +768,7 @@ def correction_proposals(failures: dict, state: dict, extras: dict = None, db_co
         by_spec.setdefault(mine["spec"], []).append(
             {"tag": mine["tag"], "id": identifier, "fichier": fichier, "titre": titre,
              "step": result.get("step", ""), "message": result.get("message", ""), "tentatives": len(tried),
+             "heure": result.get("heure", ""),
              **((extras or {}).get(identifier) or {})})
     return [{"spec": spec, "scenarios": items} for spec, items in sorted(by_spec.items())], to_prove
 

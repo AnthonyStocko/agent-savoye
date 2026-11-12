@@ -412,6 +412,21 @@ L'URL de retour doit alors être en HTTPS (exigence des fournisseurs, sauf `loca
 - ajoutez `https://<nom-du-poste>:8501/oauth2callback` comme URI de redirection dans l'inscription ;
 - relancez `python -m tools.auth_setup … --redirect-uri https://<nom-du-poste>:8501/oauth2callback`.
 
+## Logs serveur avec Groundcover (serveur MCP)
+
+Par défaut, les appels Claude de l'agent ne chargent **aucun** serveur MCP (`--strict-mcp-config`) : aucun connecteur ne peut écrire dans Jira. Groundcover est le seul serveur qui peut être ajouté, en **lecture** des logs serveur, et seulement pour les étapes de diagnostic : correction des échecs d'un run importé, correction de l'initialisation, correction après exécution (revue du run de vérification d'un lot). L'analyse d'un ticket et la génération d'un patch n'y ont jamais accès.
+
+Mise en place (une fois par poste et par compte Claude) :
+
+1. Dans Groundcover, **Connect to MCP** : copiez l'adresse du serveur MCP (ou la commande / la configuration JSON proposée).
+2. Onglet ⚙️, section **Serveurs MCP** : collez-la dans « Adresse du serveur MCP Groundcover » (l'adresse et les en-têtes non secrets en sont extraits ; un en-tête de jeton est refusé), cochez **Groundcover activé**, enregistrez.
+3. **Se connecter à Groundcover** : une console Claude Code s'ouvre avec le même `CLAUDE_CONFIG_DIR` que l'agent et le même fichier de configuration MCP ; tapez `/mcp`, choisissez `groundcover`, **Authenticate**, connectez-vous dans le navigateur avec votre compte Groundcover, puis `/exit`.
+4. **Tester** : l'agent démarre Claude Code avec ce seul serveur, relève ses outils, puis fait un appel de lecture minimal. État affiché : connecté, connexion expirée ou absente, non configuré, erreur. Les outils de lecture relevés (get, list, query, search…) sont ceux autorisés ensuite ; les autres sont refusés explicitement (`--disallowedTools`).
+
+Pendant un diagnostic, l'agent reçoit pour chaque échec la fenêtre heure du step en échec −30 s / +30 s (UTC), le namespace et le conteneur de l'application de test (profil du client : « namespace Kubernetes de l'application de test », « conteneur de l'application de test », ex. `jenkins` / `local-appli` ; à défaut le namespace lu dans la console du build) et le pod du build (console, `[PodInfo] namespace/pod`). Une cause prouvée cite les lignes de log mot pour mot. Si l'accès échoue (session expirée), le journal le dit, l'état passe à « connexion expirée » : reconnectez-vous, sinon exportez les logs à la main et importez-les avec le run.
+
+Sécurité : aucun jeton Groundcover dans le `.env`, les journaux ni les connaissances partagées (la connexion est gardée par Claude Code dans son dossier de configuration) ; la réponse de l'agent est masquée (mots de passe, jetons) avant tout affichage ou stockage. Le fichier de configuration MCP (`.tmp/mcp/mcp-config.json`) ne contient que le serveur Groundcover.
+
 ## Personnaliser les prompts
 
 Les consignes envoyées à l'agent sont dans `prompts/` :
