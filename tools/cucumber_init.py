@@ -332,9 +332,13 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     à chaque feature d'init (cucumber_environment), steps écrits par `writer(worktree, controles, recreations)` ;
     non livrables, ils restent commentés (TODO-ENVIRONNEMENT). Lève RuntimeError, notamment sans clear_name dans le
     profil du client (le clear est propre au client : la question est posée) ou si une valeur du profil d'un autre
-    client apparaît dans les fichiers générés.
+    client apparaît dans les fichiers générés. Configuration copiée (profil client, cucumber_copied_config) : aucun
+    clear exigé ni écrit, aucune recréation ni intégration de fichiers ; seuls restent actifs les désactivations de
+    jobs et les contrôles en lecture seule (copied_feature).
     """
-    clear = clear_name(profile)
+    from tools import cucumber_copied_config
+    copied = cucumber_copied_config.active(profile)
+    clear = clear_name(profile) or ("" if not copied else "aucun (configuration copiée)")
     if not clear:
         raise RuntimeError(f"clear du client {client_name} inconnu : {cucumber_profile_question()} ; aucune "
                            f"initialisation n'est générée sans le clear propre au client (jamais celui d'un autre).")
@@ -344,7 +348,7 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     out_of_scope = cucumber_modules.excluded(profile)
     kept = sorted(m for m in modules if m in std and m.upper() not in out_of_scope)
     result = {"modules": kept, "exclus": sorted(m for m in modules if m.upper() in out_of_scope), "fichiers": [], "patch": "", "absents": sorted(set(modules) - set(std) - out_of_scope),
-              "avertissements": ([] if spec_files else [
+              "avertissements": ([] if spec_files or copied else [
                   "aucun fichier du module spécifique dans le profil client : après le clear, les données propres au "
                   "client (documents, statuts, partenaires…) ne seront pas recréées"]) + initializer_limits(profile),
               "todo_version": [], "recreation": {}}
@@ -358,10 +362,13 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     library, aligned, version = _library_snapshots(cucumber_std_dir, (profile or {}).get("library_version", ""))
     # Java écrit d'après la bibliothèque du pom du client, jamais d'après les sources du Standard
     library_api = cucumber_library.load_api(cucumber_library.repo_library_version(worktree))
-    if not clear.startswith(CLEAR_RESOURCE_PREFIX):
+    if copied:
+        # Configuration copiée : ni fichiers du module spécifique, ni recréation (aucun clear), contrôles seulement
+        spec_files, environment = [], {**(environment or {}), "recreations": []}
+    if not copied and not clear.startswith(CLEAR_RESOURCE_PREFIX):
         result["avertissements"].append(f"clear « {clear} » : nom attendu {CLEAR_RESOURCE_PREFIX}<module> "
                                         f"(ressource REST du Standard) ; la purge échouera à l'exécution")
-    items = recreation_plan(cucumber_std_dir, client_name, profile)
+    items = [] if copied else recreation_plan(cucumber_std_dir, client_name, profile)
     missing = [s for s in spec_files if not os.path.exists(os.path.join(worktree, *s.split("/")))]
     if missing:
         result["avertissements"].append(f"fichier(s) du module spécifique absent(s) de la base : {', '.join(missing)}")
@@ -377,6 +384,10 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
                 if library:
                     text, notes = mark_version_gaps(text, library, aligned, version)
                     result["todo_version"] += [f"{target_rel} : {n}" for n in notes]
+                if copied:
+                    text, removed = cucumber_copied_config.copied_feature(text, client_name)
+                    result["avertissements"].append(f"{target_rel} : {removed} step(s) commenté(s) "
+                                                    f"({cucumber_copied_config.MARKER} configuration copiée)")
                 if out_of_scope:
                     # Module décoché (profil) : son clear, sa configuration et ses fichiers retirés, sans trace
                     text, removed = cucumber_modules.strip_excluded_steps(text, profile, out_of_scope)
@@ -384,6 +395,9 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
                                                  f"décoché) : {r['lignes'][0].strip()[:100]}" for r in removed]
                 with open(target, "w", encoding="utf-8", newline="") as f:
                     f.write(text)
+            elif copied:
+                # Fichiers de données de l'init globale : inutiles, la configuration vient de la copie
+                continue
             else:
                 shutil.copyfile(source, target)
             result["fichiers"].append(client_path(rel, client_name))
@@ -396,11 +410,12 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
                 f"{len(checked['non_prouves'])} job(s) absent(s) chez le client, commenté(s) sous TODO-JOB : "
                 + ", ".join(sorted({m['nom'] for m in checked['non_prouves']}))[:300])
     java = clear_step_path(client_name)
-    target = os.path.join(worktree, *java.split("/"))
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, "w", encoding="utf-8", newline="\n") as f:
-        f.write(clear_step_java(client_name, library_api))
-    result["fichiers"].append(java)
+    if not copied:
+        target = os.path.join(worktree, *java.split("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write(clear_step_java(client_name, library_api))
+        result["fichiers"].append(java)
     result["recreation"] = _recreate_project_steps(worktree, base, client_name, items, result["fichiers"], recreate)
     result["avertissements"] += result["recreation"]["avertissements"]
     if os.path.exists(os.path.join(worktree, *cucumber_recreation.java_path(client_name).split("/"))):
@@ -412,7 +427,8 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     extra_java = [p for p in (cucumber_recreation.java_path(client_name), cucumber_environment.java_path(client_name))
                   if p in result["fichiers"]]
     _check_isolation(client_name, worktree, result["fichiers"], profile, cucumber_std_dir)
-    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files", java, *extra_java)
+    _git(worktree, "add", "-A", "--", f"{RESOURCES_DIR}/features", f"{RESOURCES_DIR}/files",
+         *([java] if java in result["fichiers"] else []), *extra_java)
     if _git(worktree, "diff", "--cached", "--quiet").returncode == 0:
         return result
     commit = _git(worktree, "commit", "-m", f"{INIT_COMMIT_PREFIX}{client_name} ({', '.join(kept)})")

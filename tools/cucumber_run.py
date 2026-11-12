@@ -252,7 +252,17 @@ def launch(client_name: str, worktree: str, profile: dict, tags: str = "", log=p
                 + (f", filtre de tags {tags}" if tags else "") + f") ; suivi jusqu'à sa fin (au plus {timeout()} s)...")
         return queue
     # Un seul build Cucumber à la fois : attente qu'aucun autre ne tourne, arrêt du build au-delà du délai
-    build = jenkins_tools.run_exclusive(check["job"], trigger, timeout())
+    # Configuration copiée (profil client) : copie de référence restaurée avant le run, schéma du run vérifié
+    from tools import cucumber_copied_config
+    guard = cucumber_copied_config.run_guard(client_name, None, log)
+    build = jenkins_tools.run_exclusive(check["job"], trigger, timeout(), guard)
+    if guard is not None:
+        run["config_copiee"] = guard.info
+        log(f"[RUN JENKINS] {cucumber_copied_config.bilan_line(guard.info)}")
+    if build.get("schema_errone"):
+        run.update(build=build["url"], resultat=build["result"], ok=False, message=build["message"])
+        record(client_name, run)
+        return run
     if build["result"] == "INDISPONIBLE" and not build["url"]:
         run["message"] = (f"lancement du job {check['job']} refusé par Jenkins"
                           if build.get("message") == "lancement refusé par Jenkins" else

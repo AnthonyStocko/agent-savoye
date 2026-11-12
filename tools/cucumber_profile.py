@@ -32,16 +32,21 @@ FIELDS = ("features_root", "tag_client", "init_features", "init_tags", "clear_na
           "initializers_survive_clear", "workarounds", "verify_branch", "verify_branch_param", "run_job",
           "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
           "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible",
-          "maj_bibliotheque", "adresse_test", "logs_namespace", "logs_conteneur")
+          "maj_bibliotheque", "adresse_test", "logs_namespace", "logs_conteneur", "config_copiee", "schema_copie")
 # Champs dont l'absence est normale : vides sans avertissement
 OPTIONAL_FIELDS = ("server_initialized_data", "workarounds", "verify_branch", "verify_branch_param", "run_job",
                    "environment_checks", "reponses", "job_roles", "job_params", "run_tags_target", "modules",
                    "modules_exclus", "cucumber_repo_url", "livraison_autonome", "branche_cible",
-          "maj_bibliotheque", "adresse_test", "logs_namespace", "logs_conteneur")
+          "maj_bibliotheque", "adresse_test", "logs_namespace", "logs_conteneur", "config_copiee", "schema_copie")
+# Option « configuration copiée » et son schéma : réglés à l'étape 1 de l'onglet Cucumber, gardés par toute saisie
+COPIED_CONFIG_FIELDS = ("config_copiee", "schema_copie")
 # Paramètre du job de vérification qui porte la branche, à défaut de saisie
 DEFAULT_VERIFY_BRANCH_PARAM = "CUCUMBER_SPEC_BRANCH"
 SURVIVE_CLEAR = {"": "inconnu", "vrai": "vrai", "faux": "faux"}
-LABELS = {"adresse_test": "adresse de livraison de test (remplace l'adresse par défaut de l'agent, ex. client hors "
+LABELS = {"config_copiee": "configuration copiée, sans purge : tests dans la configuration réelle du client, copiée "
+                           "dans le schéma de test des runs et restaurée avant chaque run (désactivée par défaut)",
+          "schema_copie": "schéma de test des runs visé par la configuration copiée (vide : CUCUMBER_DB_SCHEMA)",
+          "adresse_test": "adresse de livraison de test (remplace l'adresse par défaut de l'agent, ex. client hors "
                           "de France)",
           "cucumber_repo_url": "dépôt Cucumber du client (seul dépôt où l'agent peut écrire)",
           "logs_namespace": "namespace Kubernetes de l'application de test (logs Groundcover ; vide : celui du pod "
@@ -99,7 +104,8 @@ def empty_profile() -> dict:
             "verify_branch_param": "", "run_job": "", "environment_checks": [], "reponses": [], "job_roles": {},
             "job_params": [], "run_tags_target": "", "modules": [], "modules_exclus": [],
             "cucumber_repo_url": "", "livraison_autonome": False, "branche_cible": "",
-            "maj_bibliotheque": "", "adresse_test": {}, "logs_namespace": "", "logs_conteneur": ""}
+            "maj_bibliotheque": "", "adresse_test": {}, "logs_namespace": "", "logs_conteneur": "",
+            "config_copiee": False, "schema_copie": ""}
 
 
 def is_empty(value) -> bool:
@@ -371,16 +377,20 @@ def effective_profile(document: dict) -> dict:
     # Version du client choisie (tools/client_version) : paramètres Jenkins des runs de l'agent qui en sont déduits
     version = (document or {}).get("version_client") or {}
     proven = dict((document or {}).get(PROVEN_CLEARS) or {})
+    # Copie de référence du mode « configuration copiée » (cucumber_copied_config)
+    copied_reference = dict((document or {}).get("reference_copie") or {})
     return cucumber_modules.scope_profile({**profile, "sources": sources, "avertissements": warnings,
                                            "clears_application": clears, "init_tags_detectes": detected_tags,
-                                           "version_client": version, PROVEN_CLEARS: proven})
+                                           "version_client": version, PROVEN_CLEARS: proven,
+                                           "reference_copie": copied_reference})
 
 
 def save_user_fields(client_name: str, fields: dict) -> dict:
     """Enregistre la saisie de l'IHM : seuls les champs différents de la détection sont gardés. Renvoie le document."""
     document = load_profile(client_name)
     detected = document.get("detecte") or empty_profile()
-    document["saisi"] = {k: v for k, v in fields.items() if k in FIELDS and v != detected.get(k)}
+    kept = {k: v for k, v in (document.get("saisi") or {}).items() if k in COPIED_CONFIG_FIELDS and k not in fields}
+    document["saisi"] = {**kept, **{k: v for k, v in fields.items() if k in FIELDS and v != detected.get(k)}}
     _write_json(profile_path(client_name), document)
     return document
 
@@ -426,7 +436,8 @@ def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_
         "=== PROFIL CLIENT (seuls emplacement, tag et données autorisés) ===",
         f"- Racine des features (seul emplacement autorisé) : '{root}'",
         f"- Tag du client (casse exacte) : {tag}",
-        cucumber_init_data.init_block(init_view(profile), clear, max_codes),
+        # Configuration copiée : codes de référence lus dans la copie, jamais ceux de l'init du Standard
+        _copied_block(profile) or cucumber_init_data.init_block(init_view(profile), clear, max_codes),
         protected_block(profile.get("protected_files") or []),
         *filter(None, [excluded_modules_block(profile),
                        version_block(profile.get("library_version", ""), profile.get("server_version", ""),
@@ -437,6 +448,11 @@ def profile_block(profile: dict, max_codes: int = cucumber_init_data.MAX_PROMPT_
                                                          if any(p["source"] in ("init", "depot") for p in places)})]),
         "- N'utilise QUE des steps existants (catalogue du Standard, steps du client) ou définis par ce lot, avec la "
         "syntaxe de colonnes du Standard actuel ; préfère un Background à un scénario « Contexte » séparé."])
+
+
+def _copied_block(profile: dict) -> str:
+    from tools import cucumber_copied_config
+    return cucumber_copied_config.prompt_block(profile)
 
 
 def excluded_modules_block(profile: dict) -> str:

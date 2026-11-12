@@ -1125,8 +1125,16 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
         return {"ok": False, "message": f"non lancé : « {tags} » ne sélectionne que l'init de modules exclus du "
                                         f"périmètre testé", "build": "", "resultats": {}}
     tags = scoped
-    if mode == "branche":
-        return run_on_branch(worktree, tags, env, overrides, label, sources or {})
+    if mode in ("branche", "jenkins"):
+        # Configuration copiée (profil client) : copie de référence restaurée avant le run, schéma du run vérifié
+        from tools import cucumber_copied_config
+        guard = cucumber_copied_config.run_guard(cucumber_copied_config.client_of(sources, worktree))
+        result = (run_on_branch(worktree, tags, env, overrides, label, sources or {}, guard) if mode == "branche"
+                  else _run_with_patch(worktree, base, tags, env, overrides, label, sources, guard))
+        if guard is not None:
+            result["config_copiee"] = guard.info
+            print(f"[CUCUMBER] {cucumber_copied_config.bilan_line(guard.info)}")
+        return result
     if mode == "local":
         command = os.getenv("CUCUMBER_VERIFY_LOCAL_CMD", "").strip()
         if env and "{env}" not in command:
@@ -1155,6 +1163,12 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
             return {"ok": False, "message": gap, "build": "", "resultats": {}, "ecart_selection": True}
         return {"ok": True, "message": f"exécution locale en {time.time() - started:.0f} s", "build": "",
                 "resultats": parse_cucumber_report(report)}
+    return _run_with_patch(worktree, base, tags, env, overrides, label, sources)
+
+
+def _run_with_patch(worktree: str, base: str, tags: str, env: str, overrides: dict, label: str, sources: dict = None,
+                    guard=None) -> dict:
+    """Exécution Jenkins par patch (job CUCUMBER_VERIFY_JOB, paramètre PATCH) ; `guard` : configuration copiée."""
     # Jenkins : patch du worktree depuis la base (fichiers mutés écrits le temps de produire le patch)
     originals = {rel: _read_text_file(os.path.join(worktree, *rel.split("/"))) for rel in overrides}
     try:
@@ -1171,10 +1185,14 @@ def run_tags(mode: str, worktree: str, base: str, build_fn, tags: str, env: str,
     job = os.getenv("CUCUMBER_VERIFY_JOB", "").strip()
     # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
     build = jenkins_tools.run_exclusive(
-        job, lambda: jenkins_tools.trigger_cucumber_job_with_file(job, parameters, "PATCH", patch_file), _timeout())
+        job, lambda: jenkins_tools.trigger_cucumber_job_with_file(job, parameters, "PATCH", patch_file), _timeout(),
+        guard)
     if build["result"] == "INDISPONIBLE" and not build["url"]:
         return {"ok": False, "message": f"lancement du job Jenkins impossible ({build.get('message', '')})",
                 "build": "", "resultats": {}}
+    if build.get("schema_errone"):
+        return {"ok": False, "message": build["message"], "build": build["url"], "resultats": {},
+                "schema_errone": True}
     if build["result"] not in ("SUCCESS", "UNSTABLE") and _patch_not_applicable(build, patch_file, label):
         return {"ok": False, "message": PATCH_NOT_APPLICABLE, "build": build["url"], "resultats": {}}
     reports = [a for a in build["artifacts"] if a.lower().endswith(".json") and "cucumber" in a.lower()]
@@ -1207,7 +1225,13 @@ def branch_sources(profile: dict, repository: str) -> dict:
     return {"profil": profile, "depot": repository}
 
 
-def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: str, sources: dict) -> dict:
+def _copied_info(run: dict) -> dict:
+    """Bilan du run en configuration copiée (mode, référence, schéma vérifié, restauration) ; {} sinon."""
+    return {"config_copiee": run["config_copiee"]} if (run or {}).get("config_copiee") else {}
+
+
+def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: str, sources: dict,
+                  guard=None) -> dict:
     """
     Exécution sur la branche de travail (job CUCUMBER_VERIFY_JOB sans patch) : `overrides` écrits et commités, le
     worktree poussé (jamais forcé) puis contrôlé en tête de la branche distante, fichiers d'origine rétablis par un
@@ -1268,10 +1292,14 @@ def run_on_branch(worktree: str, tags: str, env: str, overrides: dict, label: st
     if switched and not profile.get("init_standard_modules"):
         print(f"[CUCUMBER] Suites du Standard décochées pour ce run de vérification ({len(switched)} paramètre(s)).")
     # Un seul build Cucumber à la fois : attend que Jenkins soit libre, arrête le build s'il dépasse le délai
-    build = jenkins_tools.run_exclusive(job, lambda: jenkins_tools.trigger_job(job, params), _timeout())
+    build = jenkins_tools.run_exclusive(job, lambda: jenkins_tools.trigger_job(job, params), _timeout(), guard)
     if build["result"] == "INDISPONIBLE" and not build["url"]:
         return {"ok": False, "message": f"lancement du job Jenkins impossible ({build.get('message', '')})",
                 "build": "", "resultats": {}}
+    if build.get("schema_errone"):
+        # Configuration copiée : le run a obtenu un autre slot que le schéma copié, arrêté avant les tests
+        return {"ok": False, "message": build["message"], "build": build["url"], "resultats": {},
+                "schema_errone": True}
     if not build["url"]:
         return {"ok": False, "message": f"build non abouti : {build['result']}", "build": "", "resultats": {}}
     console = mask_secrets(jenkins_tools.build_bytes(build["url"], "consoleText").decode("utf-8", "replace"))[0]
@@ -1581,7 +1609,8 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
                       os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), copies, f"{label}-client", sources)
     init_result, stop = judged(client)
     builds.append({"execution": "client" + (" + mutation" if copies else ""), "build": client["build"],
-                   "message": client["message"], **({"init": init_result} if init_result else {})})
+                   "message": client["message"], **({"init": init_result} if init_result else {}),
+                   **_copied_info(client)})
     if stop:
         # Init du client en échec dans ce build : les scénarios du lot ne sont pas jugés (RÈGLE : jamais sur un
         # environnement non initialisé)
@@ -1597,7 +1626,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
                             sources)
         standard_init, standard_stop = judged(standard)
         builds.append({"execution": "standard", "build": standard["build"], "message": standard["message"],
-                       **({"init": standard_init} if standard_init else {})})
+                       **({"init": standard_init} if standard_init else {}), **_copied_info(standard)})
         for tag in overrides:
             levels[tag]["standard"] = ("nv", standard_stop) if standard_stop else \
                 _level(standard["resultats"].get(key_of.get(tag, ("", ""))), True, True) \
@@ -1627,7 +1656,7 @@ def verify_lot(mode: str, worktree: str, base: str, build_fn, files: list, scena
                                 os.getenv("CUCUMBER_VERIFY_ENV", "").strip(), mutated, f"{label}-mutation", sources)
             mutation_init, mutation_stop = judged(mutation)
             builds.append({"execution": "mutation", "build": mutation["build"], "message": mutation["message"],
-                           **({"init": mutation_init} if mutation_init else {})})
+                           **({"init": mutation_init} if mutation_init else {}), **_copied_info(mutation)})
             for tag in to_run:
                 levels[tag]["mutation"] = ("nv", mutation_stop) if mutation_stop else \
                     _level(mutation["resultats"].get(key_of.get(tag, ("", ""))), True) \

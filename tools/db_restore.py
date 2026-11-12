@@ -14,7 +14,10 @@ la méthode du script restore.ps1 de l'équipe (PostgreSQL) :
 Source : CLIENT_SOURCE_DB_* (HOST, PORT, NAME, USER, PASSWORD), à défaut DB_* ; schéma donné par l'utilisateur.
 Cible : base des tests Cucumber (CUCUMBER_DB_*, PARTAGÉE avec Jenkins), schéma dédié aux essais locaux du client
 (cucumber_env_diagnosis.local_schema : cucumber_local_<client>), jamais un schéma du pool des runs Jenkins
-(cucumber_customer_<N>) : la copie y casserait les runs (clear de l’init en échec reproductible).
+(cucumber_customer_<N>) : la copie y casserait les runs (clear de l’init en échec reproductible). Seule exception :
+l'option « configuration copiée, sans purge » du profil client (cucumber_copied_config), où la copie va dans le
+schéma de test du profil (`allowed_pool`), suivie d'un instantané « référence » (pg_dump du schéma copié) restauré
+avant chaque run (restore_reference).
 Outils PostgreSQL : PG_BIN_DIR (ex. C:\\Program Files\\PostgreSQL\\16\\bin), sinon le PATH. Mots de passe passés par
 PGPASSWORD, jamais en ligne de commande ni dans les journaux.
 
@@ -99,8 +102,11 @@ def filter_listing(listing: str, extra: list = ()) -> tuple:
     return "\n".join(out) + "\n", excluded
 
 
-def check_plan(source_schema: str, target_schema: str, source: dict, target: dict) -> list:
-    """Erreurs bloquantes avant toute action (vide : la restauration peut partir)."""
+def check_plan(source_schema: str, target_schema: str, source: dict, target: dict, allowed_pool: str = "") -> list:
+    """
+    Erreurs bloquantes avant toute action (vide : la restauration peut partir). `allowed_pool` : schéma du pool des
+    runs autorisé comme cible (schéma de test du profil en mode configuration copiée), seul et nommément.
+    """
     errors = []
     for label, schema in (("source", source_schema), ("cible", target_schema)):
         if not _IDENTIFIER.match(schema or ""):
@@ -115,7 +121,7 @@ def check_plan(source_schema: str, target_schema: str, source: dict, target: dic
     # Schéma du pool des runs Jenkins (cucumber_customer_<N>) : jamais la cible d'une copie (essais locaux seulement)
     from tools import cucumber_env_diagnosis
     refusal = cucumber_env_diagnosis.pool_refusal(target_schema or "")
-    if refusal:
+    if refusal and not (allowed_pool and (target_schema or "").lower() == allowed_pool.lower()):
         errors.append(refusal)
     same_db = (source["host"], source["port"], source["name"]) == (target["host"], target["port"], target["name"])
     if same_db and (source_schema or "").lower() == (target_schema or "").lower():
@@ -229,17 +235,19 @@ def _record(client_name: str, entry: dict) -> None:
 
 
 def restore_client_config(client_name: str, source_schema: str, target_schema: str, log=print,
-                          jenkins_busy=None) -> dict:
+                          jenkins_busy=None, allowed_pool: str = "", reference_dir: str = "") -> dict:
     """
     Recopie complète (étapes 1 à 6), avec sauvegarde préalable du schéma cible. `jenkins_busy()` : builds Jenkins en
-    cours (liste) — non vide, rien n'est fait. Renvoie l'entrée d'historique ({ok, message, sauvegarde, ...}).
+    cours (liste) — non vide, rien n'est fait. `allowed_pool` : schéma du pool des runs accepté comme cible (mode
+    configuration copiée) ; `reference_dir` : après la copie, instantané « référence » du schéma copié (pg_dump)
+    écrit dans ce dossier (entrée « reference »). Renvoie l'entrée d'historique ({ok, message, sauvegarde, ...}).
     """
     source, target = source_connection(), target_connection()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     entry = {"date": datetime.now().isoformat(timespec="seconds"), "source": f"{describe(source)} / {source_schema}",
              "cible": f"{describe(target)} / {target_schema}", "ok": False, "sauvegarde": ""}
     try:
-        errors = check_plan(source_schema, target_schema, source, target)
+        errors = check_plan(source_schema, target_schema, source, target, allowed_pool)
         if errors:
             raise RestoreError(" ; ".join(errors))
         busy = list(jenkins_busy() if jenkins_busy else [])
@@ -261,6 +269,13 @@ def restore_client_config(client_name: str, source_schema: str, target_schema: s
         entry.update(result, ok=True, message=f"config client recopiée dans {target_schema} : "
                                               f"{result['exclus']} jeu(x) de données d'historique exclu(s), "
                                               f"{result['duree_s']} s")
+        if reference_dir:
+            # Instantané « référence » du schéma tel que copié : restauré avant chaque run (configuration copiée)
+            snapshot = os.path.join(reference_dir, f"reference-{target_schema}-{stamp}.pgdump")
+            log(f"Instantané de référence du schéma {target_schema}")
+            dump_schema(target, target_schema, snapshot, log)
+            entry["reference"] = snapshot
+            entry["message"] += " ; instantané de référence enregistré"
     except (RestoreError, subprocess.TimeoutExpired, OSError) as e:
         entry["message"] = str(e)
     _record(client_name, entry)
@@ -280,6 +295,30 @@ def restore_backup(client_name: str, backup: str, target_schema: str, log=print,
             raise RestoreError(f"sauvegarde introuvable : {backup}")
         result = restore_dump(target, backup, target_schema, target_schema, log, exclude=False)
         entry.update(result, ok=True, message=f"schéma {target_schema} remis tel qu'avant la recopie")
+    except (RestoreError, subprocess.TimeoutExpired, OSError) as e:
+        entry["message"] = str(e)
+    _record(client_name, entry)
+    return entry
+
+
+def restore_reference(client_name: str, dump: str, target_schema: str, log=print) -> dict:
+    """
+    Copie de référence (mode configuration copiée) remise dans le schéma de test des runs avant un run : le schéma
+    repart de la configuration du client, sans les données des runs précédents. L'appelant garantit qu'aucun build
+    ne tourne (jenkins_tools.run_exclusive). Journalisée dans l'historique (« reference_restauree »).
+    """
+    target = target_connection()
+    entry = {"date": datetime.now().isoformat(timespec="seconds"), "source": f"référence {os.path.basename(dump)}",
+             "cible": f"{describe(target)} / {target_schema}", "ok": False, "sauvegarde": "",
+             "reference_restauree": True}
+    try:
+        if not _IDENTIFIER.match(target_schema or "") or target_schema.lower() in ("public", "information_schema",
+                                                                                   "pg_catalog"):
+            raise RestoreError(f"schéma cible invalide ou interdit : « {target_schema} »")
+        if not os.path.exists(dump or ""):
+            raise RestoreError(f"instantané de référence introuvable : {dump}")
+        result = restore_dump(target, dump, target_schema, target_schema, log, exclude=False)
+        entry.update(result, ok=True, message=f"copie de référence restaurée dans {target_schema}")
     except (RestoreError, subprocess.TimeoutExpired, OSError) as e:
         entry["message"] = str(e)
     _record(client_name, entry)

@@ -89,7 +89,14 @@ def prompt_block(profile: dict = None) -> str:
         "- Même principe pour toute autre donnée contrôlée par un référentiel (transporteur, mode d'expédition, "
         "produit, site, donneur d'ordres…) : valeurs reprises d'objets réels valides du client (init du client, "
         "codes de référence du profil, base de l'environnement), jamais inventées.",
-    ])
+    ]) + _copied_block(profile)
+
+
+def _copied_block(profile: dict = None) -> str:
+    """Configuration copiée (profil client) : codes de référence de la copie, ni clear ni purge ni init globale."""
+    from tools import cucumber_copied_config
+    block = cucumber_copied_config.prompt_block(profile or {})
+    return "\n" + block if block else ""
 
 
 def is_address_rejection(text: str) -> bool:

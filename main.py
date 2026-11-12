@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
-from tools import cucumber_env_diagnosis
+from tools import cucumber_env_diagnosis, cucumber_copied_config
 from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_incidents, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, mcp_servers, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import (
@@ -658,7 +658,21 @@ def run_assistant(question: str, answer_file: str) -> int:
     return 0
 
 
-def run_restore_config(client: str, source_schema: str, target_schema: str, backup: str = "") -> int:
+def copied_reference_codes(schema: str) -> dict:
+    """Codes de référence lus dans la copie (base des tests, lecture seule) : cucumber_copied_config.read_codes."""
+    def query(sql: str, target: str) -> list:
+        previous = db_tools.set_profile("cucumber")
+        try:
+            out = db_tools.run_query(sql, target, limit=cucumber_copied_config.MAX_CODES)
+        finally:
+            db_tools.set_profile(previous)
+        rows = [line.split(" | ") for line in out.splitlines()[1:-1]]
+        return [{"code": r[0].strip()} for r in rows if r]
+    return cucumber_copied_config.read_codes(schema, query)
+
+
+def run_restore_config(client: str, source_schema: str, target_schema: str, backup: str = "",
+                       copied_reference: bool = False) -> int:
     """
     Recopie de la config client (base client en direct, schéma `source_schema`) dans le schéma des tests Cucumber
     `target_schema`, méthode du script de restauration de l'équipe (db_restore) ; `backup` : retour arrière vers une
@@ -673,8 +687,31 @@ def run_restore_config(client: str, source_schema: str, target_schema: str, back
         return jenkins_tools.busy_builds(jenkins_tools.exclusive_jobs(profile.get("run_job", "")))
 
     log = lambda message: print(f"[CONFIG CLIENT] {message}")  # noqa: E731
-    entry = (db_restore.restore_backup(client, backup, target_schema, log, busy) if backup else
-             db_restore.restore_client_config(client, source_schema, target_schema, log, busy))
+    if copied_reference:
+        # Configuration copiée : seule cible admise, le schéma de test du profil ; instantané « référence » ensuite
+        expected = cucumber_copied_config.test_schema(profile)
+        if not cucumber_copied_config.active(profile) or target_schema.lower() != expected.lower():
+            print(f"[CONFIG CLIENT] ❌ Copie de référence refusée : option « {cucumber_copied_config.LABEL} » "
+                  f"inactive ou schéma cible {target_schema} différent du schéma de test du profil ({expected or '?'}).")
+            return 2
+        entry = db_restore.restore_client_config(client, source_schema, target_schema, log, busy,
+                                                 allowed_pool=expected,
+                                                 reference_dir=cucumber_copied_config.reference_dir(client))
+        if entry["ok"] and entry.get("reference"):
+            codes = {}
+            try:
+                codes = copied_reference_codes(target_schema)
+            except Exception as e:  # noqa: BLE001 - codes non lus : la référence reste utilisable
+                print(f"[CONFIG CLIENT] ⚠️ Codes de référence non lus dans la copie : {str(e)[:200]}")
+            reference = cucumber_copied_config.record_reference(client, cucumber_copied_config.new_reference_entry(
+                entry["source"], target_schema, cucumber_copied_config.app_version(profile), entry["reference"],
+                codes, entry.get("sauvegarde", "")))
+            print(f"[CONFIG CLIENT] Copie de référence : {reference['dump']} (version "
+                  f"{reference['version'] or 'non déterminée'}) ; "
+                  + ", ".join(f"{k} {v.get('total', 0)}" for k, v in codes.items()) + ".")
+    else:
+        entry = (db_restore.restore_backup(client, backup, target_schema, log, busy) if backup else
+                 db_restore.restore_client_config(client, source_schema, target_schema, log, busy))
     print(f"[CONFIG CLIENT] {'✅' if entry['ok'] else '❌'} {entry['message']}")
     if entry.get("sauvegarde"):
         print(f"[CONFIG CLIENT] Sauvegarde du schéma d'avant : {entry['sauvegarde']}")
@@ -1382,6 +1419,7 @@ def main():
     parser.add_argument("--source-schema", default="", help="restore-config : schéma de la config client (base client)")
     parser.add_argument("--target-schema", default="", help="restore-config : schéma des tests Cucumber à remplacer")
     parser.add_argument("--backup", default="", help="restore-config : sauvegarde à remettre en place (retour arrière)")
+    parser.add_argument("--copied-reference", action="store_true", help="restore-config : configuration copiée — copie dans le schéma de test des runs du profil puis instantané de référence")
     parser.add_argument("--question", default="", help="ask : question posée à l'assistant (onglet Assistant)")
     parser.add_argument("--answer-file", default="", help="ask : fichier où écrire la réponse")
     parser.add_argument("--no-init", action="store_true", help="generate-cucumber-client : aucune init lancée avant de juger les lots (données du client déjà présentes dans l'environnement des runs Jenkins)")
@@ -1449,7 +1487,7 @@ def main():
         sys.exit(run_assistant(args.question, args.answer_file))
     if args.step == "restore-config":
         sys.exit(run_restore_config(args.client_name.strip().lower(), args.source_schema.strip(),
-                                    args.target_schema.strip(), args.backup.strip()))
+                                    args.target_schema.strip(), args.backup.strip(), args.copied_reference))
     is_postmerge = args.step == "generate-cucumber-postmerge"
     if is_postmerge:
         if not (args.repo_slug and args.merge_commit):
@@ -3173,7 +3211,7 @@ def _run_cucumber_init(args, local_client_repo: str, local_cucumber_std_repo: st
         return 2
     subprocess.run(["git", "-C", cucumber_repo_dir, "fetch", "origin", "--prune"], capture_output=True)
     profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
-    if not cucumber_init.clear_name(profile):
+    if not cucumber_init.clear_name(profile) and not cucumber_copied_config.active(profile):
         # Clear propre au client introuvable dans son application : question posée, jamais la valeur d'un autre
         question = (f"Quel est le nom du clear de {client} ? Aucun clear dans le code ou la configuration de son "
                     f"application ; à renseigner dans le profil client (« clear de l'environnement »), puis relancer.")
@@ -5387,6 +5425,32 @@ def _std_init_usable(texts: dict, decision: dict, profile: dict, excluded: set, 
     return ""
 
 
+def copied_init_plan(client: str, worktree: str, plan: dict) -> dict:
+    """
+    Plan de l'étape 4 en configuration copiée : chaque feature d'init (copie du Standard, init existante,
+    compléments) réduite aux steps sans effet destructeur (cucumber_copied_config.copied_feature) ; aucun fichier de
+    données copié, aucune init du Standard lancée telle quelle (elle purge).
+    """
+    changes = {}
+    for rel, text in {**plan.get("present", {}), **plan.get("complements", {}), **plan.get("changes", {})}.items():
+        if not rel.endswith(".feature"):
+            changes[rel] = text
+            continue
+        reduced, removed = cucumber_copied_config.copied_feature(text, client)
+        if removed and _read_text(os.path.join(worktree, *rel.split("/"))) != reduced:
+            changes[rel] = reduced
+            plan.setdefault("reasons", []).append(f"{rel.rsplit('/', 1)[-1]} : {removed} step(s) commenté(s) "
+                                                  f"(configuration copiée : aucune purge ni initialisation)")
+        elif rel in plan.get("changes", {}):
+            changes[rel] = reduced
+    plan["changes"] = changes
+    plan["binaries"] = {}
+    plan["standard"] = {}
+    plan.setdefault("remarks", []).append("configuration copiée : désactivations de jobs et contrôles en lecture "
+                                          "seule seulement ; codes de référence lus dans la copie")
+    return plan
+
+
 def _simple_init_plan(client: str, worktree: str, cucumber_std_dir: str, version: str, tested: list,
                       excluded: set, profile: dict, decision: dict, force_copy=(), version_ref: str = "",
                       std_files=None, copy_files=()) -> dict:
@@ -5840,7 +5904,21 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         detail["fichiers_copies"] = sorted(copy_files)
     if (last.get("detail") or {}).get("echec_fichiers_standard"):
         detail["echec_fichiers_standard"] = last["detail"]["echec_fichiers_standard"]
-    decision = h["clear"]() if "clear" in h else simple_clear_decision(client_root, std_root, version, tested)
+    copied = cucumber_copied_config.active(profile)
+    if copied:
+        # Configuration copiée : aucune purge ni clear ; la copie de référence doit être valide avant tout run
+        problem = cucumber_copied_config.reference_problem(profile)
+        if problem:
+            simple_record(client, "init", "echec", f"Configuration copiée : {problem}.", detail)
+            return 1
+        decision = {"mode": "copie", "routes": [], "motif": "configuration copiée du client : aucun clear",
+                    "preuves": [f"copie de référence du "
+                                f"{cucumber_copied_config.reference(profile).get('date', '?')[:16].replace('T', ' ')}"
+                                f" dans {cucumber_copied_config.test_schema(profile)}"]}
+        force_copy = set(tested)
+        copy_files = set()
+    else:
+        decision = h["clear"]() if "clear" in h else simple_clear_decision(client_root, std_root, version, tested)
     if decision.get("erreur"):
         simple_record(client, "init", "echec", f"Clear non déterminé : {decision['erreur']}. Rien n'est généré sans "
                                                f"le clear prouvé du client.",
@@ -5879,8 +5957,9 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
         return step_cache
 
     def make_plan() -> dict:
-        return _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
-                                 force_copy, f"origin/{branch}", std_files, copy_files)
+        built = _simple_init_plan(client, worktree, cucumber_std_dir, version, tested, excluded, profile, decision,
+                                  force_copy, f"origin/{branch}", None if copied else std_files, copy_files)
+        return copied_init_plan(client, worktree, built) if copied else built
     plan = make_plan()
     detail.update(bibliotheque=plan["library"], remarques=plan["remarks"][:30], ecarts_standard=plan["gaps"][:10])
 

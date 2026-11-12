@@ -413,13 +413,40 @@ def _acquire_local_lock(timeout_s: int, poll_s: int = 15) -> bool:
         time.sleep(poll_s)
 
 
-def run_exclusive(job_name: str, trigger, timeout_s: int) -> dict:
+def wait_build_started(queue_url: str, timeout_s: int, poll_s: int = 5, job_name: str = "") -> str:
+    """URL du build issu de l'élément de file `queue_url` dès qu'il démarre ('' : annulé ou pas démarré à temps)."""
+    _, auth = _jenkins()
+    deadline, queue_url = time.time() + timeout_s, same_base(queue_url)
+    while time.time() < deadline:
+        try:
+            response = requests.get(f"{queue_url}/api/json", auth=auth, timeout=20)
+            if response.status_code == 404:
+                found = build_from_queue(job_name, queue_url)
+                if found:
+                    return found
+            else:
+                item = response.json()
+                if item.get("cancelled"):
+                    return ""
+                url = (item.get("executable") or {}).get("url")
+                if url:
+                    return same_base(url)
+        except (requests.RequestException, ValueError) as e:
+            print(f"[JENKINS] Suivi du démarrage du build momentanément impossible : {e}")
+        time.sleep(poll_s)
+    return ""
+
+
+def run_exclusive(job_name: str, trigger, timeout_s: int, guard=None) -> dict:
     """
     Lance un build par `trigger()` (renvoie l'URL de file d'attente, '' en cas d'échec) et attend son résultat en
     garantissant qu'un seul build Cucumber tourne à la fois : verrou local entre traitements de l'agent, attente
     qu'aucun build des exclusive_jobs ne tourne ni n'attende, puis lancement ; un build qui dépasse le délai est arrêté
     pour ne pas chevaucher le suivant. Renvoie le résultat de wait_build_result ({"url", "result", "artifacts"}),
-    result INDISPONIBLE et "message" si rien n'a été lancé.
+    result INDISPONIBLE et "message" si rien n'a été lancé. `guard` (configuration copiée,
+    cucumber_copied_config.RunGuard) : `prepare()` juste avant le lancement, Jenkins libre (restauration de la copie
+    de référence ; un message arrête tout) ; `check(build_url)` dès le démarrage du build (schéma du run) : un
+    message signifie build arrêté, résultat ABORTED avec "message" et "schema_errone".
     """
     if not _acquire_local_lock(timeout_s):
         return {"url": "", "result": "INDISPONIBLE", "artifacts": [], "message": "verrou Jenkins local non obtenu"}
@@ -427,9 +454,19 @@ def run_exclusive(job_name: str, trigger, timeout_s: int) -> dict:
         if not wait_until_idle(exclusive_jobs(job_name), timeout_s):
             return {"url": "", "result": "INDISPONIBLE", "artifacts": [],
                     "message": "un autre build Cucumber occupe Jenkins au-delà du délai"}
+        if guard is not None:
+            refused = guard.prepare()
+            if refused:
+                return {"url": "", "result": "INDISPONIBLE", "artifacts": [], "message": refused}
         queue = trigger()
         if not queue:
             return {"url": "", "result": "INDISPONIBLE", "artifacts": [], "message": "lancement refusé par Jenkins"}
+        if guard is not None:
+            started = wait_build_started(queue, timeout_s, job_name=job_name)
+            wrong = guard.check(started) if started else ""
+            if wrong:
+                wait_until_idle([job_name], 600)
+                return {"url": started, "result": "ABORTED", "artifacts": [], "message": wrong, "schema_errone": True}
         build = wait_build_result(queue, timeout_s, job_name=job_name)
         if build["result"] == "TIMEOUT" and build["url"]:
             stop_build(build["url"])

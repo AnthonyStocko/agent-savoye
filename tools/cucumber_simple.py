@@ -4,7 +4,9 @@ résultat en une ou deux phrases (0 token ici : ce module ne fait que calculer l
 
 États : « a_faire », « en_cours », « ok », « echec », et « bloquee » quand l'étape précédente (obligatoire) n'est
 pas OK. L'étape 3 (base de données) est OPTIONNELLE : elle recopie dans le schéma des essais locaux, jamais dans le schéma des
-runs Jenkins (cucumber_customer_<slot>) ; elle ne bloque jamais l'étape 4.
+runs Jenkins (cucumber_customer_<slot>) ; elle ne bloque jamais l'étape 4. Exception : option « configuration copiée,
+sans purge » du profil client (cucumber_copied_config) — l'étape 3 copie la base du client dans le schéma de test des
+runs et enregistre la copie de référence ; elle devient OBLIGATOIRE et l'étape 4 reste bloquée sans référence valide.
 
 Les résultats des étapes sont gardés dans etat.json (« simple » : {depot, base, init, tests}) par
 record_step ; aucune valeur propre à un client n'est écrite en dur.
@@ -25,6 +27,8 @@ INIT_OFF_NOTE = ("Facultative : option « Initialisation » décochée (données
 def init_enabled(records: dict) -> bool:
     """Option « Initialisation » de l'onglet (etat.json simple.options.init) : cochée par défaut (projet neuf)."""
     return ((records or {}).get("options") or {}).get("init", True) is not False
+COPIED_NOTE = ("Obligatoire (configuration copiée) : copie de la base du client dans le schéma de test des runs, puis "
+               "copie de référence restaurée avant chaque run de vérification.")
 OPTIONAL_NOTE = ("Optionnelle : recopie dans un schéma dédié aux essais locaux (cucumber_local_<client>), jamais "
                  "dans un schéma des runs Jenkins (cucumber_customer_<n>) ; l'agent ne le lit que si vous le "
                  "choisissez. L'étape ne bloque pas l'initialisation.")
@@ -86,14 +90,18 @@ def project_step(deduction: dict, ready: bool, missing: list = ()) -> dict:
     return {"etat": "a_faire", "resultat": "Choisissez la version du client."}
 
 
-def states(project: dict, records: dict) -> list:
+def states(project: dict, records: dict, copied: dict = None) -> list:
     """
     États des 5 étapes : [{numero, cle, titre, etat, resultat, optionnelle, detail}]. `project` : état de
     l'étape 1 (project_step) ; `records` : etat.json « simple ». Une étape obligatoire non OK bloque les étapes
-    obligatoires suivantes ; l'étape optionnelle est bloquée seulement si l'étape 1 ou 2 n'est pas OK.
+    obligatoires suivantes ; l'étape optionnelle est bloquée seulement si l'étape 1 ou 2 n'est pas OK. `copied` :
+    {"actif", "probleme"} du mode configuration copiée — actif, l'étape 3 est obligatoire et n'est OK qu'avec une
+    copie de référence valide (sinon « à faire », avec la raison).
     """
     from tools.cucumber_repo_setup import branch_version_line, version_line as line_of
-    optional = OPTIONAL | ({"init"} if not init_enabled(records) else set())
+    copied_mode = bool((copied or {}).get("actif"))
+    optional = (OPTIONAL - ({"base"} if copied_mode else set())) | (
+        {"init"} if not init_enabled(records) else set())
     out, previous_ok = [], True
     wanted = line_of((project or {}).get("version", ""))
     depot_branch = (((records or {}).get("depot") or {}).get("detail") or {}).get("branche", "")
@@ -112,10 +120,14 @@ def states(project: dict, records: dict) -> list:
         if stale and record.get("etat"):
             status, result = "a_faire", f"Version changée ({stale}) : relancez l'étape."
             record = {**record, "detail": {k: v for k, v in (record.get("detail") or {}).items() if k != "plan"}}
+        if key == "base" and copied_mode and (copied or {}).get("probleme") and status != "en_cours":
+            status, result = "a_faire", f"Configuration copiée : {copied['probleme']}."
         if not previous_ok:
             status = "bloquee"
             result = "Se débloque quand l'étape précédente est OK."
-        if key in OPTIONAL and not result:
+        if key == "base" and copied_mode and not result:
+            result = COPIED_NOTE
+        elif key in optional and key == "base" and not result:
             result = OPTIONAL_NOTE
         if key == "init" and key in optional and status != "bloquee":
             result = INIT_OFF_NOTE + (f" Dernier résultat : {result}" if result else "")

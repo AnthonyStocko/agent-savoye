@@ -517,6 +517,13 @@ def lot_outcome(lot: dict, results: list, files: list, committed: bool, total: i
     if init:
         from tools.cucumber_verify import init_line
         timing = f" — {init_line(init)}" + ("" if init.get("ok") else " (lot non jugé : environnement non initialisé)")
+    # Configuration copiée : mode, date de la référence, schéma vérifié, restauration faite (dernier run du lot)
+    copied = next((b["config_copiee"] for b in reversed((lot.get("execution") or {}).get("builds") or [])
+                   if isinstance(b, dict) and b.get("config_copiee")), None)
+    if copied:
+        from tools.cucumber_copied_config import bilan_line
+        out["config_copiee"] = copied
+        timing += f" — {bilan_line(copied)}"
     out["ligne"] = f"{icon} " + ", ".join(parts) + f" — {where}{timing}"
     return out
 

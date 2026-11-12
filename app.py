@@ -28,7 +28,7 @@ from tools.jira_tools import (
 )
 from tools.db_tools import DB_TYPES, test_connection
 from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant, db_restore, skills
-from tools import mcp_servers, ui_timer, cucumber_env_diagnosis
+from tools import mcp_servers, ui_timer, cucumber_env_diagnosis, cucumber_copied_config
 from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
@@ -2066,7 +2066,8 @@ def render_cucumber_profile(ctx: dict, profile_doc: dict, detection: dict, statu
             return
         depot = profile_doc.get("depot") or {}
         editable = [k for k in cucumber_profile.FIELDS if k not in depot
-                    and k not in ("workarounds", "reponses", "modules", "modules_exclus")]
+                    and k not in ("workarounds", "reponses", "modules", "modules_exclus")
+                    and k not in cucumber_profile.COPIED_CONFIG_FIELDS]
         extra = st.multiselect("Autres champs faux à corriger", [k for k in editable if k not in indicator["manquants"]],
                                format_func=cucumber_profile.LABELS.get, key=f"cucumber_profile_extra_{client}")
         fields = [k for k in editable if k in indicator["manquants"] or k in extra]
@@ -2197,6 +2198,29 @@ def render_simple_project(ctx: dict, step: dict) -> None:
     if ctx["ready"]:
         render_client_version(ctx, "cs_")
         render_tested_modules(ctx, "cs_", simple=True)
+        render_copied_config_option(ctx)
+
+
+def render_copied_config_option(ctx: dict) -> None:
+    """Option du profil client « Configuration copiée, sans purge » (désactivée par défaut) et son schéma de test."""
+    client = ctx["client"]
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+    enabled = cucumber_copied_config.active(profile)
+    wanted = st.checkbox(cucumber_copied_config.LABEL, value=enabled, key=f"cs_copied_{client}",
+                         help="Les tests tournent dans la configuration réelle du client, copiée de sa base dans le "
+                              "schéma de test des runs Jenkins (étape 3) : aucun clear, aucune purge, aucune "
+                              "initialisation globale.")
+    if wanted:
+        st.warning(cucumber_copied_config.WARNING, icon=":material/warning:")
+    schema = st.text_input("Schéma de test des runs (configuration copiée)",
+                           value=profile.get(cucumber_copied_config.SCHEMA_FIELD) or "", key=f"cs_copied_schema_{client}",
+                           disabled=not wanted,
+                           placeholder=os.getenv("CUCUMBER_DB_SCHEMA", "") or "ex. cucumber_customer_1",
+                           help="Schéma des runs Jenkins où la configuration est copiée puis restaurée avant chaque "
+                                "run ; vide = CUCUMBER_DB_SCHEMA. Un run qui obtient un autre slot est arrêté.")
+    if wanted != enabled or (wanted and schema.strip() != (profile.get(cucumber_copied_config.SCHEMA_FIELD) or "")):
+        cucumber_copied_config.save_option(client, wanted, schema if wanted else "")
+        st.rerun()
 
 
 def render_simple_depot(ctx: dict, step: dict) -> None:
@@ -2217,7 +2241,11 @@ def render_simple_depot(ctx: dict, step: dict) -> None:
 
 def render_simple_base(ctx: dict, step: dict) -> None:
     """Étape 3 (optionnelle) : recopie de la configuration du client dans le schéma des essais locaux (jamais un
-    schéma du pool des runs Jenkins)."""
+    schéma du pool des runs Jenkins). En configuration copiée : copie de référence dans le schéma de test des runs."""
+    profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(ctx["client"]))
+    if cucumber_copied_config.active(profile):
+        render_copied_reference(ctx, step, profile)
+        return
     target = cucumber_env_diagnosis.local_schema(ctx["client"])
     connection = db_restore.connection("CUCUMBER_DB_", "DB_")
     source = (st.session_state.get("cs_source_schema") or "").strip()
@@ -2243,6 +2271,41 @@ def render_simple_base(ctx: dict, step: dict) -> None:
         cucumber_tools.save_state(ctx["client"], state)
         st.rerun()
     render_backup_restore(ctx["client"], db_restore.load_history(ctx["client"]), "cs_restore")
+
+
+def render_copied_reference(ctx: dict, step: dict, profile: dict) -> None:
+    """Étape 3 en configuration copiée : base du client copiée dans le schéma de test des runs, puis référence."""
+    client = ctx["client"]
+    target = cucumber_copied_config.test_schema(profile)
+    connection = db_restore.connection("CUCUMBER_DB_", "DB_")
+    source = (st.session_state.get("cs_source_schema") or "").strip()
+    reference = cucumber_copied_config.reference(profile)
+    st.caption(f"Base modifiée : {connection['host']} / {connection['name'] or '?'} / schéma {target or '?'} (schéma "
+               f"de test des runs). Source : schéma {source or '?'} de la base client, en lecture seule. Le schéma est "
+               f"sauvegardé avant d'être remplacé ; un instantané « référence » est enregistré juste après la copie "
+               f"et restauré avant chaque run de vérification.")
+    if reference:
+        st.markdown(f"**Copie de référence** : {reference.get('date', '?')[:16].replace('T', ' ')} — source "
+                    f"{reference.get('source', '?')}, version {reference.get('version') or '?'}"
+                    + (f" — **invalidée** : {reference['invalide']}" if reference.get("invalide") else ""))
+    confirm = st.text_input("Pour confirmer, tapez le nom du schéma remplacé", key=f"cs_copied_confirm_{client}")
+    if st.button("Copier la configuration du client (référence des runs)", icon=":material/database:",
+                 type="primary", key=f"cs_copied_base_{client}",
+                 disabled=not (target and source and confirm.strip() == target) or step["etat"] == "bloquee"):
+        code = run_main_step([sys.executable, "main.py", "--step", "restore-config", "--client-name", client,
+                              "--source-schema", source, "--target-schema", target, "--copied-reference"])
+        entry = (db_restore.load_history(client) or [{}])[-1]
+        state = cucumber_tools.load_state(client)
+        cucumber_simple.record_step(
+            state, "base", "ok" if code == 0 else "echec",
+            (f"Configuration du client copiée dans {target} depuis {source}, copie de référence enregistrée ; "
+             f"sauvegarde : {os.path.basename(entry.get('sauvegarde') or '') or 'aucune'}. "
+             if code == 0 else "Copie en échec : ") + (entry.get("message") or interruption_cause(code)),
+            {"sauvegarde": entry.get("sauvegarde", ""), "message": entry.get("message", ""),
+             "reference": entry.get("reference", ""), "mode": cucumber_copied_config.MODE})
+        cucumber_tools.save_state(client, state)
+        st.rerun()
+    render_backup_restore(client, db_restore.load_history(client), "cs_restore")
 
 
 def render_simple_init(ctx: dict, step: dict) -> None:
@@ -2385,13 +2448,22 @@ def render_simple_cucumber() -> None:
             state.setdefault("simple", {}).setdefault("options", {})["init"] = wanted
             cucumber_tools.save_state(client, state)
             records = state["simple"]
-        if not cucumber_simple.init_enabled(records):
+        if not cucumber_simple.init_enabled(records) and not cucumber_copied_config.active(
+                cucumber_profile.effective_profile(cucumber_profile.load_profile(client))):
             # Environnement remonté à chaque run : les données lues en base ne sont pas garanties sans init
             warning = cucumber_simple.client_no_init_warning(client)
             if warning:
                 st.warning(warning, icon=":material/warning:")
     project = cucumber_simple.project_step(deduction, ctx["ready"], cucumber_simple.missing_prerequisites())
-    for step in cucumber_simple.states(project, records):
+    copied = {}
+    if client:
+        copied_profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+        if cucumber_copied_config.active(copied_profile):
+            # Changement de version de l'application : copie de référence invalidée, nouvelle copie demandée
+            cucumber_copied_config.invalidate_on_version_change(client, copied_profile)
+            copied_profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
+            copied = {"actif": True, "probleme": cucumber_copied_config.reference_problem(copied_profile)}
+    for step in cucumber_simple.states(project, records, copied):
         with st.container(border=True):
             st.markdown(f"{cucumber_simple.ICONS[step['etat']]} **{cucumber_simple.label(step, client)}**")
             if step["resultat"]:
