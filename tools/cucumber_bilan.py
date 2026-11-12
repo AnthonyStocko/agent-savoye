@@ -214,7 +214,8 @@ def build_bilan(client_name: str, analysis: dict, state: dict) -> dict:
              "livraisons": (state.get("livraisons") or [])[-3:],
              "bibliotheque": (state.get("bibliotheque") or [])[-2:],
              "ecritures": [e for e in cucumber_delivery.events(client_name, ("push", "promotion", "annulation",
-                                                                             "annulation_impossible", "refus"), 10)]}
+                                                                             "annulation_impossible", "refus",
+                                                                             "integration"), 10)]}
     bilan["prochaine_action"] = next_action(analysis, bilan)
     return bilan
 
@@ -234,7 +235,8 @@ def _defect_lines(defect: dict) -> list:
 
 
 EVENT_LABELS = {"push": "commit poussé sur", "promotion": "promotion vers", "annulation": "annulation (revert) sur",
-                "annulation_impossible": "annulation impossible sur", "refus": "écriture refusée"}
+                "annulation_impossible": "annulation impossible sur", "refus": "écriture refusée",
+                "integration": "commits humains intégrés depuis"}
 
 
 def delivery_markdown(deliveries: list) -> str:

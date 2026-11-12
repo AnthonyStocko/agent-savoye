@@ -339,8 +339,7 @@ def describe(client: str, step: str, message: str, version: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 def _git(worktree: str, *args, stdin: str = None) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", worktree, *args], capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", input=stdin)
+    return cucumber_tools._git(worktree, *args, stdin=stdin)   # commits signés de l'identité de l'agent
 
 
 def apply_patch(worktree: str, patch: str) -> str:

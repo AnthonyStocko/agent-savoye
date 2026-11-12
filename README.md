@@ -226,6 +226,10 @@ Désactivée par défaut, valable pour tous les clients (`tools/cucumber_copied_
 - **Changement de version de l'application** : référence invalidée, nouvelle copie demandée avant tout run.
 - **Bilan de chaque run** : mode, date de la référence, schéma vérifié, restauration faite.
 
+#### Commits de l'agent et commits humains sur la branche de vérification
+
+Les commits de l'agent sont signés d'une identité dédiée (`CUCUMBER_AGENT_GIT_NAME` / `CUCUMBER_AGENT_GIT_EMAIL`, par défaut « Agent Cucumber »), posée par `cucumber_tools._git` sur toute commande qui crée un commit ; les commits antérieurs, signés comme l'humain, sont reconnus à leur message. Avant chaque push (`cucumber_checks.integrate_remote`, jamais de push forcé) : branche distante portant seulement des runs précédents de l'agent → merge « ours », le run courant fait foi ; commits d'un humain → intégrés par un merge, conflits résolus fichier par fichier : init et configuration modifiées par l'humain (`01-Contexte/`, classes `Init*.java`, `pom.xml`, `.properties`, `.yml`) → version humaine ; fichiers de test de l'agent et fichiers que seul l'agent a modifiés → version de l'agent ; tout autre passage modifié des deux côtés → merge annulé, diff écrit dans `.tmp/cucumber/<client>/integration_conflit.diff`, arrêt. L'intégration (commits humains, fichiers gardés de chaque côté) figure au bilan, section « Livraison autonome ».
+
 ### Onglet Cucumber simplifié (parcours normal)
 
 L'onglet se lit sans explication ; tout ce qui est technique est dans le **Mode expert**, replié par défaut.

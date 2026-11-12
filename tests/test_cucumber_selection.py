@@ -138,10 +138,11 @@ def test_push_for_verification_commits_and_pushes_without_force(tmp_path, repo):
     # Branche distante divergente en conflit : jamais de push forcé, merge annulé, la vérification s'arrête
     other = str(tmp_path / "autre")
     git(str(tmp_path), "clone", "-q", "-b", "verif", remote, other)
-    write(os.path.join(other, REL), FEATURE + "  Scenario: Autre\n    Given y\n")
-    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-am", "autre")
+    write(os.path.join(other, "COUVERTURE.md"), "humain\n")  # hors init, configuration et tests : arrêt
+    git(other, "add", "-A")
+    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-m", "autre")
     git(other, "push", "-q", "origin", "verif")
-    write(os.path.join(repo, REL), FEATURE)
+    write(os.path.join(repo, "COUVERTURE.md"), "agent\n")
     error, committed = cc.push_for_verification(repo, "verif", "lot 2 (vérification)")
     assert committed and "push sur verif refusé" in error and "conflit" in error
 
@@ -163,10 +164,11 @@ def test_verify_execution_lot_pushes_then_runs_on_the_branch(tmp_path, repo, mai
     # Push refusé (branche distante divergente, en conflit) : aucune exécution, scénarios non vérifiés
     other = str(tmp_path / "autre")
     git(str(tmp_path), "clone", "-q", "-b", "verif", remote, other)
-    write(os.path.join(other, REL), FEATURE + "  Scenario: Autre\n    Given y\n")
-    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-am", "autre")
+    write(os.path.join(other, "COUVERTURE.md"), "humain\n")  # hors init, configuration et tests : arrêt
+    git(other, "add", "-A")
+    git(other, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-m", "autre")
     git(other, "push", "-q", "origin", "verif")
-    write(os.path.join(repo, REL), FEATURE)
+    write(os.path.join(repo, "COUVERTURE.md"), "agent\n")
     called.clear()
     main_module.verify_execution_lot(lot, [], "1/1", repo, "HEAD", [REL], [], "jenkins", "job", CLIENT, "", "", "",
                                      {}, "sonnet", "K", "/run", lambda u: None, context={"conventions": conventions})

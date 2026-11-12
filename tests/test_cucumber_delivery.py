@@ -226,7 +226,7 @@ def test_push_integrates_a_remote_branch_that_moved_ahead(setup, tmp_path):
     assert _remote_head(origin, "cucumber-agent") == git(worktree, "rev-parse", "HEAD")
     assert os.path.exists(os.path.join(worktree, "src", "test", "resources", "cucumber", "files", "clientx", "WMS",
                                        "init.csv"))
-    # Conflit : merge annulé, rien n'est écrasé sur origin
+    # Conflit sur un fichier de test de l'agent : sa version est gardée, le commit humain reste dans l'historique
     git(other, "fetch", "-q", "origin")
     git(other, "reset", "-q", "--hard", "origin/cucumber-agent")
     _change(other, FEATURE, TEXT + "\n  Scenario: Manuel\n    Given m\n", "manuel")
@@ -234,7 +234,10 @@ def test_push_integrates_a_remote_branch_that_moved_ahead(setup, tmp_path):
     remote = _remote_head(origin, "cucumber-agent")
     _change(worktree, FEATURE, TEXT + "\n  Scenario: Agent\n    Given a\n")
     error, _ = cc.push_for_verification(worktree, "cucumber-agent", "x")
-    assert "conflit" in error and "a.feature" in error and _remote_head(origin, "cucumber-agent") == remote
+    assert error == "" and _remote_head(origin, "cucumber-agent") == git(worktree, "rev-parse", "HEAD")
+    git(worktree, "merge-base", "--is-ancestor", remote, "HEAD")
+    with open(os.path.join(worktree, FEATURE), encoding="utf-8") as f:
+        assert "Scenario: Agent" in f.read()
     assert git(worktree, "status", "--porcelain") == ""
 
 

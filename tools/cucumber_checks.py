@@ -657,41 +657,130 @@ def drop_case_duplicates(worktree: str) -> list:
 _NOT_FAST_FORWARD = re.compile(r"non-fast-forward|fetch first|rejected|fast-forwards|updates were rejected", re.I)
 
 
-# Commits écrits par l'agent (commit_lot, vérifications, init, compléments d'init, intégrations précédentes)
+# Commits écrits par l'agent avant son identité dédiée (même auteur que l'humain) : reconnus à leur message
 _AGENT_COMMIT = re.compile(r"Cucumber coverage of |Cucumber verification \(|Cucumber \S+ : init|Cucumber initialisation complements of "
                            r"|Intégration de origin/")
+
+
+def is_agent_commit(author: str, subject: str) -> bool:
+    """Commit de l'agent : signé de son identité dédiée, ou (commits antérieurs à celle-ci) message de l'agent."""
+    from tools.cucumber_tools import agent_identity
+    return author == agent_identity()[0] or bool(_AGENT_COMMIT.match(subject or ""))
+
+
+def human_commits(worktree: str, revisions: str) -> list:
+    """Commits de `revisions` écrits par un humain : [{"sha", "auteur", "sujet"}]."""
+    out = []
+    for line in _git(worktree, "log", "--format=%H%x1f%an%x1f%s", revisions).stdout.splitlines():
+        sha, author, subject = (line.split("\x1f") + ["", ""])[:3]
+        if sha and not is_agent_commit(author, subject):
+            out.append({"sha": sha, "auteur": author, "sujet": subject})
+    return out
+
+
+def is_init_or_config(path: str) -> bool:
+    """Fichier d'init ou de configuration : priorité à la modification humaine en cas de conflit."""
+    name = os.path.basename(path)
+    return ("/01-Contexte/" in "/" + path or (name.startswith("Init") and name.endswith(".java"))
+            or name == "pom.xml" or name.endswith((".properties", ".yml", ".yaml")))
+
+
+def is_test_file(path: str) -> bool:
+    """Fichier de test de l'agent (features, steps, données de test) : sa version est gardée en cas de conflit."""
+    return path.startswith("src/test/") and not is_init_or_config(path)
+
+
+def _changed_by(worktree: str, commits: list) -> set:
+    """Fichiers modifiés par ces commits (premier parent pour une fusion)."""
+    paths = set()
+    for commit in commits:
+        diff = _git(worktree, "diff", "--name-only", f"{commit['sha']}^1", commit["sha"])
+        paths |= {p for p in diff.stdout.splitlines() if p}
+    return paths
+
+
+def _take_side(worktree: str, path: str, side: str) -> bool:
+    """Version `side` (--ours : l'agent, --theirs : la branche distante) d'un fichier en conflit, absente = supprimée."""
+    if _git(worktree, "checkout", side, "--", path).returncode != 0:
+        return _git(worktree, "rm", "-q", "--", path).returncode == 0
+    return _git(worktree, "add", "--", path).returncode == 0
+
+
+def _conflict_diff(worktree: str, client: str, branch: str, paths: list) -> str:
+    """Diff des passages modifiés des deux côtés, écrit dans l'espace du client : chemin du fichier ('' sinon)."""
+    diff = _git(worktree, "diff", "--", *paths).stdout
+    if not client or not diff:
+        return ""
+    target = os.path.join(cache_dir(client), "integration_conflit.diff")
+    _write_text(target, f"# Conflit en intégrant origin/{branch} : passages modifiés des deux côtés\n{diff}")
+    return target
 
 
 def integrate_remote(worktree: str, branch: str) -> str:
     """
     Intègre origin/`branch` dans HEAD par un merge (sans forcer ni réécrire). Renvoie '' si HEAD contient désormais la
     branche distante, sinon la raison (fetch impossible, conflit : merge annulé, fichiers en conflit cités).
+    Branche distante portant seulement des runs précédents de l'agent : merge « ours », le run courant fait foi.
+    Commits d'un humain : intégrés, conflits résolus fichier par fichier — init et configuration modifiées par
+    l'humain : version distante (humaine) ; fichiers de test de l'agent et fichiers que seul l'agent a modifiés :
+    version de l'agent ; tout autre passage modifié des deux côtés : merge annulé, diff écrit, arrêt. L'intégration
+    est tracée (journal des écritures, bilan).
     """
+    from tools import cucumber_delivery
     fetch = _git(worktree, "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
     if fetch.returncode != 0:
         return "fetch impossible : " + " ".join((fetch.stderr.strip().splitlines() or ["?"])[-1].split())[:160]
     remote = f"refs/remotes/origin/{branch}"
-    subjects = [line for line in _git(worktree, "log", "--format=%s", f"HEAD..{remote}").stdout.splitlines() if line]
-    if subjects and all(_AGENT_COMMIT.match(subject) for subject in subjects):
+    incoming = [line for line in _git(worktree, "log", "--format=%H", f"HEAD..{remote}").stdout.splitlines() if line]
+    humans = human_commits(worktree, f"HEAD..{remote}")
+    if incoming and not humans:
         # La branche distante ne porte que des runs précédents de l'agent : l'espace de l'agent fait foi (nouvelle
         # génération), merge « ours » — historique conservé, rien n'est forcé, anciens fichiers non réintroduits
         merge = _git(worktree, "merge", "-s", "ours", "-m", f"Intégration de origin/{branch} : le run courant de "
                      f"l'agent remplace ses runs précédents", remote)
         if merge.returncode == 0:
-            print(f"[CUCUMBER] 🔀 {branch} ne portait que {len(subjects)} commit(s) de runs précédents de l'agent : "
+            print(f"[CUCUMBER] 🔀 {branch} ne portait que {len(incoming)} commit(s) de runs précédents de l'agent : "
                   f"remplacés par le run courant (merge ours, sans force), push relancé.")
             return ""
-    merge = _git(worktree, "merge", "--no-edit", "-m", f"Intégration de origin/{branch} avant la vérification",
-                 remote)
-    if merge.returncode == 0:
-        print(f"[CUCUMBER] 🔀 {branch} avait avancé sur origin : branche distante intégrée (merge), push relancé.")
-        return ""
+    client = cucumber_delivery.client_of(worktree)
+    human_paths = _changed_by(worktree, humans)
+    merge = _git(worktree, "merge", "--no-edit", "-m", f"Intégration de origin/{branch} avant la vérification"
+                 + (" (commits humains prioritaires sur l'init et la configuration)" if humans else ""), remote)
     conflicts = [p for p in _git(worktree, "diff", "--name-only", "--diff-filter=U").stdout.splitlines() if p]
-    _git(worktree, "merge", "--abort")
-    if conflicts:
-        return (f"conflit en intégrant origin/{branch} ({', '.join(conflicts[:5])}) : merge annulé — résous le "
-                f"conflit sur la branche, puis relance")
-    return "merge impossible : " + " ".join((merge.stderr.strip().splitlines() or ["?"])[-1].split())[:160]
+    if merge.returncode != 0 and not conflicts:
+        _git(worktree, "merge", "--abort")
+        return "merge impossible : " + " ".join((merge.stderr.strip().splitlines() or ["?"])[-1].split())[:160]
+    kept_remote, kept_agent, unresolved = [], [], []
+    for path in conflicts:
+        if path in human_paths and is_init_or_config(path):
+            side, kept = "--theirs", kept_remote
+        elif path not in human_paths or is_test_file(path):
+            side, kept = "--ours", kept_agent
+        else:
+            unresolved.append(path)
+            continue
+        (kept if _take_side(worktree, path, side) else unresolved).append(path)
+    if unresolved:
+        diff_file = _conflict_diff(worktree, client, branch, unresolved)
+        _git(worktree, "merge", "--abort")
+        return (f"conflit en intégrant origin/{branch} ({', '.join(unresolved[:5])}) : passage modifié des deux "
+                f"côtés hors init, configuration et fichiers de test — merge annulé"
+                + (f", diff dans {diff_file}" if diff_file else "") + " ; résous le conflit sur la branche, puis relance")
+    if conflicts and _git(worktree, "commit", "--no-edit", "-q").returncode != 0:
+        _git(worktree, "merge", "--abort")
+        return f"conflit en intégrant origin/{branch} ({', '.join(conflicts[:5])}) : commit du merge impossible"
+    if humans:
+        summary = (f"{len(humans)} commit(s) humain(s) intégré(s) ({'; '.join(c['sujet'][:60] for c in humans[:3])})"
+                   + (f" ; version humaine gardée : {', '.join(kept_remote[:5])}" if kept_remote else "")
+                   + (f" ; version de l'agent gardée : {', '.join(kept_agent[:5])}" if kept_agent else ""))
+        cucumber_delivery.log_event(client, "integration", branche=branch, motif=summary,
+                                    commit=_git(worktree, "rev-parse", "HEAD").stdout.strip(),
+                                    humains=[c["sha"] for c in humans], version_humaine=kept_remote,
+                                    version_agent=kept_agent)
+        print(f"[CUCUMBER] 🔀 {branch} : {summary}. Push relancé.")
+    else:
+        print(f"[CUCUMBER] 🔀 {branch} avait avancé sur origin : branche distante intégrée (merge), push relancé.")
+    return ""
 
 
 def init_paths_changed(worktree: str, ref: str, init_features: list) -> list:
