@@ -244,6 +244,9 @@ def test_fix_plan(main_module, monkeypatch):
 
 def test_fix_loop_goes_on_while_errors_change(main_module, monkeypatch, tmp_path):
     monkeypatch.delenv("CLAUDE_MODEL_CUCUMBER_FIX", raising=False)
+    # Tours par défaut, jamais ceux du .env du poste
+    monkeypatch.delenv("CUCUMBER_FIX_MAX_TURNS", raising=False)
+    monkeypatch.delenv("CUCUMBER_FIX_LOT_MAX_TURNS", raising=False)
     monkeypatch.setenv("CUCUMBER_FIX_ATTEMPTS", "1")
     monkeypatch.setenv("CUCUMBER_FIX_MAX_ATTEMPTS", "6")
     checks = iter([["e1", "e2", "e3"], ["e2", "e3"], ["e3"], ["e3"], []])

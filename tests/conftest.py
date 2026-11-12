@@ -77,17 +77,20 @@ def _isolated_knowledge(tmp_path, monkeypatch):
     import dotenv
     from tools import knowledge_tools
     monkeypatch.setenv("AGENT_KNOWLEDGE_DIR", str(tmp_path / "connaissances_partagees"))
+    # Groundcover (MCP) jamais actif par le .env du poste : les tests qui en ont besoin l'activent eux-mêmes
+    monkeypatch.setenv("GROUNDCOVER_MCP_ENABLED", "0")
     monkeypatch.setattr(knowledge_tools, "OUTBOX_DIR", str(tmp_path / "knowledge_outbox"))
     monkeypatch.setattr(knowledge_tools, "INDEX_CACHE", str(tmp_path / "knowledge_index.json"))
     original = dotenv.load_dotenv
 
     def guarded(*args, **kwargs):
-        kept = os.environ.get("AGENT_KNOWLEDGE_DIR")
+        kept = {name: os.environ.get(name) for name in ("AGENT_KNOWLEDGE_DIR", "GROUNDCOVER_MCP_ENABLED")}
         try:
             return original(*args, **kwargs)
         finally:
-            if kept is None:
-                os.environ.pop("AGENT_KNOWLEDGE_DIR", None)
-            else:
-                os.environ["AGENT_KNOWLEDGE_DIR"] = kept
+            for name, value in kept.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
     monkeypatch.setattr(dotenv, "load_dotenv", guarded)
