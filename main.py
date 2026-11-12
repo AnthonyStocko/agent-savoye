@@ -2050,6 +2050,11 @@ def _add_usage(first: dict, second: dict) -> dict:
     return out
 
 
+def mcp_kwargs(mcp_step: str) -> dict:
+    """{"mcp_step": …} pour une étape de diagnostic, {} sinon (appels hors diagnostic inchangés)."""
+    return {"mcp_step": mcp_step} if mcp_step else {}
+
+
 def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns: str, run_dir: str,
                         effort: str, system_file: str = "", db_log: list = None, db_step: str = "",
                         resume: str = "", mcp_step: str = "") -> tuple:
@@ -2059,14 +2064,15 @@ def run_cucumber_claude(prompt: str, model: str, allowed_tools: list, max_turns:
     tout le travail de l'appel. `mcp_step` : étape de diagnostic (Groundcover, voir run_claude).
     """
     returncode, output, usage, limit_hit = _run_cucumber_claude_once(
-        prompt, model, allowed_tools, max_turns, run_dir, effort, system_file, db_log, db_step, resume, mcp_step)
+        prompt, model, allowed_tools, max_turns, run_dir, effort, system_file, db_log, db_step, resume,
+        **mcp_kwargs(mcp_step))
     finish = _env_int("CUCUMBER_FINISH_TURNS", 12)
     if finish > 0 and not limit_hit and (usage or {}).get("fin") == "error_max_turns" and usage.get("session_id"):
         print(f"[CUCUMBER] Nombre maximal de tours atteint : reprise de la session pour la réponse finale "
               f"({finish} tours au plus).")
         returncode, output, more, limit_hit = _run_cucumber_claude_once(
             FINISH_PROMPT, model, allowed_tools, str(finish), run_dir, effort, system_file, db_log, db_step,
-            usage["session_id"], mcp_step)
+            usage["session_id"], **mcp_kwargs(mcp_step))
         usage = _add_usage(usage, more)
     return returncode, output, usage, limit_hit
 
@@ -2092,7 +2098,7 @@ def _run_cucumber_claude_once(prompt: str, model: str, allowed_tools: list, max_
     try:
         return run_claude(prompt, model, [cucumber_tools.STD_CACHE_DIR], allowed_tools, extra_args=extra,
                           cwd=run_dir, effort=effort, lean=lean_session(), budget_usd=cucumber_budget(),
-                          mcp_step=mcp_step)
+                          **mcp_kwargs(mcp_step))
     finally:
         # Fichiers de test écrits hors du dépôt <client>-cucumber (dossier parasite) : rapatriés dans le worktree
         for source, target in cucumber_stray.relocate(run_dir, os.path.join(run_dir, "worktree"), started):
@@ -2167,7 +2173,7 @@ def cucumber_followup(lot: dict, prompt: str, model: str, effort: str, tools: li
         system_file = system_file if system_file and os.path.exists(system_file) else ""
         returncode, output, usage, limit_hit = run_cucumber_claude(prompt, lot_model, tools, max_turns, run_dir,
                                                                    lot_effort, system_file, db_log, db_step,
-                                                                   resume=session, mcp_step=mcp_step)
+                                                                   resume=session, **mcp_kwargs(mcp_step))
         if returncode == 0 or limit_hit or budget_hit(usage):
             if usage and usage.get("session_id"):
                 lot["session"] = usage["session_id"]
@@ -2175,7 +2181,8 @@ def cucumber_followup(lot: dict, prompt: str, model: str, effort: str, tools: li
         print("[CUCUMBER] Reprise de la session du lot impossible : appel neuf.")
         lot.pop("session", None)
     returncode, output, usage, limit_hit = run_cucumber_claude(prompt, model, tools, max_turns, run_dir, effort,
-                                                               db_log=db_log, db_step=db_step, mcp_step=mcp_step)
+                                                               db_log=db_log, db_step=db_step,
+                                                               **mcp_kwargs(mcp_step))
     return returncode, output, usage, limit_hit, model, effort
 
 
