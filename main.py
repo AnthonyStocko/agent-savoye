@@ -18,6 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 from tools import env_tools, secret_tools
+from tools import cucumber_env_diagnosis
 from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_incidents, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, mcp_servers, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
 from tools.epic_tools import (
@@ -1383,7 +1384,7 @@ def main():
     parser.add_argument("--backup", default="", help="restore-config : sauvegarde à remettre en place (retour arrière)")
     parser.add_argument("--question", default="", help="ask : question posée à l'assistant (onglet Assistant)")
     parser.add_argument("--answer-file", default="", help="ask : fichier où écrire la réponse")
-    parser.add_argument("--no-init", action="store_true", help="generate-cucumber-client : aucune init lancée avant de juger les lots (données du client déjà présentes dans l'environnement, ex. configuration recopiée)")
+    parser.add_argument("--no-init", action="store_true", help="generate-cucumber-client : aucune init lancée avant de juger les lots (données du client déjà présentes dans l'environnement des runs Jenkins)")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
@@ -3922,6 +3923,77 @@ def init_failure_line(init: dict, action: str) -> str:
             f"{(init.get('message') or 'message absent du rapport')[:300]} — action : {action or 'aucune'}")
 
 
+def _failure_step(run: dict) -> str:
+    failure = next(iter(run.get("echecs") or []), {}) or run.get("init_en_echec") or {}
+    return str(failure.get("step") or "")
+
+
+def clear_lock_failure(run: dict) -> bool:
+    """Le run a échoué sur la purge de l'init en conflit de verrouillage (« Batch update returned unexpected row
+    count »…)."""
+    return cucumber_env_diagnosis.is_clear_lock_failure(_failure_step(run), cucumber_incidents.failure_text(run))
+
+
+def clear_lock_failures(client: str, run: dict) -> int:
+    """Échec du clear du run noté (environnement.json) ; nombre d'échecs consécutifs sur ce schéma (0 : autre échec)."""
+    if not clear_lock_failure(run):
+        return 0
+    schema, table = cucumber_env_diagnosis.statement_target(cucumber_incidents.failure_text(run))
+    return cucumber_env_diagnosis.record_clear_failure(client, run.get("build", ""), schema, table)
+
+
+def purge_server_logs(client: str, run: dict, numero: int, schema: str, table: str, builds: list) -> str:
+    """
+    Logs serveur de la purge, résumés : extrait du dossier de l'import (logs-serveur.txt, 0 token), sinon
+    Groundcover (serveur MCP, lecture seule, étape de diagnostic) ; sinon la raison pour laquelle ils n'ont pas été lus.
+    """
+    if numero:
+        extract = os.path.join(cucumber_import.imports_dir(client), str(numero), cucumber_server_logs.EXTRACT_NAME)
+        if os.path.exists(extract):
+            lines = [line.strip() for line in _read_text(extract).splitlines()
+                     if re.search(r"\b(ERROR|WARN)\b", line) and (not table or table in line.lower()
+                                                                 or cucumber_incidents.is_lock_conflict(line))]
+            if lines:
+                return "extrait du serveur : " + " | ".join(secret_tools.mask_secrets(line)[0][:200]
+                                                             for line in lines[:2])
+    failures = run.get("echecs") or []
+    block = build_mcp_logs_block("cucumber-init-fix", client, failures, build=run.get("build", ""))
+    if not block:
+        reason = mcp_servers.unavailable_reason() or "désactivé"
+        return f"non lus (Groundcover : {reason} ; extrait serveur absent de l'import)"
+    prompt = render_prompt("env_purge_logs", client_name=client, schema=schema or "?", table=table or "?",
+                           erreur=cucumber_incidents.failure_text(run)[:400], logs_block=block,
+                           builds=", ".join(builds) or "?")
+    model = os.getenv("CLAUDE_MODEL_ENV_DIAGNOSIS", "").strip() or "haiku"
+    code, output, usage, _ = run_claude(prompt, model, [], [], ("--max-turns", "6"), mcp_step="cucumber-init-fix")
+    report_token_usage(client, "env-diagnosis", model, usage, len(prompt), code)
+    found = re.search(r"LOGS_PURGE\s*:\s*(.+)", output or "")
+    return found.group(1).strip()[:400] if found else f"non lus (réponse sans LOGS_PURGE, code {code})"
+
+
+def diagnose_environment(client: str, run: dict, numero: int = 0) -> dict:
+    """
+    Clear de l'init en échec reproductible : diagnostic de la base en lecture seule (contraintes de clé étrangère et
+    déclencheurs comparés à un autre schéma, copies de base vers ce schéma, logs serveur de la purge), conclusion
+    « environnement corrompu », init bloquée jusqu'à la réparation. Rien n'est modifié dans l'init ni dans les tests.
+    """
+    text = cucumber_incidents.failure_text(run)
+    schema, table = cucumber_env_diagnosis.statement_target(text)
+    schema = schema or (run.get("concurrence") or {}).get("schema", "")
+    builds = [f["build"] for f in cucumber_env_diagnosis.clear_failures(client) if f.get("schema") == schema] or \
+        [b for b in (run.get("build_initial"), run.get("build")) if b]
+    print(f"[ENVIRONNEMENT] Clear en échec reproductible ({', '.join(builds)}) : diagnostic de la base "
+          f"(lecture seule) du schéma {schema or '?'}, table {table or '?'}.")
+    logs = purge_server_logs(client, run, numero, schema, table, builds)
+    diag = cucumber_env_diagnosis.diagnose(client, schema, table, builds, logs=logs)
+    cucumber_env_diagnosis.block(client, diag)
+    for proof in diag["preuves"]:
+        print(f"[ENVIRONNEMENT]   - {proof}")
+    print(f"[ENVIRONNEMENT] ⛔ {diag['conclusion']}. Action : {diag['action']} Aucune modification de l'init ni "
+          f"des tests.")
+    return diag
+
+
 def run_init_and_import(client: str, profile: dict, worktree: str, repository: str, mode: str,
                         lock_retry: bool = True, applied: dict = None) -> dict:
     """
@@ -3931,6 +4003,12 @@ def run_init_and_import(client: str, profile: dict, worktree: str, repository: s
     résultat alimente le registre des incidents (cucumber_incidents.observe ; `applied` : incident connu dont la
     correction vient d'être appliquée). Renvoie {ok, message, build, numero, init_en_echec, incident, concurrence}.
     """
+    blocked = cucumber_env_diagnosis.blocked(client)
+    if blocked:
+        # Environnement déclaré corrompu : l'init ne peut pas réussir, elle n'est plus relancée
+        print(f"[ENVIRONNEMENT] ⛔ Init non relancée — {cucumber_env_diagnosis.line(blocked)}")
+        return {"ok": False, "message": blocked.get("conclusion", ""), "build": "", "numero": 0, "init_en_echec": {},
+                "environnement": blocked, "bloque": True, "incident": {}}
     work = profile["verify_branch"]
     head = cucumber_tools.rev_parse(worktree, "HEAD")
     tags = profile.get("init_tags") or cucumber_verify.init_tags()
@@ -3943,8 +4021,15 @@ def run_init_and_import(client: str, profile: dict, worktree: str, repository: s
 
     def concurrency(run: dict) -> dict:
         return cucumber_incidents.check_concurrency(client, run.get("build", ""), jenkins_tools.exclusive_jobs(
-            cucumber_verify.verification_job(profile)))
-    out = cucumber_incidents.run_with_lock_retry(once, concurrency) if lock_retry else once()
+            cucumber_verify.verification_job(profile)), cucumber_incidents.failure_text(run))
+
+    def already_retried(run: dict) -> bool:
+        # Clear en échec au build précédent avec la même erreur : la relance a déjà eu lieu (erreur reproductible)
+        return clear_lock_failures(client, run) >= 2
+    out = cucumber_incidents.run_with_lock_retry(once, concurrency, already_retried=already_retried) if lock_retry \
+        else once()
+    if out.get("relance") and not out.get("ok"):
+        clear_lock_failures(client, out)
     result = {**out, "numero": 0, "init_en_echec": {}}
     if out.get("build"):
         try:
@@ -3956,6 +4041,11 @@ def run_init_and_import(client: str, profile: dict, worktree: str, repository: s
                                                cucumber_tools.worktree_dir(client))
             result["numero"] = imported["numero"]
             result["init_en_echec"] = analysis.get("init_en_echec") or {}
+    if result.get("ok"):
+        cucumber_env_diagnosis.reset_failures(client)
+    elif out.get("concurrence") and clear_lock_failure(out):
+        # Clear en échec après UNE relance : plus de relance, diagnostic de la base en lecture seule
+        result["environnement"] = diagnose_environment(client, out, result.get("numero", 0))
     observed = cucumber_incidents.observe(client, profile, result, worktree, applied)
     result["incident"] = observed["incident"]
     if not result.get("ok"):
@@ -4139,6 +4229,16 @@ def fix_init_known_incident(args, numero: int, cucumber_repo_dir: str) -> object
         return None
     worktree, start = init_workspace(args, cucumber_repo_dir, profile)
     if not match.get("applicable"):
+        imported_run = {"build": cucumber_import.load_analysis(client, numero).get("build", "") or f"import {numero}",
+                        "echecs": [init], "message": init.get("message", "")}
+        if clear_lock_failure(imported_run):
+            # Clear en échec dans ce build importé : la relance suivante est la seule ; si elle échoue aussi,
+            # diagnostic de la base au lieu d'une nouvelle relance (run_init_and_import)
+            clear_lock_failures(client, imported_run)
+            print(f"[INCIDENTS] Import n° {numero} : clear en conflit de verrouillage — relance unique de l'init ; "
+                  f"si elle échoue aussi, diagnostic de l'environnement (lecture seule), sans autre relance.")
+            return deliver_init_correction(args, profile, worktree, start, [], "", init,
+                                           "relance unique (clear en conflit de verrouillage)", lock_retry=True)
         print(f"[INCIDENTS] Import n° {numero} : conflit de verrouillage ({cucumber_incidents.line(match)}) — relance "
               f"automatique de l'init, une fois.")
         return deliver_init_correction(args, profile, worktree, start, [], "", init,
@@ -5643,6 +5743,13 @@ SIMPLE_INIT_AUTO_STEPS = 10
 SIMPLE_INIT_AUTO_RUNS = 3
 
 
+def simple_init_environment_line(label: str, diag: dict) -> str:
+    """Bilan de l'étape 4 quand l'environnement est en cause : conclusion, preuve, action humaine en une phrase."""
+    return (f"Init impossible : environnement ({label}) — {cucumber_env_diagnosis.CONCLUSION} "
+            f"(schéma {diag.get('schema') or '?'}). Preuve : " + " ; ".join((diag.get("preuves") or ["?"])[:3])[:500]
+            + f". Action : {diag.get('action', '')}")
+
+
 def run_simple_init_auto(client: str, client_root: str, cucumber_std_dir: str, std_root, version: str,
                          helpers: dict = None, run_step=None) -> int:
     """
@@ -5999,10 +6106,20 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                 return 1
             run = run_init_and_import(client, run_profile, worktree, slug, mode)
         builds.append(run.get("build", ""))
-        detail["build"] = run.get("build", "")
+        detail["build"] = run.get("build", "") or detail.get("build", "")
         detail["builds"] = [b for b in builds if b]
         if run.get("ok"):
             continue
+        if run.get("environnement"):
+            # Clear en échec reproductible : l'environnement est en cause, pas l'init — rien n'est modifié, l'init
+            # n'est plus relancée tant que l'environnement n'est pas réparé
+            diag = run["environnement"]
+            simple_record(client, "init", "echec", simple_init_environment_line(label, diag),
+                          {**detail, "cause_echec": "environnement", "action_humaine": diag.get("action", ""),
+                           "environnement": {k: diag.get(k) for k in ("schema", "table", "builds", "preuves",
+                                                                       "action", "conclusion", "copie_en_cause")},
+                           "plan": {}})
+            return 1
         message_run = run.get("message", "")
         if run.get("concurrence"):
             # Conflit de verrouillage persistant après la relance automatique : concurrence vérifiée et dite
@@ -6081,8 +6198,9 @@ def run_simple_init(client: str, client_root: str, cucumber_std_dir: str, std_ro
                               {**detail, "incident_applique": match["numero"], "plan": {"action": "lancer"}})
                 return 1
             detail["incident"] += " — non applicable : " + (" ; ".join(applied["erreurs"]) or refused)[:200]
-        simple_record(client, "init", "echec", f"Init en échec ({label}) : {message_run} — {detail['incident']}"[:600],
-                      {**detail, "plan": {"action": "lancer"}})
+        simple_record(client, "init", "echec", f"Init en échec à cause de l'init ({label}) : {message_run} — "
+                                               f"{detail['incident']}"[:600],
+                      {**detail, "cause_echec": "init", "plan": {"action": "lancer"}})
         return 1
     simple_record(client, "init", "ok", f"Init verte sur {work} ({detail['tags']}).{pending}", detail)
     # Clear prouvé par ce run vert (route de l'application ou du socle KIS / init-data) : valide, gardé au profil
@@ -6250,7 +6368,7 @@ def require_db_proof(results: list, prompt: str, fixed_values: dict, model: str,
 
 NO_INIT_BLOCK = """=== ENVIRONNEMENT SANS INITIALISATION ===
 L'option « Initialisation » est décochée : aucune init ni aucun clear n'est lancé avant tes tests ; l'environnement où
-Jenkins les joue contient déjà les données du client (sa configuration a été recopiée depuis sa base).
+Jenkins les joue contient déjà les données du client.
 - Une donnée, un document, un paramétrage, un besoin ou un champ personnalisé PRÉSENT dans la base de l'environnement
   (accès en lecture seule ci-dessus : vérifie-le par une requête) est DISPONIBLE : utilise-le tel quel, ne le recrée
   pas, et ne conclus jamais « donnee_impossible », « non livré » ni « non déployé » pour lui.

@@ -12,7 +12,9 @@ la méthode du script restore.ps1 de l'équipe (PostgreSQL) :
 6. script SQL facultatif après import (RESTORE_POST_SQL), précédé de « set schema '<cible>'; ».
 
 Source : CLIENT_SOURCE_DB_* (HOST, PORT, NAME, USER, PASSWORD), à défaut DB_* ; schéma donné par l'utilisateur.
-Cible : base des tests Cucumber (CUCUMBER_DB_*, PARTAGÉE avec Jenkins), schéma du projet ou CUCUMBER_DB_SCHEMA.
+Cible : base des tests Cucumber (CUCUMBER_DB_*, PARTAGÉE avec Jenkins), schéma dédié aux essais locaux du client
+(cucumber_env_diagnosis.local_schema : cucumber_local_<client>), jamais un schéma du pool des runs Jenkins
+(cucumber_customer_<N>) : la copie y casserait les runs (clear de l’init en échec reproductible).
 Outils PostgreSQL : PG_BIN_DIR (ex. C:\\Program Files\\PostgreSQL\\16\\bin), sinon le PATH. Mots de passe passés par
 PGPASSWORD, jamais en ligne de commande ni dans les journaux.
 
@@ -110,6 +112,11 @@ def check_plan(source_schema: str, target_schema: str, source: dict, target: dic
             errors.append(f"base {label} de type « {conn['type']} » : seule PostgreSQL est prise en charge")
         if not (conn["name"] and conn["user"]):
             errors.append(f"connexion {label} incomplète (nom de base et utilisateur requis)")
+    # Schéma du pool des runs Jenkins (cucumber_customer_<N>) : jamais la cible d'une copie (essais locaux seulement)
+    from tools import cucumber_env_diagnosis
+    refusal = cucumber_env_diagnosis.pool_refusal(target_schema or "")
+    if refusal:
+        errors.append(refusal)
     same_db = (source["host"], source["port"], source["name"]) == (target["host"], target["port"], target["name"])
     if same_db and (source_schema or "").lower() == (target_schema or "").lower():
         errors.append("le schéma source et le schéma cible sont le même schéma de la même base")

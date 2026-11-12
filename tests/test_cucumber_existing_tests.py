@@ -126,6 +126,7 @@ def test_covered_and_not_measured_without_run(project):
 
 def test_screen_shows_tests_as_covered_and_not_measured(project):
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state["nav_page"] = "cucumber-avance"  # seule la page choisie est exécutée
     at.session_state[f"cucumber_section_detail_{CLIENT}"] = True  # détail du projet ouvert
     at.run()
     assert not at.exception, [e.value for e in at.exception]
@@ -134,7 +135,7 @@ def test_screen_shows_tests_as_covered_and_not_measured(project):
     assert "2 ont un test, pas encore vérifié." in buttons and "2 restent à tester." in buttons
     assert "Importer un résultat Jenkins" in [p.proto.popover.label for p in at.get("popover")]
     # Onglet Cucumber seul (les autres onglets affichent les tickets et la mémoire du poste) ; « 100 % » n'est pas 0 %
-    text = " ".join(m.value for m in at.tabs[3].markdown)
+    text = " ".join(m.value for m in at.main.markdown)
     assert "4 fonctionnalités spécifiques." in text
     assert not re.search(r"(?<![\d,.])0 %", " ".join(buttons) + text)
     # Liste : les tests écrits à la main apparaissent « test écrit »

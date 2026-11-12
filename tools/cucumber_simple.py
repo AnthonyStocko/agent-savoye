@@ -3,8 +3,8 @@ Onglet « Cucumber » simplifié : 5 étapes l'une sous l'autre, chacune avec un
 résultat en une ou deux phrases (0 token ici : ce module ne fait que calculer les états).
 
 États : « a_faire », « en_cours », « ok », « echec », et « bloquee » quand l'étape précédente (obligatoire) n'est
-pas OK. L'étape 3 (base de données) est OPTIONNELLE : le clear de l'init efface ce qu'elle recopie et le schéma des
-runs Jenkins dépend du slot alloué (cucumber_customer_<slot>) ; elle ne bloque jamais l'étape 4.
+pas OK. L'étape 3 (base de données) est OPTIONNELLE : elle recopie dans le schéma des essais locaux, jamais dans le schéma des
+runs Jenkins (cucumber_customer_<slot>) ; elle ne bloque jamais l'étape 4.
 
 Les résultats des étapes sont gardés dans etat.json (« simple » : {depot, base, init, tests}) par
 record_step ; aucune valeur propre à un client n'est écrite en dur.
@@ -18,16 +18,16 @@ ICONS = {"a_faire": ":material/radio_button_unchecked:", "en_cours": ":material/
 STEPS = ((1, "projet", "Projet"), (2, "depot", "Dépôt <client>-cucumber"), (3, "base", "Base de données"),
          (4, "init", "Initialisation"), (5, "tests", "Tests"))
 OPTIONAL = {"base"}
-INIT_OFF_NOTE = ("Facultative : option « Initialisation » décochée (données du client déjà présentes, ex. recopiées à "
-                 "l'étape 3) — l'étape 5 génère et vérifie les tests sans lancer l'init.")
+INIT_OFF_NOTE = ("Facultative : option « Initialisation » décochée (données du client déjà présentes dans "
+                 "l'environnement des runs Jenkins) — l'étape 5 génère et vérifie les tests sans lancer l'init.")
 
 
 def init_enabled(records: dict) -> bool:
     """Option « Initialisation » de l'onglet (etat.json simple.options.init) : cochée par défaut (projet neuf)."""
     return ((records or {}).get("options") or {}).get("init", True) is not False
-OPTIONAL_NOTE = ("Optionnelle : recopie pour les essais locaux. Les runs Jenkins utilisent le schéma de leur slot "
-                 "(cucumber_customer_<n>) et l'init commence par un clear qui efface cette configuration : l'étape "
-                 "ne bloque pas l'initialisation.")
+OPTIONAL_NOTE = ("Optionnelle : recopie dans un schéma dédié aux essais locaux (cucumber_local_<client>), jamais "
+                 "dans un schéma des runs Jenkins (cucumber_customer_<n>) ; l'agent ne le lit que si vous le "
+                 "choisissez. L'étape ne bloque pas l'initialisation.")
 
 
 def record_step(state: dict, step: str, status: str, result: str, detail: dict = None) -> dict:

@@ -201,6 +201,39 @@
         "relances": 1,
         "puis": "vérification de la concurrence (builds Jenkins et copies de base sur le même schéma)"
       }
+    },
+    {
+      "cas": "500 « Batch update returned unexpected row count » sur wms_device_identifier pendant le clear de la purge d'init, 2e échec de suite (après une relance) : environnement corrompu",
+      "console": "17-clear-environnement-corrompu.console.txt",
+      "source": "réel anonymisé (nom du client, schéma source) : builds 363 puis 369, même erreur sur cucumber_customer_1.wms_device_identifier ; schéma du slot 1 recréé par la copie de base de l'étape 3 le 10/11/2026, sans sauvegarde",
+      "contexte": {
+        "environnement_corrompu": {
+          "schema": "cucumber_customer_1",
+          "table": "wms_device_identifier",
+          "builds": [
+            "363",
+            "369"
+          ],
+          "preuve": "schéma recréé par la copie de base du 10/11/2026 13:23 depuis la base du client (étape 3), sans sauvegarde",
+          "action": "Demander la réinitialisation du schéma cucumber_customer_1 (recréé par la copie de base du 10/11/2026 13:23, sans sauvegarde) à l'équipe qui gère l'environnement Jenkins, puis débloquer l'init."
+        }
+      },
+      "attendu": {
+        "categorie": "environnement",
+        "nature": "environnement_corrompu",
+        "cause_contient": [
+          "environnement corrompu",
+          "l'init ne peut pas réussir",
+          "cucumber_customer_1",
+          "wms_device_identifier",
+          "build 363",
+          "build 369"
+        ]
+      },
+      "suite": {
+        "relances": 0,
+        "puis": "diagnostic de la base en lecture seule (contraintes de clé étrangère comparées à un autre slot, copies de base, logs serveur de la purge), init bloquée, aucune modification de l'init ni des tests"
+      }
     }
   ],
   "runs": [

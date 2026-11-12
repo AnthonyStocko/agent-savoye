@@ -56,6 +56,9 @@ NATURES = {
                                "test (profil, sinon défaut), sans toucher aux contrôles du test",
     "conflit_verrouillage": "conflit de verrouillage (écritures concurrentes sur le même schéma) : relance "
                             "automatique unique, puis vérification des builds et copies de base concurrents",
+    "environnement_corrompu": "environnement corrompu (structure ou données du schéma) : l'init ne peut pas réussir — "
+                              "aucune modification de l'init ni des tests ; restaurer la sauvegarde de la copie de "
+                              "base en cause, sinon demander la réinitialisation du schéma",
     "route_sans_preuve": "route HTTP sans preuve appelée par un step du projet : fonction de la bibliothèque de la "
                          "version du pom, sinon route prouvée dans le code REST de la version testée (fichier, ligne, "
                          "méthode HTTP cités en commentaire)",
@@ -130,6 +133,18 @@ def classify(result: dict) -> dict:
                    "mvn test-compile ; aucune livraison sans compilation réussie.")
     # Conflit de verrouillage (StaleState, OptimisticLock, « Batch update returned unexpected row count ») : écritures
     # concurrentes sur le même schéma, jamais un défaut du test — relance unique, puis vérification de la concurrence
+    # Même conflit sur le clear après UNE relance (build précédent ou relance du passage) : erreur reproductible,
+    # l'environnement est diagnostiqué (contexte « environnement_corrompu » : cucumber_env_diagnosis.diagnose)
+    corrupt = (result.get("contexte") or {}).get("environnement_corrompu") or {}
+    if corrupt and cucumber_incidents.is_lock_conflict(full):
+        table = corrupt.get("table") or cucumber_incidents.lock_table(full)
+        return out("environnement", "environnement_corrompu",
+                   f"Init impossible : environnement corrompu (structure ou données du schéma "
+                   f"{corrupt.get('schema') or '?'}) : l'init ne peut pas réussir — clear en échec reproductible sur "
+                   f"{table} (" + ", ".join(f"build {b}" for b in corrupt.get("builds") or []) + ")"
+                   + (f" ; {corrupt['preuve']}" if corrupt.get("preuve") else ""),
+                   corrupt.get("action") or "Demander la réinitialisation du schéma à l'équipe qui gère "
+                                            "l'environnement Jenkins ; aucune modification de l'init ni des tests.")
     if cucumber_incidents.is_lock_conflict(full):
         table = cucumber_incidents.lock_table(full)
         return out("environnement", cucumber_incidents.NATURE_LOCK,

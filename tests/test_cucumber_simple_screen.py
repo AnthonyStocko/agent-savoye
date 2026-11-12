@@ -114,12 +114,13 @@ def visible_texts(at) -> list:
             texts.append(str(option))
         for child in (getattr(node, "children", None) or {}).values():
             walk(child)
-    walk(at.tabs[3] if len(at.tabs) > 3 else at.main)
+    walk(at.main)
     return texts
 
 
 def open_app() -> AppTest:
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=120)
+    at.session_state["nav_page"] = "cucumber-avance"  # seule la page choisie est exécutée
     at.run()
     assert not at.exception, [e.value for e in at.exception]
     return at

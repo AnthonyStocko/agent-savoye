@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 import streamlit as st
 import logging
 
@@ -27,7 +28,7 @@ from tools.jira_tools import (
 )
 from tools.db_tools import DB_TYPES, test_connection
 from tools import pr_review, cucumber_overview, cucumber_set_aside, assistant, db_restore, skills
-from tools import mcp_servers
+from tools import mcp_servers, ui_timer, cucumber_env_diagnosis
 from tools.jenkins_tools import trigger_cucumber_job
 from tools import jenkins_tools
 from tools.memory_tools import (
@@ -317,17 +318,19 @@ def search_criteria_form(key_prefix: str) -> dict:
              "Équipe et statut : JIRA_OPEN_EPICS_TEAM et JIRA_OPEN_EPICS_STATUS (onglet Configuration)."
     ) and bool(open_epics_team and open_epics_status)
 
+    # Valeurs par défaut du .env posées une fois : la saisie est gardée quand on change de page (PERSISTENT_KEYS)
+    for name, env_name in (("search_project", "JIRA_PROJECT_KEY"), ("search_team", "JIRA_SEARCH_TEAM"),
+                           ("search_statuses", "JIRA_SEARCH_STATUSES"), ("search_labels", "JIRA_SEARCH_LABELS")):
+        st.session_state.setdefault(f"{key_prefix}{name}", os.getenv(env_name, ""))
     col1, col2 = st.columns(2)
     with col1:
         jira_project_input = st.text_input(
             "Projet Jira cible :",
-            value=os.getenv("JIRA_PROJECT_KEY", ""),
             key=f"{key_prefix}search_project",
             help="Clé du projet Jira (ex. PROJ)."
         )
         jira_team_input = st.text_input(
             "Équipe / Composant (Optionnel) :",
-            value=os.getenv("JIRA_SEARCH_TEAM", ""),
             key=f"{key_prefix}search_team",
             help="Composant Jira ou équipe Atlassian (ex. WMS, Socle...)",
             disabled=open_epics_only
@@ -336,14 +339,12 @@ def search_criteria_form(key_prefix: str) -> dict:
     with col2:
         jira_status_input = st.text_input(
             "États / Statuts (Séparés par une virgule) :",
-            value=os.getenv("JIRA_SEARCH_STATUSES", ""),
             key=f"{key_prefix}search_statuses",
             help="Ex: Analysée, En cours, A traiter (laissez vide pour tous les états)",
             disabled=open_epics_only
         )
         jira_label_input = st.text_input(
             "Labels (Séparés par une virgule) :",
-            value=os.getenv("JIRA_SEARCH_LABELS", ""),
             key=f"{key_prefix}search_labels",
             help="Ex. le label d'attente de l'équipe (laissez vide si aucun label requis)",
             disabled=open_epics_only
@@ -397,6 +398,51 @@ CONNECTED = auth_tools.require_login(st)
 st.title("🤖 Tableau de bord - Agent Scrum Master")
 
 
+# Navigation : seule la page choisie est exécutée (st.tabs exécutait toutes les pages à chaque interaction, avec
+# leurs appels réseau et les fragments à rafraîchissement automatique de l'onglet Cucumber)
+PAGES = {"integration": "🧩 Intégration", "lancement": "🚀 Lancement", "cucumber": "🥒 Cucumber",
+         "cucumber-avance": "🥒 Cucumber (avancé)", "revue": "🔍 Revue de PR", "assistant": "💬 Assistant",
+         "connaissances": "📚 Connaissances partagées", "configuration": "⚙️ Configuration (.env)"}
+NAV_KEY = "nav_page"
+# Réglages saisis sur une page et gardés quand on en change (Streamlit efface l'état d'un widget non affiché) :
+# seulement des widgets sans valeur par défaut passée en paramètre (sinon avertissement de Streamlit)
+PERSISTENT_KEYS = ("cucumber_project", "cucumber_repo", "cucumber_client_name", "cucumber_db_schema",
+                   "cucumber_application", "cucumber_std_repo", "cucumber_source_schema",
+                   "cs_project", "cs_repo", "cs_client", "cs_application", "cs_source_schema", "cs_std_repo",
+                   "integ_selected") + tuple(f"{prefix}{name}" for prefix in ("", "integ_") for name in (
+                       "open_epics_only", "search_project", "search_team", "search_statuses", "search_labels"))
+
+
+def keep_page_state() -> None:
+    """Valeurs des réglages des autres pages conservées (réaffectées avant tout widget, comme le préconise Streamlit)."""
+    for key in PERSISTENT_KEYS:
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+
+
+def page_changed() -> None:
+    """Page désélectionnée (clic sur la page active) : la page précédente reste ; l'adresse garde la page choisie."""
+    page = st.session_state.get(NAV_KEY)
+    if page not in PAGES:
+        page = st.session_state.get("nav_last") or next(iter(PAGES))
+        st.session_state[NAV_KEY] = page
+    st.session_state["nav_last"] = page
+    st.query_params["page"] = page
+
+
+def render_navigation() -> str:
+    """Choix de la page (adresse ?page=… reprise au rechargement du navigateur). Renvoie la page à exécuter."""
+    keep_page_state()
+    if st.session_state.get(NAV_KEY) not in PAGES:
+        wanted = st.query_params.get("page", "")
+        st.session_state[NAV_KEY] = wanted if wanted in PAGES else next(iter(PAGES))
+    st.session_state["nav_last"] = st.session_state[NAV_KEY]
+    st.segmented_control("Page", list(PAGES), key=NAV_KEY, format_func=PAGES.get, on_change=page_changed,
+                         label_visibility="collapsed", width="stretch")
+    return st.session_state.get(NAV_KEY) or st.session_state["nav_last"]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def agent_version() -> str:
     """Version de l'agent : branche et commit du dépôt (« modifié » si des fichiers suivis ne sont pas commités)."""
     root = os.path.dirname(os.path.abspath(__file__))
@@ -428,9 +474,7 @@ if env_problems:
                        f".env.bak.")
             st.rerun()
 
-(tab_integration, tab_execution, tab_cucumber_simple, tab_cucumber, tab_review, tab_assistant, tab_knowledge,
- tab_config) = st.tabs(["🧩 Intégration", "🚀 Lancement", "🥒 Cucumber", "🥒 Cucumber (avancé)", "🔍 Revue de PR",
-                        "💬 Assistant", "📚 Connaissances partagées", "⚙️ Configuration (.env)"])
+PAGE = render_navigation()
 
 # Initialisation de l'état
 if "workflow_step" not in st.session_state:
@@ -439,7 +483,7 @@ if "workflow_step" not in st.session_state:
 # ---------------------------------------------------------
 # ONGLET 1 : LANCEMENT & RECHERCHE PARAMÉTRABLE
 # ---------------------------------------------------------
-with tab_execution:
+if PAGE == "lancement":
     render_technical_journal()
     missing_env = [name for name in REQUIRED_ENV if not os.getenv(name, "").strip()]
     if missing_env:
@@ -1233,7 +1277,7 @@ def render_cucumber_corrections(client: str, cucumber_cmd: list, rows: list, sta
             run_main_step(cucumber_cmd + ["--complete", "--from-import", str(numero)])
 
 
-with tab_integration:
+if PAGE == "integration":
     render_technical_journal()
     st.markdown("### 1. Critères de Recherche Jira")
     integration_criteria = search_criteria_form("integ_")
@@ -1497,8 +1541,8 @@ def render_project_settings(ctx: dict) -> None:
             render_delivery_settings(ctx)
         st.text_input("Schéma de la config client (base client) :", key="cucumber_source_schema",
                       help="Schéma de la base client (connexion CLIENT_SOURCE_DB_*, à défaut DB_*) dont la "
-                           "configuration est recopiée dans le schéma des tests Cucumber par le bouton « Recopier la "
-                           "config client ».")
+                           "configuration est recopiée dans le schéma des essais locaux (cucumber_local_<client>, "
+                           "jamais un slot des runs Jenkins) par le bouton « Recopier la config client ».")
         std_input = st.text_input(
             "Dépôt Bitbucket du Cucumber Standard :", key="cucumber_std_repo",
             help="URL de navigation (.../projects/X/repos/Y/browse), URL clonable (.../scm/x/y.git) ou chemin d'un "
@@ -1702,8 +1746,11 @@ def render_client_version(ctx: dict, prefix: str = "") -> None:
     repo = ctx.get("repo") or (st.session_state.get("cucumber_repo") or "").strip()
     current = client_version.saved(client)
     versions = current.get("versions") or []
+    # Versions lues une fois puis gardées en cache avec leur date ; relues seulement sur « Actualiser »
+    read_on = short_date(current.get("versions_date") or "")
     refresh = st.button("Actualiser les versions", key=f"{prefix}client_versions_refresh_{client}", type="tertiary",
-                        icon=":material/refresh:")
+                        icon=":material/refresh:",
+                        help=f"Versions lues le {read_on}." if read_on else "Versions jamais lues.")
     if repo and (refresh or not current.get("versions_date")):
         with st.spinner("Lecture des versions du client (dépôts, tags, dépôt Maven)…"):
             try:
@@ -1754,29 +1801,34 @@ def render_standard_version(client: str, prefix: str = "") -> None:
     """
     Version du Standard du client, détectée en arrière-plan (code, builds Jenkins, bibliothèque Cucumber) : une
     ligne ; sources divergentes : les deux avec leurs sources et le choix ; aucune source : saisie proposée.
+    Tout le bloc est un fragment : pendant la détection, seul ce bloc est réexécuté (toutes les 2 s) et, à la fin,
+    il affiche le résultat et arrête son minuteur, sans réexécuter la page.
     """
     repo = (st.session_state.get("cucumber_repo") or "").strip()
     if repo:
+        # Seulement quand une page Cucumber est affichée, et au plus une fois par intervalle (15 min par défaut)
         standard_version_task.start(client, repo, os.getenv("BITBUCKET_STD_REPO_PATH", "").strip(),
                                     interval_s=cucumber_detection.interval())
 
-    def progress() -> None:
+    def block() -> None:
         task = standard_version_task.view(client)
         if task.get("statut") == "en_cours":
-            st.session_state[f"std_version_running_{client}"] = True
             first = (task.get("provisoire") or {})
             st.caption(f":material/progress_activity: Version du Standard : {task.get('etape') or 'démarrage'}"
                        + (f" {task['progression']}" if task.get("progression") else "") + "…"
                        + (f" — premier résultat : {standard_version.line(first)}" if first.get("statut") == "ok"
                           else ""))
+            ui_timer.set_timer(2)
             return
-        if st.session_state.pop(f"std_version_running_{client}", False):
-            st.rerun()
+        ui_timer.set_timer(None)
+        render_standard_version_result(client, prefix, repo, task)
 
-    task = standard_version_task.view(client)
-    if task.get("statut") == "en_cours":
-        st.fragment(progress, run_every="2s")()
-        return
+    running = standard_version_task.view(client).get("statut") == "en_cours"
+    st.fragment(block, run_every="2s" if running else None)()
+
+
+def render_standard_version_result(client: str, prefix: str, repo: str, task: dict) -> None:
+    """Résultat de la détection de la version du Standard (ligne, conflit à trancher ou saisie)."""
     shown = standard_version.display(client)
     if task.get("statut") == "non_detectee" and shown["statut"] != "choisie":
         st.warning(f"Version du Standard non détectée : {task.get('cause') or 'cause inconnue'}",
@@ -1814,28 +1866,59 @@ def render_standard_version(client: str, prefix: str = "") -> None:
             st.rerun()
 
 
+def short_date(iso: str) -> str:
+    """« 12/11 14:02 » d'une date ISO ('' si illisible)."""
+    try:
+        return datetime.fromisoformat(iso).strftime("%d/%m %H:%M")
+    except (TypeError, ValueError):
+        return ""
+
+
 def render_cucumber_detection(ctx: dict) -> None:
     """
     Détection automatique en arrière-plan (inventaire, profil, faits de l'init ; 0 token, lecture seule) : lancée
-    quand le projet est prêt puis, à chaque contrôle périodique, si les commits des dépôts ont changé. Indicateur
-    discret pendant l'analyse ; la page est rechargée à la fin.
+    quand le projet est prêt puis, au plus toutes les CUCUMBER_DETECTION_INTERVAL secondes (15 min par défaut) et
+    seulement tant que cette page est affichée, si les commits des dépôts ont changé. Bouton « Revérifier
+    maintenant ». Tout se passe dans un fragment : suivi toutes les 3 s pendant l'analyse, puis minuteur espacé
+    jusqu'au prochain contrôle ; la fin d'une analyse ne réexécute jamais toute la page (bouton « Afficher les
+    résultats »).
     """
     client = ctx["client"]
     if not ctx["ready"]:
         return
+    detecting, done = f"cucumber_detecting_{client}", f"cucumber_detection_done_{client}"
+    # Exécution complète de la page : elle affiche déjà les derniers résultats
+    st.session_state.pop(done, None)
     cucumber_detection.start(client, ctx["cmd"])
     active = cucumber_detection.running(client)
 
     def watch() -> None:
+        if not cucumber_detection.running(client) and cucumber_detection.due(client):
+            cucumber_detection.start(client, ctx["cmd"])
         if cucumber_detection.running(client):
-            st.session_state[f"cucumber_detecting_{client}"] = True
+            st.session_state[detecting] = True
             st.caption(":material/progress_activity: Analyse du projet en cours…")
+            ui_timer.set_timer(3)
             return
-        if st.session_state.pop(f"cucumber_detecting_{client}", False):
+        if st.session_state.pop(detecting, False):
             cucumber_detection.finish(client)
-            st.rerun()
-        if cucumber_detection.start(client, ctx["cmd"]):
-            st.rerun()
+            st.session_state[done] = True
+        checked = short_date(cucumber_detection.checked_at(client))
+        upcoming = short_date((datetime.now() + timedelta(seconds=cucumber_detection.next_check_in(client)))
+                              .isoformat())
+        with st.container(horizontal=True, vertical_alignment="center"):
+            if st.session_state.get(done):
+                st.caption(":material/check_circle: Analyse du projet terminée.")
+                if st.button("Afficher les résultats", key=f"cucumber_detection_show_{client}", type="primary",
+                             icon=":material/refresh:"):
+                    st.session_state.pop(done, None)
+                    st.rerun()
+            st.caption((f"Commits vérifiés le {checked}" if checked else "Commits pas encore vérifiés")
+                       + f" — prochaine vérification vers {upcoming} (si cette page est affichée).")
+            st.button("Revérifier maintenant", key=f"cucumber_detection_recheck_{client}", type="tertiary",
+                      icon=":material/sync:", on_click=cucumber_detection.start, args=(client, ctx["cmd"]),
+                      kwargs={"now": True})
+        ui_timer.set_timer(max(30, cucumber_detection.next_check_in(client)))
 
     st.fragment(watch, run_every="3s" if active else f"{cucumber_detection.interval()}s")()
 
@@ -2133,12 +2216,15 @@ def render_simple_depot(ctx: dict, step: dict) -> None:
 
 
 def render_simple_base(ctx: dict, step: dict) -> None:
-    """Étape 3 (optionnelle) : recopie de la configuration du client pour les essais locaux."""
-    target = (os.getenv("CUCUMBER_DB_SCHEMA", "") or "").strip()
+    """Étape 3 (optionnelle) : recopie de la configuration du client dans le schéma des essais locaux (jamais un
+    schéma du pool des runs Jenkins)."""
+    target = cucumber_env_diagnosis.local_schema(ctx["client"])
     connection = db_restore.connection("CUCUMBER_DB_", "DB_")
     source = (st.session_state.get("cs_source_schema") or "").strip()
     st.caption(f"Base modifiée : {connection['host']} / {connection['name'] or '?'} / schéma {target or '?'} "
-               f"(CUCUMBER_DB_*). Source : schéma {source or '?'} de la base client.")
+               f"(essais locaux, CUCUMBER_LOCAL_SCHEMA). Source : schéma {source or '?'} de la base client. Les runs "
+               f"Jenkins n'utilisent jamais ce schéma ; l'agent ne le lit que si vous le choisissez comme schéma du "
+               f"projet.")
     confirm = st.text_input("Pour confirmer, tapez le nom du schéma recréé", key=f"cs_base_confirm_{ctx['client']}",
                             help="Le schéma est sauvegardé avant d'être supprimé puis recréé.")
     if st.button("Recopier la configuration du client (essais locaux)", icon=":material/database:",
@@ -2156,6 +2242,7 @@ def render_simple_base(ctx: dict, step: dict) -> None:
             {"sauvegarde": entry.get("sauvegarde", ""), "message": entry.get("message", "")})
         cucumber_tools.save_state(ctx["client"], state)
         st.rerun()
+    render_backup_restore(ctx["client"], db_restore.load_history(ctx["client"]), "cs_restore")
 
 
 def render_simple_init(ctx: dict, step: dict) -> None:
@@ -2164,6 +2251,21 @@ def render_simple_init(ctx: dict, step: dict) -> None:
     existante comparée), diff validé avant tout push, run Jenkins de l'init ; correction connue proposée sur échec.
     """
     plan = step["detail"].get("plan") or {}
+    blocked = cucumber_env_diagnosis.blocked(ctx["client"])
+    if blocked:
+        # Init impossible : environnement corrompu — action humaine, l'init n'est plus relancée jusque-là
+        st.error(f"**Init impossible : environnement** — {blocked.get('conclusion', '')}.\n\n"
+                 + "\n".join(f"- {p}" for p in blocked.get("preuves") or [])
+                 + f"\n\n**À faire** : {blocked.get('action', '')}", icon=":material/dangerous:")
+        if st.button("Schéma réinitialisé ou restauré : débloquer l'init", icon=":material/lock_open:",
+                     key=f"cs_init_unblock_{ctx['client']}",
+                     help="À cliquer une fois le schéma réparé (la restauration de la sauvegarde par l'étape 3 "
+                          "débloque d'elle-même). L'init pourra de nouveau être lancée."):
+            user = (auth_tools.identity(st.user) or {}).get("nom", "") if auth_tools.enabled() else ""
+            cucumber_env_diagnosis.unblock(ctx["client"], "réparation déclarée dans l'onglet Cucumber"
+                                           + (f" par {user}" if user else ""))
+            st.rerun()
+        return
     if plan.get("diff"):
         st.code(plan["diff"][:20000], language="diff")
     action = plan.get("action") or "verifier"
@@ -2272,12 +2374,12 @@ def render_simple_cucumber() -> None:
     deduction = (client_version.saved(client).get("deduction") or {}) if client else {}
     records = (cucumber_tools.load_state(client).get("simple") or {}) if client else {}
     if client:
-        # Projet neuf : init nécessaire ; données du client déjà présentes (recopiées) : init facultative
+        # Projet neuf : init nécessaire ; données du client déjà présentes dans l'environnement : init facultative
         wanted = st.checkbox("Initialisation de l'environnement (projet neuf, sans données client)",
                              value=cucumber_simple.init_enabled(records), key=f"cs_init_option_{client}",
-                             help="Décochée : les données du client sont déjà dans l'environnement (ex. configuration "
-                                  "recopiée à l'étape 3) ; l'étape 4 devient facultative et l'étape 5 génère et "
-                                  "vérifie les tests sans lancer l'init.")
+                             help="Décochée : les données du client sont déjà dans l'environnement des runs Jenkins "
+                                  "(la copie de l'étape 3 ne va que dans le schéma des essais locaux) ; l'étape 4 "
+                                  "devient facultative et l'étape 5 génère et vérifie les tests sans lancer l'init.")
         if wanted != cucumber_simple.init_enabled(records):
             state = cucumber_tools.load_state(client)
             state.setdefault("simple", {}).setdefault("options", {})["init"] = wanted
@@ -3078,6 +3180,30 @@ def render_tests_overview(ctx: dict, rows: list) -> None:
                          column_config={"Raison": st.column_config.TextColumn(width="large")})
 
 
+def render_backup_restore(client: str, history: list, prefix: str) -> None:
+    """
+    « Restaurer la sauvegarde » : la dernière sauvegarde prise avant une copie de base est remise dans le schéma
+    d'où elle vient (ex. un slot cucumber_customer_<n> écrasé par une ancienne copie), nom du schéma à retaper.
+    Restaurée sur le schéma d'un environnement déclaré corrompu, elle débloque l'init (cucumber_env_diagnosis).
+    """
+    backups = [h for h in history if h.get("ok") and h.get("sauvegarde") and os.path.exists(h["sauvegarde"])]
+    if not backups:
+        return
+    latest = backups[-1]
+    backup_schema = (latest.get("cible") or "").rsplit("/", 1)[-1].strip()
+    st.caption(f"Sauvegarde du schéma {backup_schema or '?'} d'avant la copie du {latest['date'][:16].replace('T', ' ')} : "
+               f"{os.path.basename(latest['sauvegarde'])}")
+    back_confirm = st.text_input(f"Pour restaurer cette sauvegarde, tapez le nom du schéma remis en place "
+                                 f"({backup_schema or '?'})", key=f"{prefix}_back_confirm_{client}")
+    if st.button("Restaurer la sauvegarde", icon=":material/undo:",
+                 disabled=not backup_schema or back_confirm.strip() != backup_schema, key=f"{prefix}_back_{client}"):
+        with st.spinner("Remise en place de la sauvegarde…"):
+            code = run_main_step([sys.executable, "main.py", "--step", "restore-config", "--client-name",
+                                  client, "--target-schema", backup_schema, "--backup", latest["sauvegarde"]])
+        entry = (db_restore.load_history(client) or [{}])[-1]
+        (st.success if code == 0 else st.error)(entry.get("message") or interruption_cause(code))
+
+
 def render_client_config_restore(ctx: dict) -> None:
     """
     Recopie de la config client (base client) dans le schéma des tests Cucumber, avant les tests : base PARTAGÉE avec
@@ -3085,8 +3211,8 @@ def render_client_config_restore(ctx: dict) -> None:
     """
     client = ctx["client"]
     source_schema = (st.session_state.get("cucumber_source_schema") or "").strip()
-    target_schema = ((st.session_state.get("cucumber_db_schema") or "").strip()
-                     or os.getenv("CUCUMBER_DB_SCHEMA", "").strip())
+    # Schéma dédié aux essais locaux : jamais un schéma du pool des runs Jenkins (cucumber_customer_<N>)
+    target_schema = cucumber_env_diagnosis.local_schema(client)
     history = db_restore.load_history(client)
     last = history[-1] if history else {}
     title = "🗄️ Config client dans la base des tests" + (
@@ -3098,7 +3224,9 @@ def render_client_config_restore(ctx: dict) -> None:
                    f"({db_restore.describe(source)}) dans le schéma des tests **{target_schema or '?'}** "
                    f"({db_restore.describe(target)}), comme le script de restauration de l'équipe : toutes les tables, "
                    f"sans les données d'historique et de journaux. Le schéma des tests est d'abord sauvegardé, puis "
-                   f"remplacé. ⚠️ Cette base est partagée avec Jenkins : rien n'est fait pendant un build.")
+                   f"remplacé. ⚠️ Cette base est partagée avec Jenkins : rien n'est fait pendant un build. Ce schéma "
+                   f"sert aux essais locaux : les runs Jenkins utilisent leur slot (cucumber_customer_<n>) et l'agent "
+                   f"ne le lit que si vous le choisissez comme « Schéma BDD » du projet.")
         problems = db_restore.check_plan(source_schema, target_schema, source, target)
         if problems:
             st.warning("À compléter avant de pouvoir recopier : " + " ; ".join(problems)
@@ -3114,17 +3242,7 @@ def render_client_config_restore(ctx: dict) -> None:
                                       "--source-schema", source_schema, "--target-schema", target_schema])
             entry = (db_restore.load_history(client) or [{}])[-1]
             (st.success if code == 0 else st.error)(entry.get("message") or interruption_cause(code))
-        backups = [h for h in history if h.get("ok") and h.get("sauvegarde") and os.path.exists(h["sauvegarde"])]
-        if backups:
-            latest = backups[-1]
-            st.caption(f"Sauvegarde du schéma d'avant la dernière recopie : {os.path.basename(latest['sauvegarde'])}")
-            if st.button("Revenir à cette sauvegarde", icon=":material/undo:", disabled=confirm.strip() != target_schema,
-                         key=f"restore_back_{client}", help="Tape aussi le nom du schéma ci-dessus pour confirmer."):
-                with st.spinner("Remise en place de la sauvegarde…"):
-                    code = run_main_step([sys.executable, "main.py", "--step", "restore-config", "--client-name",
-                                          client, "--target-schema", target_schema, "--backup", latest["sauvegarde"]])
-                entry = (db_restore.load_history(client) or [{}])[-1]
-                (st.success if code == 0 else st.error)(entry.get("message") or interruption_cause(code))
+        render_backup_restore(client, history, "restore")
         if history:
             st.dataframe([{"Date": h["date"][:16].replace("T", " "), "Opération": "retour arrière" if h.get("retour")
                            else "recopie", "Résultat": ("✅ " if h.get("ok") else "❌ ") + h.get("message", "")}
@@ -3841,10 +3959,10 @@ def render_cucumber_review(client: str, state: dict) -> None:
 # ---------------------------------------------------------
 # ONGLET CUCUMBER : PARCOURS EN 7 ÉTAPES, DU CHOIX DES TÂCHES AU PATCH VERT
 # ---------------------------------------------------------
-with tab_cucumber_simple:
+if PAGE == "cucumber":
     render_simple_cucumber()
 
-with tab_cucumber:
+if PAGE == "cucumber-avance":
     st.markdown("### Tests Cucumber des fonctionnalités spécifiques")
     st.caption("Choisissez le projet : l'agent analyse le reste tout seul, sans rien modifier dans les dépôts. Les "
                "tests écrits sont livrés comme des modifications à télécharger : rien n'est envoyé.")
@@ -4114,7 +4232,7 @@ def render_review_tab() -> None:
             render_review_result(result, chosen)
 
 
-with tab_review:
+if PAGE == "revue":
     render_review_tab()
 
 
@@ -4175,7 +4293,7 @@ def render_assistant_tab() -> None:
         st.rerun()
 
 
-with tab_assistant:
+if PAGE == "assistant":
     render_assistant_tab()
 
 
@@ -4371,11 +4489,11 @@ def render_knowledge_tab() -> None:
         render_knowledge_document(documents[selected[0]], index["documents"])
 
 
-with tab_knowledge:
+if PAGE == "connaissances":
     render_knowledge_tab()
 
 
-with tab_config:
+if PAGE == "configuration":
     st.subheader("🛠️ Configuration globale du fichier .env")
     st.caption("Modifiez l'ensemble des variables d'environnement utilisées par l'application. "
                "Le fichier .env.example du projet donne les valeurs usuelles.")
@@ -4691,9 +4809,27 @@ with tab_config:
                  "Désigne aussi les features d'init dont les codes créés sont imposés aux lots (défaut : tag "
                  "@INIT_*, dossier 0x-Contexte). Vide = pas d'initialisation préalable.")
         env_values["CUCUMBER_DETECTION_INTERVAL"] = st.text_input(
-            "CUCUMBER_DETECTION_INTERVAL", value=os.getenv("CUCUMBER_DETECTION_INTERVAL", ""), placeholder="300",
+            "CUCUMBER_DETECTION_INTERVAL", value=os.getenv("CUCUMBER_DETECTION_INTERVAL", ""), placeholder="900",
             help="Onglet Cucumber : délai en secondes entre deux contrôles des commits des dépôts du projet ; la "
                  "détection automatique (inventaire, profil, état de l'init) n'est refaite que s'ils ont changé.")
+        env_values["CUCUMBER_LOCAL_SCHEMA"] = st.text_input(
+            "CUCUMBER_LOCAL_SCHEMA", value=os.getenv("CUCUMBER_LOCAL_SCHEMA", ""),
+            placeholder="cucumber_local_{client}",
+            help="Schéma des essais locaux, cible de la copie de la config client (étape 3) ; {client} = nom du client. "
+                 "Jamais un schéma du pool des runs Jenkins. L'agent ne le lit que s'il est choisi comme schéma du "
+                 "projet.")
+        env_values["CUCUMBER_POOL_SCHEMA_PATTERN"] = st.text_input(
+            "CUCUMBER_POOL_SCHEMA_PATTERN", value=os.getenv("CUCUMBER_POOL_SCHEMA_PATTERN", ""),
+            placeholder=r"cucumber_customer_\d+",
+            help="Expression régulière des schémas des runs Jenkins (un par slot) : aucune copie de base n'y écrit.")
+        env_values["CUCUMBER_REFERENCE_SCHEMA"] = st.text_input(
+            "CUCUMBER_REFERENCE_SCHEMA", value=os.getenv("CUCUMBER_REFERENCE_SCHEMA", ""),
+            help="Diagnostic de l'environnement (clear en échec reproductible) : schéma de référence de la version, "
+                 "dont les contraintes de clé étrangère servent de comparaison. Vide : un autre slot du pool.")
+        env_values["CLAUDE_MODEL_ENV_DIAGNOSIS"] = st.text_input(
+            "CLAUDE_MODEL_ENV_DIAGNOSIS", value=os.getenv("CLAUDE_MODEL_ENV_DIAGNOSIS", ""), placeholder="haiku",
+            help="Modèle qui résume les logs serveur de la purge via Groundcover (lecture seule) pendant le "
+                 "diagnostic de l'environnement.")
         env_values["CUCUMBER_RUN_JOB"] = st.text_input(
             "CUCUMBER_RUN_JOB", value=os.getenv("CUCUMBER_RUN_JOB", ""), placeholder="DOSSIER/JOB",
             help="Run Jenkins automatique (onglet Cucumber, mode expert, « Résultats ») : job qui exécute <client>-cucumber, si "

@@ -45,7 +45,8 @@ DELIVERABLE = ("initializer", "champ_personnalise", "controle_environnement")
 # Constats qui rendent tous les tests dépendants de l'init
 GLOBAL_FINDINGS = ("absente", "clear", "init_en_echec")
 PROJECT_FILE = "projet.json"
-DEFAULT_INTERVAL = 300
+# Vérification des commits : au plus toutes les 15 min, et seulement quand l'onglet Cucumber est affiché
+DEFAULT_INTERVAL = 900
 _PURGE_STEP = re.compile(r"^INIT- Purge\b")
 _PURGE_ARGUMENT = re.compile(r"^INIT- Purge\b.*\"([^\"]+)\"\s*$")
 _STEP = re.compile(r"^\s*(Given|When|Then|And|But|\*|Soit|Quand|Alors|Et|Mais)\s+(.+?)\s*$")
@@ -480,24 +481,33 @@ def running(client_name: str) -> bool:
     return bool(process) and process.poll() is None
 
 
+def checked_at(client_name: str) -> str:
+    """Date du dernier contrôle des commits (ISO, '' s'il n'a jamais été fait)."""
+    return load_detection(client_name).get("verifie_le") or ""
+
+
+def next_check_in(client_name: str, now: float = None) -> int:
+    """Secondes avant le prochain contrôle des commits (0 : à faire maintenant)."""
+    try:
+        age = (now or time.time()) - datetime.fromisoformat(checked_at(client_name)).timestamp()
+    except ValueError:
+        return 0
+    return max(0, int(interval() - age))
+
+
 def due(client_name: str) -> bool:
     """Contrôle des commits à faire : jamais fait, ou plus ancien que interval()."""
-    document = load_detection(client_name)
-    checked = document.get("verifie_le") or ""
-    try:
-        age = time.time() - datetime.fromisoformat(checked).timestamp()
-    except ValueError:
-        return True
-    return age >= interval()
+    return next_check_in(client_name) == 0
 
 
-def start(client_name: str, cmd: list, force: bool = False) -> bool:
+def start(client_name: str, cmd: list, force: bool = False, now: bool = False) -> bool:
     """
     Lance la détection en arrière-plan (main.py --detect-only, journal detection.log), sauf si elle tourne déjà
-    ou si le dernier contrôle est récent (`force` : sans attendre). Renvoie True si elle a été lancée.
+    ou si le dernier contrôle est récent. `now` (« Revérifier maintenant ») : contrôle des commits sans attendre ;
+    `force` : en plus, détection refaite même si les commits n'ont pas changé. Renvoie True si elle a été lancée.
     """
     finish(client_name)
-    if running(client_name) or not (force or due(client_name)):
+    if running(client_name) or not (force or now or due(client_name)):
         return False
     log = open(log_path(client_name), "w", encoding="utf-8")
     try:

@@ -1,0 +1,9 @@
+[2026-11-12T10:47:03.112Z] Scenario: Client - Initialisation des données WMS          # src/test/resources/cucumber/features/client/01-Contexte/WMS/01-Initialisation.feature:4
+[2026-11-12T10:47:03.112Z]   Given INIT- Purge de l'environnement par le clear "wms/all" # cucumber.features.client.InitClientSteps.purgeParClear(java.lang.String)
+[2026-11-12T10:47:03.112Z]
+[2026-11-12T10:47:09.645Z] [ERROR] Client - Initialisation des données WMS.Client - Initialisation des données WMS -- Time elapsed: 6.53 s <<< FAILURE!
+[2026-11-12T10:47:09.645Z] java.lang.RuntimeException: 500 - Batch update returned unexpected row count from update 0 (expected row count 1 but was 0) [delete from cucumber_customer_1.wms_device_identifier where wms_device_identifier_id=? and version=?]
+[2026-11-12T10:47:09.645Z] 	at cucumber.endPoints.EndPoints.sendDeleteRest(EndPoints.java:212)
+[2026-11-12T10:47:09.645Z] 	at cucumber.features.client.InitClientSteps.purgeParClear(InitClientSteps.java:31)
+[2026-11-12T10:47:09.645Z] 	at ✽.INIT- Purge de l'environnement par le clear "wms/all"(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/01-Contexte/WMS/01-Initialisation.feature:5)
+[2026-11-12T10:47:09.645Z]

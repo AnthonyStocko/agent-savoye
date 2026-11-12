@@ -101,9 +101,17 @@ def is_lock_conflict(text: str) -> bool:
     return bool(LOCK_CONFLICT.search(str(text or "")))
 
 
+_STATEMENT_TABLE = re.compile(r"\b(?:delete\s+from\s+|update\s+(?=\S+\s+set\b)|insert\s+into\s+)(?:[a-z_][a-z0-9_$+]*\.)?([a-z_][a-z0-9_]*)",
+                              re.I)
+
+
 def lock_table(text: str) -> str:
-    """Table en conflit de verrouillage citée par le message ('' si absente)."""
+    """Table en conflit de verrouillage citée par le message ('' si absente) : celle de l'ordre SQL d'abord
+    (« delete from <schéma>.<table> »), jamais le schéma."""
     text = str(text or "")
+    found = _STATEMENT_TABLE.search(text)
+    if found:
+        return found.group(1).lower()
     found = _LOCK_TABLE.search(text)
     if found:
         return found.group(1)
@@ -791,24 +799,38 @@ def failure_text(run: dict) -> str:
                     + [f"{f.get('message', '')} {f.get('journal', '')}" for f in failures])
 
 
-def run_with_lock_retry(run_fn, concurrency_fn=None, log=print) -> dict:
+def run_with_lock_retry(run_fn, concurrency_fn=None, log=print, already_retried=None, diagnosis_fn=None) -> dict:
     """
-    Run lancé par `run_fn()` ; en échec sur un conflit de verrouillage : UNE relance automatique. Si l'échec
-    persiste, `concurrency_fn(run)` dit quels autres builds ou copies de base utilisaient le même schéma au même
-    moment (clé « concurrence » du résultat). Renvoie le résultat du dernier run (« relance » : nombre de relances).
+    Run lancé par `run_fn()` ; en échec sur un conflit de verrouillage : UNE relance automatique, sauf si
+    `already_retried(run)` dit que la relance a déjà eu lieu (même échec au build précédent : erreur reproductible).
+    Si l'échec persiste, `concurrency_fn(run)` dit quels autres builds ou copies de base utilisaient le même schéma
+    au même moment (clé « concurrence ») et `diagnosis_fn(run, builds)` diagnostique l'environnement en lecture
+    seule (clé « environnement », {} si sans objet). Renvoie le résultat du dernier run (« relance » : nombre de
+    relances).
     """
     run = run_fn()
     if run.get("ok") or not is_lock_conflict(failure_text(run)):
         return {**run, "relance": 0}
-    log(f"[INCIDENTS] Conflit de verrouillage ({lock_table(failure_text(run)) or 'table non citée'}) au build "
-        f"{run.get('build') or '?'} : relance automatique du run (une fois).")
-    again = run_fn()
-    again = {**again, "relance": 1, "build_initial": run.get("build", "")}
-    if again.get("ok") or not is_lock_conflict(failure_text(again)):
-        return again
+    builds = [run.get("build", "")]
+    if already_retried and already_retried(run):
+        log(f"[INCIDENTS] Conflit de verrouillage ({lock_table(failure_text(run)) or 'table non citée'}) au build "
+            f"{run.get('build') or '?'}, déjà en échec après relance : erreur reproductible, pas de nouvelle relance.")
+        again = {**run, "relance": 0, "reproductible": True}
+    else:
+        log(f"[INCIDENTS] Conflit de verrouillage ({lock_table(failure_text(run)) or 'table non citée'}) au build "
+            f"{run.get('build') or '?'} : relance automatique du run (une fois).")
+        again = run_fn()
+        again = {**again, "relance": 1, "build_initial": run.get("build", "")}
+        if again.get("ok") or not is_lock_conflict(failure_text(again)):
+            return again
+        builds.append(again.get("build", ""))
     found = concurrency_fn(again) if concurrency_fn else {"message": "concurrence non vérifiée"}
     again["concurrence"] = found
     log(f"[INCIDENTS] ⛔ Conflit de verrouillage persistant après relance : {found.get('message', '')}")
+    if diagnosis_fn:
+        diag = diagnosis_fn(again, builds) or {}
+        if diag:
+            again["environnement"] = diag
     return again
 
 
@@ -818,7 +840,11 @@ _CURRENT_SCHEMA = re.compile(r"currentSchema=([\w$-]+)", re.I)
 
 
 def schema_of(params: dict) -> str:
-    """Schéma de base d'un build d'après ses paramètres (paramètre *SCHEMA*, option -D…schema…=, currentSchema=)."""
+    """
+    Schéma de base d'un build d'après ses paramètres (paramètre *SCHEMA*, option -D…schema…=, currentSchema=).
+    Valeur passée aux tests telle quelle (ex. « cucumber_customer_+1 », expression du pipeline non évaluée) : le
+    schéma réel est celui que cite l'erreur du serveur (check_concurrency, `error_text`).
+    """
     for name, value in (params or {}).items():
         text = str(value or "")
         if _SCHEMA_PARAM.search(str(name)) and re.fullmatch(r"[\w$-]+", text.strip()):
@@ -872,8 +898,17 @@ def concurrency(client: str, build: dict, builds: list, copies: list, schema: st
     return {"builds": found_builds, "copies": found_copies, "schema": schema, "message": message}
 
 
-def check_concurrency(client: str, build_url: str, jobs: list) -> dict:
-    """concurrency() sur les données réelles : build Jenkins, builds récents des jobs exclusifs, journal des copies."""
+def schema_in_error(text: str) -> str:
+    """Schéma cité par l'ordre SQL de l'erreur du serveur (« delete from <schéma>.<table> »), '' sinon."""
+    found = re.search(r"\b(?:delete\s+from\s+|update\s+(?=\S+\s+set\b)|insert\s+into\s+)([a-z_][a-z0-9_$]*)\.[a-z_]", str(text or ""), re.I)
+    return found.group(1).lower() if found else ""
+
+
+def check_concurrency(client: str, build_url: str, jobs: list, error_text: str = "") -> dict:
+    """
+    concurrency() sur les données réelles : build Jenkins, builds récents des jobs exclusifs, journal des copies.
+    Schéma : celui de l'erreur du serveur s'il est cité (`error_text`), sinon celui du build.
+    """
     from tools import db_restore, jenkins_tools
     info = jenkins_tools.build_info(build_url) if build_url else {}
     builds = [b for job in jobs or [] for b in jenkins_tools.recent_builds(job, 30)]
@@ -885,7 +920,7 @@ def check_concurrency(client: str, build_url: str, jobs: list) -> dict:
         return {"builds": [], "copies": [], "schema": "", "message": "horaires du build illisibles : concurrence non "
                                                                     "vérifiée"}
     # Schéma posé par le pipeline (absent des paramètres) : lu dans la console du build (-D…schema…=)
-    schema = schema_of(build["parametres"])
+    schema = schema_in_error(error_text) or schema_of(build["parametres"])
     if not schema and build_url:
         console = jenkins_tools.build_bytes(build_url, "consoleText").decode("utf-8", "replace")
         schema = schema_of({"console": console})
