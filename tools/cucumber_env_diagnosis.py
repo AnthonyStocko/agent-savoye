@@ -340,10 +340,14 @@ def blocked(client: str, history: list = None) -> dict:
     if history is None:
         from tools import db_restore
         history = db_restore.load_history(client)
-    restored = [c for c in copies_into(diag.get("schema", ""), history) if c.get("ok") and c.get("retour")
+    # Schéma remplacé après le diagnostic : sauvegarde restaurée, ou copie de référence (configuration copiée,
+    # cucumber_copied_config) copiée ou restaurée — le schéma diagnostiqué n'existe plus
+    restored = [c for c in copies_into(diag.get("schema", ""), history) if c.get("ok")
+                and (c.get("retour") or c.get("reference") or c.get("reference_restauree"))
                 and c.get("date", "") > diag.get("date", "")]
     if restored:
-        unblock(client, f"sauvegarde restaurée le {_date(restored[-1]['date'])}")
+        what = "sauvegarde restaurée" if restored[-1].get("retour") else "copie de référence mise en place"
+        unblock(client, f"{what} le {_date(restored[-1]['date'])}")
         return {}
     return diag
 

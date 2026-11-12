@@ -240,3 +240,14 @@ def test_restore_reference_refuses_missing_dump(tmp_path, monkeypatch):
     assert not entry["ok"] and "introuvable" in entry["message"]
     assert db_restore.load_history(CLIENT)[-1]["reference_restauree"]
     assert not os.path.exists(tmp_path / "absent.pgdump")
+
+
+def test_reference_copy_lifts_a_corrupted_environment_block():
+    from tools import cucumber_env_diagnosis as env
+    env.block(CLIENT, {"schema": SCHEMA, "table": "t", "conclusion": "corrompu", "preuves": [], "action": "a",
+                       "date": "2026-11-12T15:31:32"})
+    assert env.blocked(CLIENT, [])
+    copy = {"date": "2026-11-12T18:00:00", "cible": f"u@h:5432/db / {SCHEMA}", "ok": True,
+            "reference": "ref.pgdump"}
+    assert env.blocked(CLIENT, [{**copy, "date": "2026-11-12T10:00:00"}])
+    assert env.blocked(CLIENT, [copy]) == {}
