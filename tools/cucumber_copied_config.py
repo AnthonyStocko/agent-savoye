@@ -203,8 +203,17 @@ def prompt_block(profile: dict) -> str:
              "copie. N'en écris jamais.",
              "- Codes de référence (sites, donneurs d'ordres, transporteurs, emplacements, échanges…) : UNIQUEMENT ceux "
              "présents dans la copie ci-dessous ; jamais les codes de l'init du Standard s'ils n'y sont pas.",
+             "- Avant de créer une donnée de configuration (échange, document, règle, paramètre, imprimante, "
+             "planification…) : cherche celle du client dans la copie (requête en lecture seule) et RÉUTILISE-la "
+             "(ex. échange déjà lié au document). Ne crée que ce qui n'existe vraiment pas, et justifie-le dans un "
+             "commentaire de la feature (table lue, résultat vide).",
+             "- Création d'une donnée de configuration : step idempotent qui relit avec le même critère que la création "
+             "(code ET site), attend l'enregistrement s'il est asynchrone et, en cas d'échec, remonte la réponse du "
+             "serveur (code HTTP, message) — jamais d'échec silencieux.",
              "- Données propres à chaque test : créées par le test, avec des codes uniques au test, en création "
-             "idempotente (rejouable sur une copie qui contient déjà la donnée)."]
+             "idempotente (rejouable sur une copie qui contient déjà la donnée). Fichiers GS1 (WOI…) : destinataire "
+             "(receiver) avec son code (additionalPartyIdentification) unique au test, sinon intégration en erreur "
+             "« La propriété code est requise »."]
     codes = ref.get("codes") or {}
     for category, found in codes.items():
         values = found.get("codes") or []
