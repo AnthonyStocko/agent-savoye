@@ -132,7 +132,10 @@ def test_no_init_warning_on_an_environment_rebuilt_for_each_run():
     assert proof
     warning = cucumber_simple.no_init_warning(proof, "postgresql u@h:5432/db", "schema_1")
     assert "schema_1" in warning and "PAS garanties" in warning and "cochez « Initialisation" in warning
+    assert "recréé" not in warning and "Configuration copiée" in warning
     assert cucumber_simple.rebuilt_environment(["Finished: SUCCESS"]) == ""
+    # « dropschema » ne recrée que le schéma des tests du Standard (cucumber_spec_<N>) : ce n'est pas une preuve
+    assert cucumber_simple.rebuilt_environment(["containers with incomplete status: [dropschema]"]) == ""
     assert cucumber_simple.no_init_warning("") == ""
 
 

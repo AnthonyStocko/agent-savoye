@@ -339,13 +339,15 @@ def merge_features(previous: list, current: list) -> list:
     return [line for line in previous or [] if line.get("id") not in ids] + list(current)
 
 
-# Environnement des runs Jenkins remonté à chaque run : schéma supprimé puis recréé (conteneur « dropschema »),
-# slot alloué au build (« Build running on slot N ») ; lu dans les consoles des builds du client (0 token)
-_REBUILT_MARKERS = (re.compile(r"\bdrop_?schema\b", re.I), re.compile(r"\bBuild running on slot \d+", re.I))
+# Schéma des runs Jenkins attribué à chaque build : le job prend un slot libre du pool (« Build running on slot N »)
+# et joue les tests sur le schéma de ce slot (cucumber_customer_<N>), partagé par les runs de tous les clients. Le
+# conteneur « dropschema » ne recrée que le schéma des tests du Standard (cucumber_spec_<N>), jamais celui du slot :
+# il ne prouve rien ici. Lu dans les consoles des builds du client (0 token).
+_REBUILT_MARKERS = (re.compile(r"\bBuild running on slot \d+", re.I),)
 
 
 def rebuilt_environment(consoles: list) -> str:
-    """Preuve qu'un run Jenkins remonte son environnement (premier indice trouvé dans les consoles) ; '' sinon."""
+    """Preuve que les runs Jenkins prennent un slot du pool (premier indice trouvé dans les consoles) ; '' sinon."""
     for text in consoles or []:
         for marker in _REBUILT_MARKERS:
             found = marker.search(text or "")
@@ -356,16 +358,20 @@ def rebuilt_environment(consoles: list) -> str:
 
 def no_init_warning(proof: str, db_target: str = "", db_schema: str = "") -> str:
     """
-    Avertissement « sans init » sur un environnement remonté à chaque run : ce qui est lu dans la base de test n'est
-    pas garanti dans le schéma du slot alloué au run ; propose de cocher l'initialisation. '' sans preuve.
+    Avertissement « sans init » quand les runs prennent un slot du pool : ce qui est lu dans la base de test n'est
+    garanti ni dans le schéma du slot obtenu par le run, ni d'un run à l'autre ; propose de cocher l'initialisation
+    ou la configuration copiée. '' sans preuve.
     """
     if not proof:
         return ""
     where = f" ({db_target}{', schéma ' + db_schema if db_schema else ''})" if db_target or db_schema else ""
-    return (f"Sans initialisation, sur un environnement remonté à chaque run (console Jenkins : « {proof} ») : les "
-            f"données lues dans la base de test{where} ne sont PAS garanties dans l'environnement du run (schéma "
-            f"cucumber_customer_<slot> recréé pour le build). Les tests qui s'appuient sur elles échoueront ou ne "
-            f"prouveront rien : cochez « Initialisation de l'environnement » pour que l'init les crée à chaque run.")
+    return (f"Sans initialisation, sur un environnement à slots partagés (console Jenkins : « {proof} ») : les "
+            f"données lues dans la base de test{where} ne sont PAS garanties dans l'environnement du run. Chaque run "
+            f"prend un slot libre et joue les tests sur son schéma (cucumber_customer_<slot>), qui n'est pas forcément "
+            f"celui lu, et que les runs d'autres clients modifient ou purgent entre deux runs. Les tests qui "
+            f"s'appuient sur elles échoueront ou ne prouveront rien : cochez « Initialisation de l'environnement » "
+            f"pour que l'init les crée à chaque run, ou « Configuration copiée, sans purge » (étape 1) pour restaurer "
+            f"la configuration du client avant chaque run.")
 
 
 def client_no_init_warning(client_name: str) -> str:
