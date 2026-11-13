@@ -252,5 +252,29 @@
         "Colisage déclaratif : lignes consolidées de l'UP avec le produit": "donnee_non_idempotente"
       }
     }
+  ],
+  "constats_environnement": [
+    {
+      "cas": "précolisage injoignable (configuration copiée de production) : OP en CUBING_ERROR, campagne refusée",
+      "console": "18-precolisage-hote-inconnu.console.txt",
+      "logs": "18-precolisage-hote-inconnu.logs.txt",
+      "source": "réel anonymisé (hôte, pod, identifiants et codes remplacés) : génération du 13/11, correction 4 qui concluait à une cause hors test dans « restantes » sans changer le statut",
+      "constat": {
+        "type": "environnement",
+        "detail": "précolisage sur l'adresse de production de la copie, injoignable depuis le pod de test",
+        "preuve": "Impossible de précoliser après avoir tenté toutes les URL [http://<hote-precolisage>:80]",
+        "reactivation": "réactiver quand le précolisage pointe sur le serveur de test (ADDITIONAL_ARGLINE -DurlCubing)"
+      },
+      "attendu": {
+        "statut": "environnement",
+        "cause": "environnement",
+        "prouvee": true,
+        "source": "logs serveur du run",
+        "piste_contient": [
+          "CUBING_ERROR",
+          "ADDITIONAL_ARGLINE"
+        ]
+      }
+    }
   ]
 }

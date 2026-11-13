@@ -325,6 +325,9 @@ def proof_status(cause: str, item: dict) -> tuple:
                        "une fois la mise en place corrigée ; " + logs)
     if cause == "bug_applicatif":
         return False, f"erreur serveur constatée, défaut produit déduit : le confirmer par la trace serveur ; {logs}"
+    if cause == "environnement" and item.get("preuve_verifiee"):
+        # Constat « environnement » d'une correction dont l'extrait a été retrouvé (console ou logs serveur du run)
+        return True, ""
     if cause == "deploiement":
         # Constat de l'agent dont l'extrait a été retrouvé dans le journal de l'exécution (D8)
         return (True, "") if item.get("preuve_verifiee") else (
@@ -335,6 +338,11 @@ def proof_status(cause: str, item: dict) -> tuple:
     return False, f"cause déduite, absente du message d'échec : la confirmer par une preuve directe ; {logs}"
 
 
+def _reactivation(cause: str, item: dict) -> str:
+    """Condition de réactivation : celle du constat qui a prouvé la cause, à défaut celle de la cause."""
+    return " ".join(str(item.get("reactivation") or "").split())[:300] or CAUSES[cause][1]
+
+
 def _proof(item: dict, max_chars: int = 200) -> str:
     return " ".join(str(item.get("motif", "")).split())[:max_chars]
 
@@ -343,7 +351,7 @@ def disabled_comment(cause: str, item: dict, pending: bool = False) -> str:
     """« # À revoir : <cause> — cause PROUVÉE | cause NON PROUVÉE [— décision en attente] — <preuve> — réactivation : … »."""
     proven = proof_status(cause, item)[0]
     return (f"{DISABLED_COMMENT} {CAUSES[cause][0]} — {PROVEN if proven else 'cause ' + UNPROVEN}"
-            f"{PENDING if pending else ''} — {_proof(item)} — réactivation : {CAUSES[cause][1]}")
+            f"{PENDING if pending else ''} — {_proof(item)} — réactivation : {_reactivation(cause, item)}")
 
 
 def _disable_at(lines: list, line: int, comment: str, client_tag: str) -> None:
@@ -447,7 +455,7 @@ def apply_decision(worktree: str, files: list, scenarios: dict, decision: dict, 
         for title, (cause, item) in items.items():
             proven, check = proof_status(cause, item)
             entries.append({"fichier": rel, "titre": title, "id": item.get("id", ""), "cause": cause,
-                            "preuve": _proof(item, 400), "reactivation": CAUSES[cause][1], "prouvee": proven,
+                            "preuve": _proof(item, 400), "reactivation": _reactivation(cause, item), "prouvee": proven,
                             "verification": check, "heure": item.get("heure", "")})
     return entries
 

@@ -72,6 +72,8 @@ _TAG_OPTION = re.compile(rf"\s*-D{re.escape(TAG_FILTER)}=(?:'[^']*'|\"[^\"]*\"|\
 # Options des arguments dont la valeur est un identifiant (masquée partout, en plus des motifs communs)
 _CREDENTIAL_KEY = re.compile(r"user|login|pass|pwd|token|secret|key|auth|cred|account|compte|identifiant", re.I)
 _OPTION = re.compile(r"-D([\w.-]+)=('[^']*'|\"[^\"]*\"|\S+)")
+# Adresse d'un service de test (urlCubing, urlTdm…) ; « url » seul est l'adresse de l'application
+_SERVICE_URL_KEY = re.compile(r"url\w+$", re.I)
 _UNREADABLE_TYPES = ("Password", "File", "Credentials")
 
 
@@ -123,11 +125,21 @@ def effective_roles(profile: dict, definitions: dict) -> tuple:
     return roles, warnings + absent
 
 
-def register_job_secrets(definitions: dict, roles: dict) -> None:
-    """Identifiants des arguments du job (valeurs des options -D… d'identifiant, et la valeur entière) masqués."""
-    argline = str((definitions.get(roles.get("arguments") or "") or {}).get("defaut") or "")
-    values = [argline] + [v.strip("'\"") for k, v in _OPTION.findall(argline) if _CREDENTIAL_KEY.search(k)]
+def register_argline_secrets(argline: str) -> None:
+    """
+    Valeurs d'une ligne d'arguments du job masquées partout et interdites dans les fichiers du client : la ligne
+    entière, les identifiants (-D…user…, -D…password…) et les adresses des services de test (-DurlCubing, -DurlTdm…,
+    jamais -Durl de l'application).
+    """
+    argline = str(argline or "")
+    values = [argline] + [v.strip("'\"") for k, v in _OPTION.findall(argline)
+                          if _CREDENTIAL_KEY.search(k) or _SERVICE_URL_KEY.match(k)]
     secret_tools.register_secrets(values)
+
+
+def register_job_secrets(definitions: dict, roles: dict) -> None:
+    """Identifiants et adresses des services des arguments du job (configuration actuelle) masqués."""
+    register_argline_secrets(str((definitions.get(roles.get("arguments") or "") or {}).get("defaut") or ""))
 
 
 def standard_suites(definitions: dict, roles: dict) -> list:
@@ -284,6 +296,8 @@ def reference_parameters(job: str, repository: str, definitions: dict = None, bu
         if repo in values and not (agent_branch and agent_branch.strip().lower() in values):
             kept = {k: (("true" if v else "false") if isinstance(v, bool) else str(v)) for k, v in params.items()
                     if v is not None and (not definitions or k in definitions)}
+            # Arguments repris de ce build (ADDITIONAL_ARGLINE…) : identifiants et adresses masqués partout
+            register_argline_secrets(" ".join(v for k, v in kept.items() if "ARGLINE" in k.upper()))
             return {"numero": build.get("numero"), "parametres": kept}
     return {}
 

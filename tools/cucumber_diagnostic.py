@@ -117,6 +117,44 @@ def _normalize(text: str) -> str:
     return " ".join(str(text or "").split()).lower()
 
 
+ENVIRONMENT = "cause hors test prouvée par la correction"
+
+
+def environment_findings(fix: dict, scenarios: dict, server_log_check=None) -> tuple:
+    """
+    Constats « environnement » d'une correction (cause hors test : service injoignable, branchement de
+    l'environnement…) : retenus seulement si l'extrait cité figure dans le journal de la dernière exécution du
+    scénario, ou, à défaut, dans les logs serveur du run (`server_log_check(item, extrait)` → bool, relecture
+    bornée en lecture seule). Renvoie ({tag: mise à jour du résultat}, [constats refusés, avec la raison]).
+    """
+    accepted, refused = {}, []
+    for constat in fix.get("constats") or []:
+        if not isinstance(constat, dict) or str(constat.get("type", "")).strip().lower() != "environnement":
+            continue
+        tag, proof = str(constat.get("tag", "")).strip(), str(constat.get("preuve", "")).strip()
+        item = scenarios.get(tag)
+        if not item:
+            refused.append(f"{tag or '(sans tag)'} : constat d'environnement sur un scénario inconnu du lot")
+            continue
+        if len(_normalize(proof)) < MIN_PROOF_CHARS:
+            refused.append(f"{tag} : constat d'environnement sans extrait de preuve exploitable (une ligne exacte du "
+                           f"journal ou des logs serveur du run)")
+            continue
+        if _normalize(proof) in _normalize(item.get("journal", "")):
+            source = "journal de l'exécution"
+        elif server_log_check and server_log_check(item, proof):
+            source = "logs serveur du run"
+        else:
+            refused.append(f"{tag} : extrait « {proof[:120]} » retrouvé ni dans le journal de l'exécution ni dans les "
+                           f"logs serveur du run — constat d'environnement refusé")
+            continue
+        detail = " ".join(str(constat.get("detail", "")).split())[:200]
+        accepted[tag] = {"statut": "environnement", "preuve_verifiee": True,
+                         "reactivation": " ".join(str(constat.get("reactivation", "")).split())[:300],
+                         "motif": f"{ENVIRONMENT} : {detail} — extrait vérifié ({source}) : « {proof[:200]} »"}
+    return accepted, refused
+
+
 def deployment_findings(fix: dict, scenarios: dict) -> tuple:
     """
     Constats « deploiement » d'une correction appliqués aux scénarios ({tag: résultat}) : retenus seulement si

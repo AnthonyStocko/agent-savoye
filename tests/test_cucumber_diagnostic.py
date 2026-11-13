@@ -173,6 +173,9 @@ def test_adaptive_budget_stops_when_the_failure_repeats_and_continues_while_it_c
 
     def claude(prompt, *args, **kwargs):
         calls.append(prompt)
+        # Chaque correction modifie la feature (sans modification, le scénario ne serait pas relancé)
+        with open(os.path.join(repo, REL), "a", encoding="utf-8") as f:
+            f.write("    # correction %d\n" % len(calls))
         return 0, '{"corrigees": 1}', {}, False
     monkeypatch.setattr(main_module.cucumber_verify, "verify_lot", verify_lot)
     monkeypatch.setattr(main_module, "run_cucumber_claude", claude)
@@ -234,3 +237,73 @@ def test_held_scenario_is_not_rerun_so_its_diagnostic_is_not_claimed_and_fixing_
     assert "retiré sans avoir été exécuté" in out and "exécuté puis retiré" not in out
     assert "non relancé (décision humaine en attente)" in out
     assert cd.temporary_steps(repo) == []
+
+
+def _fix_loop(repo, main_module, monkeypatch, claude, verify_lot, attempts="3"):
+    """Boucle de correction après exécution d'un lot d'un scénario, Claude et Jenkins simulés."""
+    write(os.path.join(repo, REL), FEATURE)
+    write(os.path.join(repo, STEPS_REL), STEPS + "}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    tag = "@agent_clientx_1_1"
+    monkeypatch.setattr(main_module.cucumber_verify, "verify_lot", verify_lot)
+    monkeypatch.setattr(main_module, "run_cucumber_claude", claude)
+    monkeypatch.setattr(main_module, "render_prompt", lambda name, **values: values["erreurs"])
+    monkeypatch.setattr(main_module, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "verify_cucumber_lot", lambda *a, **k: {"ok": True})
+    monkeypatch.setenv("CUCUMBER_MAX_RETRACT_PCT", "100")
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_ATTEMPTS", attempts)
+    monkeypatch.setenv("CUCUMBER_AUTONOMY", "1")
+    lot = {"numero": 1, "tags": {tag: f"{REL}::Bouton de reconditionnement"}, "indicateurs": {"scenarios": []}}
+    main_module.verify_execution_lot(lot, [], "1/1", repo, "HEAD", [REL], [], "local", "", CLIENT, "", "", "", {},
+                                     "sonnet", "K", "/run", lambda u: None,
+                                     context={"conventions": {"client_tag": CLIENT_TAG}})
+    return lot, tag
+
+
+def test_environment_cause_concluded_by_the_fix_is_disabled_with_its_proof(repo, main_module, monkeypatch):
+    """« restantes » d'une cause hors test, avec constat « environnement » prouvé : désactivé, PROUVÉE, bilan."""
+    line = "Impossible de précoliser après avoir tenté toutes les URL [http://<hote>:80]"
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "Unable to create a launching Campaign", "journal": f"log serveur : {line}", "sorties": []}
+    runs = []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        runs.append(1)
+        return {"scenarios": {"@agent_clientx_1_1": dict(failing)}, "builds": []}
+
+    def claude(prompt, *args, **kwargs):
+        return 0, json.dumps({"corrigees": 0, "restantes": ["cause hors test : précolisage injoignable"],
+                              "constats": [{"tag": "@agent_clientx_1_1", "type": "environnement",
+                                            "detail": "précolisage de production injoignable", "preuve": line,
+                                            "reactivation": "réactiver quand le précolisage est branché sur le test"}]}
+                             ), {}, False
+    lot, tag = _fix_loop(repo, main_module, monkeypatch, claude, verify_lot)
+    item = lot["execution"]["scenarios"][tag]
+    assert item["statut"] == "environnement" and item["preuve_verifiee"] and len(runs) == 1
+    assert [(e["cause"], e["prouvee"]) for e in lot["a_revoir"]] == [("environnement", True)]
+    assert lot["a_revoir"][0]["reactivation"] == "réactiver quand le précolisage est branché sur le test"
+    assert lot["correction"]["restantes"] == ["cause hors test : précolisage injoignable"]
+    with open(os.path.join(repo, REL), encoding="utf-8") as f:
+        text = f.read()
+    assert "@A_REVOIR" in text and ar.PROVEN in text and "Scenario: Bouton de reconditionnement" in text
+
+
+def test_fix_without_any_change_does_not_rerun_the_scenario(repo, main_module, monkeypatch, capsys):
+    """Correction qui ne modifie aucun fichier : pas de nouvelle exécution (restauration + build évités)."""
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "expected true", "journal": "expected true", "sorties": []}
+    runs, prompts = [], []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        runs.append(1)
+        return {"scenarios": {"@agent_clientx_1_1": dict(failing)}, "builds": []}
+
+    def claude(prompt, *args, **kwargs):
+        prompts.append(prompt)
+        return 0, '{"corrigees": 0, "restantes": ["NON PROUVÉE : cause inconnue"]}', {}, False
+    lot, tag = _fix_loop(repo, main_module, monkeypatch, claude, verify_lot)
+    out = capsys.readouterr().out
+    assert len(runs) == 1 and len(prompts) == 1
+    assert "exécution non relancée" in out and "non relancé (aucune modification)" in out
+    assert lot["execution"]["scenarios"][tag]["statut"] == "invalide"

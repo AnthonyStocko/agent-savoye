@@ -368,6 +368,11 @@ def prompt_block(profile: dict) -> str:
              "test crée les siennes (fichiers d'intégration, steps de création du Standard), y compris le produit. "
              "Seule la CONFIGURATION du client (sites, donneurs d'ordres, emplacements, secteurs, transporteurs, "
              "échanges, documents, terminaux, paramètres) est reprise de la copie.",
+             "- Services de l'environnement de test (précolisage, TDM…) : la copie garde les adresses de PRODUCTION "
+             "du client. Les adresses et identifiants de test sont fournis par le job Jenkins (ADDITIONAL_ARGLINE : "
+             "-DurlCubing, -DuserCubing, -DpasswordCubing…) et lus À L'EXÉCUTION par System.getProperty dans un step "
+             "(ex. « INIT- Configuration du colisage ») ; ne les écris JAMAIS dans une feature, une classe ou un "
+             "fichier de données (dépôts publics, contrôle des fichiers).",
              "- Données propres à chaque test : créées par le test, avec des codes uniques au test, en création "
              "idempotente (rejouable sur une copie qui contient déjà la donnée). Fichiers GS1 (WOI…) : destinataire "
              "(receiver) avec son code (additionalPartyIdentification) unique au test, sinon intégration en erreur "

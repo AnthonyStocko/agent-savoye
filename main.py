@@ -578,6 +578,28 @@ def build_mcp_logs_block(step: str, client: str, failures: list, build: str = ""
     return "\n" + render_prompt("logs_mcp_access", **values)
 
 
+def server_log_contains(client: str, item: dict, proof: str) -> bool:
+    """
+    L'extrait `proof` cité par une correction figure-t-il dans les logs serveur du run du scénario `item` ?
+    Relecture Groundcover bornée, en lecture seule (fenêtre de l'échec, pod du build) ; la réponse doit RECOPIER la
+    ligne trouvée, vérifiée ici (jamais un simple oui). Groundcover indisponible : False.
+    """
+    block = build_mcp_logs_block("cucumber-verify-fix", client, [
+        {"id": item.get("id", ""), "step": item.get("step", ""), "heure": item.get("heure", "")}],
+        build=item.get("build", ""))
+    if not block:
+        return False
+    prompt = (block + "\n\nTÂCHE (lecture seule, Groundcover seulement) : cherche dans les logs de l'application du "
+              "run, fenêtre élargie à ±5 minutes autour de l'échec, la ligne qui contient cet extrait :\n"
+              f"<<<{proof[:600]}>>>\nRecopie mot pour mot la ou les lignes trouvées (au plus 3) entre ```text et ```, "
+              "rien d'autre. Aucune ligne trouvée : réponds AUCUNE.")
+    returncode, output, usage, _ = run_claude(prompt, os.getenv("CUCUMBER_LOG_CHECK_MODEL", "sonnet"), [], [],
+                                              lean=True, mcp_step="cucumber-verify-fix")
+    report_token_usage(item.get("id", "")[:80], "cucumber-log-check", "sonnet", usage, len(prompt), returncode, "")
+    found = " ".join(re.findall(r"```(?:text)?\s*(.*?)```", output or "", flags=re.S))
+    return returncode == 0 and cucumber_diagnostic._normalize(proof) in cucumber_diagnostic._normalize(found)
+
+
 def build_db_block(db_schema: str, python_exe: str, workspace_dir: str, step: str = "default",
                    profile: str = "") -> str:
     """
@@ -949,6 +971,24 @@ def _git_out(repo_dir: str, *args: str) -> str:
     # Sortie de git en UTF-8 (messages de commit accentués), pas dans l'encodage de la console Windows
     return subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True, encoding="utf-8",
                           errors="replace").stdout.strip()
+
+
+def tests_fingerprint(worktree: str) -> str:
+    """
+    Empreinte des fichiers de test du worktree (src/test) : commit courant, fichiers modifiés ou nouveaux et leur
+    contenu. Deux empreintes égales : aucune modification entre les deux (correction sans effet).
+    """
+    import hashlib
+    digest = hashlib.sha256(_git_out(worktree, "rev-parse", "HEAD").encode())
+    status = subprocess.run(["git", "-C", worktree, "status", "--porcelain=v1", "-uall", "--", "src/test"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    for line in sorted(l for l in status.splitlines() if l.strip()):
+        digest.update(line.encode("utf-8", "replace"))
+        path = os.path.join(worktree, *line[3:].strip().strip('"').split(" -> ")[-1].split("/"))
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                digest.update(f.read())
+    return digest.hexdigest()
 
 
 def _same_git_url(a: str, b: str) -> bool:
@@ -2500,6 +2540,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
                                             for v in bad.values()]),
                                fichiers="\n".join(f"- {f}" for f in files))
         before = cucumber_a_revoir.snapshot(worktree, files)
+        fingerprint = tests_fingerprint(worktree)
         verify_model, effort = verify_fix_model(model)
         # Modèle dédié : appel neuf (la reprise de la session imposerait le modèle du lot et relirait tout son
         # contexte, l'essentiel du coût d'une correction après exécution)
@@ -2519,12 +2560,28 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         for tag, update in deployed.items():
             result["scenarios"][tag].update(update)
             print(f"[LOT {label}] 🚚 {result['scenarios'][tag]['id']} : {update['motif']}")
+        # Cause hors test conclue par la correction : retenue si son extrait est retrouvé (journal ou logs serveur)
+        environment, env_refused = cucumber_diagnostic.environment_findings(
+            fix_result, {t: v for t, v in result["scenarios"].items() if t in bad},
+            lambda item, proof: server_log_contains(client, item, proof))
+        for tag, update in environment.items():
+            result["scenarios"][tag].update(update)
+            print(f"[LOT {label}] 🌐 {result['scenarios'][tag]['id']} : {update['motif']}")
+        deployed.update(environment)
+        refused += env_refused
         for error in refused:
             print(f"[LOT {label}] ⛔ {error}")
+        # Ce qui reste non résolu selon la correction : gardé pour le bilan (jamais perdu)
+        remaining = [" ".join(str(r).split())[:600] for r in fix_result.get("restantes") or [] if str(r).strip()]
+        if remaining:
+            kept = lot.setdefault("correction", {}).setdefault("restantes", [])
+            kept += [r for r in remaining if r not in kept]
         violations = refused + cucumber_a_revoir.check_corrections(worktree, before)
         for error in violations:
             print(f"[LOT {label}] ⛔ {error}")
         held = hold_meaning_changes(client, worktree, before, conventions.get("client_tag", ""), label, lot)
+        # Correction sans aucune modification des fichiers de test : rien de nouveau à exécuter
+        unchanged = tests_fingerprint(worktree) == fingerprint
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         check = verify_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
                                     values, model, work_key, run_dir, on_usage, inspired_of(results), context,
@@ -2539,6 +2596,9 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         if present and stop:
             print(f"[LOT {label}] ⛔ Revérification arrêtée : {stop}")
             break
+        if present and unchanged:
+            print(f"[LOT {label}] ⏭ Correction sans modification des fichiers de test : exécution non relancée.")
+            present = {}
         if present:
             again = cucumber_verify.verify_lot(mode, worktree, base, build, files,
                                                {t: scenarios[t] for t in present}, kinds,
@@ -2553,11 +2613,13 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             print(f"[LOT {label}] 🧹 Diagnostic temporaire exécuté puis retiré : {rel}" if present else
                   f"[LOT {label}] 🧹 Diagnostic temporaire retiré sans avoir été exécuté (aucun scénario relancé) : "
                   f"{rel}")
-        # Scénario corrigé mais pas relancé (décision humaine en attente) : rien de nouveau à lire, on n'y revient pas
+        # Scénario corrigé mais pas relancé (décision humaine en attente, correction sans modification) : rien de
+        # nouveau à lire, on n'y revient pas
         waiting = {t for t in sent if t not in present and t in to_fix()}
         for tag in sorted(waiting):
-            print(f"[LOT {label}] ⏸ {result['scenarios'][tag]['id']} : non relancé (décision humaine en attente), "
-                  f"arrêt des corrections pour ce scénario.")
+            print(f"[LOT {label}] ⏸ {result['scenarios'][tag]['id']} : non relancé ("
+                  + ("aucune modification" if unchanged else "décision humaine en attente")
+                  + "), arrêt des corrections pour ce scénario.")
         stuck |= waiting
         # Même échec qu'avant la correction : ce scénario ne repart plus (sauf diagnostic dont la sortie est nouvelle)
         newly = (set() if temporary and present else cucumber_fix_budget.stuck_after(sent, to_fix())) - waiting
@@ -2809,6 +2871,13 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
     errors += cucumber_isolation.check_files(client, worktree, files, own_profile, cucumber_std_dir)
     # Configuration copiée : aucune donnée métier de la copie (OP, UP, produit…) reprise, le test crée les siennes
     errors += cucumber_copied_config.check_business_data(worktree, files, own_profile)
+    # Valeurs des arguments du job Jenkins (ADDITIONAL_ARGLINE : adresses des services de test, identifiants) :
+    # jamais écrites dans un fichier du client (dépôts publics), lues à l'exécution par les propriétés système
+    load_job_values(client, own_profile)
+    for rel in secret_tools.files_with_job_values(worktree, files):
+        errors.append(f"{rel} : valeur des arguments du job Jenkins (ADDITIONAL_ARGLINE : adresse d'un service de "
+                      f"test, utilisateur ou mot de passe) écrite en dur — interdit (dépôts publics) : lis-la à "
+                      f"l'exécution par System.getProperty(\"<propriété>\") dans un step du projet")
     # Adresse de livraison inventée dans un fichier de données (commande, client) : remplacée par l'adresse de test
     for rel, found in cucumber_test_data.normalize_files(worktree, files, cucumber_test_data.test_address(own_profile)):
         print(f"[LOT {label}] 🏠 {cucumber_test_data.normalized_line(rel, found)}")
@@ -2873,6 +2942,24 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
 def inspired_of(results: list) -> list:
     """Scénarios Standard dont le lot s'inspire (« inspire_de » du JSON final) : guident la copie des fichiers."""
     return [str(p) for r in results or [] for p in r.get("inspire_de") or [] if p]
+
+
+_JOB_VALUES_LOADED = set()
+
+
+def load_job_values(client: str, profile: dict) -> None:
+    """
+    Valeurs des arguments du job de vérification (identifiants, adresses des services de test) enregistrées auprès
+    du masquage commun, une fois par client et par processus. Jenkins injoignable : contrôle sans ces valeurs.
+    """
+    if client in _JOB_VALUES_LOADED or os.getenv("CUCUMBER_JOB_VALUES_CHECK", "1").strip() == "0":
+        return
+    _JOB_VALUES_LOADED.add(client)
+    try:
+        cucumber_job.prepare(cucumber_verify.verification_job(profile), profile)
+    except Exception as e:  # noqa: BLE001 — contrôle facultatif : jamais bloquant
+        print(f"[CUCUMBER] Arguments du job Jenkins illisibles ({type(e).__name__}) : valeurs du job non contrôlées "
+              f"dans les fichiers du lot.")
 
 
 def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumber_std_dir: str, files: list,

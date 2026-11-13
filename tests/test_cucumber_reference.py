@@ -53,3 +53,47 @@ def test_reference_full_run(run):
     assert all(cucumber_failures.classify(r)["categorie"] in cucumber_failures.CATEGORIES for r in failures.values())
     for title, nature in run["natures"].items():
         assert natures[title] == nature, f"{title} : {natures[title]}"
+
+
+ENV_CASES = json.load(open(os.path.join(REFERENCE, "attendus.json"), encoding="utf-8")).get("constats_environnement") or []
+
+
+@pytest.mark.parametrize("case", ENV_CASES, ids=[c["console"].split(".")[0] for c in ENV_CASES])
+def test_reference_environment_constat_is_proven_and_disabled(case, tmp_path):
+    """Cause hors test conclue par une correction, preuve dans les logs serveur : statut environnement, A_REVOIR."""
+    from tools import cucumber_a_revoir as ar
+    from tools import cucumber_diagnostic as cd
+    from tools import cucumber_verify as cv
+    with open(os.path.join(REFERENCE, case["console"]), encoding="utf-8") as f:
+        console = f.read()
+    with open(os.path.join(REFERENCE, case["logs"]), encoding="utf-8") as f:
+        logs = f.read()
+    # Aucun hôte, pod ni identifiant réel dans le cas de référence
+    assert "<hote-precolisage>" in logs and "precubing" not in (console + logs).lower()
+    (rel, title), failure = next((k, r) for k, r in cucumber_import.console_results(console).items()
+                                 if r["statut"] != "passe")
+    tag = "@agent_client_1_1"
+    item = {"id": f"{rel}::{title}", "statut": "invalide", "motif": failure.get("message", ""), "journal": console}
+    checked = []
+
+    def server_log_check(scenario, proof):
+        checked.append(proof)
+        return " ".join(proof.split()).lower() in " ".join(logs.split()).lower()
+    accepted, refused = cd.environment_findings({"constats": [{"tag": tag, **case["constat"]}]}, {tag: item},
+                                                server_log_check)
+    expected = case["attendu"]
+    assert not refused and checked == [case["constat"]["preuve"]]       # absent de la console : relu dans les logs
+    item.update(accepted[tag])
+    assert item["statut"] == expected["statut"] and expected["source"] in item["motif"]
+    decision = ar.decide({tag: item}, {}, max_pct=100, autonomous=True)
+    assert decision["desactiver"] == {tag: expected["cause"]} and not decision["bloquants"]
+    assert ar.proof_status(expected["cause"], item)[0] is expected["prouvee"]
+    comment = ar.disabled_comment(expected["cause"], item)
+    assert ar.PROVEN in comment and case["constat"]["reactivation"] in comment
+    # Piste de diagnostic de l'échec : cite la source de la bonne adresse
+    hint = cv.failure_hint(logs)
+    assert all(word in hint for word in expected["piste_contient"])
+    # Extrait absent des logs et de la console : constat refusé, statut inchangé
+    wrong = {"constats": [{"tag": tag, **case["constat"], "preuve": "Connection refused by remote service X"}]}
+    accepted, refused = cd.environment_findings(wrong, {tag: {**item, "statut": "invalide"}}, server_log_check)
+    assert accepted == {} and "constat d'environnement refusé" in refused[0]

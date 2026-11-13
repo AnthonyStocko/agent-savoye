@@ -125,3 +125,27 @@ def remaining_secrets(text: str, environ=None) -> list:
     if any(_contains(value, text or "") for value in _RUNTIME_SECRETS):
         found.append(("argument du job", "valeur lue dans la configuration du job"))
     return found
+
+
+def job_values_in(text: str, min_len: int = 0) -> bool:
+    """
+    Le texte contient une valeur lue dans les arguments d'un job (register_secrets) : adresse, identifiant… `min_len` :
+    valeurs plus courtes ignorées (un mot court comme « Test » se trouve partout dans une feature).
+    """
+    return any(_contains(value, text or "") for value in _RUNTIME_SECRETS if len(value) >= min_len)
+
+
+def files_with_job_values(worktree: str, files: list) -> list:
+    """Fichiers (chemins relatifs) du lot qui contiennent une valeur des arguments d'un job Jenkins."""
+    if not _RUNTIME_SECRETS:
+        return []
+    found = []
+    for rel in files:
+        path = os.path.join(worktree, *rel.split("/"))
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            if job_values_in(f.read(), SHORT_SECRET_LEN):
+                found.append(rel)
+    return found
+

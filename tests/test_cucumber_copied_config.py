@@ -438,3 +438,8 @@ def test_business_data_of_the_copy_is_refused_in_the_lot_files(tmp_path):
     # Option inactive : aucun contrôle
     assert cc.check_business_data(str(tmp_path), [rel], {}, query) == []
     assert "Données MÉTIER" in cc.prompt_block(profile)
+
+
+def test_copied_prompt_sends_test_services_to_the_job_arguments():
+    block = cc.prompt_block({cc.OPTION: True, cc.SCHEMA_FIELD: "cucumber_customer_1"})
+    assert "ADDITIONAL_ARGLINE" in block and "System.getProperty" in block and "JAMAIS" in block

@@ -1,0 +1,4 @@
+2026-11-13T19:07:14.192Z error Error when try to connect session in Rest API : http://<hote-precolisage>:80
+2026-11-13T19:07:14.203Z error Error when managing cubing response (Impossible de précoliser après avoir tenté toutes les URL [http://<hote-precolisage>:80] com.github.kevinsawicki.http.HttpRequest$HttpRequestException: java.net.UnknownHostException: <hote-precolisage>)
+2026-11-13T19:07:14.216Z info WmsPreparationOrder(SPEC-0018-1,SPEC-0018-1) status CUBING_ERROR
+2026-11-13T19:07:14.903Z error Exception during <HistorizedFrame>, signal propagated <(-1, Unable to create a launching Campaign. Preparation order SPEC-0018-1,SPEC-0018-1 is not A lancer or already associated to a launching campaign)>

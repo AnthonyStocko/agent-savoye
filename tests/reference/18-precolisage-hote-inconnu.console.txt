@@ -1,0 +1,17 @@
+[2026-11-13T19:07:05.000Z] @CLIENT @WMS @PREPARATION @agent_client_1 @agent_client_1_1
+[2026-11-13T19:07:05.000Z] Scenario: Palettisation de la dernière UP de l'OP                       # src/test/resources/cucumber/features/client/WMS/03-Preparation/SPEC-0018-Palettiser.feature:30
+[2026-11-13T19:07:05.000Z]   Given INIT- Intégration des fichiers GS1                                  # cucumber.features.kis.QAFileIntegrationStep.integrationDesFichiersGS1(io.cucumber.datatable.DataTable)
+[2026-11-13T19:07:05.000Z]     | fileName          |
+[2026-11-13T19:07:05.000Z]     | WOI-SPEC-0018.xml |
+[2026-11-13T19:07:05.000Z]   And PREP- Campagne et Mise en Préparation des ordres de préparation       # cucumber.features.wmsPreparation.WmsLaunchingCampaignStep.campagneEtMiseEnPreparation(io.cucumber.datatable.DataTable)
+[2026-11-13T19:07:05.000Z]     | code        |
+[2026-11-13T19:07:05.000Z]     | SPEC-0018-1 |
+[2026-11-13T19:07:05.000Z]       java.lang.AssertionError: Unable to create a launching Campaign. Preparation order SPEC-0018-1,SPEC-0018-1 is not A lancer or already associated to a launching campaign
+[2026-11-13T19:07:05.000Z] 	at cucumber.endPoints.EndPointsNotification.waitNotification(EndPointsNotification.java:208)
+[2026-11-13T19:07:05.000Z] 	at ✽.PREP- Campagne et Mise en Préparation des ordres de préparation(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/03-Preparation/SPEC-0018-Palettiser.feature:36)
+[2026-11-13T19:07:05.000Z] 
+[2026-11-13T19:07:06.000Z] [ERROR] Tests run: 5, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 9.1 s <<< FAILURE! -- in cucumber.RunnerTest
+[2026-11-13T19:07:06.000Z] [ERROR] Client - SPEC-0018-Palettiser.Palettisation de la dernière UP de l'OP -- Time elapsed: 2.1 s <<< ERROR!
+[2026-11-13T19:07:06.000Z] java.lang.AssertionError: Unable to create a launching Campaign. Preparation order SPEC-0018-1,SPEC-0018-1 is not A lancer or already associated to a launching campaign
+[2026-11-13T19:07:06.000Z] 	at ✽.PREP- Campagne et Mise en Préparation des ordres de préparation(file:///home/jenkins/agent/workspace/CUCUMBER-CUSTOMER/spec/src/test/resources/cucumber/features/client/WMS/03-Preparation/SPEC-0018-Palettiser.feature:36)
+[2026-11-13T19:07:06.000Z] [ERROR] Tests run: 5, Failures: 0, Errors: 1, Skipped: 0

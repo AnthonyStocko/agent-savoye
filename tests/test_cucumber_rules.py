@@ -1,4 +1,5 @@
 """Phase 5 : runner dans le rapport, enseignements du point 9 (échecs connus, longueurs, environnement dans l'init)."""
+import base64
 import json
 import os
 
@@ -177,3 +178,31 @@ def test_check_fails_only_on_proven_absence(tmp_path):
     write(os.path.join(worktree, ce.java_path(CLIENT)),
           body % 'log.warn("non confirmée : " + x); if (!absents.isEmpty()) fail("Absentes : " + absents);')
     assert ce.unconfirmed_failures(worktree, CLIENT) == []
+
+
+def test_precubing_unreachable_points_to_the_job_arguments_never_to_hard_coded_values():
+    message = ("Error when managing cubing response (Impossible de précoliser après avoir tenté toutes les URL "
+               "[http://<hote>:80] java.net.UnknownHostException: <hote>)")
+    assert cv.failure_kind(message)[0] == "environnement"
+    hint = cv.failure_hint(message)
+    assert "ADDITIONAL_ARGLINE" in hint and "-DurlCubing" in hint and "JAMAIS" in hint
+    assert "CUBING_ERROR" in cv.failure_hint("Preparation order X-1 is not A lancer or already associated")
+
+
+def test_job_argument_values_are_masked_and_refused_in_lot_files(tmp_path, monkeypatch):
+    """Adresse d'un service de test et identifiants des arguments du job : masqués, interdits dans les fichiers."""
+    from tools import cucumber_job, secret_tools
+    monkeypatch.setattr(secret_tools, "_RUNTIME_SECRETS", set())
+    fake_password = base64.b64encode(b"motdepasse-fictif").decode()
+    cucumber_job.register_argline_secrets(
+        f"-Durl='localhost:8888' -DurlCubing='https://service-fictif.invalid' -DuserCubing='utilisateur-fictif' "
+        f"-DpasswordCubing='{fake_password}'")
+    masked = secret_tools.mask_secrets("appel https://service-fictif.invalid/ws avec motdepasse-fictif")[0]
+    assert "service-fictif" not in masked and "motdepasse-fictif" not in masked
+    assert "localhost:8888" not in {v for v in secret_tools._RUNTIME_SECRETS if v == "localhost:8888"}
+    files = {"a.feature": 'Given INIT- Configuration du colisage "https://service-fictif.invalid"\n',
+             "B.java": f'String p = "{fake_password}";\n',
+             "c.feature": "Given INIT- Configuration du colisage\n    # Test de bout en bout\n"}
+    for rel, text in files.items():
+        (tmp_path / rel).write_text(text, encoding="utf-8")
+    assert secret_tools.files_with_job_values(str(tmp_path), list(files)) == ["a.feature", "B.java"]

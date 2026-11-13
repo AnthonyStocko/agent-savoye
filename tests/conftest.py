@@ -79,12 +79,15 @@ def _isolated_knowledge(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_KNOWLEDGE_DIR", str(tmp_path / "connaissances_partagees"))
     # Groundcover (MCP) jamais actif par le .env du poste : les tests qui en ont besoin l'activent eux-mêmes
     monkeypatch.setenv("GROUNDCOVER_MCP_ENABLED", "0")
+    # Arguments du job Jenkins jamais lus par le contrôle des fichiers du lot (aucun appel réseau en test)
+    monkeypatch.setenv("CUCUMBER_JOB_VALUES_CHECK", "0")
     monkeypatch.setattr(knowledge_tools, "OUTBOX_DIR", str(tmp_path / "knowledge_outbox"))
     monkeypatch.setattr(knowledge_tools, "INDEX_CACHE", str(tmp_path / "knowledge_index.json"))
     original = dotenv.load_dotenv
 
     def guarded(*args, **kwargs):
-        kept = {name: os.environ.get(name) for name in ("AGENT_KNOWLEDGE_DIR", "GROUNDCOVER_MCP_ENABLED")}
+        kept = {name: os.environ.get(name) for name in ("AGENT_KNOWLEDGE_DIR", "GROUNDCOVER_MCP_ENABLED",
+                                                         "CUCUMBER_JOB_VALUES_CHECK")}
         try:
             return original(*args, **kwargs)
         finally:

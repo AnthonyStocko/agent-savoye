@@ -957,9 +957,21 @@ KNOWN_FAILURES = (
      "technique", "ordre non lançable après le contrôle du client : les données reprises du Standard ne respectent pas "
      "une règle active du client ; crée dans le Background des données conformes (fichiers propres à la feature), "
      "sans modifier l'init globale ni affaiblir la règle"),
+    # Précolisage injoignable (configuration copiée de production, ou service de test non branché) : OP en
+    # CUBING_ERROR, jamais lancé ; la bonne adresse vient du job Jenkins, jamais recopiée
+    (re.compile(r"Impossible de pr[ée]coliser|UnknownHostException[^\n]{0,80}precub|precub[^\n]{0,80}"
+                r"UnknownHostException|\bCUBING_ERROR\b", re.I), "environnement",
+     "précolisage injoignable : l'OP reste en CUBING_ERROR et la campagne de lancement est refusée. L'adresse du "
+     "serveur de précolisage de TEST est fournie par le job Jenkins dans ADDITIONAL_ARGLINE (-DurlCubing, "
+     "-DuserCubing, -DpasswordCubing) et appliquée par « INIT- Configuration du colisage », qui la lit à "
+     "l'exécution (System.getProperty) — à vérifier : le step a-t-il reçu ces propriétés (pom du client qui les "
+     "écrase, init qui ne le joue pas) ? Ne recopie JAMAIS ces valeurs (adresse, utilisateur, mot de passe) dans une "
+     "feature, une classe ou un fichier de données ; ne touche pas au scénario et cite la ligne de log en preuve "
+     "d'un constat « environnement »"),
     (re.compile(r"already (?:exists?|associated|used|integrated)|is not [«\"']?A lancer|d[ée]j[àa] (?:existant|"
                 r"associ[ée]|utilis[ée]|int[ée]gr[ée])|existe d[ée]j[àa]|duplicate key|unique constraint", re.I),
-     "technique", "objet déjà présent en base : si aucun clear ne passe entre deux exécutions (init décochée, runs "
+     "technique", "OP pas « A lancer » : vérifie d'abord son statut en base (CUBING_ERROR = précolisage en échec, "
+     "cause hors test, voir les logs serveur du run). Objet déjà présent en base : si aucun clear ne passe entre deux exécutions (init décochée, runs "
      "précédents conservés), les objets créés par les tests (OP, commandes, UP, SSCC, palettes…) restent d'un run à l'autre — "
      "vérifie-le par une requête sur le code en base, puis rends leurs codes UNIQUES à chaque exécution (mécanisme du "
      "Standard s'il existe : variable de contexte, step qui génère un code, substitution dans les fichiers ; sinon "
