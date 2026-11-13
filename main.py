@@ -5437,10 +5437,16 @@ def copied_init_plan(client: str, worktree: str, plan: dict) -> dict:
             changes[rel] = text
             continue
         reduced, removed = cucumber_copied_config.copied_feature(text, client)
-        if removed and _read_text(os.path.join(worktree, *rel.split("/"))) != reduced:
+        # Init déjà réduite et poussée : seuls les steps de branchement sur l'environnement de test sont réactivés
+        restored = cucumber_copied_config.restored_connections(text, reduced)
+        if (removed or restored) and _read_text(os.path.join(worktree, *rel.split("/"))) != reduced:
             changes[rel] = reduced
-            plan.setdefault("reasons", []).append(f"{rel.rsplit('/', 1)[-1]} : {removed} step(s) commenté(s) "
-                                                  f"(configuration copiée : aucune purge ni initialisation)")
+            reason = f"{removed} step(s) commenté(s) (configuration copiée : aucune purge ni initialisation)" \
+                if removed else ""
+            if restored:
+                reason += ("" if not reason else " ; ") + (f"{restored} step(s) de branchement sur l'environnement "
+                                                           f"de test réactivé(s)")
+            plan.setdefault("reasons", []).append(f"{rel.rsplit('/', 1)[-1]} : {reason}")
         elif rel in plan.get("changes", {}):
             changes[rel] = reduced
     plan["changes"] = changes

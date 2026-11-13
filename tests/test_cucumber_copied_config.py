@@ -172,6 +172,30 @@ def test_copied_init_keeps_the_test_environment_connections():
     assert removed == 5
 
 
+def test_already_reduced_init_gets_its_connections_back():
+    """Init réduite et poussée par une version précédente : l'étape 4 réactive les branchements, rien d'autre."""
+    pushed = ("  Scenario: Intégration des données\n"
+              "    And KIS- Désactivation de tous les jobs\n"
+              f"    # {cc.MARKER} configuration copiée du client (aucune purge ni initialisation)\n"
+              '    # Given MESS- Configuration du partenaire "WMS_TMS_LOCAL"\n'
+              f"    # {cc.MARKER} configuration copiée du client (aucune purge ni initialisation)\n"
+              "    # Given INIT- Configuration du colisage\n"
+              f"    # {cc.MARKER} configuration copiée du client (aucune purge ni initialisation)\n"
+              "    # And INIT- Configuration du prestataire transport \"TDM\"\n"
+              f"    # {cc.MARKER} configuration copiée du client (aucune purge ni initialisation)\n"
+              "    # And KIS- Création du job\n"
+              "    # | name | type |\n"
+              "    # | J1   | a.B  |\n")
+    text, removed = cc.copied_feature(pushed, CLIENT)
+    active = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    assert active == ["Scenario: Intégration des données", "And KIS- Désactivation de tous les jobs",
+                      'Given MESS- Configuration du partenaire "WMS_TMS_LOCAL"',
+                      "Given INIT- Configuration du colisage", 'And INIT- Configuration du prestataire transport "TDM"']
+    assert removed == 0 and cc.restored_connections(pushed, text) == 3
+    assert "    # And KIS- Création du job\n    # | name | type |\n" in text
+    assert cc.copied_feature(text, CLIENT) == (text, 0)
+
+
 def import_main():
     saved = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = io.StringIO(), io.StringIO()

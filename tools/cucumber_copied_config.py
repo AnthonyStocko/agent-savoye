@@ -268,7 +268,7 @@ def copied_feature(text: str, client_name: str = "") -> tuple:
     from tools import cucumber_environment, cucumber_jobs
     check = cucumber_environment.check_expression(client_name).split("{", 1)[0].strip() if client_name else ""
     created = {u["nom"] for u in cucumber_jobs.usages(text or "") if u["step"] == "KIS- Création du job" and u["nom"]}
-    lines = (text or "").splitlines(keepends=True)
+    lines = _restore_connections((text or "").splitlines(keepends=True))
     out, scenario, commented, i = [], "", 0, 0
     while i < len(lines):
         line = lines[i]
@@ -299,6 +299,44 @@ def copied_feature(text: str, client_name: str = "") -> tuple:
         out.append(f"{indent}# {MARKER} configuration copiée du client (aucune purge ni initialisation)" + eol)
         out += [f"{indent}# {b.lstrip()}" if b.strip() and not b.lstrip().startswith("#") else b for b in block]
     return "".join(out), commented
+
+
+_COMMENTED_STEP = re.compile(r"^(\s*)#\s?((?:Given|When|Then|And|But|\*)\s+.*?)\s*$")
+_COMMENTED_ROW = re.compile(r"^\s*#\s?(\||\"\"\")")
+
+
+def _restore_connections(lines: list) -> list:
+    """
+    Steps de branchement sur l'environnement de test (ENV_CONNECTION_STEPS) commentés sous « # CONFIG-COPIEE: » par
+    une version précédente de l'agent : réactivés (marqueur retiré, step et table décommentés). Une init déjà réduite
+    et poussée est ainsi remise à jour par l'étape 4 au lieu de rester telle quelle.
+    """
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        step = _COMMENTED_STEP.match(lines[i + 1].rstrip("\r\n")) if i + 1 < len(lines) else None
+        if not (MARKER in line and line.lstrip().startswith("#") and step
+                and _connects_test_environment(_STEP.match(step.group(2)).group(3))):
+            out.append(line)
+            i += 1
+            continue
+        indent, eol = step.group(1), "\r\n" if lines[i + 1].endswith("\r\n") else "\n"
+        out.append(f"{indent}{step.group(2)}{eol}")
+        i += 2
+        while i < len(lines) and _COMMENTED_ROW.match(lines[i]):
+            row = lines[i].split("#", 1)[1].lstrip(" ").rstrip("\r\n")
+            out.append(f"{indent}  {row}{eol}")
+            i += 1
+    return out
+
+
+def restored_connections(before: str, after: str) -> int:
+    """Steps de branchement actifs dans `after` mais pas dans `before` (réactivés par copied_feature)."""
+    def active(text):
+        return sum(1 for line in (text or "").splitlines()
+                   if (m := _STEP.match(line)) and not line.lstrip().startswith("#")
+                   and _connects_test_environment(m.group(3)))
+    return max(0, active(after) - active(before))
 
 
 def _drop_rows(block: list, created: set) -> tuple:
