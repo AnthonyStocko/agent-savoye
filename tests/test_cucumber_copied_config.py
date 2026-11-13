@@ -6,6 +6,7 @@ restaurée avant chaque run, run arrêté s'il utilise un autre schéma, référ
 import importlib
 import io
 import os
+import subprocess
 import sys
 
 import pytest
@@ -150,6 +151,27 @@ def test_copied_init_keeps_only_job_deactivations_and_read_only_checks():
     assert removed == 4 and text.count(cc.MARKER) == 4
 
 
+def test_copied_init_keeps_the_test_environment_connections():
+    """Colisage, prestataire transport, partenaire de messages : adresses du job Jenkins, jamais celles du client."""
+    init = INIT.replace("    And KIS- Désactivation de tous les jobs\n",
+                        "    And KIS- Désactivation de tous les jobs\n"
+                        '    Given MESS- Configuration du partenaire "WMS_TMS_LOCAL"\n'
+                        "    Given INIT- Configuration du colisage\n"
+                        '    Given INIT- Configuration du prestataire transport "TDM"\n'
+                        '    Given MESS- Configuration du partenaire  "WMS_TMS_LOCAL"\n'
+                        "      | url  |\n"
+                        "      | http://ailleurs |\n")
+    text, removed = cc.copied_feature(init, CLIENT)
+    active = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    assert 'Given MESS- Configuration du partenaire "WMS_TMS_LOCAL"' in active
+    assert "Given INIT- Configuration du colisage" in active
+    assert 'Given INIT- Configuration du prestataire transport "TDM"' in active
+    # Variante à table : modification libre du partenaire, pas un branchement → commentée
+    assert 'Given MESS- Configuration du partenaire  "WMS_TMS_LOCAL"' not in active
+    assert "| http://ailleurs |" not in active
+    assert removed == 5
+
+
 def import_main():
     saved = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
@@ -240,6 +262,82 @@ def test_restore_reference_refuses_missing_dump(tmp_path, monkeypatch):
     assert not entry["ok"] and "introuvable" in entry["message"]
     assert db_restore.load_history(CLIENT)[-1]["reference_restauree"]
     assert not os.path.exists(tmp_path / "absent.pgdump")
+
+
+REF_LISTING = """;
+; Archive created at 2026-11-13
+13157; 1259 561293378 TABLE cucumber_customer_1 ref_site pgadm
+13158; 1259 561293383 TABLE cucumber_customer_1 wms_preparation_order pgadm
+13159; 1259 561293388 TABLE cucumber_customer_1 kis_property pgadm
+;13160; 1259 561293390 TABLE cucumber_customer_1 commentee pgadm
+20001; 0 561293378 TABLE DATA cucumber_customer_1 ref_site pgadm
+"""
+
+
+class FakeRestore:
+    """pg_restore / psql simulés : `tables` successifs comptés après chaque pg_restore."""
+
+    def __init__(self, tables):
+        self.tables, self.restores = list(tables), 0
+
+    def run(self, args, conn, log, data=None, timeout=3600):
+        out = REF_LISTING if "-l" in args else ""
+        if "-l" not in args and os.path.basename(args[0]).startswith("pg_restore"):
+            self.restores += 1
+            return subprocess.CompletedProcess(args, 1, "", "pg_restore: error: connection lost")
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    def psql(self, conn, sql, log, quiet=True):
+        if "relkind" in sql:
+            return subprocess.CompletedProcess([], 0, f"{self.tables[min(self.restores, len(self.tables)) - 1]}\n", "")
+        if "information_schema.schemata" in sql:
+            return subprocess.CompletedProcess([], 0, "1\n", "")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+
+def fake_restore(tmp_path, monkeypatch, tables):
+    fake = FakeRestore(tables)
+    monkeypatch.setattr(db_restore, "ROOT", str(tmp_path / "restauration"))
+    monkeypatch.setattr(db_restore, "_run", fake.run)
+    monkeypatch.setattr(db_restore, "_psql", fake.psql)
+    dump = tmp_path / "reference.pgdump"
+    dump.write_text("dump")
+    return fake, str(dump)
+
+
+def test_listed_tables_counts_structure_only():
+    assert db_restore.listed_tables(REF_LISTING, SCHEMA) == 3
+    assert db_restore.listed_tables(REF_LISTING, "autre") == 0
+
+
+def test_interrupted_reference_restore_is_retried_once(tmp_path, monkeypatch):
+    fake, dump = fake_restore(tmp_path, monkeypatch, [2, 3])
+    logs = []
+    entry = db_restore.restore_reference(CLIENT, dump, SCHEMA, logs.append)
+    assert entry["ok"] and fake.restores == 2
+    assert "copie incomplète (2/3 tables" in entry["premiere_tentative"]
+    assert any("nouvelle tentative" in line for line in logs)
+
+
+def test_reference_restore_incomplete_twice_fails_and_blocks_the_run(tmp_path, monkeypatch):
+    fake, dump = fake_restore(tmp_path, monkeypatch, [1, 1])
+    entry = db_restore.restore_reference(CLIENT, dump, SCHEMA, lambda m: None)
+    assert not entry["ok"] and fake.restores == 2
+    assert entry["message"].startswith("copie incomplète (1/3 tables dans cucumber_customer_1")
+    assert db_restore.load_history(CLIENT)[-1]["ok"] is False
+    # Garde du run : restauration en échec → rien n'est lancé
+    events = []
+    guard = cc.RunGuard(CLIENT, copied_profile(tmp_path), lambda m: None,
+                        restore=lambda client, d, schema, log: db_restore.restore_reference(client, dump, schema, log))
+    assert "copie incomplète (1/3 tables" in guard.prepare() and not guard.info["restauration"]
+
+
+def test_complete_restore_with_pg_restore_errors_stays_ok(tmp_path, monkeypatch):
+    """Une copie complète a aussi des erreurs pg_restore (commentaires, extensions) : seules les tables comptent."""
+    fake, dump = fake_restore(tmp_path, monkeypatch, [3])
+    entry = db_restore.restore_reference(CLIENT, dump, SCHEMA, lambda m: None)
+    assert entry["ok"] and fake.restores == 1 and entry["erreurs_restauration"] == 1
+    assert "premiere_tentative" not in entry
 
 
 def test_reference_copy_lifts_a_corrupted_environment_block():

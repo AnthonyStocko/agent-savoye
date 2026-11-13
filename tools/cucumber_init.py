@@ -334,7 +334,7 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
     profil du client (le clear est propre au client : la question est posée) ou si une valeur du profil d'un autre
     client apparaît dans les fichiers générés. Configuration copiée (profil client, cucumber_copied_config) : aucun
     clear exigé ni écrit, aucune recréation ni intégration de fichiers ; seuls restent actifs les désactivations de
-    jobs et les contrôles en lecture seule (copied_feature).
+    jobs, le branchement sur les services de test et les contrôles en lecture seule (copied_feature).
     """
     from tools import cucumber_copied_config
     copied = cucumber_copied_config.active(profile)

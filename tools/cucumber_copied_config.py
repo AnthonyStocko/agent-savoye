@@ -15,7 +15,8 @@ Déroulé :
    « référence » (pg_dump du schéma copié, dans le cache du client) avec date, source, version de l'application et
    codes de référence lus dans la copie ; sans référence valide, l'étape 4 reste bloquée ;
 3. init : aucun clear, aucune purge, aucune initialisation globale ; seuls restent actifs les steps sans effet
-   destructeur nécessaires aux tests (désactivation de jobs, contrôles en lecture seule) — copied_feature ;
+   destructeur nécessaires aux tests (désactivation de jobs, branchement sur les services de l'environnement de
+   test — ENV_CONNECTION_STEPS —, contrôles en lecture seule) — copied_feature ;
 4. avant chaque run lancé par l'agent : restauration de la référence (pg_restore, journalisée), Jenkins libre
    (jenkins_tools.run_exclusive) ; après le démarrage, schéma du run lu dans la console : un autre schéma arrête
    le build (« le run n'utilise pas le schéma copié (schéma <N>) ») — RunGuard ;
@@ -50,6 +51,13 @@ _SCHEMA_ARG = re.compile(r"bdd_schema\s*[=:]\s*['\"]?([\w$+-]+)", re.I)
 _STEP = re.compile(r"^(\s*)(Given|When|Then|And|But|\*)\s+(.*?)\s*$")
 _SCENARIO = re.compile(r"^\s*(Scenario|Scenario Outline|Background|Scénario|Contexte)\s*:", re.I)
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+# Steps du Standard qui rebranchent l'application sur les services de l'environnement de test (adresses et comptes
+# passés par le job Jenkins : -DurlCubing, -DurlTdm, -Durl…) sans toucher à la configuration métier du client. Gardés
+# actifs en configuration copiée : sinon la copie garde les adresses de production du client (ex. précubage
+# « http://precubing:80 » injoignable depuis le pod → OP en CUBING_ERROR, campagne de lancement refusée).
+ENV_CONNECTION_STEPS = (re.compile(r"^INIT- Configuration du colisage$"),
+                        re.compile(r'^INIT- Configuration du prestataire transport "[^"]*"$'),
+                        re.compile(r'^MESS- Configuration du partenaire "[^"]*"$'))
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +240,16 @@ def prompt_block(profile: dict) -> str:
 # Init en mode configuration copiée
 # ---------------------------------------------------------------------------
 
+def _connects_test_environment(step: str) -> bool:
+    """Step qui branche l'application sur les services de l'environnement de test (ENV_CONNECTION_STEPS)."""
+    return any(pattern.match(step.strip()) for pattern in ENV_CONNECTION_STEPS)
+
+
 def _is_kept(step: str, scenario: str, client_check: str = "") -> bool:
     from tools import cucumber_jobs
     if cucumber_jobs.step_key(step) in (cucumber_jobs.ONE_OFF, cucumber_jobs.ALL_OFF):
+        return True
+    if _connects_test_environment(step):
         return True
     if client_check and step.startswith(client_check):
         return True
@@ -244,9 +259,10 @@ def _is_kept(step: str, scenario: str, client_check: str = "") -> bool:
 def copied_feature(text: str, client_name: str = "") -> tuple:
     """
     Feature d'init en mode configuration copiée : seuls restent actifs les steps sans effet destructeur
-    nécessaires aux tests — désactivation de jobs (sauf ceux que l'init créait, la création étant retirée) et
-    contrôles en lecture seule de l'environnement ; tout le reste (purge, clear, initialisation globale, fichiers,
-    créations, paramétrages, recréations) est commenté sous « # CONFIG-COPIEE: », tables comprises. Renvoie
+    nécessaires aux tests — désactivation de jobs (sauf ceux que l'init créait, la création étant retirée),
+    branchement sur les services de l'environnement de test (ENV_CONNECTION_STEPS) et contrôles en lecture seule
+    de l'environnement ; tout le reste (purge, clear, initialisation globale, fichiers, créations, paramétrages,
+    recréations) est commenté sous « # CONFIG-COPIEE: », tables comprises. Renvoie
     (texte, nombre de steps commentés).
     """
     from tools import cucumber_environment, cucumber_jobs

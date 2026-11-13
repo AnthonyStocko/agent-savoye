@@ -150,6 +150,27 @@ def _psql(conn: dict, sql: str, log, quiet: bool = True) -> subprocess.Completed
                 + (["-q"] if quiet else []) + ["-c", sql], conn, log)
 
 
+class IncompleteRestore(RestoreError):
+    """Schéma restauré avec moins de tables que le dump : restauration interrompue."""
+
+
+_LISTED_TABLE = re.compile(r"^\d+;\s+\d+\s+\d+\s+TABLE\s+(\S+)\s+\S+")
+
+
+def listed_tables(listing: str, schema: str) -> int:
+    """Tables (structure, pas TABLE DATA) du schéma `schema` dans un listing pg_restore -l, entrées commentées exclues."""
+    return sum(1 for line in (listing or "").splitlines()
+               if (m := _LISTED_TABLE.match(line)) and m.group(1).lower() == (schema or "").lower())
+
+
+def count_tables(conn: dict, schema: str, log) -> int:
+    """Tables (ordinaires et partitionnées) du schéma sur la base ; -1 si la base ne répond pas."""
+    result = _psql(conn, "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                         f"WHERE n.nspname = '{schema}' AND c.relkind IN ('r', 'p');", log)
+    lines = (result.stdout or "").strip().splitlines()
+    return int(lines[-1]) if result.returncode == 0 and lines and lines[-1].strip().isdigit() else -1
+
+
 def schema_exists(conn: dict, schema: str, log) -> bool:
     result = _psql(conn, f"SELECT count(*) FROM information_schema.schemata WHERE schema_name = '{schema}';", log)
     if result.returncode != 0:
@@ -198,6 +219,15 @@ def restore_dump(conn: dict, dump: str, dump_schema_name: str, target_schema: st
             raise RestoreError(f"renommage {dump_schema_name} → {target_schema} impossible : "
                                f"{renamed.stderr.strip()[:300]}")
     warnings = sum(1 for line in (restored.stderr or "").splitlines() if "error" in line.lower())
+    # Restauration interrompue (coupure réseau, poste en veille) : pg_restore laisse un schéma partiel et ses erreurs
+    # ne suffisent pas à le dire (une copie complète en a aussi) ; seules les tables manquantes le prouvent
+    expected = listed_tables(filtered, dump_schema_name)
+    found = count_tables(conn, target_schema, log)
+    if expected and found < expected:
+        counted = f"{found}/{expected} tables" if found >= 0 else f"tables illisibles, {expected} attendues"
+        raise IncompleteRestore(f"copie incomplète ({counted} dans {target_schema} ; pg_restore code "
+                                f"{restored.returncode}, {warnings} erreur(s)) : "
+                                f"{(restored.stderr or '').strip()[-200:]}")
     log("ANALYZE des tables du schéma " + target_schema)
     _psql(conn, "DO $$ DECLARE r RECORD; BEGIN FOR r IN SELECT table_schema, table_name FROM "
                 f"information_schema.tables WHERE table_schema = '{target_schema}' AND table_type = 'BASE TABLE' "
@@ -317,7 +347,13 @@ def restore_reference(client_name: str, dump: str, target_schema: str, log=print
             raise RestoreError(f"schéma cible invalide ou interdit : « {target_schema} »")
         if not os.path.exists(dump or ""):
             raise RestoreError(f"instantané de référence introuvable : {dump}")
-        result = restore_dump(target, dump, target_schema, target_schema, log, exclude=False)
+        try:
+            result = restore_dump(target, dump, target_schema, target_schema, log, exclude=False)
+        except IncompleteRestore as e:
+            # Coupure pendant la restauration : une seule nouvelle tentative, sinon le run n'est pas lancé
+            log(f"⚠️ {e} — nouvelle tentative de restauration")
+            entry["premiere_tentative"] = str(e)[:300]
+            result = restore_dump(target, dump, target_schema, target_schema, log, exclude=False)
         entry.update(result, ok=True, message=f"copie de référence restaurée dans {target_schema}")
     except (RestoreError, subprocess.TimeoutExpired, OSError) as e:
         entry["message"] = str(e)

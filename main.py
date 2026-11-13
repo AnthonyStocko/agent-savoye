@@ -5446,8 +5446,9 @@ def copied_init_plan(client: str, worktree: str, plan: dict) -> dict:
     plan["changes"] = changes
     plan["binaries"] = {}
     plan["standard"] = {}
-    plan.setdefault("remarks", []).append("configuration copiée : désactivations de jobs et contrôles en lecture "
-                                          "seule seulement ; codes de référence lus dans la copie")
+    plan.setdefault("remarks", []).append("configuration copiée : désactivations de jobs, branchement sur les "
+                                          "services de test (colisage, transport, partenaires) et contrôles en "
+                                          "lecture seule seulement ; codes de référence lus dans la copie")
     return plan
 
 
