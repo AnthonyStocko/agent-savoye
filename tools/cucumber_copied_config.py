@@ -56,8 +56,63 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 # actifs en configuration copiée : sinon la copie garde les adresses de production du client (ex. précubage
 # « http://precubing:80 » injoignable depuis le pod → OP en CUBING_ERROR, campagne de lancement refusée).
 ENV_CONNECTION_STEPS = (re.compile(r"^INIT- Configuration du colisage$"),
-                        re.compile(r'^INIT- Configuration du prestataire transport "[^"]*"$'),
-                        re.compile(r'^MESS- Configuration du partenaire "[^"]*"$'))
+                        re.compile(r'^INIT- Configuration du prestataire transport "([^"]*)"$'),
+                        re.compile(r'^MESS- Configuration du partenaire "([^"]*)"$'))
+# Donnée que chaque step met à jour (créée chez le Standard par l'init globale, jamais en configuration copiée) :
+# (table, colonne, valeur fixe ou None = valeur entre guillemets du step). Sans elle dans la copie, le step échoue
+# (« Impossible de trouver le partenaire [WMS_TMS_LOCAL] ») : il reste commenté.
+CONNECTION_TARGETS = (("wms_preparation_saas_param", "code", "CUBING"), ("tms_provider_gen_exc", "code", None),
+                      ("exc_message_partner", "code", None))
+
+
+def connection_target(step: str) -> tuple:
+    """(table, colonne, valeur) mise à jour par un step de branchement ; () si ce n'en est pas un."""
+    for pattern, (table, column, value) in zip(ENV_CONNECTION_STEPS, CONNECTION_TARGETS):
+        found = pattern.match((step or "").strip())
+        if found:
+            return table, column, value if value is not None else found.group(1)
+    return ()
+
+
+def copy_query(sql: str, schema: str) -> list:
+    """Requête de lecture dans la copie (base des tests, profil « cucumber » de db_tools) : lignes [{"code": …}]."""
+    from tools import db_tools
+    previous = db_tools.set_profile("cucumber")
+    try:
+        out = db_tools.run_query(sql, schema, limit=MAX_CODES)
+    finally:
+        db_tools.set_profile(previous)
+    rows = [line.split(" | ") for line in out.splitlines()[1:-1]]
+    return [{"code": r[0].strip()} for r in rows if r]
+
+
+def checker_for(profile: dict):
+    """connection_checker sur le schéma de test du profil ; None sans schéma (steps de branchement gardés)."""
+    schema = test_schema(profile)
+    return connection_checker(schema, copy_query) if schema else None
+
+
+def connection_checker(schema: str, query):
+    """
+    available(step) : la donnée du step de branchement existe dans la copie (`query(sql, schema)` → lignes, lecture
+    seule). Base illisible : step gardé (l'échec de l'init le montrera plutôt qu'un précubage silencieusement faux).
+    """
+    cache = {}
+
+    def available(step: str) -> bool:
+        target = connection_target(step)
+        if not target or not (_IDENTIFIER.match(target[0]) and _IDENTIFIER.match(target[1])):
+            return False
+        if target not in cache:
+            table, column, value = target
+            try:
+                rows = query(f"SELECT {column} AS code FROM {table} WHERE {column} = '{value.replace(chr(39), '')}'",
+                             schema)
+                cache[target] = bool(rows)
+            except Exception as e:  # noqa: BLE001 - table absente : pas de donnée ; base injoignable : step gardé
+                cache[target] = not re.search(r"UndefinedTable|does not exist|n'existe pas", str(e))
+        return cache[target]
+    return available
 
 
 # ---------------------------------------------------------------------------
@@ -245,30 +300,31 @@ def _connects_test_environment(step: str) -> bool:
     return any(pattern.match(step.strip()) for pattern in ENV_CONNECTION_STEPS)
 
 
-def _is_kept(step: str, scenario: str, client_check: str = "") -> bool:
+def _is_kept(step: str, scenario: str, client_check: str = "", available=None) -> bool:
     from tools import cucumber_jobs
     if cucumber_jobs.step_key(step) in (cucumber_jobs.ONE_OFF, cucumber_jobs.ALL_OFF):
         return True
     if _connects_test_environment(step):
-        return True
+        return available is None or available(step)
     if client_check and step.startswith(client_check):
         return True
     return "lecture seule" in scenario.lower() and "contr" in scenario.lower()
 
 
-def copied_feature(text: str, client_name: str = "") -> tuple:
+def copied_feature(text: str, client_name: str = "", available=None) -> tuple:
     """
     Feature d'init en mode configuration copiée : seuls restent actifs les steps sans effet destructeur
     nécessaires aux tests — désactivation de jobs (sauf ceux que l'init créait, la création étant retirée),
     branchement sur les services de l'environnement de test (ENV_CONNECTION_STEPS) et contrôles en lecture seule
     de l'environnement ; tout le reste (purge, clear, initialisation globale, fichiers, créations, paramétrages,
-    recréations) est commenté sous « # CONFIG-COPIEE: », tables comprises. Renvoie
+    recréations) est commenté sous « # CONFIG-COPIEE: », tables comprises. `available(step)` (connection_checker) :
+    un step de branchement dont la donnée est absente de la copie reste commenté (il échouerait). Renvoie
     (texte, nombre de steps commentés).
     """
     from tools import cucumber_environment, cucumber_jobs
     check = cucumber_environment.check_expression(client_name).split("{", 1)[0].strip() if client_name else ""
     created = {u["nom"] for u in cucumber_jobs.usages(text or "") if u["step"] == "KIS- Création du job" and u["nom"]}
-    lines = _restore_connections((text or "").splitlines(keepends=True))
+    lines = _restore_connections((text or "").splitlines(keepends=True), available)
     out, scenario, commented, i = [], "", 0, 0
     while i < len(lines):
         line = lines[i]
@@ -285,7 +341,7 @@ def copied_feature(text: str, client_name: str = "") -> tuple:
         while i < len(lines) and lines[i].strip().startswith(("|", "#", '"""')):
             block.append(lines[i])
             i += 1
-        keep = _is_kept(step, scenario, check)
+        keep = _is_kept(step, scenario, check, available)
         if keep and created and cucumber_jobs.step_key(step) == cucumber_jobs.ONE_OFF:
             # Désactivation d'un job que l'init créait : la création est retirée, la ligne aussi
             block, header = _drop_rows(block, created)
@@ -305,7 +361,7 @@ _COMMENTED_STEP = re.compile(r"^(\s*)#\s?((?:Given|When|Then|And|But|\*)\s+.*?)\
 _COMMENTED_ROW = re.compile(r"^\s*#\s?(\||\"\"\")")
 
 
-def _restore_connections(lines: list) -> list:
+def _restore_connections(lines: list, available=None) -> list:
     """
     Steps de branchement sur l'environnement de test (ENV_CONNECTION_STEPS) commentés sous « # CONFIG-COPIEE: » par
     une version précédente de l'agent : réactivés (marqueur retiré, step et table décommentés). Une init déjà réduite
@@ -316,7 +372,8 @@ def _restore_connections(lines: list) -> list:
         line = lines[i]
         step = _COMMENTED_STEP.match(lines[i + 1].rstrip("\r\n")) if i + 1 < len(lines) else None
         if not (MARKER in line and line.lstrip().startswith("#") and step
-                and _connects_test_environment(_STEP.match(step.group(2)).group(3))):
+                and _connects_test_environment(_STEP.match(step.group(2)).group(3))
+                and (available is None or available(_STEP.match(step.group(2)).group(3)))):
             out.append(line)
             i += 1
             continue

@@ -196,6 +196,33 @@ def test_already_reduced_init_gets_its_connections_back():
     assert cc.copied_feature(text, CLIENT) == (text, 0)
 
 
+def test_connection_without_its_data_in_the_copy_stays_commented():
+    """Partenaire WMS_TMS_LOCAL et prestataire TDM créés par l'init globale du Standard : absents de la copie."""
+    queries = []
+
+    def query(sql, schema):
+        queries.append((sql, schema))
+        if "table_absente" in sql or "tms_provider_gen_exc" in sql:
+            raise RuntimeError('(psycopg2.errors.UndefinedTable) relation "x" does not exist')
+        return [{"code": "CUBING"}] if "CUBING" in sql else []
+
+    available = cc.connection_checker(SCHEMA, query)
+    pushed = ("  Scenario: Intégration des données\n"
+              '    Given MESS- Configuration du partenaire "WMS_TMS_LOCAL"\n'
+              "    Given INIT- Configuration du colisage\n"
+              f"    # {cc.MARKER} configuration copiée du client (aucune purge ni initialisation)\n"
+              '    # Given INIT- Configuration du prestataire transport "TDM"\n')
+    text, removed = cc.copied_feature(pushed, CLIENT, available)
+    active = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    assert active == ["Scenario: Intégration des données", "Given INIT- Configuration du colisage"]
+    assert removed == 1 and cc.copied_feature(text, CLIENT, available) == (text, 0)
+    assert all(schema == SCHEMA for _, schema in queries)
+    assert "WHERE code = 'WMS_TMS_LOCAL'" in " ".join(sql for sql, _ in queries)
+    # Base injoignable : le step est gardé (l'échec de l'init le montrera)
+    down = cc.connection_checker(SCHEMA, lambda sql, schema: (_ for _ in ()).throw(RuntimeError("timeout")))
+    assert down("INIT- Configuration du colisage")
+
+
 def import_main():
     saved = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = io.StringIO(), io.StringIO()

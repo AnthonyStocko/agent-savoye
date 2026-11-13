@@ -660,15 +660,12 @@ def run_assistant(question: str, answer_file: str) -> int:
 
 def copied_reference_codes(schema: str) -> dict:
     """Codes de référence lus dans la copie (base des tests, lecture seule) : cucumber_copied_config.read_codes."""
-    def query(sql: str, target: str) -> list:
-        previous = db_tools.set_profile("cucumber")
-        try:
-            out = db_tools.run_query(sql, target, limit=cucumber_copied_config.MAX_CODES)
-        finally:
-            db_tools.set_profile(previous)
-        rows = [line.split(" | ") for line in out.splitlines()[1:-1]]
-        return [{"code": r[0].strip()} for r in rows if r]
-    return cucumber_copied_config.read_codes(schema, query)
+    return cucumber_copied_config.read_codes(schema, cucumber_copied_config.copy_query)
+
+
+def copied_connection_checker(client: str):
+    """Steps de branchement dont la donnée existe dans la copie du client (cucumber_copied_config)."""
+    return cucumber_copied_config.checker_for(cucumber_profile.effective_profile(cucumber_profile.load_profile(client)))
 
 
 def run_restore_config(client: str, source_schema: str, target_schema: str, backup: str = "",
@@ -5432,11 +5429,12 @@ def copied_init_plan(client: str, worktree: str, plan: dict) -> dict:
     données copié, aucune init du Standard lancée telle quelle (elle purge).
     """
     changes = {}
+    available = copied_connection_checker(client)
     for rel, text in {**plan.get("present", {}), **plan.get("complements", {}), **plan.get("changes", {})}.items():
         if not rel.endswith(".feature"):
             changes[rel] = text
             continue
-        reduced, removed = cucumber_copied_config.copied_feature(text, client)
+        reduced, removed = cucumber_copied_config.copied_feature(text, client, available)
         # Init déjà réduite et poussée : seuls les steps de branchement sur l'environnement de test sont réactivés
         restored = cucumber_copied_config.restored_connections(text, reduced)
         if (removed or restored) and _read_text(os.path.join(worktree, *rel.split("/"))) != reduced:

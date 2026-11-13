@@ -385,7 +385,8 @@ def build_client_init(cucumber_repo_dir: str, cucumber_std_dir: str, client_name
                     text, notes = mark_version_gaps(text, library, aligned, version)
                     result["todo_version"] += [f"{target_rel} : {n}" for n in notes]
                 if copied:
-                    text, removed = cucumber_copied_config.copied_feature(text, client_name)
+                    text, removed = cucumber_copied_config.copied_feature(
+                        text, client_name, cucumber_copied_config.checker_for(profile))
                     result["avertissements"].append(f"{target_rel} : {removed} step(s) commenté(s) "
                                                     f"({cucumber_copied_config.MARKER} configuration copiée)")
                 if out_of_scope:
