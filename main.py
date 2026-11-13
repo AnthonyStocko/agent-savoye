@@ -2429,6 +2429,102 @@ def print_init_line(label: str, result: dict) -> None:
               + ("" if outcome.get("ok") else f" — lot non jugé : {outcome.get('message', '')}"))
 
 
+READ_ONLY_EXCLUDED_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+FINAL_ANALYSIS_RULE = (
+    "ANALYSE DU DERNIER RUN, EN LECTURE SEULE : aucune correction n'est plus autorisée pour ce lot. Ne modifie AUCUN "
+    "fichier (toute modification est annulée). Établis la cause de chaque échec ci-dessous sur CE run (base, logs "
+    "serveur, console) et réponds uniquement par le bloc JSON final : « restantes » au format structuré (nature "
+    "hors_test_prouvee avec la ligne de preuve, validation_humaine, ou a_verifier) et, par scénario, "
+    "« corrections » : [{\"tag\", \"cause\", \"correction\": \"aucune (analyse seule)\", \"cause_prouvee\"}] si tu "
+    "prouves la cause.")
+
+
+def _changed_tests(worktree: str) -> dict:
+    """{chemin relatif: contenu (octets)} des fichiers de test modifiés ou nouveaux (src/test), à l'instant."""
+    status = subprocess.run(["git", "-C", worktree, "status", "--porcelain=v1", "-uall", "--", "src/test"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+    out = {}
+    for line in status.splitlines():
+        rel = line[3:].strip().strip('"').split(" -> ")[-1]
+        path = os.path.join(worktree, *rel.split("/"))
+        out[rel] = open(path, "rb").read() if os.path.isfile(path) else None
+    return out
+
+
+def _restore_tests(worktree: str, saved: dict) -> bool:
+    """
+    Remet les fichiers de test dans l'état `saved` (_changed_tests pris avant une analyse en lecture seule) :
+    contenu d'avant réécrit, fichier modifié depuis remis au commit, fichier créé depuis supprimé. True si remis.
+    """
+    now = _changed_tests(worktree)
+    if now == saved:
+        return False
+    for rel in set(now) | set(saved):
+        path = os.path.join(worktree, *rel.split("/"))
+        if rel in saved:
+            if saved[rel] is None:
+                if os.path.isfile(path):
+                    os.remove(path)
+            else:
+                with open(path, "wb") as f:
+                    f.write(saved[rel])
+        elif subprocess.run(["git", "-C", worktree, "ls-files", "--error-unmatch", "--", rel],
+                            capture_output=True).returncode == 0:
+            subprocess.run(["git", "-C", worktree, "checkout", "-q", "HEAD", "--", rel], capture_output=True)
+        elif os.path.isfile(path):
+            os.remove(path)
+    return True
+
+
+def analyse_last_run(label: str, lot: dict, worktree: str, files: list, failing: dict, values: dict, model: str,
+                     run_dir: str, work_key: str, on_usage, apply_findings, client: str) -> dict:
+    """
+    Dernier run d'un lot jamais lu par une correction (plafond atteint, scénario bloqué) : analyse en LECTURE SEULE
+    (outils d'écriture retirés, fichiers de test remis à l'état du commit s'ils ont bougé), diagnostic structuré
+    gardé sur chaque scénario et dans le bilan ; une cause hors test prouvée suit le chemin des corrections
+    (apply_findings). Renvoie la réponse lue ({} si l'appel échoue).
+    """
+    lines = []
+    for tag, item in failing.items():
+        hint = cucumber_verify.failure_hint(item.get("motif", ""))
+        lines.append(f"- {item['id']} [tag {tag}] : {item.get('motif', '')}" + (f" — piste : {hint}" if hint else ""))
+        lines += cucumber_diagnostic.diagnostic_lines(item)
+    gc_block = build_mcp_logs_block("cucumber-verify-fix", client, [
+        {"id": v["id"], "step": v.get("step", ""), "heure": v.get("heure", "")} for v in failing.values()],
+        build=next((v.get("build") for v in failing.values() if v.get("build")), ""))
+    prompt = render_prompt("cucumber_client_fix", **{
+        "logs_block": "", "donnees_test": cucumber_test_data.prompt_block(),
+        "regle_spec_code": cucumber_decisions.spec_code_rule(), "competences": "", **values,
+        "logs_block": values.get("logs_block", "") + gc_block}, lot_label=label,
+        etape="ANALYSE DU DERNIER RUN (lecture seule)", erreurs=FINAL_ANALYSIS_RULE + "\n\n" + "\n".join(lines),
+        fichiers="\n".join(f"- {f}" for f in files))
+    tools = [t for t in lot_tools(values) if t not in READ_ONLY_EXCLUDED_TOOLS]
+    saved = _changed_tests(worktree)
+    verify_model, effort = verify_fix_model(model)
+    print(f"[LOT {label}] 🔍 Analyse du dernier run (lecture seule) : {len(failing)} scénario(s) en échec.")
+    returncode, output, usage, limit_hit, used_model, effort = cucumber_followup(
+        None, prompt, verify_model, effort, tools, str(_env_int("CUCUMBER_FIX_MAX_TURNS", 10)), run_dir,
+        db_log=lot.setdefault("base", []), db_step="analyse du dernier run", mcp_step="cucumber-verify-fix")
+    report_token_usage(work_key, "cucumber-verify-analysis", used_model, usage, len(prompt), returncode, effort)
+    on_usage(usage)
+    if _restore_tests(worktree, saved):
+        print(f"[LOT {label}] ⛔ L'analyse du dernier run a modifié des fichiers de test : modifications annulées.")
+    if returncode != 0 or limit_hit:
+        print(f"[LOT {label}] ⚠️ Analyse du dernier run impossible (code {returncode}"
+              + (", quota atteint" if limit_hit else "") + ") : diagnostic absent du bilan.")
+        return {}
+    answer = cucumber_diagnostic.parse_fix_result(output)
+    for error in apply_findings(answer, failing, "analyse du dernier run")[1]:
+        print(f"[LOT {label}] ⛔ {error}")
+    for tag, item in failing.items():
+        causes = [c for c in answer.get("corrections") or [] if isinstance(c, dict) and c.get("tag") == tag]
+        if causes and str(causes[-1].get("cause", "")).strip():
+            item["diagnostic_final"] = " ".join(str(causes[-1]["cause"]).split())[:600]
+            item["motif"] = f"{item.get('motif', '')} — diagnostic du dernier run : {item['diagnostic_final']}"
+    print(f"[LOT {label}] 🔍 Diagnostic du dernier run gardé pour le bilan.")
+    return answer
+
+
 def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, base: str, files: list,
                          results: list, mode: str, mode_message: str, client: str, cucumber_std_dir: str,
                          compile_cmd: str, dry_run_cmd: str, values: dict, model: str, work_key: str, run_dir: str,
@@ -2504,6 +2600,50 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         initial.update({s.get("tag"): s.get("message", "") for s in lot.get("corrections") or [] if s.get("tag")})
     described = list((lot.get("correction") or {}).get("corrections") or [])
     second_chance = set()
+    # Cause prouvée par la dernière correction de chaque scénario (cucumber_fix_budget.proven_causes) ; le dernier
+    # run a-t-il été lu par une correction ?
+    proven, last_run_read, quota_hit = {}, False, False
+
+    def apply_findings(fix_result: dict, scope: dict, source: str) -> tuple:
+        """
+        Constats et « restantes » structurés d'une réponse (correction ou analyse du dernier run) : déploiement et
+        cause hors test PROUVÉE (extrait retrouvé dans le journal ou les logs serveur) → statut hors test ; validation
+        humaine → décision ; le reste gardé pour le bilan. Renvoie ({tag: mise à jour}, [refus]).
+        """
+        deployed, refused = cucumber_diagnostic.deployment_findings(fix_result, result["scenarios"])
+        for tag, update in deployed.items():
+            result["scenarios"][tag].update(update)
+            print(f"[LOT {label}] 🚚 {result['scenarios'][tag]['id']} : {update['motif']}")
+        remaining = cucumber_diagnostic.parse_remaining(fix_result)
+        constats = list(fix_result.get("constats") or []) + cucumber_diagnostic.remaining_constats(remaining)
+        environment, env_refused = cucumber_diagnostic.environment_findings(
+            {"constats": constats}, {t: v for t, v in result["scenarios"].items() if t in scope},
+            lambda item, proof: server_log_contains(client, item, proof))
+        for tag, update in environment.items():
+            result["scenarios"][tag].update(update)
+            print(f"[LOT {label}] 🌐 {result['scenarios'][tag]['id']} : {update['motif']}")
+        for entry in remaining:
+            if entry["nature"] == "hors_test_prouvee" and entry["tag"] not in environment:
+                # Preuve non retrouvée : la cause reste à vérifier, jamais prise pour prouvée
+                entry.update(nature="a_verifier", cause=entry["cause"] + " (preuve non retrouvée dans le journal ni "
+                                                                         "dans les logs serveur du run)")
+            if entry["nature"] == "validation_humaine" and entry["tag"] in result["scenarios"]:
+                record = (cucumber_decisions.record_agent_decision if cucumber_decisions.autonomous()
+                          else cucumber_decisions.propose)
+                scenario_id = result["scenarios"][entry["tag"]]["id"]
+                record(client, "donnees", f"{scenario_id} : validation demandée par la correction — {entry['cause']}",
+                       scenario=scenario_id, lot=lot.get("numero"), avant=[entry["valeur"].get("avant", "")],
+                       apres=[entry["valeur"].get("apres", "")], cause=entry["cause"])
+            entry["source"] = source
+        if remaining:
+            # Gardés pour le bilan, jamais perdus : lignes (ancien format) et détail structuré
+            kept = lot.setdefault("correction", {})
+            lines_kept = kept.setdefault("restantes", [])
+            lines_kept += [line for line in map(cucumber_diagnostic.remaining_line, remaining)
+                           if line not in lines_kept]
+            kept.setdefault("restantes_detail", []).extend(remaining)
+        deployed.update(environment)
+        return deployed, refused + env_refused
     # Plafond adaptatif (cucumber_fix_budget) : on continue tant que l'échec change, scénario par scénario
     for attempt in range(cucumber_fix_budget.max_attempts() if mode else 0):
         bad = {t: v for t, v in to_fix().items() if t not in stuck}
@@ -2551,31 +2691,17 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         report_token_usage(work_key, "cucumber-verify-fix", used_model, usage, len(prompt), returncode, effort)
         on_usage(usage)
         if limit_hit:
+            quota_hit = True
             break
+        last_run_read = True
         # D8 : déploiement retenu seulement si l'extrait cité par l'agent est dans le journal de l'exécution
         fix_result = cucumber_diagnostic.parse_fix_result(output)
         described += [c for c in fix_result.get("corrections") or [] if isinstance(c, dict)]
         skills.record_use(fix_result.get("competences_utilisees") or [])
-        deployed, refused = cucumber_diagnostic.deployment_findings(fix_result, result["scenarios"])
-        for tag, update in deployed.items():
-            result["scenarios"][tag].update(update)
-            print(f"[LOT {label}] 🚚 {result['scenarios'][tag]['id']} : {update['motif']}")
-        # Cause hors test conclue par la correction : retenue si son extrait est retrouvé (journal ou logs serveur)
-        environment, env_refused = cucumber_diagnostic.environment_findings(
-            fix_result, {t: v for t, v in result["scenarios"].items() if t in bad},
-            lambda item, proof: server_log_contains(client, item, proof))
-        for tag, update in environment.items():
-            result["scenarios"][tag].update(update)
-            print(f"[LOT {label}] 🌐 {result['scenarios'][tag]['id']} : {update['motif']}")
-        deployed.update(environment)
-        refused += env_refused
+        new_causes = cucumber_fix_budget.proven_causes(fix_result)
+        deployed, refused = apply_findings(fix_result, bad, f"correction {attempt + 1}")
         for error in refused:
             print(f"[LOT {label}] ⛔ {error}")
-        # Ce qui reste non résolu selon la correction : gardé pour le bilan (jamais perdu)
-        remaining = [" ".join(str(r).split())[:600] for r in fix_result.get("restantes") or [] if str(r).strip()]
-        if remaining:
-            kept = lot.setdefault("correction", {}).setdefault("restantes", [])
-            kept += [r for r in remaining if r not in kept]
         violations = refused + cucumber_a_revoir.check_corrections(worktree, before)
         for error in violations:
             print(f"[LOT {label}] ⛔ {error}")
@@ -2607,6 +2733,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             init_runs += [again["init"]] if again.get("init") else []
             builds += again["builds"]
             result["scenarios"].update(again["scenarios"])
+            last_run_read = False
         # D7 : un diagnostic temporaire ne s'exécute qu'une fois, sa sortie est gardée dans le journal du scénario
         temporary = cucumber_diagnostic.remove_temporary(worktree)
         for rel in temporary:
@@ -2623,6 +2750,14 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         stuck |= waiting
         # Même échec qu'avant la correction : ce scénario ne repart plus (sauf diagnostic dont la sortie est nouvelle)
         newly = (set() if temporary and present else cucumber_fix_budget.stuck_after(sent, to_fix())) - waiting
+        # Même message Cucumber mais cause nouvelle prouvée par la correction (autre erreur serveur, autre règle) :
+        # c'est un progrès, le run suivant est analysé
+        moved = {t for t in newly if new_causes.get(t) and new_causes[t] != proven.get(t)}
+        for tag in sorted(moved):
+            print(f"[LOT {label}] 🔎 {result['scenarios'][tag]['id']} : même message, mais cause nouvelle prouvée par "
+                  f"la correction — le run suivant est analysé.")
+        newly -= moved
+        proven.update(new_causes)
         # Premier « même échec » : une correction de plus, qui doit d'abord prouver la cause (base, logs,
         # diagnostic) ; le second arrête ce scénario
         retry = {t for t in newly if t not in second_chance}
@@ -2635,6 +2770,11 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             print(f"[LOT {label}] ⏹ {result['scenarios'][tag]['id']} : même échec après correction, arrêt des "
                   f"tentatives (cause à prouver au prochain run importé).")
         stuck |= newly
+    # Dernier run jamais lu par une correction (plafond atteint, scénario bloqué) : analysé en lecture seule, son
+    # diagnostic va au bilan (une cause hors test prouvée suit le même chemin qu'en correction)
+    if mode and cucumber_fix_budget.enabled() and not last_run_read and not quota_hit and to_fix():
+        analyse_last_run(label, lot, worktree, files, to_fix(), values, model, run_dir, work_key, on_usage,
+                         apply_findings, client)
     # Échecs rendus verts sur Jenkins par les corrections de l'agent : procédure retenue comme compétence
     fixed = [t for t in initial if t in result["scenarios"] and result["scenarios"][t]["statut"] == "pertinent"]
     if mode and fixed and (described or lot.get("type") == "correction"):

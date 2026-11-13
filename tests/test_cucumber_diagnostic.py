@@ -190,7 +190,9 @@ def test_adaptive_budget_stops_when_the_failure_repeats_and_continues_while_it_c
     main_module.verify_execution_lot(lot, [], "1/1", repo, "HEAD", [REL], [], "local", "", CLIENT, "", "", "", {},
                                      "sonnet", "K", "/run", lambda u: None,
                                      context={"conventions": {"client_tag": CLIENT_TAG}})
-    assert len(calls) == 3                                     # plafond : le scénario mouvant change à chaque fois
+    # Plafond : 3 corrections (le scénario mouvant change à chaque fois), puis le dernier run, jamais lu par une
+    # correction, est analysé en lecture seule
+    assert len(calls) == 4 and "ANALYSE DU DERNIER RUN" in calls[3] and "ANALYSE DU DERNIER RUN" not in calls[2]
     # Même échec une fois : renvoyé avec l'obligation de prouver la cause ; deux fois : bloqué
     assert "Bloqué" in calls[0] and "Bloqué" in calls[1] and "Bloqué" not in calls[2]
     assert "MÊME ÉCHEC" not in calls[0] and "MÊME ÉCHEC" in calls[1] and "PROUVE la cause" in calls[1]
@@ -283,7 +285,9 @@ def test_environment_cause_concluded_by_the_fix_is_disabled_with_its_proof(repo,
     assert item["statut"] == "environnement" and item["preuve_verifiee"] and len(runs) == 1
     assert [(e["cause"], e["prouvee"]) for e in lot["a_revoir"]] == [("environnement", True)]
     assert lot["a_revoir"][0]["reactivation"] == "réactiver quand le précolisage est branché sur le test"
-    assert lot["correction"]["restantes"] == ["cause hors test : précolisage injoignable"]
+    # Ancien format (chaîne) accepté : gardé « à vérifier » pour le bilan
+    assert lot["correction"]["restantes"] == ["[À vérifier au prochain run] cause hors test : précolisage injoignable"]
+    assert lot["correction"]["restantes_detail"][0]["source"] == "correction 1"
     with open(os.path.join(repo, REL), encoding="utf-8") as f:
         text = f.read()
     assert "@A_REVOIR" in text and ar.PROVEN in text and "Scenario: Bouton de reconditionnement" in text
@@ -307,3 +311,121 @@ def test_fix_without_any_change_does_not_rerun_the_scenario(repo, main_module, m
     assert len(runs) == 1 and len(prompts) == 1
     assert "exécution non relancée" in out and "non relancé (aucune modification)" in out
     assert lot["execution"]["scenarios"][tag]["statut"] == "invalide"
+
+
+def test_remaining_points_are_read_in_both_formats():
+    """« restantes » : objets structurés (nature, cause, preuve) et ancien format (chaînes), mélangés."""
+    fix = {"restantes": [
+        "@agent_clientx_1_1 NON PROUVÉE : délai du canal form",
+        {"tag": "@agent_clientx_1_1", "nature": "hors_test_prouvee", "cause": "précolisage injoignable",
+         "preuve": "Impossible de précoliser après avoir tenté toutes les URL", "reactivation": "brancher le test"},
+        {"tag": "@agent_clientx_1_1", "nature": "validation_humaine", "cause": "code d'UM imposé par le site",
+         "valeur": {"step": "CONTENT- Le stock suivant", "avant": "HU-01", "apres": "<code conforme>"}},
+        {"tag": "@agent_clientx_1_1", "nature": "inconnue", "cause": "écrans suivants pas encore exécutés"}, "  "]}
+    remaining = cd.parse_remaining(fix)
+    assert [(e["tag"], e["nature"]) for e in remaining] == [
+        ("@agent_clientx_1_1", "a_verifier"), ("@agent_clientx_1_1", "hors_test_prouvee"),
+        ("@agent_clientx_1_1", "validation_humaine"), ("@agent_clientx_1_1", "a_verifier")]
+    assert cd.remaining_constats(remaining) == [{"tag": "@agent_clientx_1_1", "type": "environnement",
+                                                 "detail": "précolisage injoignable",
+                                                 "preuve": "Impossible de précoliser après avoir tenté toutes les URL",
+                                                 "reactivation": "brancher le test"}]
+    assert "« HU-01 » → « <code conforme> »" in cd.remaining_line(remaining[2])
+    section = "\n".join(cd.remaining_markdown([{"numero": 1, "correction": {"restantes_detail": remaining}}]))
+    assert "### Validation humaine demandée" in section and "### À vérifier au prochain run" in section
+    assert cd.parse_remaining({}) == [] and cd.parse_remaining({"restantes": None}) == []
+
+
+def test_two_rules_behind_the_same_error_are_two_proven_causes():
+    from tools import cucumber_fix_budget as fb
+
+    def fix(rule, code):
+        return {"corrections": [{"tag": "@t", "cause_prouvee": {
+            "erreur": f"The handling unit code {code} is not valid", "step": "CONTENT- Le stock suivant",
+            "donnee": "code UM", "regle": rule}}]}
+    length = fb.proven_causes(fix("code numérique de 18 caractères", "039999021111197001"))
+    prefix = fb.proven_causes(fix("code qui commence par le préfixe GS1 du site", "039999021111197001"))
+    again = fb.proven_causes(fix("code numérique de 18 caractères", "039999021111197999"))
+    assert length["@t"] != prefix["@t"] and length == again
+    assert fb.proven_causes({"corrections": [{"tag": "@t", "cause": "sans preuve"}]}) == {}
+
+
+def test_new_proven_cause_under_the_same_message_keeps_the_scenario_analysed(repo, main_module, monkeypatch, capsys):
+    """Même message Cucumber, causes prouvées différentes : pas « bloqué » ; même cause deux fois : bloqué."""
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "Pas d'élément correspondant à l'attendu", "journal": "x", "sorties": []}
+    rules = iter(["code numérique de 18 caractères", "préfixe GS1 du site", "préfixe GS1 du site",
+                  "préfixe GS1 du site", "préfixe GS1 du site"])
+    runs, calls = [], []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        runs.append(1)
+        return {"scenarios": {"@agent_clientx_1_1": dict(failing)}, "builds": []}
+
+    def claude(prompt, *args, **kwargs):
+        calls.append(prompt)
+        with open(os.path.join(repo, REL), "a", encoding="utf-8") as f:
+            f.write("    # correction %d\n" % len(calls))
+        return 0, json.dumps({"corrigees": 1, "corrections": [{"tag": "@agent_clientx_1_1", "cause": "UM refusée",
+                              "correction": "code", "cause_prouvee": {"erreur": "code 1 is not valid",
+                                                                       "step": "CONTENT- Le stock suivant",
+                                                                       "donnee": "code UM",
+                                                                       "regle": next(rules)}}]}), {}, False
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_MAX", "6")
+    _fix_loop(repo, main_module, monkeypatch, claude, verify_lot, attempts="")
+    out = capsys.readouterr().out
+    # Corr. 1 (règle A, 1re cause) → run 2 ; corr. 2 (règle B, nouvelle) → run 3 ; corr. 3 (B encore) → 1er
+    # « même échec » ; corr. 4 (B) → bloqué ; le dernier run n'a pas été lu : analyse finale
+    assert out.count("cause nouvelle prouvée") == 2 and "arrêt des tentatives" in out
+    assert len(runs) == 5 and len(calls) == 5 and "ANALYSE DU DERNIER RUN" in calls[-1]
+
+
+def test_last_run_analysis_is_read_only_and_reaches_the_bilan(repo, main_module, monkeypatch, capsys):
+    """Plafond atteint : le dernier run est analysé sans modification possible, son diagnostic va au bilan."""
+    line = "Impossible de précoliser après avoir tenté toutes les URL [http://<hote>:80]"
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "Unable to create a launching Campaign", "journal": f"serveur : {line}", "sorties": []}
+    calls, tools_seen = [], []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        return {"scenarios": {"@agent_clientx_1_1": dict(failing)}, "builds": []}
+
+    def followup(lot, prompt, model, effort, tools, *args, **kwargs):
+        calls.append(prompt)
+        tools_seen.append(list(tools))
+        with open(os.path.join(repo, REL), "a", encoding="utf-8") as f:
+            f.write("    # modification %d\n" % len(calls))
+        if "ANALYSE DU DERNIER RUN" not in prompt:
+            return 0, '{"corrigees": 1}', {}, False, model, effort
+        return 0, json.dumps({"corrigees": 0, "corrections": [
+            {"tag": "@agent_clientx_1_1", "cause": "OP en CUBING_ERROR : précolisage injoignable",
+             "correction": "aucune (analyse seule)"}], "restantes": [
+            {"tag": "@agent_clientx_1_1", "nature": "hors_test_prouvee", "cause": "précolisage injoignable",
+             "preuve": line, "reactivation": "brancher le précolisage de test"},
+            {"tag": "@agent_clientx_1_1", "nature": "validation_humaine", "cause": "code UM",
+             "valeur": {"step": "CONTENT- Le stock suivant", "avant": "A", "apres": "B"}}]}), {}, False, model, effort
+    monkeypatch.setattr(main_module, "cucumber_followup", followup)
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_MAX", "1")
+    lot, tag = _fix_loop(repo, main_module, monkeypatch, lambda *a, **k: (0, "{}", {}, False), verify_lot,
+                         attempts="1")
+    out = capsys.readouterr().out
+    assert len(calls) == 2 and "ANALYSE DU DERNIER RUN" in calls[1]
+    assert "Write" not in tools_seen[1] and "Edit" not in tools_seen[1] and "Edit" in tools_seen[0]
+    with open(os.path.join(repo, REL), encoding="utf-8") as f:
+        text = f.read()
+    assert "# modification 1" in text and "# modification 2" not in text      # écriture de l'analyse annulée
+    assert "modifications annulées" in out
+    item = lot["execution"]["scenarios"][tag]
+    assert item["statut"] == "environnement" and "diagnostic du dernier run" in item["motif"]
+    assert [e["cause"] for e in lot["a_revoir"]] == ["environnement"] and lot["a_revoir"][0]["prouvee"]
+    natures = {e["nature"]: e["source"] for e in lot["correction"]["restantes_detail"]}
+    assert natures == {"hors_test_prouvee": "analyse du dernier run", "validation_humaine": "analyse du dernier run"}
+    from tools import cucumber_decisions
+    assert any(d["type"] == "donnees" and "validation demandée" in d["proposition"]
+               for d in cucumber_decisions.load_decisions(CLIENT))
+
+
+def test_fix_prompt_asks_for_structured_remaining_points():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "prompts", "cucumber_client_fix.md"), encoding="utf-8").read()
+    assert all(n in text for n in ("hors_test_prouvee", "validation_humaine", "a_verifier", "cause_prouvee"))

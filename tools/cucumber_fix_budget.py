@@ -47,3 +47,20 @@ def stuck_after(before: dict, after: dict) -> set:
     (`after`) avec le même échec : bloqués.
     """
     return {tag for tag, item in before.items() if tag in after and signature(after[tag]) == signature(item)}
+
+
+def proven_causes(fix: dict) -> dict:
+    """
+    {tag: clé de la cause prouvée} d'une réponse de correction (« corrections[].cause_prouvee » : erreur serveur,
+    step, donnée et règle en cause). Valeurs variables masquées dans l'erreur seulement : deux codes refusés pour
+    deux règles différentes (longueur, puis préfixe GS1) sont deux causes. Sans cause prouvée : tag absent.
+    """
+    out = {}
+    for item in (fix or {}).get("corrections") or []:
+        cause = item.get("cause_prouvee") if isinstance(item, dict) else None
+        if not isinstance(cause, dict) or not str(cause.get("erreur", "")).strip():
+            continue
+        key = " | ".join([_volatile_free(str(cause["erreur"]))] + [" ".join(str(cause.get(k, "")).lower().split())
+                                                                  for k in ("step", "donnee", "regle")])
+        out[str(item.get("tag", "")).strip()] = key
+    return out

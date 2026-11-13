@@ -179,3 +179,72 @@ def deployment_findings(fix: dict, scenarios: dict) -> tuple:
             accepted[tag] = {"statut": "deploiement", "preuve_verifiee": True,
                              "motif": f"{DEPLOYMENT} : {detail} — extrait vérifié dans le log : « {proof[:200]} »"}
     return accepted, refused
+
+
+# ---------------------------------------------------------------------------
+# « restantes » d'une correction : format structuré (nature, cause, preuve), ancien format accepté
+# ---------------------------------------------------------------------------
+REMAINING_NATURES = {"hors_test_prouvee": "Cause hors test prouvée",
+                     "validation_humaine": "Validation humaine demandée",
+                     "a_verifier": "À vérifier au prochain run"}
+_AGENT_TAG = re.compile(r"@agent_\w+")
+
+
+def _flat(value, limit: int = 600) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def parse_remaining(fix: dict) -> list:
+    """
+    « restantes » d'une réponse de correction en entrées normalisées {tag, nature, cause, preuve, reactivation,
+    valeur}. Nouveau format : objets {tag, nature: hors_test_prouvee | validation_humaine | a_verifier, cause,
+    preuve, reactivation, valeur: {step, avant, apres}} ; nature inconnue → a_verifier. Ancien format (chaînes) :
+    a_verifier, tag repris du texte s'il y est cité.
+    """
+    out = []
+    for raw in (fix or {}).get("restantes") or []:
+        if isinstance(raw, dict):
+            nature = str(raw.get("nature", "")).strip().lower()
+            value = raw.get("valeur") if isinstance(raw.get("valeur"), dict) else {}
+            entry = {"tag": _flat(raw.get("tag"), 80), "nature": nature if nature in REMAINING_NATURES else "a_verifier",
+                     "cause": _flat(raw.get("cause")), "preuve": _flat(raw.get("preuve")),
+                     "reactivation": _flat(raw.get("reactivation"), 300),
+                     "valeur": {k: _flat(value.get(k), 300) for k in ("step", "avant", "apres") if value.get(k)}}
+        else:
+            text = _flat(raw)
+            found = _AGENT_TAG.search(text)
+            entry = {"tag": found.group(0) if found else "", "nature": "a_verifier", "cause": text, "preuve": "",
+                     "reactivation": "", "valeur": {}}
+        if entry["cause"] or entry["preuve"]:
+            out.append(entry)
+    return out
+
+
+def remaining_constats(remaining: list) -> list:
+    """Entrées « hors_test_prouvee » au format des constats « environnement » (même vérification de la preuve)."""
+    return [{"tag": e["tag"], "type": "environnement", "detail": e["cause"], "preuve": e["preuve"],
+             "reactivation": e["reactivation"]} for e in remaining if e["nature"] == "hors_test_prouvee"]
+
+
+def remaining_line(entry: dict) -> str:
+    """Ligne de bilan d'une entrée restante : [nature] tag : cause — preuve."""
+    return (f"[{REMAINING_NATURES[entry['nature']]}] " + (f"{entry['tag']} : " if entry.get("tag") else "")
+            + entry["cause"] + (f" — preuve : « {entry['preuve'][:200]} »" if entry.get("preuve") else "")
+            + (f" — {entry['valeur'].get('step', '')} : « {entry['valeur'].get('avant', '')} » → "
+               f"« {entry['valeur'].get('apres', '')} »" if entry.get("valeur") else ""))
+
+
+def remaining_markdown(lots: list) -> list:
+    """Section du bilan : points restants des corrections et diagnostics du dernier run, groupés par nature."""
+    entries = [(lot.get("numero", "?"), e) for lot in lots or []
+               for e in (lot.get("correction") or {}).get("restantes_detail") or []]
+    if not entries:
+        return []
+    lines = ["## Points restants des corrections", ""]
+    for nature, label in REMAINING_NATURES.items():
+        mine = [(n, e) for n, e in entries if e.get("nature") == nature]
+        if mine:
+            lines += [f"### {label}", ""] + [
+                f"- Lot {n}" + (f" ({e['source']})" if e.get("source") else "") + f" : {remaining_line(e)}"
+                for n, e in mine] + [""]
+    return lines

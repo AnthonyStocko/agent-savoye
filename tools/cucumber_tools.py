@@ -3938,6 +3938,11 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
         lines += ["", "## Scénarios supprimés à la revue", ""]
         lines += [f"- {d['fichier']} / {d['titre']} : {' ; '.join(d['motifs'])}"
                   + (f" — {d['justification']}" if d.get("justification") else "") for d in deleted]
+    # Points restants des corrections et diagnostics du dernier run, groupés par nature
+    from tools import cucumber_diagnostic
+    remaining_section = cucumber_diagnostic.remaining_markdown(lots)
+    if remaining_section:
+        lines += [""] + remaining_section
     noted = [(i, c) for i in selected for c in (results.get(i) or {}).get("constats") or []]
     if noted:
         lines += ["", "## Constats des lots", "",
