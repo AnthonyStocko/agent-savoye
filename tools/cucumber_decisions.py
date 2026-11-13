@@ -19,7 +19,7 @@ import re
 from datetime import datetime
 
 from tools import cucumber_arbitrage, knowledge_tools
-from tools.cucumber_a_revoir import DISABLED_COMMENT, PENDING, REALIGNED, scenario_blocks
+from tools.cucumber_a_revoir import DISABLED_COMMENT, PENDING, REALIGNED, expected_kept, scenario_blocks
 from tools.cucumber_diagnostic import temporary_steps
 from tools.cucumber_tools import (_git, _read_json, _read_text_file, _write_json, _write_text, a_revoir_tag,
                                   cache_dir, patch_path, write_patch)
@@ -246,7 +246,9 @@ def _change_kind(old: dict, new: dict, new_block: list) -> str:
     kept = {(s["texte"], tuple(s.get("table") or [])) for s in new["steps"] if s["phase"] != "then"}
     if not all(step in kept for step in given):
         return "donnees"
-    return "realignement" if any(line.strip().startswith(REALIGNED) for line in new_block) else ""
+    # « Réaligné sur le code » sans attendu changé (même contrôle refait par un autre step) : correction ordinaire
+    realigned = any(line.strip().startswith(REALIGNED) for line in new_block)
+    return "realignement" if realigned and not expected_kept(old, new) else ""
 
 
 # ---------------------------------------------------------------------------

@@ -400,3 +400,41 @@ def test_reference_copy_lifts_a_corrupted_environment_block():
             "reference": "ref.pgdump"}
     assert env.blocked(CLIENT, [{**copy, "date": "2026-11-12T10:00:00"}])
     assert env.blocked(CLIENT, [copy]) == {}
+
+
+def test_business_data_of_the_copy_is_refused_in_the_lot_files(tmp_path):
+    """Config copiée : un OP / une UP / un produit de la copie repris par le test est une erreur de fichier."""
+    rel = "src/test/resources/cucumber/features/clientx/Palettiser.feature"
+    data = "src/test/resources/cucumber/files/clientx/WOI_test.xml"
+    feature = ('Feature: Palettiser\n  Scenario: Dernière UP\n'
+               '    Given PREP- Initialisation de la première UP de l\'ordre de préparation "0082387332" répondant\n'
+               '      | code               | site |\n      | 314895000000005829 | 01   |\n'
+               '    # | 999999999999 | commenté |\n'
+               '    Then KIS- Le message contient "Edition du bon de livraison"\n')
+    for path, text in ((rel, feature), (data, "<order><product>A1710227</product><qty>120000</qty></order>")):
+        full = tmp_path / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(text, encoding="utf-8")
+    copy = {"wms_preparation_order": {"0082387332"}, "wms_preparation_unit": {"314895000000005829"},
+            "ref_product": {"A1710227"}}
+    queries = []
+
+    def query(sql, schema):
+        queries.append(sql)
+        table = sql.split(" FROM ")[1].split()[0]
+        if table not in copy and table != "wms_handling_unit":
+            raise RuntimeError("relation does not exist")
+        return [{"code": v} for v in copy.get(table, ()) if f"'{v}'" in sql]
+    profile = {cc.OPTION: True, cc.SCHEMA_FIELD: "cucumber_customer_1",
+               cc.REFERENCE_KEY: {"date": "2026-11-13T09:56:45"}}
+    errors = cc.check_business_data(str(tmp_path), [rel, data], profile, query)
+    assert len(errors) == 3
+    assert any("« 0082387332 » est un(e) ordre de préparation" in e for e in errors)
+    assert any("« 314895000000005829 » est un(e) UP" in e for e in errors)
+    assert any(e.startswith(data) and "« A1710227 » est un(e) produit" in e for e in errors)
+    # Lignes créées par un run (après la copie) ignorées ; valeurs courtes, phrases et lignes commentées non lues
+    assert "created_date < TIMESTAMP '2026-11-13 09:56:45' - INTERVAL '3 hours'" in queries[0]
+    assert not any("'01'" in q or "Edition du bon" in q or "999999999999" in q for q in queries)
+    # Option inactive : aucun contrôle
+    assert cc.check_business_data(str(tmp_path), [rel], {}, query) == []
+    assert "Données MÉTIER" in cc.prompt_block(profile)

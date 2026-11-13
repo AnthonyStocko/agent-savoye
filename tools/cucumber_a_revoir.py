@@ -126,6 +126,26 @@ def _kept(old: tuple, now: list) -> bool:
     return any(text == old[0] and old[1] <= pairs for text, pairs in now)
 
 
+_QUOTED = re.compile(r'"([^"]*)"')
+
+
+def _expected_values(assertion: tuple) -> set:
+    """Valeurs attendues d'une assertion : valeurs entre guillemets du step et valeurs de sa table."""
+    text, pairs = assertion
+    return set(_QUOTED.findall(text)) | {value for _, value in pairs if value}
+
+
+def expected_kept(old: dict, new: dict) -> bool:
+    """
+    Attendus conservés : chaque assertion (Then) d'avant est gardée telle quelle (colonnes ou lignes ajoutées
+    permises), ou remplacée par des Then qui reprennent toutes ses valeurs attendues — contrôle passé dans un
+    step du projet par exemple. Une assertion sans valeur doit rester identique.
+    """
+    was, now = _assertions(old), _assertions(new)
+    values_now = set().union(*(_expected_values(a) for a in now))
+    return all(_kept(a, now) or (_expected_values(a) and _expected_values(a) <= values_now) for a in was)
+
+
 def snapshot(worktree: str, files: list) -> dict:
     """{feature: texte} des features du lot, avant une correction."""
     return {rel: _read_text_file(os.path.join(worktree, *rel.split("/"))) for rel in files
@@ -158,7 +178,7 @@ def forbidden_changes(before: str, after: str, rel: str, allowed_removals=()) ->
         if len(now) < len(was):
             errors.append(f"{rel} / {scenario['titre']} : {len(was) - len(now)} assertion(s) (Then) retirée(s) — "
                           f"interdit, une assertion ne s'affaiblit pas")
-        elif not all(_kept(a, now) for a in was) and not any(line.strip().startswith(REALIGNED) and line.strip() != REALIGNED
+        elif not expected_kept(scenario, changed) and not any(line.strip().startswith(REALIGNED) and line.strip() != REALIGNED
                                     for line in block):
             errors.append(f"{rel} / {scenario['titre']} : valeur attendue modifiée sans justification par le code — "
                           f"ajoute « {REALIGNED} <fichier du code> » au-dessus du scénario, ou rétablis l'attendu")

@@ -194,3 +194,43 @@ def test_adaptive_budget_stops_when_the_failure_repeats_and_continues_while_it_c
     assert fb.max_attempts() == 3
     monkeypatch.setenv("CUCUMBER_VERIFY_FIX_ATTEMPTS", "0")
     assert fb.max_attempts() == 0
+
+
+def test_held_scenario_is_not_rerun_so_its_diagnostic_is_not_claimed_and_fixing_stops(repo, main_module, monkeypatch,
+                                                                                       capsys):
+    """Scénario en attente de décision humaine : pas relancé, donc diagnostic non exécuté et plus de correction."""
+    write(os.path.join(repo, REL), FEATURE)
+    write(os.path.join(repo, STEPS_REL), STEPS + "}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    tag = "@agent_clientx_1_1"
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "échoue sur le client : expected true", "journal": "expected true", "sorties": []}
+    runs, prompts = [], []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        runs.append(sorted(scenarios))
+        return {"scenarios": {tag: dict(failing)}, "builds": []}
+
+    def claude(prompt, *args, **kwargs):
+        prompts.append(prompt)
+        write(os.path.join(repo, REL), DIAGNOSED)
+        write(os.path.join(repo, STEPS_REL), STEPS + TEMP_METHOD + "}\n")
+        return 0, '{"corrigees": 0, "restantes": ["à trancher"]}', {}, False
+    monkeypatch.setattr(main_module.cucumber_verify, "verify_lot", verify_lot)
+    monkeypatch.setattr(main_module, "run_cucumber_claude", claude)
+    monkeypatch.setattr(main_module, "render_prompt", lambda name, **values: values["erreurs"])
+    monkeypatch.setattr(main_module, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "verify_cucumber_lot", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(main_module, "hold_meaning_changes", lambda *a, **k: {failing["id"]})
+    monkeypatch.setenv("CUCUMBER_MAX_RETRACT_PCT", "100")
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_ATTEMPTS", "4")
+    lot = {"numero": 1, "tags": {tag: failing["id"]}, "indicateurs": {"scenarios": []}}
+    main_module.verify_execution_lot(lot, [], "1/1", repo, "HEAD", [REL], [], "local", "", CLIENT, "", "", "", {},
+                                     "sonnet", "K", "/run", lambda u: None,
+                                     context={"conventions": {"client_tag": CLIENT_TAG}})
+    out = capsys.readouterr().out
+    assert len(runs) == 1 and len(prompts) == 1                  # run initial seulement, une seule correction
+    assert "retiré sans avoir été exécuté" in out and "exécuté puis retiré" not in out
+    assert "non relancé (décision humaine en attente)" in out
+    assert cd.temporary_steps(repo) == []

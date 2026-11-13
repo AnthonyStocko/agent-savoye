@@ -74,6 +74,95 @@ def connection_target(step: str) -> tuple:
     return ()
 
 
+# Données métier de la copie (libellé, table ; colonne « code ») : jamais reprises par un test. Elles changent à chaque
+# nouvelle copie (étape 3, après une montée de version) ; seule la configuration du client est stable. Surchargeable
+# par CUCUMBER_COPY_BUSINESS_TABLES (« libellé=table,… »).
+BUSINESS_TABLES = (("produit", "ref_product"), ("ordre de préparation", "wms_preparation_order"),
+                   ("UP", "wms_preparation_unit"), ("UP précubée", "wms_precubed_unit"),
+                   ("contenant de stock", "wms_handling_unit"), ("unité d'expédition", "wms_dispatch_unit"),
+                   ("colis transport", "tms_shipping_unit"), ("ordre d'expédition", "wms_dispatch_order"),
+                   ("avis d'expédition", "wms_dispatch_advice"))
+# Valeurs plus courtes ignorées (quantités, codes courts de configuration) ; marge sur la date de la copie
+# (fuseau du serveur) : une ligne créée après elle vient d'un run, pas du client
+MIN_BUSINESS_CODE = 6
+REFERENCE_MARGIN_HOURS = 3
+_QUOTED_VALUE = re.compile(r'"([^"\n]+)"')
+_XML_VALUE = re.compile(r">([^<>\n]+)<")
+_CODE_VALUE = re.compile(r"^[\w.\-/]+$")
+_DATA_FILE = (".feature", ".xml", ".csv", ".json", ".txt")
+
+
+def business_tables() -> tuple:
+    raw = os.getenv("CUCUMBER_COPY_BUSINESS_TABLES", "").strip()
+    if not raw:
+        return BUSINESS_TABLES
+    pairs = (item.split("=", 1) for item in raw.split(",") if "=" in item)
+    return tuple((label.strip(), table.strip()) for label, table in pairs if _IDENTIFIER.match(table.strip()))
+
+
+def file_values(rel: str, text: str) -> set:
+    """Valeurs littérales d'un fichier du lot : entre guillemets, cellules de tables Gherkin, texte des balises."""
+    values = set(_QUOTED_VALUE.findall(text))
+    if rel.endswith(".feature"):
+        for line in text.splitlines():
+            if line.strip().startswith("|") and not line.strip().startswith("#"):
+                values |= {cell.strip() for cell in line.strip().strip("|").split("|")}
+    else:
+        values |= set(_XML_VALUE.findall(text))
+    return {v.strip() for v in values if len(v.strip()) >= MIN_BUSINESS_CODE and _CODE_VALUE.match(v.strip())}
+
+
+def business_reuse(values, schema: str, reference_date: str, query) -> dict:
+    """
+    {valeur: libellé} des valeurs qui sont des codes de données métier de la copie, créées avant la copie
+    (`query(sql, schema)`, lecture seule). Table absente ou base illisible : rien (contrôle passé, jamais bloquant).
+    """
+    values = sorted({v for v in values if "'" not in v})
+    if not values:
+        return {}
+    found = {}
+    listed = ", ".join(f"'{v}'" for v in values)
+    since = ""
+    if reference_date:
+        since = (f" AND (created_date IS NULL OR created_date < TIMESTAMP '{reference_date.replace('T', ' ')[:19]}'"
+                 f" - INTERVAL '{REFERENCE_MARGIN_HOURS} hours')")
+    for label, table in business_tables():
+        try:
+            rows = query(f"SELECT DISTINCT code FROM {table} WHERE code IN ({listed}){since}", schema)
+        except Exception:  # noqa: BLE001 - table ou colonne absente, base injoignable : rien à signaler
+            continue
+        for row in rows:
+            found.setdefault(row["code"], label)
+    return found
+
+
+def check_business_data(worktree: str, files: list, profile: dict, query=None) -> list:
+    """
+    Configuration copiée : erreurs des fichiers du lot qui reprennent une donnée métier de la copie (OP, UP, produit,
+    contenant…) au lieu de créer la leur. Option inactive ou sans schéma : [].
+    """
+    schema = test_schema(profile)
+    if not active(profile) or not schema:
+        return []
+    by_file = {}
+    for rel in files:
+        path = os.path.join(worktree, *rel.split("/"))
+        if rel.endswith(_DATA_FILE) and os.path.exists(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                by_file[rel] = file_values(rel, f.read())
+    reused = business_reuse(set().union(*by_file.values()) if by_file else set(), schema,
+                            reference(profile).get("date", ""), query or copy_query)
+    errors = []
+    for rel, values in by_file.items():
+        for value in sorted(values & set(reused)):
+            errors.append(f"{rel} : « {value} » est un(e) {reused[value]} déjà présent(e) dans la copie du client — "
+                          f"donnée métier interdite en configuration copiée : elle disparaît à la prochaine copie "
+                          f"(étape 3, montée de version). Le test crée sa propre donnée (fichier d'intégration ou step "
+                          f"de création, code unique au test) ; seule la configuration (sites, emplacements, secteurs, "
+                          f"transporteurs, échanges, documents, terminaux…) est reprise de la copie.")
+    return errors
+
+
 def copy_query(sql: str, schema: str) -> list:
     """Requête de lecture dans la copie (base des tests, profil « cucumber » de db_tools) : lignes [{"code": …}]."""
     from tools import db_tools
@@ -273,6 +362,12 @@ def prompt_block(profile: dict) -> str:
              "- Création d'une donnée de configuration : step idempotent qui relit avec le même critère que la création "
              "(code ET site), attend l'enregistrement s'il est asynchrone et, en cas d'échec, remonte la réponse du "
              "serveur (code HTTP, message) — jamais d'échec silencieux.",
+             "- Données MÉTIER (ordres de préparation, UP, commandes, produits, stock et contenants, expéditions…) : "
+             "JAMAIS reprises de la copie, même trouvées en base. Elles disparaissent à la prochaine copie (étape 3, "
+             "montée de version) ; le contrôle des fichiers refuse tout code d'une donnée métier de la copie. Le "
+             "test crée les siennes (fichiers d'intégration, steps de création du Standard), y compris le produit. "
+             "Seule la CONFIGURATION du client (sites, donneurs d'ordres, emplacements, secteurs, transporteurs, "
+             "échanges, documents, terminaux, paramètres) est reprise de la copie.",
              "- Données propres à chaque test : créées par le test, avec des codes uniques au test, en création "
              "idempotente (rejouable sur une copie qui contient déjà la donnée). Fichiers GS1 (WOI…) : destinataire "
              "(receiver) avec son code (additionalPartyIdentification) unique au test, sinon intégration en erreur "

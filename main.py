@@ -2550,9 +2550,17 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         # D7 : un diagnostic temporaire ne s'exécute qu'une fois, sa sortie est gardée dans le journal du scénario
         temporary = cucumber_diagnostic.remove_temporary(worktree)
         for rel in temporary:
-            print(f"[LOT {label}] 🧹 Diagnostic temporaire exécuté puis retiré : {rel}")
+            print(f"[LOT {label}] 🧹 Diagnostic temporaire exécuté puis retiré : {rel}" if present else
+                  f"[LOT {label}] 🧹 Diagnostic temporaire retiré sans avoir été exécuté (aucun scénario relancé) : "
+                  f"{rel}")
+        # Scénario corrigé mais pas relancé (décision humaine en attente) : rien de nouveau à lire, on n'y revient pas
+        waiting = {t for t in sent if t not in present and t in to_fix()}
+        for tag in sorted(waiting):
+            print(f"[LOT {label}] ⏸ {result['scenarios'][tag]['id']} : non relancé (décision humaine en attente), "
+                  f"arrêt des corrections pour ce scénario.")
+        stuck |= waiting
         # Même échec qu'avant la correction : ce scénario ne repart plus (sauf diagnostic dont la sortie est nouvelle)
-        newly = set() if temporary else cucumber_fix_budget.stuck_after(sent, to_fix())
+        newly = (set() if temporary and present else cucumber_fix_budget.stuck_after(sent, to_fix())) - waiting
         # Premier « même échec » : une correction de plus, qui doit d'abord prouver la cause (base, logs,
         # diagnostic) ; le second arrête ce scénario
         retry = {t for t in newly if t not in second_chance}
@@ -2799,6 +2807,8 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
     # Aucune valeur du profil d'un autre client (clear, sites, codes, chemins) dans les fichiers du lot
     own_profile = cucumber_profile.effective_profile(cucumber_profile.load_profile(client))
     errors += cucumber_isolation.check_files(client, worktree, files, own_profile, cucumber_std_dir)
+    # Configuration copiée : aucune donnée métier de la copie (OP, UP, produit…) reprise, le test crée les siennes
+    errors += cucumber_copied_config.check_business_data(worktree, files, own_profile)
     # Adresse de livraison inventée dans un fichier de données (commande, client) : remplacée par l'adresse de test
     for rel, found in cucumber_test_data.normalize_files(worktree, files, cucumber_test_data.test_address(own_profile)):
         print(f"[LOT {label}] 🏠 {cucumber_test_data.normalized_line(rel, found)}")

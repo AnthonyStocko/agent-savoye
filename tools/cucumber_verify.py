@@ -965,6 +965,14 @@ KNOWN_FAILURES = (
      "Standard s'il existe : variable de contexte, step qui génère un code, substitution dans les fichiers ; sinon "
      "step du projet qui copie le fichier sous target/ avec un suffixe propre au run et l'intègre), sans réutiliser "
      "l'objet d'un run précédent"),
+    # Client à un seul site : pas d'écran « CHOIX DU SITE », le step du Standard « KIS- Ouvrir une interaction »
+    # ferme et redémarre le process, qui ne retrouve plus d'équipement pour la session
+    (re.compile(r"[ÉE]quipement (?:not found|non trouv[ée](?:\(e\))?) (?:with|avec) site", re.I), "technique",
+     "client à un seul site : l'écran « CHOIX DU SITE » n'apparaît pas, le step du Standard « KIS- Ouvrir une "
+     "interaction » ferme alors l'interaction et la redémarre, et le 2e démarrage ne trouve plus d'équipement pour la "
+     "session (erreur dès l'ouverture, avant toute saisie). Utilise le step du projet qui ouvre l'interaction SANS la "
+     "redémarrer (cherche-le dans les classes du projet ; s'il manque, crée-le à l'image du step du Standard, sans "
+     "le redémarrage) ; la saisie du site n'a pas lieu, le premier écran est celui du terminal"),
     (re.compile(r"(?:websocket|ws)\b.{0,80}\bform\b|\bform\b.{0,80}(?:websocket|ws)\b|canal\s*«?\s*form", re.I),
      "technique", "écran attendu différent de l'écran reçu (délai sur le canal « form ») : ajoute un diagnostic "
      "temporaire d'écran avant le step (titre, éléments, erreur, dernier bouton soumis), exécuté au run suivant"),

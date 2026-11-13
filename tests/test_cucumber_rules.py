@@ -21,6 +21,8 @@ RES = "src/test/resources/cucumber"
     ("Erreur : liste de choix vide pour le champ motif", "environnement", "liste de choix vide"),
     ("L'ordre OP-1 ne peut pas être lancé : contrôle du client", "technique", "règle active du client"),
     ("Timeout: no websocket message received on channel form", "technique", "diagnostic temporaire d'écran"),
+    ("java.lang.Error: Équipement non trouvé(e) avec site 01", "technique", "SANS la redémarrer"),
+    ("signal propagated <(-1, Équipement not found with site 01 )>", "technique", "client à un seul site"),
 ])
 def test_known_failures_have_a_nature_and_a_hint(message, nature, hint):
     assert cv.failure_kind(message)[0] == nature and hint in cv.failure_hint(message)

@@ -297,3 +297,15 @@ def test_autonomy_never_asks(client, repo, monkeypatch):
     done = cd.auto_resolve_pending(client, repo)
     assert len(done) == 1 and done[0]["statut"] == "validee" and not cd.pending(client)
     assert "| C1   | 7   |" in _text(repo) and "@A_REVOIR" not in _scenarios(repo)["Statut du contenant"]["tags"]
+
+
+def test_realigned_comment_without_changed_expected_value_is_not_held(client, repo, jira):
+    """« Réaligné sur le code » ajouté alors que l'attendu est repris tel quel par un autre step : rien à arbitrer."""
+    write(os.path.join(repo, REL), FEATURE)
+    before = ar.snapshot(repo, [REL])
+    write(os.path.join(repo, REL), FEATURE.replace(
+        f'  {CLIENT_TAG}\n  Scenario: Statut du contenant', f'  # Réaligné sur le code : StockService.java\n'
+                                                             f'  {CLIENT_TAG}\n  Scenario: Statut du contenant')
+          .replace('Then le statut est "LIBRE"', 'Then le statut du contenant "C1" vaut "LIBRE"'))
+    assert cd.held_changes(repo, before, CLIENT_TAG) == []
+    assert 'vaut "LIBRE"' in _text(repo) and cd.PENDING_COMMENT not in _text(repo)

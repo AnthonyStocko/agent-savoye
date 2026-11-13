@@ -241,3 +241,20 @@ def test_verify_execution_lot_stops_and_keeps_scenarios(repo, main_module, monke
     assert lot["arret"] and lot["a_revoir"] == []
     with open(os.path.join(repo, REL), encoding="utf-8") as f:
         assert f.read() == FEATURE
+
+
+def test_same_check_moved_to_a_project_step_keeps_the_expected_values():
+    """Contrôle refait par un step du projet avec les mêmes valeurs attendues : ni interdit ni réalignement."""
+    moved = FEATURE.replace("    Then STOCK- le contenant a les valeurs\n      | code | statut |\n      | C1   | LIBRE  |\n",
+                            '    Then STOCK- Le statut du contenant "C1" vaut "LIBRE"\n')
+    assert ar.forbidden_changes(FEATURE, moved, REL) == []
+    old, new = ar.scenario_blocks(FEATURE), ar.scenario_blocks(moved)
+    key = cv._title_key("Statut du contenant")
+    assert ar.expected_kept(old[key][0], new[key][0])
+    # Une valeur attendue perdue au passage reste interdite sans justification
+    lost = moved.replace('vaut "LIBRE"', 'vaut "BLOQUE"')
+    assert "valeur attendue modifiée sans justification" in ar.forbidden_changes(FEATURE, lost, REL)[0]
+    # Assertion sans valeur : son texte ne change pas sans justification
+    plain = FEATURE.replace('Then STOCK- le motif est "DECANTING"', "Then STOCK- le contenant est bloqué")
+    other = plain.replace("Then STOCK- le contenant est bloqué", "Then STOCK- le contenant est libre")
+    assert ar.forbidden_changes(plain, other, REL)
