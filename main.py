@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 import requests
 from dotenv import load_dotenv
 
-from tools import env_tools, secret_tools
+from tools import env_tools, secret_tools, cucumber_cost, cucumber_lessons
 from tools import cucumber_env_diagnosis, cucumber_copied_config
 from tools import bitbucket_std, client_version, cucumber_a_revoir, cucumber_arbitrage, cucumber_compile, cucumber_db_proof, cucumber_fix_budget, cucumber_stray, cucumber_incidents, cucumber_init_fix, cucumber_isolation, cucumber_lock, cucumber_routes, cucumber_test_data, cucumber_jobs, cucumber_modules, cucumber_delivery, cucumber_library, cucumber_library_upgrade, standard_version, cucumber_bilan, cucumber_checks, cucumber_coverage, cucumber_data_rules, cucumber_disabled, cucumber_guard, cucumber_job, cucumber_decisions, cucumber_detection, cucumber_diagnostic, cucumber_failures, cucumber_environment, cucumber_rules, cucumber_run, cucumber_testability, cucumber_preflight, cucumber_results, cucumber_links, cucumber_server_logs, groundcover_tools, mcp_servers, cucumber_import, cucumber_init, cucumber_recreation, cucumber_init_data, cucumber_initializers, cucumber_profile, cucumber_tools, cucumber_verify, cucumber_versions, cucumber_wait_steps, db_tools, integration_tools, knowledge_tools, pr_review, assistant, db_restore, jenkins_tools, skills
 from tools.jira_cli import attach_files, create_or_get_issue
@@ -240,6 +240,10 @@ def cucumber_budget() -> str:
     except ValueError:
         print(f"[CONFIG] ⚠️ CUCUMBER_MAX_BUDGET_USD='{value}' n'est pas un montant : pas de budget par appel.")
         return ""
+
+
+# Lot Cucumber en cours d'exécution : chaque appel reçoit au plus son budget restant (cucumber_cost)
+CURRENT_LOT = {"lot": None}
 
 
 def budget_hit(usage: dict) -> bool:
@@ -722,9 +726,15 @@ def run_restore_config(client: str, source_schema: str, target_schema: str, back
                 codes = copied_reference_codes(target_schema)
             except Exception as e:  # noqa: BLE001 - codes non lus : la référence reste utilisable
                 print(f"[CONFIG CLIENT] ⚠️ Codes de référence non lus dans la copie : {str(e)[:200]}")
+            # Branchements de la copie vers les services externes du client (adresses de production) : listés avec
+            # la neutralisation proposée, repris à l'étape 4
+            load_job_values(client, profile)       # adresses des services de test du job : masquées
+            connections = cucumber_copied_config.external_connections(target_schema, cucumber_copied_config.copy_query)
+            for line in cucumber_copied_config.connections_lines(connections):
+                print(f"[CONFIG CLIENT] ⚠️ Branchement externe de la copie : {line}")
             reference = cucumber_copied_config.record_reference(client, cucumber_copied_config.new_reference_entry(
                 entry["source"], target_schema, cucumber_copied_config.app_version(profile), entry["reference"],
-                codes, entry.get("sauvegarde", "")))
+                codes, entry.get("sauvegarde", ""), connections))
             print(f"[CONFIG CLIENT] Copie de référence : {reference['dump']} (version "
                   f"{reference['version'] or 'non déterminée'}) ; "
                   + ", ".join(f"{k} {v.get('total', 0)}" for k, v in codes.items()) + ".")
@@ -1462,6 +1472,7 @@ def main():
     parser.add_argument("--no-init", action="store_true", help="generate-cucumber-client : aucune init lancée avant de juger les lots (données du client déjà présentes dans l'environnement des runs Jenkins)")
     parser.add_argument("--specifics", default="", help="generate-cucumber-client : ids des spécifiques à traiter, séparés par des virgules (défaut : non couverts et partiels de l'inventaire)")
     parser.add_argument("--resume", action="store_true", help="generate-cucumber-client : reprend les lots non terminés de la dernière génération")
+    parser.add_argument("--reprise", action="store_true", help="generate-cucumber-client : relance --specifics déjà générés en reprenant leur test existant (vérification puis correction, jamais régénéré) ; un test déjà vert n'est pas relancé ; un spécifique sans test est généré en complément")
     parser.add_argument("--complete", action="store_true", help="generate-cucumber-client : complète la dernière génération (worktree et lots conservés) par de nouveaux lots pour --specifics, à défaut pour les spécifiques non couverts faute de step, d'endpoint, d'interaction ou de vérification")
     parser.add_argument("--max-lots", type=int, default=0, help="generate-cucumber-client : nombre maximal de lots traités par cette exécution (0 = tous), les suivants restent à reprendre")
     parser.add_argument("--inventory-only", action="store_true", help="generate-cucumber-client : pré-calculs seuls (inventaire, catalogues, couverture), sans appel à Claude")
@@ -2173,7 +2184,8 @@ def _run_cucumber_claude_once(prompt: str, model: str, allowed_tools: list, max_
     started = time.time() - 1
     try:
         return run_claude(prompt, model, [cucumber_tools.STD_CACHE_DIR], allowed_tools, extra_args=extra,
-                          cwd=run_dir, effort=effort, lean=lean_session(), budget_usd=cucumber_budget(),
+                          cwd=run_dir, effort=effort, lean=lean_session(),
+                          budget_usd=cucumber_cost.call_budget(CURRENT_LOT["lot"], cucumber_budget()),
                           **mcp_kwargs(mcp_step))
     finally:
         # Fichiers de test écrits hors du dépôt <client>-cucumber (dossier parasite) : rapatriés dans le worktree
@@ -2603,6 +2615,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     # Cause prouvée par la dernière correction de chaque scénario (cucumber_fix_budget.proven_causes) ; le dernier
     # run a-t-il été lu par une correction ?
     proven, last_run_read, quota_hit = {}, False, False
+    lesson_candidates = {}
 
     def apply_findings(fix_result: dict, scope: dict, source: str) -> tuple:
         """
@@ -2622,6 +2635,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         for tag, update in environment.items():
             result["scenarios"][tag].update(update)
             print(f"[LOT {label}] 🌐 {result['scenarios'][tag]['id']} : {update['motif']}")
+            # Blocage d'environnement PROUVÉ : le lot s'arrête (ni correction ni run), la génération aussi
+            lot.setdefault("blocage_environnement", []).append({
+                "scenario": result["scenarios"][tag]["id"], "preuve": update["motif"],
+                "action": update.get("reactivation") or cucumber_a_revoir.CAUSES["environnement"][1]})
         for entry in remaining:
             if entry["nature"] == "hors_test_prouvee" and entry["tag"] not in environment:
                 # Preuve non retrouvée : la cause reste à vérifier, jamais prise pour prouvée
@@ -2647,7 +2664,7 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
     # Plafond adaptatif (cucumber_fix_budget) : on continue tant que l'échec change, scénario par scénario
     for attempt in range(cucumber_fix_budget.max_attempts() if mode else 0):
         bad = {t: v for t, v in to_fix().items() if t not in stuck}
-        if not bad:
+        if not bad or cucumber_cost.over_budget(lot, label):
             break
         sent = {t: dict(v) for t, v in bad.items()}
         print(f"[LOT {label}] Correction après exécution {attempt + 1} : {len(bad)} scénario(s) invalide(s) "
@@ -2699,6 +2716,24 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         described += [c for c in fix_result.get("corrections") or [] if isinstance(c, dict)]
         skills.record_use(fix_result.get("competences_utilisees") or [])
         new_causes = cucumber_fix_budget.proven_causes(fix_result)
+        # Leçons : cause prouvée déjà connue = erreur de l'agent ; sinon leçon candidate, confirmée au run suivant
+        lessons = cucumber_lessons.load(client)
+        for fixed_item in fix_result.get("corrections") or []:
+            if not isinstance(fixed_item, dict):
+                continue
+            tag = str(fixed_item.get("tag", "")).strip()
+            already = cucumber_lessons.match(lessons, fixed_item)
+            if already:
+                origin = {"lot": lot.get("numero"), "scenario": (result["scenarios"].get(tag) or {}).get("id", tag)}
+                print(f"[LOT {label}] ⛔ Erreur de l'agent : leçon déjà connue, n° {already['numero']} — "
+                      f"{already['regle']}")
+                cucumber_lessons.record_recurrence(client, already["numero"], origin)
+                lot.setdefault("lecons_recidives", []).append({**origin, "numero": already["numero"],
+                                                               "regle": already["regle"]})
+                continue
+            candidate = cucumber_lessons.lesson_from_fix(fixed_item)
+            if candidate:
+                lesson_candidates[tag] = candidate
         deployed, refused = apply_findings(fix_result, bad, f"correction {attempt + 1}")
         for error in refused:
             print(f"[LOT {label}] ⛔ {error}")
@@ -2708,6 +2743,10 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         held = hold_meaning_changes(client, worktree, before, conventions.get("client_tag", ""), label, lot)
         # Correction sans aucune modification des fichiers de test : rien de nouveau à exécuter
         unchanged = tests_fingerprint(worktree) == fingerprint
+        if lot.get("blocage_environnement"):
+            print(f"[LOT {label}] ⛔ Blocage d'environnement prouvé : arrêt du lot, sans nouvelle correction ni "
+                  f"nouveau run.")
+            break
         files[:] = list(dict.fromkeys(files + cucumber_tools.lot_files(worktree, [])))
         check = verify_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
                                     values, model, work_key, run_dir, on_usage, inspired_of(results), context,
@@ -2734,6 +2773,18 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
             builds += again["builds"]
             result["scenarios"].update(again["scenarios"])
             last_run_read = False
+            # Leçon confirmée : la cause corrigée ne revient pas (scénario vert, ou échec qui a changé)
+            for tag, candidate in list(lesson_candidates.items()):
+                after = again["scenarios"].get(tag)
+                if after is not None and tag in sent and (
+                        after.get("statut") == "pertinent"
+                        or cucumber_fix_budget.signature(after) != cucumber_fix_budget.signature(sent[tag])):
+                    lesson = cucumber_lessons.add(client, candidate, {"lot": lot.get("numero"),
+                                                                      "scenario": after.get("id", tag)})
+                    lot.setdefault("lecons_apprises", []).append(lesson["numero"])
+                    print(f"[LOT {label}] 📘 Leçon n° {lesson['numero']} retenue pour le client : {lesson['regle']}"
+                          + (" (contrôle automatique)" if lesson.get("controle") else ""))
+                lesson_candidates.pop(tag, None)
         # D7 : un diagnostic temporaire ne s'exécute qu'une fois, sa sortie est gardée dans le journal du scénario
         temporary = cucumber_diagnostic.remove_temporary(worktree)
         for rel in temporary:
@@ -2772,7 +2823,8 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         stuck |= newly
     # Dernier run jamais lu par une correction (plafond atteint, scénario bloqué) : analysé en lecture seule, son
     # diagnostic va au bilan (une cause hors test prouvée suit le même chemin qu'en correction)
-    if mode and cucumber_fix_budget.enabled() and not last_run_read and not quota_hit and to_fix():
+    if mode and cucumber_fix_budget.enabled() and not last_run_read and not quota_hit and to_fix() \
+            and not cucumber_cost.over_budget(lot, label):
         analyse_last_run(label, lot, worktree, files, to_fix(), values, model, run_dir, work_key, on_usage,
                          apply_findings, client)
     # Échecs rendus verts sur Jenkins par les corrections de l'agent : procédure retenue comme compétence
@@ -2845,6 +2897,8 @@ def verify_execution_lot(lot: dict, lot_specs: list, label: str, worktree: str, 
         if hint:
             item["motif"] += f" — {hint}"
             print(f"[LOT {label}] ⚠️ {item['id']} : {hint}")
+    # Tests vérifiés verts : empreinte figée (jamais réécrits ensuite, hors nouvelle génération confirmée)
+    cucumber_a_revoir.record_green(worktree, result["scenarios"])
     lot["execution"] = {"mode": mode or "aucun", "message": mode_message, "builds": builds,
                         "scenarios": result["scenarios"], "desactives": disabled}
     if init_runs:
@@ -3011,6 +3065,10 @@ def check_cucumber_lot(client: str, label: str, worktree: str, base: str, cucumb
     errors += cucumber_isolation.check_files(client, worktree, files, own_profile, cucumber_std_dir)
     # Configuration copiée : aucune donnée métier de la copie (OP, UP, produit…) reprise, le test crée les siennes
     errors += cucumber_copied_config.check_business_data(worktree, files, own_profile)
+    # Leçons du client : contrôles déterministes (0 token)
+    errors += cucumber_lessons.check_files(worktree, files, cucumber_lessons.load(client))
+    # Un test vérifié vert n'est jamais réécrit (empreinte figée à sa vérification)
+    errors += cucumber_a_revoir.check_green(worktree, cucumber_tools.load_state(client))
     # Valeurs des arguments du job Jenkins (ADDITIONAL_ARGLINE : adresses des services de test, identifiants) :
     # jamais écrites dans un fichier du client (dépôts publics), lues à l'exécution par les propriétés système
     load_job_values(client, own_profile)
@@ -3126,7 +3184,7 @@ def verify_cucumber_lot(client: str, label: str, worktree: str, base: str, cucum
     for attempt in range(attempts + 1):
         check = check_cucumber_lot(client, label, worktree, base, cucumber_std_dir, files, compile_cmd, dry_run_cmd,
                                    inspired, context)
-        if check["ok"] or check["environnement"] or attempt == attempts:
+        if check["ok"] or check["environnement"] or attempt == attempts or (lot and cucumber_cost.over_budget(lot, label)):
             return check
         errors = frozenset(check["erreurs"])
         fix_model, effort = plan[attempt]
@@ -5690,6 +5748,11 @@ def copied_init_plan(client: str, worktree: str, plan: dict) -> dict:
     plan.setdefault("remarks", []).append("configuration copiée : désactivations de jobs, branchement sur les "
                                           "services de test (colisage, transport, partenaires) et contrôles en "
                                           "lecture seule seulement ; codes de référence lus dans la copie")
+    # Branchements de la copie vers les services externes du client (relevés à l'étape 3) : à neutraliser par l'init
+    reference = cucumber_copied_config.reference(
+        cucumber_profile.effective_profile(cucumber_profile.load_profile(client)))
+    for line in cucumber_copied_config.connections_lines(reference.get("branchements") or []):
+        plan["remarks"].append(f"branchement externe de la copie à neutraliser : {line}")
     return plan
 
 
@@ -6838,6 +6901,10 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     if args.complete and not complete_state.get("lots"):
         print("❌ Aucune génération à compléter : lancez d'abord une génération.")
         return 2
+    reprise_state = cucumber_tools.load_state(client) if args.reprise else {}
+    if args.reprise and not (reprise_state.get("lots") and args.specifics):
+        print("❌ Reprise impossible : aucune génération existante, ou --specifics absent.")
+        return 2
     resume_state = cucumber_tools.load_state(client) if args.resume and not args.complete else {}
     if args.resume and not args.complete and not cucumber_tools.pending_lots(resume_state):
         print("[CUCUMBER] Aucun lot à reprendre.")
@@ -6977,6 +7044,25 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         new_lots = cucumber_import.add_correction_lots(state, analysis)
         print(f"[CUCUMBER] Import n° {args.from_import} : {len(new_lots)} lot(s) « correction » ajouté(s) ("
               f"{sum(len(lot['corrections']) for lot in new_lots)} scénario(s)), lots précédents conservés.")
+    elif reprise_state:
+        # Relance d'un spécifique déjà généré : son test existant est repris (vérifié puis corrigé), jamais régénéré
+        state = reprise_state
+        wanted = [i for i in (x.strip() for x in args.specifics.split(",")) if i in specifics]
+        marked = cucumber_tools.mark_reprise(state, wanted)
+        for spec_id in marked["verts"]:
+            print(f"[CUCUMBER] ✅ {spec_id} — {specifics[spec_id]['libelle']} : test déjà vert, non relancé.")
+        if marked["reprises"]:
+            print(f"[CUCUMBER] Reprise du test existant : lot(s) {', '.join(map(str, marked['reprises']))} "
+                  f"(vérification puis correction, aucune régénération).")
+        if marked["absents"]:
+            added = cucumber_tools.add_completion_lots(state, marked["absents"], _env_int("CUCUMBER_BATCH_SIZE", 3),
+                                                       specifics)
+            print(f"[CUCUMBER] Sans test écrit, générés en complément : {', '.join(marked['absents'])} (lot(s) "
+                  f"{', '.join(str(lot['numero']) for lot in added)}).")
+        if not marked["reprises"] and not marked["absents"]:
+            cucumber_tools.save_state(client, state)
+            print("[CUCUMBER] Rien à reprendre : tests déjà verts.")
+            return 0
     elif complete_state:
         state = complete_state
         cucumber_tools.drop_excluded(state, specifics)
@@ -7048,11 +7134,11 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
     state["partiels"] = sorted(set(state.get("partiels") or []) | {i for lot in cucumber_tools.pending_lots(state)
                                                                     for i in lot["ids"] if i in partial})
     try:
-        worktree = cucumber_tools.prepare_worktree(cucumber_repo_dir, client, state["base"], reset=not (resume_state or complete_state))
+        worktree = cucumber_tools.prepare_worktree(cucumber_repo_dir, client, state["base"], reset=not (resume_state or complete_state or reprise_state))
     except RuntimeError as e:
         print(f"❌ {e}")
         return 2
-    if args.from_import or resume_state or complete_state:
+    if args.from_import or resume_state or complete_state or reprise_state:
         # Correction d'un run, reprise ou complément : l'espace de travail est remis sur la branche réelle lue par
         # Jenkins (scénarios écrits ou corrigés hors de l'agent compris) ; sur un conflit, la branche l'emporte
         subprocess.run(["git", "-C", worktree, "fetch", "-q", "origin"], capture_output=True)
@@ -7160,7 +7246,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         "client_name": client, "token_saving_rules": token_saving_rules,
         # Adresse de livraison de test (profil, sinon défaut de l'agent) et données de référentiel jamais inventées :
         # prompt système des lots et prompts de correction
-        "donnees_test": cucumber_test_data.prompt_block(profile),
+        "donnees_test": cucumber_test_data.prompt_block(profile) + cucumber_lessons.prompt_block(client),
         "knowledge_block": f"\n{shared['bloc']}\n" if shared["bloc"] else "",
         # Accès base en lecture seule de tous les lots et de leurs corrections (--db-schema), journalisé par lot
         # Base de l'environnement où Jenkins joue les tests (CUCUMBER_DB_*), à défaut la base DB_*
@@ -7287,13 +7373,19 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         java = cucumber_tools.client_java_context(client, worktree, std_java, conventions)
         context = {"init": client_init, "java": java, "conventions": conventions, "reference": reference,
                    "longueurs": code_lengths, "init_tags": init_tags, "routes": routes_context}
+        # Plafond de coût par exécution de lot (cucumber_cost) : appels bornés au budget restant
+        cucumber_cost.start_lot(lot)
+        CURRENT_LOT["lot"] = lot
+        lot.pop("blocage_environnement", None)
+        state.pop("arret_environnement", None)
         if lot.get("type") == "correction" and lot.get("resultats") is None:
             # Lot « correction » d'un import : scénarios existants, aucune génération
             results = []
             lot.setdefault("tokens", {})
             files = run_correction_lot(lot, label, worktree, {**fixed_values, **java}, model, work_key, run_dir,
                                        lambda usage: add_usage(lot, usage))
-        elif lot.get("statut") in ("erreur_compilation", "decision_humaine") and lot.get("resultats") is not None:
+        elif lot.get("statut") in ("erreur_compilation", "decision_humaine", cucumber_tools.REPRISE) \
+                and lot.get("resultats") is not None:
             # Reprise d'un lot écrit mais qui ne compilait pas, ou arrêté pour décision humaine : correction et
             # vérification seules
             results, files = lot["resultats"], lot.get("fichiers") or []
@@ -7333,6 +7425,7 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
             report_token_usage(work_key, "cucumber-lot", model, usage, len(system_prompt) + len(prompt), returncode,
                                effort)
             lot["tokens"] = {}
+            lot["cout_debut"] = 0.0
             add_usage(lot, usage)
             # Session du lot, reprise par la revue et les corrections (CUCUMBER_RESUME_SESSION)
             lot.update(session=(usage or {}).get("session_id", ""), modele=model, effort=effort, systeme=system_file)
@@ -7429,6 +7522,14 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
                    else None)
         # Résultat obligatoire de la génération de chaque tâche du lot (carte de la tâche)
         cucumber_results.record_lot(state, lot)
+        # Coût de cette exécution du lot, cumulé par spécifique (conservé d'une génération à l'autre)
+        lot["cout_execution"] = round(cucumber_cost.run_cost(lot), 4)
+        cumulated = cucumber_cost.record_lot_run(client, lot, state.get("debut", ""))
+        CURRENT_LOT["lot"] = None
+        print(f"[LOT {label}] 💰 Coût de cette exécution : {lot['cout_execution']:.2f} $"
+              + (f" (plafond {cucumber_cost.lot_budget():g} $ atteint)" if lot.get("plafond_cout") else "")
+              + " ; cumul : " + ", ".join(f"{i} {float((cumulated.get(i) or {}).get('total') or 0):.2f} $"
+                                        for i in lot["ids"] if i in cumulated) + ".")
         if lot.get("type") == "correction":
             # Résultat explicite de chaque échec corrigé : correction (diff, patch) ou diagnostic nécessaire
             for item in cucumber_failures.record_correction(cucumber_import.imports_dir(client), lot, worktree):
@@ -7471,6 +7572,19 @@ def run_cucumber_client(args, work_key: str, local_client_repo: str, local_std_r
         if fixed_values["db_block"]:
             print(f"[LOT {label}] Base consultée : {db_summary(lot.get('base') or [])}.")
             print(f"[LOT {label}] Coût des recherches en base : {base_share['ligne']}.")
+        if lot.get("blocage_environnement"):
+            # Cause hors test PROUVÉE : l'environnement est commun à tous les lots, la génération s'arrête
+            others = [other["numero"] for other in cucumber_tools.pending_lots(state)]
+            print(f"[CUCUMBER] ⛔ Génération arrêtée : blocage d'environnement prouvé au lot {lot['numero']}"
+                  + (f" ; lot(s) {', '.join(map(str, others))} non lancé(s)" if others else "") + ".")
+            for block in lot["blocage_environnement"]:
+                print(f"    - {block['scenario']} : {block['preuve'][:300]}")
+                print(f"      Action à faire : {block['action']}")
+            state["arret_environnement"] = {"lot": lot["numero"], "blocages": lot["blocage_environnement"],
+                                            "date": datetime.now().isoformat(timespec="seconds")}
+            cucumber_tools.save_state(client, state)
+            exit_code = 1
+            break
 
     # 4. Patch et récapitulatif, produits en Python ; « couvert_indirectement » vérifié sur l'ensemble des lots
     requalified = cucumber_tools.requalify_indirect(state, inventory)

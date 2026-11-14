@@ -313,6 +313,27 @@ def feature_result(state: dict, spec_id: str, label: str = "") -> dict:
                                f"{first.get('motif') or ''}"[:400]}
 
 
+def generation_mode(state: dict, ids: str, renew: bool = False) -> list:
+    """
+    Options de main.py pour une ligne de l'étape 5 : nouvelle génération seulement sur demande confirmée (`renew`) ou
+    s'il n'existe aucune génération ; test déjà écrit pour toutes ses tâches → « --reprise » (vérifié puis corrigé,
+    jamais régénéré) ; sinon « --complete » (génération conservée, nouveau lot).
+    """
+    from tools import cucumber_tools
+    if renew or not (state or {}).get("lots"):
+        return []
+    wanted = [i for i in (ids or "").split(",") if i]
+    if wanted and all(cucumber_tools.latest_written_lot(state, i) for i in wanted):
+        return ["--reprise"]
+    return ["--complete"]
+
+
+def spec_cost(client: str, ids: str) -> float:
+    """Coût cumulé (USD) des appels Claude d'une ligne de l'étape 5, toutes générations et reprises confondues."""
+    from tools import cucumber_cost
+    return sum(cucumber_cost.spec_total(client, i) for i in (ids or "").split(",") if i)
+
+
 def lots_signature(state: dict, ids: str) -> str:
     """Empreinte des lots qui concernent `ids` (début de la génération, statuts, résultats) : inchangée = rien de neuf."""
     import json

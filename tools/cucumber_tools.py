@@ -179,6 +179,42 @@ def pending_lots(state: dict) -> list:
     return [lot for lot in state.get("lots", []) if lot.get("statut") not in ("termine", "exclu")]
 
 
+REPRISE = "reprise"
+
+
+def latest_written_lot(state: dict, spec_id: str) -> dict:
+    """Dernier lot qui a écrit le test de `spec_id` (fichiers et résultats connus), {} sinon."""
+    written = [lot for lot in state.get("lots", []) if spec_id in (lot.get("ids") or [])
+               and lot.get("fichiers") and lot.get("resultats") is not None]
+    return max(written, key=lambda lot: lot["numero"]) if written else {}
+
+
+def lot_green(lot: dict) -> bool:
+    """Lot dont tous les scénarios exécutés sont verts sur Jenkins (statut « pertinent »)."""
+    scenarios = list(((lot.get("execution") or {}).get("scenarios") or {}).values())
+    return bool(scenarios) and all(s.get("statut") == "pertinent" for s in scenarios)
+
+
+def mark_reprise(state: dict, spec_ids: list) -> dict:
+    """
+    Relance de spécifiques déjà générés : leur dernier lot écrit repart en « reprise » (test existant vérifié puis
+    corrigé, jamais régénéré). Un lot déjà vert n'est pas relancé. Renvoie {"reprises": [numéros], "verts": [ids],
+    "absents": [ids sans test écrit, à générer]}.
+    """
+    out = {"reprises": [], "verts": [], "absents": []}
+    for spec_id in spec_ids:
+        lot = latest_written_lot(state, spec_id)
+        if not lot:
+            out["absents"].append(spec_id)
+        elif lot_green(lot):
+            out["verts"].append(spec_id)
+        elif lot["numero"] not in out["reprises"]:
+            lot["statut"] = REPRISE
+            lot["reprises"] = int(lot.get("reprises") or 0) + 1
+            out["reprises"].append(lot["numero"])
+    return out
+
+
 def drop_excluded(state: dict, spec_ids) -> list:
     """
     Reprise après un nouvel inventaire : retire des lots restants les spécifiques qui n'y figurent plus (dépôt
@@ -3826,6 +3862,26 @@ def write_coverage_summary(client_name: str, inventory: dict, state: dict) -> st
              + (f", {len(unproven)} test(s) écrit(s) non vérifié(s) ou en échec (non couverts)" if unproven else "")
              + f", {len(indirect)} couvert(s) indirectement. "
              f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}.", ""]
+    stopped = state.get("arret_environnement") or {}
+    if stopped:
+        # Blocage d'environnement prouvé : la génération s'est arrêtée, l'action à faire vient en tête
+        lines += [f"> ⛔ **Génération arrêtée au lot {stopped.get('lot')} : blocage d'environnement prouvé.** Les lots "
+                  f"suivants n'ont pas été lancés."] + [
+            f"> - {b.get('scenario', '')} : {b.get('preuve', '')[:300]} — **action à faire** : {b.get('action', '')}"
+            for b in stopped.get("blocages") or []] + [""]
+    capped = [lot for lot in state.get("lots", []) if lot.get("plafond_cout")]
+    if capped:
+        lines += [f"> 💰 Plafond de coût atteint (CUCUMBER_LOT_BUDGET_USD) : lot(s) "
+                  + ", ".join(f"{lot['numero']} ({lot['plafond_cout'].get('cout', 0):.2f} $)" for lot in capped)
+                  + " — arrêtés avec ce bilan.", ""]
+    recurrences = [(lot["numero"], r) for lot in state.get("lots", []) for r in lot.get("lecons_recidives") or []]
+    if recurrences:
+        lines += ["> ⛔ **Erreurs de l'agent : leçons déjà connues redécouvertes** — "
+                  + " ; ".join(f"lot {n}, leçon n° {r['numero']} ({r['regle'][:120]})" for n, r in recurrences), ""]
+    learned = sorted({n for lot in state.get("lots", []) for n in lot.get("lecons_apprises") or []})
+    if learned:
+        lines += [f"> 📘 Leçon(s) du client apprise(s) pendant cette génération : n° {', '.join(map(str, learned))} "
+                  f"(appliquées d'office aux prochains lots).", ""]
     own_init = state.get("init_corrigee") or {}
     if own_init.get("fichiers"):
         # Compléments d'init corrigés par l'agent : en tête, à relire avant le reste du patch

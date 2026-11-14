@@ -538,3 +538,50 @@ def runner_excludes_a_revoir(runner: dict) -> bool:
     """Le runner exclut les scénarios désactivés : sinon ils restent exécutés (le filtre du job peut ne pas
     atteindre Cucumber)."""
     return excludes_tag((runner or {}).get("tags") or [], a_revoir_tag())
+
+
+# ---------------------------------------------------------------------------
+# Tests vérifiés verts : jamais réécrits (hors nouvelle génération confirmée)
+# ---------------------------------------------------------------------------
+
+def green_signature(text: str, title: str) -> str:
+    """Empreinte du contenu d'un scénario (steps et tables, hors tags et commentaires) ; '' s'il est absent."""
+    import hashlib
+    import json
+    scenario = next((s for s in parse_scenarios(text) if _title_key(s["titre"]) == _title_key(title)), None)
+    if not scenario:
+        return ""
+    body = [(st["texte"], list(st.get("table") or [])) for st in scenario["steps"]]
+    return hashlib.sha256(json.dumps(body, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def record_green(worktree: str, scenarios: dict) -> int:
+    """Empreinte des scénarios vérifiés verts (statut « pertinent ») posée sur leur résultat. Renvoie leur nombre."""
+    count = 0
+    for item in scenarios.values():
+        rel, _, title = str(item.get("id", "")).partition("::")
+        path = os.path.join(worktree, *rel.split("/"))
+        if item.get("statut") == "pertinent" and title and os.path.exists(path):
+            item["empreinte_verte"] = green_signature(_read_text_file(path), title)
+            count += 1
+    return count
+
+
+def check_green(worktree: str, state: dict) -> list:
+    """Erreurs : scénario vérifié vert (empreinte connue) modifié ou retiré depuis — interdit."""
+    errors = []
+    for lot in (state or {}).get("lots") or []:
+        for item in ((lot.get("execution") or {}).get("scenarios") or {}).values():
+            expected = item.get("empreinte_verte")
+            if item.get("statut") != "pertinent" or not expected:
+                continue
+            rel, _, title = item["id"].partition("::")
+            path = os.path.join(worktree, *rel.split("/"))
+            now = green_signature(_read_text_file(path), title) if os.path.exists(path) else ""
+            if now != expected:
+                build = item.get("build") or "build vert"
+                errors.append(f"{rel} / {title} : scénario vérifié vert ({build}) "
+                              + ("retiré" if not now else "modifié")
+                              + " — interdit : un test vert n'est jamais réécrit (nouvelle génération confirmée "
+                                "seulement) ; rétablis-le à l'identique")
+    return errors

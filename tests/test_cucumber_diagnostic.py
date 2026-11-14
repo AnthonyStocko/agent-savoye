@@ -382,6 +382,7 @@ def test_new_proven_cause_under_the_same_message_keeps_the_scenario_analysed(rep
 
 def test_last_run_analysis_is_read_only_and_reaches_the_bilan(repo, main_module, monkeypatch, capsys):
     """Plafond atteint : le dernier run est analysé sans modification possible, son diagnostic va au bilan."""
+    _isolated_cache(monkeypatch, repo)
     line = "Impossible de précoliser après avoir tenté toutes les URL [http://<hote>:80]"
     failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
                "motif": "Unable to create a launching Campaign", "journal": f"serveur : {line}", "sorties": []}
@@ -429,3 +430,105 @@ def test_fix_prompt_asks_for_structured_remaining_points():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     text = open(os.path.join(root, "prompts", "cucumber_client_fix.md"), encoding="utf-8").read()
     assert all(n in text for n in ("hors_test_prouvee", "validation_humaine", "a_verifier", "cause_prouvee"))
+
+
+def _isolated_cache(monkeypatch, repo):
+    from tools import cucumber_tools as ct
+    monkeypatch.setattr(ct, "CACHE_ROOT", os.path.join(os.path.dirname(repo), "cache"))
+
+
+def test_proven_and_fixed_cause_becomes_a_lesson_and_its_return_is_an_agent_error(repo, main_module, monkeypatch,
+                                                                                capsys):
+    """Cause prouvée puis corrigée (le run suivant change) : leçon du client ; la même erreur plus tard : récidive."""
+    from tools import cucumber_lessons as cl
+    _isolated_cache(monkeypatch, repo)
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "The handling unit code 1 is not valid", "journal": "x", "sorties": []}
+    messages = iter(["The handling unit code 1 is not valid", "Location not found", "Location not found"])
+    calls = []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        return {"scenarios": {"@agent_clientx_1_1": {**failing, "motif": next(messages)}}, "builds": []}
+
+    def claude(prompt, *args, **kwargs):
+        calls.append(prompt)
+        with open(os.path.join(repo, REL), "a", encoding="utf-8") as f:
+            f.write("    # correction %d\n" % len(calls))
+        return 0, json.dumps({"corrigees": 1, "corrections": [{
+            "tag": "@agent_clientx_1_1", "cause": "UM refusée", "correction": "code préfixé",
+            "cause_prouvee": {"erreur": "The handling unit code 0399 is not valid", "step": "CONTENT- Le stock suivant",
+                              "donnee": "code UM", "regle": "préfixe GS1"},
+            "lecon": {"regle": "code d'UM préfixé par le préfixe GS1 du site"}}]}), {}, False
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_MAX", "2")
+    lot, tag = _fix_loop(repo, main_module, monkeypatch, claude, verify_lot, attempts="")
+    out = capsys.readouterr().out
+    lessons = cl.load(CLIENT)
+    assert [lesson["numero"] for lesson in lessons] == [1] and lot["lecons_apprises"] == [1]
+    assert "Leçon n° 1 retenue" in out
+    # 2e correction : même erreur serveur sur le même step → leçon déjà connue, erreur de l'agent
+    assert "leçon déjà connue, n° 1" in out and lot["lecons_recidives"][0]["numero"] == 1
+    assert cl.load(CLIENT)[0]["recidives"]
+
+
+def test_proven_environment_blocker_stops_the_lot_without_new_run(repo, main_module, monkeypatch, capsys):
+    _isolated_cache(monkeypatch, repo)
+    line = "Impossible de précoliser après avoir tenté toutes les URL [http://<hote>:80]"
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "Unable to create a launching Campaign", "journal": f"serveur : {line}", "sorties": []}
+    runs, calls = [], []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        runs.append(1)
+        return {"scenarios": {"@agent_clientx_1_1": dict(failing)}, "builds": []}
+
+    def claude(prompt, *args, **kwargs):
+        calls.append(prompt)
+        with open(os.path.join(repo, REL), "a", encoding="utf-8") as f:
+            f.write("    # correction %d\n" % len(calls))
+        return 0, json.dumps({"corrigees": 0, "restantes": [
+            {"tag": "@agent_clientx_1_1", "nature": "hors_test_prouvee", "cause": "précolisage injoignable",
+             "preuve": line, "reactivation": "brancher le précolisage de test"}]}), {}, False
+    lot, tag = _fix_loop(repo, main_module, monkeypatch, claude, verify_lot)
+    out = capsys.readouterr().out
+    assert len(runs) == 1 and len(calls) == 1 and "Blocage d'environnement prouvé : arrêt du lot" in out
+    assert lot["blocage_environnement"][0]["action"] == "brancher le précolisage de test"
+
+
+def test_lot_budget_stops_corrections(repo, main_module, monkeypatch, capsys):
+    _isolated_cache(monkeypatch, repo)
+    failing = {"id": f"{REL}::Bouton de reconditionnement", "statut": "invalide", "niveaux": {},
+               "motif": "expected true", "journal": "x", "sorties": []}
+    calls = []
+
+    def verify_lot(mode, worktree, base, build, files, scenarios, *rest):
+        return {"scenarios": {"@agent_clientx_1_1": {**failing, "motif": f"expected {len(calls)}"}}, "builds": []}
+
+    def followup(lot, prompt, model, effort, tools, *args, **kwargs):
+        calls.append(prompt)
+        with open(os.path.join(repo, REL), "a", encoding="utf-8") as f:
+            f.write("    # correction %d\n" % len(calls))
+        return 0, '{"corrigees": 1}', {"cout_usd": 9.0}, False, model, effort
+    monkeypatch.setattr(main_module, "cucumber_followup", followup)
+    monkeypatch.setenv("CUCUMBER_VERIFY_FIX_MAX", "5")
+    monkeypatch.setenv("CUCUMBER_LOT_BUDGET_USD", "15")
+    write(os.path.join(repo, REL), FEATURE)
+    write(os.path.join(repo, STEPS_REL), STEPS + "}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    monkeypatch.setattr(main_module.cucumber_verify, "verify_lot", verify_lot)
+    monkeypatch.setattr(main_module, "render_prompt", lambda name, **values: values["erreurs"])
+    monkeypatch.setattr(main_module, "report_token_usage", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "verify_cucumber_lot", lambda *a, **k: {"ok": True})
+    monkeypatch.setenv("CUCUMBER_MAX_RETRACT_PCT", "100")
+    lot = {"numero": 1, "tags": {"@agent_clientx_1_1": failing["id"]}, "indicateurs": {"scenarios": []}}
+    usage = lot.setdefault("tokens", {})
+
+    def on_usage(u):
+        usage["cout_usd"] = usage.get("cout_usd", 0) + (u or {}).get("cout_usd", 0)
+    main_module.cucumber_cost.start_lot(lot)
+    main_module.verify_execution_lot(lot, [], "1/1", repo, "HEAD", [REL], [], "local", "", CLIENT, "", "", "", {},
+                                     "sonnet", "K", "/run", on_usage,
+                                     context={"conventions": {"client_tag": CLIENT_TAG}})
+    out = capsys.readouterr().out
+    # 9 $ puis 18 $ : plafond de 15 $ atteint après la 2e correction, ni 3e correction ni analyse finale
+    assert len(calls) == 2 and lot["plafond_cout"]["budget"] == 15.0 and "Plafond de coût du lot atteint" in out

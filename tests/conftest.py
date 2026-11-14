@@ -81,13 +81,17 @@ def _isolated_knowledge(tmp_path, monkeypatch):
     monkeypatch.setenv("GROUNDCOVER_MCP_ENABLED", "0")
     # Arguments du job Jenkins jamais lus par le contrôle des fichiers du lot (aucun appel réseau en test)
     monkeypatch.setenv("CUCUMBER_JOB_VALUES_CHECK", "0")
+    # Journaux des exécutions lancées par l'interface (AppTest) : jamais dans le vrai .tmp/logs ni le journal technique
+    monkeypatch.setenv("AGENT_RUN_LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("AGENT_JOURNAL_PATH", str(tmp_path / "journal_technique.log"))
     monkeypatch.setattr(knowledge_tools, "OUTBOX_DIR", str(tmp_path / "knowledge_outbox"))
     monkeypatch.setattr(knowledge_tools, "INDEX_CACHE", str(tmp_path / "knowledge_index.json"))
     original = dotenv.load_dotenv
 
     def guarded(*args, **kwargs):
         kept = {name: os.environ.get(name) for name in ("AGENT_KNOWLEDGE_DIR", "GROUNDCOVER_MCP_ENABLED",
-                                                         "CUCUMBER_JOB_VALUES_CHECK")}
+                                                         "CUCUMBER_JOB_VALUES_CHECK", "AGENT_RUN_LOGS_DIR",
+                                                         "AGENT_JOURNAL_PATH")}
         try:
             return original(*args, **kwargs)
         finally:

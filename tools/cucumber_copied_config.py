@@ -633,6 +633,47 @@ def bilan_line(info: dict) -> str:
             + (f" — {info['arret']}" if info.get("arret") else ""))
 
 
-def new_reference_entry(source: str, schema: str, version: str, dump: str, codes: dict, backup: str = "") -> dict:
+# Branchements de la copie vers des services externes du client (adresses de PRODUCTION) : (type, table, colonne
+# de l'adresse, neutralisation proposée). Seules les adresses non vides sont listées, jamais les identifiants.
+EXTERNAL_CONNECTIONS = (
+    ("précolisage", "wms_preparation_saas_param", "url",
+     "rebranché sur le serveur de test par « INIT- Configuration du colisage » (propriétés -DurlCubing… du job) ; "
+     "vérifier que le step est actif dans l'init et que le pom du client ne vide pas les propriétés du job"),
+    ("partenaire de messages", "exc_message_partner", "start_url",
+     "à neutraliser dans l'init (partenaire désactivé ou adresse de test), sinon les messages partent vers le "
+     "système du client"),
+)
+_SEPARATOR = "@@"
+_URL_HOST = re.compile(r"^(?:[a-z][\w+.-]*://)?([^/:?#]+)", re.I)
+
+
+def external_connections(schema: str, query) -> list:
+    """
+    Branchements de la copie vers des services externes : [{type, table, code, hote, neutralisation}] (hôte seul,
+    jamais d'identifiant). Table absente ou base illisible : ignorée.
+    """
+    found = []
+    for kind, table, column, action in EXTERNAL_CONNECTIONS:
+        try:
+            rows = query(f"SELECT code || '{_SEPARATOR}' || coalesce({column}, '') AS code FROM {table} "
+                         f"WHERE coalesce({column}, '') <> ''", schema)
+        except Exception:  # noqa: BLE001 - table ou colonne absente dans cette version
+            continue
+        for row in rows:
+            code, _, url = str(row.get("code", "")).partition(_SEPARATOR)
+            from tools import secret_tools
+            host = secret_tools.mask_secrets((_URL_HOST.match(url.strip()) or [None, ""])[1])[0]
+            found.append({"type": kind, "table": table, "code": code, "hote": host, "neutralisation": action})
+    return found
+
+
+def connections_lines(connections: list) -> list:
+    """Lignes lisibles des branchements externes détectés (journal, interface, plan de l'étape 4)."""
+    return [f"{c['type']} « {c['code']} » → {c['hote'] or '?'} : {c['neutralisation']}" for c in connections]
+
+
+def new_reference_entry(source: str, schema: str, version: str, dump: str, codes: dict, backup: str = "",
+                        connections: list = ()) -> dict:
     return {"date": datetime.now().isoformat(timespec="seconds"), "source": source, "schema": schema,
-            "version": version, "dump": dump, "codes": codes, "sauvegarde": backup}
+            "version": version, "dump": dump, "codes": codes, "sauvegarde": backup,
+            "branchements": list(connections or [])}

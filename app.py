@@ -111,10 +111,10 @@ def show_release_note(ticket: str, since: float) -> None:
 
 # Préfixe des problèmes d'environnement rédigés par main.py (contrôle avant tout lot)
 CUCUMBER_ENV_PREFIX = "[CUCUMBER ENVIRONNEMENT] ❌"
-JOURNAL_PATH = os.path.join(".tmp", "journal_technique.log")
+JOURNAL_PATH = os.getenv("AGENT_JOURNAL_PATH") or os.path.join(".tmp", "journal_technique.log")
 JOURNAL_MAX_BYTES = 5_000_000
 # Journal conservé de chaque exécution (le journal technique tourne, l'affichage disparaît au rechargement)
-RUN_LOGS_DIR = os.path.join(".tmp", "logs")
+RUN_LOGS_DIR = os.getenv("AGENT_RUN_LOGS_DIR") or os.path.join(".tmp", "logs")
 
 
 def render_groundcover_mcp() -> None:
@@ -2288,6 +2288,10 @@ def render_copied_reference(ctx: dict, step: dict, profile: dict) -> None:
         st.markdown(f"**Copie de référence** : {reference.get('date', '?')[:16].replace('T', ' ')} — source "
                     f"{reference.get('source', '?')}, version {reference.get('version') or '?'}"
                     + (f" — **invalidée** : {reference['invalide']}" if reference.get("invalide") else ""))
+        connections = cucumber_copied_config.connections_lines(reference.get("branchements") or [])
+        if connections:
+            st.warning("Branchements de la copie vers les services externes du client (adresses de production), à "
+                       "neutraliser par l'init avant les tests :\n" + "\n".join(f"- {line}" for line in connections))
     confirm = st.text_input("Pour confirmer, tapez le nom du schéma remplacé", key=f"cs_copied_confirm_{client}")
     if st.button("Copier la configuration du client (référence des runs)", icon=":material/database:",
                  type="primary", key=f"cs_copied_base_{client}",
@@ -2376,19 +2380,32 @@ def render_simple_tests(ctx: dict, step: dict) -> None:
                             key=f"cs_features_{ctx['client']}", disabled=step["etat"] == "bloquee")
     branch = ((cucumber_tools.load_state(ctx["client"]).get("simple") or {}).get("depot") or {}).get(
         "detail", {}).get("branche", "")
-    st.caption(f"Générées et vérifiées une par une, à partir de la branche {branch or 'de la version'} ; la première "
-               f"démarre une nouvelle génération (celle de l'onglet avancé est remplacée).")
+    st.caption(f"Générées et vérifiées une par une, à partir de la branche {branch or 'de la version'}. Une "
+               f"fonctionnalité déjà générée est REPRISE (son test existant est vérifié puis corrigé, jamais réécrit ; "
+               f"un test déjà vert n'est pas relancé).")
+    renew = st.checkbox("Nouvelle génération (écrase les tests générés)", key=f"cs_renew_{ctx['client']}",
+                        help="Repart de la branche de la version : les tests déjà générés, verts compris, sont "
+                             "réécrits. Les leçons du client et l'historique des coûts sont conservés.")
+    confirmed = renew and st.checkbox("Je confirme : les tests générés seront écrasés",
+                                      key=f"cs_renew_ok_{ctx['client']}")
+    for spec_id in chosen:
+        cost = cucumber_simple.spec_cost(ctx["client"], spec_id)
+        if cost:
+            st.caption(f"Coût cumulé de « {spec_id} » : {cost:.2f} $")
     if st.button("Générer et vérifier les tests", type="primary", icon=":material/play_arrow:",
-                 key=f"cs_tests_{ctx['client']}", disabled=step["etat"] == "bloquee" or not chosen or not branch):
+                 key=f"cs_tests_{ctx['client']}",
+                 disabled=step["etat"] == "bloquee" or not chosen or not branch or (renew and not confirmed)):
         labels = {f["id"]: f["libelle"] for f in features}
         lines = []
         for index, spec_id in enumerate(chosen):
             st.caption(f"{index + 1}/{len(chosen)} — {labels[spec_id]}")
             no_init = [] if cucumber_simple.init_enabled(
                 cucumber_tools.load_state(ctx["client"]).get("simple") or {}) else ["--no-init"]
-            before = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
+            current = cucumber_tools.load_state(ctx["client"])
+            before = cucumber_simple.lots_signature(current, spec_id)
             code = run_main_step(ctx["cmd"] + ["--cucumber-base-branch", branch, "--specifics", spec_id]
-                                 + (["--complete"] if index else []) + no_init)
+                                 + cucumber_simple.generation_mode(current, spec_id, renew and confirmed and not index)
+                                 + no_init)
             after = cucumber_simple.lots_signature(cucumber_tools.load_state(ctx["client"]), spec_id)
             if code != 0 and (code in (2, 3) or after == before):
                 # Arrêt avant le résultat (environnement, interruption, erreur) : jamais celui d'un run précédent
